@@ -1,0 +1,106 @@
+/// ClickHouse logical type system.
+///
+/// Preserves ClickHouse semantics (timezone, precision, enum labels, etc.)
+/// rather than mapping to Arrow or Python types at this layer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChType {
+    // Fixed-width numerics
+    Bool,
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
+    Float32,
+    Float64,
+
+    // Extended numerics (Phase 6)
+    // Int128, UInt128, Int256, UInt256,
+
+    // Strings
+    String,
+    FixedString(usize),
+
+    // Temporal (Phase 2)
+    // Date,
+    // Date32,
+    // DateTime { timezone: Option<String> },
+    // DateTime64 { precision: u8, timezone: Option<String> },
+
+    // Decimal (Phase 2)
+    // Decimal { precision: u8, scale: u8, bits: u16 },
+
+    // Special (Phase 3-4)
+    // Uuid,
+    // Ipv4,
+    // Ipv6,
+    // Enum8 { variants: Vec<(String, i8)> },
+    // Enum16 { variants: Vec<(String, i16)> },
+
+    // Wrappers
+    Nullable(Box<ChType>),
+    // LowCardinality(Box<ChType>),  // Phase 3
+
+    // Containers (Phase 4)
+    // Array(Box<ChType>),
+    // Tuple(Vec<(Option<String>, ChType)>),
+    // Map(Box<ChType>, Box<ChType>),
+}
+
+/// A named, typed column descriptor.
+#[derive(Debug, Clone)]
+pub struct Field {
+    pub name: String,
+    pub ch_type: ChType,
+}
+
+/// Schema describing the columns in a batch.
+#[derive(Debug, Clone)]
+pub struct Schema {
+    pub fields: Vec<Field>,
+}
+
+impl Schema {
+    pub fn new(fields: Vec<Field>) -> Self {
+        Self { fields }
+    }
+
+    pub fn num_fields(&self) -> usize {
+        self.fields.len()
+    }
+}
+
+impl ChType {
+    /// Whether this type is nullable (wrapped in Nullable).
+    pub fn is_nullable(&self) -> bool {
+        matches!(self, ChType::Nullable(_))
+    }
+
+    /// The inner type if Nullable, otherwise self.
+    pub fn inner(&self) -> &ChType {
+        match self {
+            ChType::Nullable(inner) => inner,
+            other => other,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_schema_construction() {
+        let schema = Schema::new(vec![
+            Field { name: "id".into(), ch_type: ChType::Int64 },
+            Field { name: "name".into(), ch_type: ChType::Nullable(Box::new(ChType::String)) },
+        ]);
+        assert_eq!(schema.num_fields(), 2);
+        assert_eq!(schema.fields[0].name, "id");
+        assert!(!schema.fields[0].ch_type.is_nullable());
+        assert!(schema.fields[1].ch_type.is_nullable());
+    }
+}
