@@ -1,45 +1,119 @@
 # ch-core-rs
 
-Reusable Rust core for decoding the ClickHouse **Native** binary format into a
-columnar in-memory layout, with a zero-copy **Arrow C Data Interface** export.
+Experimental shared Rust core for ClickHouse client internals.
 
-This crate is **pure Rust with zero dependencies** and no language bindings. It is
-the single shared core consumed by language-specific binding crates that each live
-in their own client repo:
+The current POC decodes ClickHouse `FORMAT Native` bytes into columnar Rust
+buffers and can export those buffers through the Arrow C Data Interface. The
+goal is to implement low-level ClickHouse type decoding once, then let each
+language client expose the decoded columnar data in the way that fits that
+runtime.
 
-- **Python** — a PyO3 binding (`_chc`) in the `clickhouse-connect` repo.
-- **JavaScript/Node** — a napi-rs binding (`.node` addon) in the `clickhouse-js` repo.
+This crate is pure Rust with zero dependencies and no Python or JavaScript
+binding code.
 
-Each binding depends on this crate as a Cargo dependency and adds its own
-language-specific materialization layer (read formats, null handling, encoding,
-timezone, number-vs-bigint policy, etc.). Only this core is shared; the glue is not.
+## Current Scope
 
-## Consuming it
+Implemented:
 
-Local development (path dependency):
+- Decode ClickHouse Native blocks from a complete byte buffer.
+- Incrementally decode Native blocks from streamed byte chunks.
+- Preserve ClickHouse blocks as separate columnar chunks.
+- Store primitive values, strings, booleans, and nullability in Arrow-compatible
+  layouts.
+- Export decoded chunks as an Arrow C Data stream.
+
+Not implemented yet:
+
+- Native encoding for inserts.
+- TCP/native protocol packet framing.
+- Compression framing.
+- Decimal, temporal, LowCardinality, Enum, UUID/IP, Array, Tuple, or Map types.
+- Language-specific materialization policy.
+
+## Binding Model
+
+Bindings live in the language client repos and depend on this crate.
+
+- Python: a PyO3 binding can expose decoded data as Python rows/columns or as an
+  Arrow C Data stream for PyArrow/Pandas/Polars.
+- JavaScript/Node: a napi-rs binding can expose decoded data as typed arrays,
+  validity bitmaps, and streamed columnar chunks.
+
+The core owns ClickHouse binary decoding and the shared columnar model. Bindings
+own runtime-specific behavior such as Python `int` versus JavaScript `BigInt`,
+native null handling, stream/backpressure integration, and public client APIs.
+
+## Consuming
+
+Local development:
 
 ```toml
 [dependencies]
 ch-core-rs = { path = "/path/to/ch-core-rs" }
 ```
 
-Production edge (pin by git tag):
+Pinned git dependency:
 
 ```toml
 [dependencies]
-ch-core-rs = { git = "https://…/ch-core-rs", tag = "v0.1.0" }
+ch-core-rs = { git = "ssh://git@github.com/ORG/ch-core-rs.git", rev = "<commit>" }
 ```
 
-Use a local `[patch]` in `.cargo/config.toml` to override the git dependency with a
-path checkout during development.
+Use a local `[patch]` in `.cargo/config.toml` when you want to override a pinned
+git dependency with a local checkout during development.
 
 ## Layout
 
-- `src/native/` — Native-format decode (varint, block/column decoders, push StreamDecoder)
-- `src/column.rs`, `src/batch.rs`, `src/schema.rs`, `src/bitmap.rs` — columnar model
-- `src/ffi.rs` — Arrow C Data Interface export (`ArrowSchema`/`ArrowArray`/`ArrowArrayStream`)
+- `src/schema.rs` - ClickHouse logical type model.
+- `src/column.rs` - Arrow-compatible physical column buffers.
+- `src/batch.rs` - `ColBatch` and `ChunkedBatch` result model.
+- `src/bitmap.rs` - validity bitmap conversion and storage.
+- `src/native/` - Native-format varints, block decode, and stream decode.
+- `src/ffi.rs` - Arrow C Data Interface export.
+
+## Data Model
+
+Decoded results are represented as:
+
+```text
+ChunkedBatch
+  schema
+  chunks: Vec<Arc<ColBatch>>
+    columns: Vec<Column>
+      typed values / offsets / data / bitmaps
+```
+
+ClickHouse Native blocks remain separate chunks. This avoids merging and
+repacking buffers, and maps naturally to Arrow record batches.
+
+## Supported Types
+
+Current decoder support:
+
+- `Bool`
+- `Int8`, `Int16`, `Int32`, `Int64`
+- `UInt8`, `UInt16`, `UInt32`, `UInt64`
+- `Float32`, `Float64`
+- `String`
+- `FixedString(N)`
+- `Nullable(T)` where `T` is one of the supported inner types
+
+Unsupported types raise a decode error.
+
+## Streaming
+
+`native::stream_decoder::StreamDecoder` accepts arbitrary byte chunks:
+
+```text
+feed(bytes) -> complete decoded blocks
+finish()    -> final blocks or truncated-stream error
+```
+
+It retains incomplete trailing bytes between calls and emits complete
+`ColBatch` values as soon as enough data has arrived. Transport-level
+backpressure is still a binding or client responsibility.
 
 ## Status
 
-Decodes Bool, Int/UInt 8–64, Float32/64, String, FixedString, and Nullable wrappers.
-Temporal/Decimal/LowCardinality/containers are not yet implemented.
+This is a POC, not a production-ready public API. The crate is intended for
+review and experimentation with Python and Node binding branches.
