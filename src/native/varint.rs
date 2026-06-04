@@ -15,7 +15,10 @@ pub fn read_varint<R: io::Read>(reader: &mut R) -> io::Result<u64> {
         }
         shift += 7;
         if shift >= 64 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "varint overflow"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "varint overflow",
+            ));
         }
     }
 }

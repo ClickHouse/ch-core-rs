@@ -47,7 +47,11 @@ impl ColBatch {
     pub fn new(schema: Schema, columns: Vec<Column>, num_rows: usize) -> Self {
         debug_assert_eq!(schema.num_fields(), columns.len());
         debug_assert!(columns.iter().all(|c| c.len() == num_rows));
-        Self { schema, columns, num_rows }
+        Self {
+            schema,
+            columns,
+            num_rows,
+        }
     }
 
     pub fn num_columns(&self) -> usize {
@@ -72,8 +76,14 @@ mod tests {
     #[test]
     fn test_batch_construction() {
         let schema = Schema::new(vec![
-            Field { name: "a".into(), ch_type: ChType::Int32 },
-            Field { name: "b".into(), ch_type: ChType::Float64 },
+            Field {
+                name: "a".into(),
+                ch_type: ChType::Int32,
+            },
+            Field {
+                name: "b".into(),
+                ch_type: ChType::Float64,
+            },
         ]);
         let columns = vec![
             Column::Int32(PrimitiveColumn::new(vec![1, 2, 3])),

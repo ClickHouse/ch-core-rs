@@ -59,14 +59,14 @@ struct SchemaPrivateData {
     format: CString,
     name: CString,
     children: Vec<*mut ArrowSchema>,
-    _child_data: Vec<Box<SchemaPrivateData>>,
+    _child_data: Vec<SchemaPrivateData>,
 }
 
 struct ArrayPrivateData {
     buffers: Vec<*const c_void>,
     children: Vec<*mut ArrowArray>,
     _batch: Arc<ColBatch>,
-    _child_data: Vec<Box<ArrayPrivateData>>,
+    _child_data: Vec<ArrayPrivateData>,
 }
 
 struct StreamPrivateData {
@@ -82,13 +82,19 @@ struct StreamPrivateData {
 // ---------------------------------------------------------------------------
 
 unsafe extern "C" fn release_schema(schema: *mut ArrowSchema) {
-    if schema.is_null() { return; }
+    if schema.is_null() {
+        return;
+    }
     let s = &mut *schema;
-    if s.private_data.is_null() { return; }
+    if s.private_data.is_null() {
+        return;
+    }
     let pd = Box::from_raw(s.private_data as *mut SchemaPrivateData);
     for child_ptr in &pd.children {
         let child = &mut **child_ptr;
-        if let Some(release_fn) = child.release { release_fn(*child_ptr); }
+        if let Some(release_fn) = child.release {
+            release_fn(*child_ptr);
+        }
         let _ = Box::from_raw(*child_ptr);
     }
     drop(pd);
@@ -97,13 +103,19 @@ unsafe extern "C" fn release_schema(schema: *mut ArrowSchema) {
 }
 
 unsafe extern "C" fn release_array(array: *mut ArrowArray) {
-    if array.is_null() { return; }
+    if array.is_null() {
+        return;
+    }
     let a = &mut *array;
-    if a.private_data.is_null() { return; }
+    if a.private_data.is_null() {
+        return;
+    }
     let pd = Box::from_raw(a.private_data as *mut ArrayPrivateData);
     for child_ptr in &pd.children {
         let child = &mut **child_ptr;
-        if let Some(release_fn) = child.release { release_fn(*child_ptr); }
+        if let Some(release_fn) = child.release {
+            release_fn(*child_ptr);
+        }
         let _ = Box::from_raw(*child_ptr);
     }
     drop(pd);
@@ -112,9 +124,13 @@ unsafe extern "C" fn release_array(array: *mut ArrowArray) {
 }
 
 unsafe extern "C" fn release_stream(stream: *mut ArrowArrayStream) {
-    if stream.is_null() { return; }
+    if stream.is_null() {
+        return;
+    }
     let s = &mut *stream;
-    if s.private_data.is_null() { return; }
+    if s.private_data.is_null() {
+        return;
+    }
     let _ = Box::from_raw(s.private_data as *mut StreamPrivateData);
     s.release = None;
     s.private_data = ptr::null_mut();
@@ -174,6 +190,11 @@ unsafe fn write_field_schema(out: *mut ArrowSchema, name: &str, ch_type: &ChType
     schema.private_data = Box::into_raw(pd) as *mut c_void;
 }
 
+/// # Safety
+///
+/// `out` must be a valid, writable pointer to an `ArrowSchema`, normally a
+/// zeroed struct. On return `out` owns its data and must be freed through its
+/// `release` callback per the Arrow C Data Interface.
 pub unsafe fn export_schema(schema_in: &Schema, out: *mut ArrowSchema) {
     let n_children = schema_in.num_fields() as i64;
 
@@ -210,11 +231,7 @@ pub unsafe fn export_schema(schema_in: &Schema, out: *mut ArrowSchema) {
 // Array export
 // ---------------------------------------------------------------------------
 
-unsafe fn export_column_array(
-    batch: &Arc<ColBatch>,
-    col_idx: usize,
-    out: *mut ArrowArray,
-) {
+unsafe fn export_column_array(batch: &Arc<ColBatch>, col_idx: usize, out: *mut ArrowArray) {
     let col = &batch.columns[col_idx];
     let num_rows = batch.num_rows as i64;
     let null_count = col.null_count() as i64;
@@ -288,6 +305,11 @@ fn push_primitive_buffers<T>(
     buffers.push(values.as_ptr() as *const c_void);
 }
 
+/// # Safety
+///
+/// `out` must be a valid, writable pointer to an `ArrowArray`, normally a
+/// zeroed struct. The exported array borrows the batch buffers and keeps the
+/// `Arc<ColBatch>` alive until `out` is freed through its `release` callback.
 pub unsafe fn export_batch_array(batch: &Arc<ColBatch>, out: *mut ArrowArray) {
     let num_rows = batch.num_rows as i64;
     let n_children = batch.num_columns() as i64;
@@ -333,14 +355,14 @@ unsafe extern "C" fn stream_get_schema(
     0
 }
 
-unsafe extern "C" fn stream_get_next(
-    stream: *mut ArrowArrayStream,
-    out: *mut ArrowArray,
-) -> i32 {
+unsafe extern "C" fn stream_get_next(stream: *mut ArrowArrayStream, out: *mut ArrowArray) -> i32 {
     let s = &mut *stream;
     let pd = &mut *(s.private_data as *mut StreamPrivateData);
     match pd.chunks.next() {
-        Some(batch) => { export_batch_array(&batch, out); 0 }
+        Some(batch) => {
+            export_batch_array(&batch, out);
+            0
+        }
         None => {
             // End of stream: mark the array released-and-empty per the spec.
             let a = &mut *out;
@@ -359,6 +381,12 @@ unsafe extern "C" fn stream_get_last_error(stream: *mut ArrowArrayStream) -> *co
 /// Export a sequence of chunks as a single Arrow C Stream — one record batch
 /// per chunk. `schema` is used for `get_schema` and remains valid even when
 /// `chunks` is empty (a zero-row result still advertises its columns).
+///
+/// # Safety
+///
+/// `out` must be a valid, writable pointer to an `ArrowArrayStream`, normally a
+/// zeroed struct. On return `out` owns its data and must be freed through its
+/// `release` callback per the Arrow C Data Interface.
 pub unsafe fn export_chunks_to_stream(
     schema: Schema,
     chunks: Vec<Arc<ColBatch>>,
@@ -392,9 +420,18 @@ mod tests {
 
     fn make_test_batch() -> Arc<ColBatch> {
         let schema = Schema::new(vec![
-            Field { name: "i".into(), ch_type: ChType::Int64 },
-            Field { name: "f".into(), ch_type: ChType::Float64 },
-            Field { name: "s".into(), ch_type: ChType::String },
+            Field {
+                name: "i".into(),
+                ch_type: ChType::Int64,
+            },
+            Field {
+                name: "f".into(),
+                ch_type: ChType::Float64,
+            },
+            Field {
+                name: "s".into(),
+                ch_type: ChType::String,
+            },
         ]);
         let columns = vec![
             Column::Int64(PrimitiveColumn::new(vec![10, 20])),
@@ -454,12 +491,11 @@ mod tests {
     fn test_export_bool_column() {
         use crate::column::BoolColumn;
 
-        let schema = Schema::new(vec![
-            Field { name: "b".into(), ch_type: ChType::Bool },
-        ]);
-        let columns = vec![
-            Column::Bool(BoolColumn::from_wire_bytes(&[1, 0, 1])),
-        ];
+        let schema = Schema::new(vec![Field {
+            name: "b".into(),
+            ch_type: ChType::Bool,
+        }]);
+        let columns = vec![Column::Bool(BoolColumn::from_wire_bytes(&[1, 0, 1]))];
         let batch = Arc::new(ColBatch::new(schema, columns, 3));
 
         unsafe {
@@ -486,12 +522,14 @@ mod tests {
     fn test_export_fixed_binary_column() {
         use crate::column::FixedBinaryColumn;
 
-        let schema = Schema::new(vec![
-            Field { name: "fs".into(), ch_type: ChType::FixedString(4) },
-        ]);
-        let columns = vec![
-            Column::FixedBinary(FixedBinaryColumn::new(b"abcdwxyz".to_vec(), 4)),
-        ];
+        let schema = Schema::new(vec![Field {
+            name: "fs".into(),
+            ch_type: ChType::FixedString(4),
+        }]);
+        let columns = vec![Column::FixedBinary(FixedBinaryColumn::new(
+            b"abcdwxyz".to_vec(),
+            4,
+        ))];
         let batch = Arc::new(ColBatch::new(schema, columns, 2));
 
         unsafe {

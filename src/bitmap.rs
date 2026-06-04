@@ -8,7 +8,7 @@ pub struct Bitmap {
 impl Bitmap {
     /// Create a bitmap where all values are valid.
     pub fn all_valid(len: usize) -> Self {
-        let num_bytes = (len + 7) / 8;
+        let num_bytes = len.div_ceil(8);
         Self {
             buffer: vec![0xFF; num_bytes],
             len,
@@ -21,7 +21,7 @@ impl Bitmap {
     /// Arrow uses bit-packed: 1 = valid, 0 = null.
     pub fn from_ch_null_map(null_bytes: &[u8]) -> Self {
         let len = null_bytes.len();
-        let num_bytes = (len + 7) / 8;
+        let num_bytes = len.div_ceil(8);
         let mut buffer = vec![0u8; num_bytes];
 
         for (i, &b) in null_bytes.iter().enumerate() {
@@ -84,7 +84,7 @@ impl Bitmap {
 
     /// Create a bitmap from a pre-built byte buffer.
     pub fn from_raw(buffer: Vec<u8>, len: usize) -> Self {
-        debug_assert!((len + 7) / 8 <= buffer.len());
+        debug_assert!(len.div_ceil(8) <= buffer.len());
         Self { buffer, len }
     }
 }

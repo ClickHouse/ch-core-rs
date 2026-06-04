@@ -50,8 +50,7 @@ impl StreamDecoder {
     /// Partial data is retained for the next `feed()` or `finish()` call.
     pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<ColBatch>, DecodeError> {
         if self.finished {
-            return Err(DecodeError::Io(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(DecodeError::Io(io::Error::other(
                 "feed() called after finish()",
             )));
         }
@@ -110,9 +109,7 @@ impl StreamDecoder {
                     self.pos = self.buffer.len();
                     break;
                 }
-                Err(DecodeError::Io(ref e))
-                    if e.kind() == io::ErrorKind::UnexpectedEof =>
-                {
+                Err(DecodeError::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
                     // Not enough data for a complete block yet.
                     // Keep the buffer as-is and wait for more data.
                     break;

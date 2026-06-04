@@ -9,11 +9,17 @@ pub struct PrimitiveColumn<T: Clone> {
 
 impl<T: Clone> PrimitiveColumn<T> {
     pub fn new(values: Vec<T>) -> Self {
-        Self { values, validity: None }
+        Self {
+            values,
+            validity: None,
+        }
     }
 
     pub fn new_nullable(values: Vec<T>, validity: Bitmap) -> Self {
-        Self { values, validity: Some(validity) }
+        Self {
+            values,
+            validity: Some(validity),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -45,13 +51,17 @@ impl BoolColumn {
     /// Packs into Arrow-compatible bitmap.
     pub fn from_wire_bytes(bytes: &[u8]) -> Self {
         let len = bytes.len();
-        let mut bitmap = vec![0u8; (len + 7) / 8];
+        let mut bitmap = vec![0u8; len.div_ceil(8)];
         for (i, &b) in bytes.iter().enumerate() {
             if b != 0 {
                 bitmap[i / 8] |= 1 << (i % 8);
             }
         }
-        Self { bitmap, len, validity: None }
+        Self {
+            bitmap,
+            len,
+            validity: None,
+        }
     }
 
     pub fn from_wire_bytes_nullable(bytes: &[u8], validity: Bitmap) -> Self {
@@ -61,11 +71,19 @@ impl BoolColumn {
     }
 
     pub fn empty() -> Self {
-        Self { bitmap: vec![], len: 0, validity: None }
+        Self {
+            bitmap: vec![],
+            len: 0,
+            validity: None,
+        }
     }
 
     pub fn empty_nullable() -> Self {
-        Self { bitmap: vec![], len: 0, validity: Some(Bitmap::from_ch_null_map(&[])) }
+        Self {
+            bitmap: vec![],
+            len: 0,
+            validity: Some(Bitmap::from_ch_null_map(&[])),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -98,15 +116,27 @@ pub struct Utf8Column {
 
 impl Utf8Column {
     pub fn new(offsets: Vec<i32>, data: Vec<u8>) -> Self {
-        Self { offsets, data, validity: None }
+        Self {
+            offsets,
+            data,
+            validity: None,
+        }
     }
 
     pub fn new_nullable(offsets: Vec<i32>, data: Vec<u8>, validity: Bitmap) -> Self {
-        Self { offsets, data, validity: Some(validity) }
+        Self {
+            offsets,
+            data,
+            validity: Some(validity),
+        }
     }
 
     pub fn len(&self) -> usize {
-        if self.offsets.is_empty() { 0 } else { self.offsets.len() - 1 }
+        if self.offsets.is_empty() {
+            0
+        } else {
+            self.offsets.len() - 1
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -136,15 +166,27 @@ pub struct FixedBinaryColumn {
 
 impl FixedBinaryColumn {
     pub fn new(data: Vec<u8>, width: usize) -> Self {
-        Self { data, width, validity: None }
+        Self {
+            data,
+            width,
+            validity: None,
+        }
     }
 
     pub fn new_nullable(data: Vec<u8>, width: usize, validity: Bitmap) -> Self {
-        Self { data, width, validity: Some(validity) }
+        Self {
+            data,
+            width,
+            validity: Some(validity),
+        }
     }
 
     pub fn len(&self) -> usize {
-        if self.width == 0 { 0 } else { self.data.len() / self.width }
+        if self.width == 0 {
+            0
+        } else {
+            self.data.len() / self.width
+        }
     }
 
     pub fn is_empty(&self) -> bool {

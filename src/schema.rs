@@ -95,8 +95,14 @@ mod tests {
     #[test]
     fn test_schema_construction() {
         let schema = Schema::new(vec![
-            Field { name: "id".into(), ch_type: ChType::Int64 },
-            Field { name: "name".into(), ch_type: ChType::Nullable(Box::new(ChType::String)) },
+            Field {
+                name: "id".into(),
+                ch_type: ChType::Int64,
+            },
+            Field {
+                name: "name".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::String)),
+            },
         ]);
         assert_eq!(schema.num_fields(), 2);
         assert_eq!(schema.fields[0].name, "id");
