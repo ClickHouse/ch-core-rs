@@ -64,10 +64,10 @@ impl std::fmt::Display for DecodeError {
 impl std::error::Error for DecodeError {}
 
 /// Server protocol revision this crate has been validated against
-/// (ClickHouse v26.5.1.882-stable). Pass this as `DecodeOptions::protocol_revision`
+/// (ClickHouse v26.2.4.23-stable). Pass this as `DecodeOptions::protocol_revision`
 /// when decoding a Native stream produced by a current server over the native
 /// TCP protocol.
-pub const DBMS_TCP_PROTOCOL_VERSION: u64 = 54484;
+pub const DBMS_TCP_PROTOCOL_VERSION: u64 = 54483;
 
 /// Protocol revision at which every column header carries a one-byte
 /// custom-serialization marker before its data (server constant
@@ -381,7 +381,7 @@ fn empty_column(ch_type: &ChType) -> Column {
 
 /// Consume the `BlockInfo` preamble that precedes each block when the producer
 /// used a protocol revision > 0 (server `BlockInfo::read` in
-/// `src/Core/BlockInfo.cpp`, confirmed at v26.5.1.882-stable).
+/// `src/Core/BlockInfo.cpp`, confirmed at v26.2.4.23-stable).
 ///
 /// `BlockInfo` is a self-describing, field-tagged structure: each field is a
 /// varint field number followed by the field value, and a field number of 0
@@ -977,7 +977,7 @@ mod tests {
 
     #[test]
     fn test_modern_framing_roundtrip() {
-        // Full v26.5 framing: a BlockInfo preamble plus a per-column
+        // Full v26.2.4.23 framing: a BlockInfo preamble plus a per-column
         // custom-serialization byte (0 = default) ahead of the data.
         let data = BlockBuilder::new()
             .revision(DBMS_TCP_PROTOCOL_VERSION)

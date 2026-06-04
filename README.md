@@ -104,6 +104,30 @@ See `DECODER_CONTRACT.md` for the definitive per-type reference: the wire
 payload, the decoded `Column` buffers, and the Arrow C Data export for every
 supported type.
 
+## Testing
+
+Run the crate checks with:
+
+```sh
+cargo test
+```
+
+The integration suite in `tests/integration.rs` decodes committed
+`FORMAT Native` fixture bytes captured from a live ClickHouse server, so CI does
+not need a server. Refresh those fixtures with:
+
+```sh
+scripts/gen_fixtures.sh
+```
+
+The script follows the `clickhouse-connect` local test convention:
+`CLICKHOUSE_CONNECT_TEST_HOST`, `CLICKHOUSE_CONNECT_TEST_PORT`,
+`CLICKHOUSE_CONNECT_TEST_USER`, and `CLICKHOUSE_CONNECT_TEST_PASSWORD`, defaulting
+to `localhost:8123` as `default` with no password. When `.server-ref` is moved
+or server framing behavior is being reconciled, regenerate the fixtures and
+update `tests/fixtures/README.md` with the capture version and first-byte
+hexdumps.
+
 ## Streaming
 
 `native::stream_decoder::StreamDecoder` accepts arbitrary byte chunks:

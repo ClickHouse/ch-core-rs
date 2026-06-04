@@ -252,19 +252,38 @@ preserve:
 New type support is the main way this crate grows. Implement a type once here and
 every binding gets it. The workflow:
 
-1. Confirm the exact wire layout against the server source first, via the
+1. Make sure the server source checkout exists at the tag in `.server-ref`,
+   shallow cloning it per "Local server source checkout" if missing. This
+   checkout is for reading the C++ to confirm layout. It is a different role from
+   the running server used to capture fixtures in step 8, and both must be the
+   same version so the bytes you commit match the source you cite.
+2. Confirm the exact wire layout against that source first, via the
    `clickhouse-server-reader` sub-agent. Do not start from a guess.
-2. Add or enable the logical variant in `src/schema.rs` (`ChType`). The enum
+3. Add or enable the logical variant in `src/schema.rs` (`ChType`). The enum
    already carries commented-out placeholders for the planned phases (temporal,
    decimal, UUID/IP, enums, LowCardinality, containers, wide ints).
-3. Teach `parse_ch_type` in `src/native/decode.rs` to parse the ClickHouse type
+4. Teach `parse_ch_type` in `src/native/decode.rs` to parse the ClickHouse type
    string into that variant.
-4. Decode the wire bytes into a `Column` variant in `src/column.rs`, keeping the
+5. Decode the wire bytes into a `Column` variant in `src/column.rs`, keeping the
    buffer layout Arrow-compatible.
-5. Add Arrow format and buffer export in `src/ffi.rs`.
-6. Add tests in the relevant module using the `BlockBuilder` pattern: cover the
-   plain case, the `Nullable` wrapper, and a zero-row block.
-7. Update `DECODER_CONTRACT.md`: move the type from "Unsupported types" into the
+6. Add Arrow format and buffer export in `src/ffi.rs`.
+7. Add unit tests in the relevant module using the `BlockBuilder` pattern: cover
+   the plain case, the `Nullable` wrapper, the zero-row block, and at least one
+   multi-block case. These synthesize wire bytes in process.
+8. Add real-server coverage in `tests/integration.rs`. Extend the `all_types`
+   query in `scripts/gen_fixtures.sh` with the new column rather than adding a new
+   fixture file, run the script against a live server of the same version as
+   `.server-ref` to recapture the committed `.native` bytes, then assert the
+   decoded values. See `tests/fixtures/README.md` for capture mechanics. This is
+   the ground-truth check the synthesized `BlockBuilder` tests cannot give you. A
+   `BlockBuilder` test encodes bytes from your understanding of the format and
+   decodes them with the same understanding, so a shared wrong assumption still
+   passes. A captured fixture proves the decoder matches what the server actually
+   emits. When capturing a framed fixture, pass `client_protocol_version` equal to
+   that version's `DBMS_TCP_PROTOCOL_VERSION`. The server caps the negotiated
+   revision at its own maximum, so name the fixture by the negotiated revision,
+   not a higher value you requested.
+9. Update `DECODER_CONTRACT.md`: move the type from "Unsupported types" into the
    support matrix and add its type section (wire payload, Arrow export, Rust
    buffer, server reference). That doc is the definitive description of decoder
    output and must not drift from the code.

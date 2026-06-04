@@ -22,8 +22,8 @@ support matrix and add a type section here in the same change. See the "Adding A
 New ClickHouse Type" workflow in `AGENTS.md`.
 
 Wire-layout claims below were confirmed against the ClickHouse server source at
-tag `v26.5.1.882-stable` (the tag pinned in `.server-ref`, protocol revision
-54484) via the `clickhouse-server-reader` sub-agent, and the per-type payloads
+tag `v26.2.4.23-stable` (the tag pinned in `.server-ref`, protocol revision
+54483) via the `clickhouse-server-reader` sub-agent, and the per-type payloads
 are verified by the crate's round-trip decode tests. Each type section cites the
 server serialization class and method it was confirmed against. When you change
 the pinned tag, reconfirm the layouts and update the citations, as `AGENTS.md`
@@ -45,7 +45,7 @@ Every type section uses the same fields, in the same order:
   `src/column.rs`.
 - **Notes**: edge cases, range limits, and anything a consumer can get wrong.
 - **Server reference**: the server serialization class and method that defines
-  the layout, confirmed at `v26.5.1.882-stable`.
+  the layout, confirmed at `v26.2.4.23-stable`.
 
 ---
 
@@ -135,11 +135,11 @@ release.
 Native block framing is gated on the server protocol revision, and the revision
 is negotiated out of band, not carried in the Native bytes. The decoder must be
 told it via `DecodeOptions.protocol_revision`. Use `DBMS_TCP_PROTOCOL_VERSION`
-(54484, the revision this crate is validated against) for a stream from a current
+(54483, the revision this crate is validated against) for a stream from a current
 server over native TCP, or 0 for a bare Native stream with no protocol framing,
 for example HTTP `FORMAT Native` with no `client_protocol_version` set.
 
-This section describes the server layout at `v26.5.1.882-stable`
+This section describes the server layout at `v26.2.4.23-stable`
 (`NativeWriter::write` / `NativeReader::read` in `src/Formats/`, with `BlockInfo`
 in `src/Core/BlockInfo.{h,cpp}`), then how the decoder reads it. "varint"
 throughout means LEB128 unsigned (`src/native/varint.rs`).
@@ -155,7 +155,7 @@ Server layout of one block, in order:
    - field 2, `bucket_num`: Int32 little-endian. Always present.
    - field 3, `out_of_order_buckets`: a varint count then that many Int32 values.
      Present at protocol revision >= 54480.
-   At v26.5.1 the revision is 54484, so all three fields are written. The
+   At v26.2.4 the revision is 54483, so all three fields are written. The
    standard block (not overflows, `bucket_num` -1, empty `out_of_order_buckets`)
    serializes to 10 bytes: `01 00 02 FF FF FF FF 03 00 00`. At revisions below
    54480 the same preamble was 8 bytes.
@@ -167,7 +167,7 @@ Server layout of one block, in order:
    - a custom-serialization marker, 1 byte: 0 for default, nonzero for custom.
      Present at protocol revision >= 54454, for every column regardless of row
      count. When nonzero, serialization-kind bytes follow before the payload. At
-     v26.5.1 this byte is always present.
+     v26.2.4 this byte is always present.
    - the column payload, as described in that type's section.
 
 The per-column payload is preceded by no other framing: the server's
@@ -266,7 +266,7 @@ their wire bit patterns.
 **Server reference:** `SerializationNumber<T>::deserializeBinaryBulk` in
 `src/DataTypes/Serializations/SerializationNumber.cpp`. On little-endian hosts it
 is a single bulk raw read into the column buffer; big-endian hosts byte-swap per
-element. Confirmed at `v26.5.1.882-stable`.
+element. Confirmed at `v26.2.4.23-stable`.
 
 ### Bool
 
@@ -296,7 +296,7 @@ LSB-first packing.
 around `SerializationNumber<UInt8>` and does not override the binary bulk path, so
 the wire form is exactly `UInt8`: one byte per row. The bulk read does no
 clamping to 0/1, so the decoder's "any nonzero byte is true" reading is safe; the
-server writes 0 or 1 in practice. Confirmed at `v26.5.1.882-stable`.
+server writes 0 or 1 in practice. Confirmed at `v26.2.4.23-stable`.
 
 ### String
 
@@ -327,7 +327,7 @@ at 0. Data is the concatenated bytes.
 
 **Server reference:** `SerializationString::deserializeBinaryBulk` in
 `src/DataTypes/Serializations/SerializationString.cpp`: per row a VarUInt length
-then that many raw bytes, no UTF-8 validation. Confirmed at `v26.5.1.882-stable`.
+then that many raw bytes, no UTF-8 validation. Confirmed at `v26.2.4.23-stable`.
 
 ### FixedString(N)
 
@@ -354,7 +354,7 @@ does not strip padding or interpret the bytes as text.
 `src/DataTypes/Serializations/SerializationFixedString.cpp`: exactly `N * num_rows`
 contiguous bytes, no length prefixes. Short values are zero-padded to `N` at
 insert time, so the wire bytes are always `N` per row. Confirmed at
-`v26.5.1.882-stable`.
+`v26.2.4.23-stable`.
 
 ### Nullable(T)
 
@@ -389,7 +389,7 @@ is carried by the inner column's `validity`.
 in `src/DataTypes/Serializations/SerializationNullable.cpp`: the null map stream
 (one `UInt8` per row, 0 present, 1 NULL) is read first, then the nested column
 with all `num_rows` values. The decode verifies the null map and nested column
-have equal length. Confirmed at `v26.5.1.882-stable`.
+have equal length. Confirmed at `v26.2.4.23-stable`.
 
 ---
 
