@@ -182,11 +182,7 @@ impl FixedBinaryColumn {
     }
 
     pub fn len(&self) -> usize {
-        if self.width == 0 {
-            0
-        } else {
-            self.data.len() / self.width
-        }
+        self.data.len().checked_div(self.width).unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {

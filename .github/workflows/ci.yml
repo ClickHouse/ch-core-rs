@@ -15,18 +15,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - name: Install pinned Rust toolchain
+        run: rustup show
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 
-      # The decode tests are self-contained: they synthesize wire bytes in
-      # process, and the planned integration tests decode committed fixture
-      # bytes. Neither needs a live ClickHouse server or the gitignored
-      # .server-src/ checkout, so CI stays hermetic.
       - name: Format check
         run: cargo fmt --all -- --check
 
