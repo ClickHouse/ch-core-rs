@@ -100,6 +100,10 @@ Current decoder support:
 
 Unsupported types raise a decode error.
 
+See `DECODER_CONTRACT.md` for the definitive per-type reference: the wire
+payload, the decoded `Column` buffers, and the Arrow C Data export for every
+supported type.
+
 ## Streaming
 
 `native::stream_decoder::StreamDecoder` accepts arbitrary byte chunks:
