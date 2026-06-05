@@ -145,3 +145,6 @@ backpressure is still a binding or client responsibility.
 
 This is a POC, not a production-ready public API. The crate is intended for
 review and experimentation with Python and Node binding branches.
+
+See `VISION.md` for what this core is for, the positioning against server
+`ArrowStream`, and the roadmap.
