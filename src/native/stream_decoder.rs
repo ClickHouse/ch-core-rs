@@ -15,10 +15,11 @@
 //! let final_blocks = decoder.finish()?;
 //! ```
 
-use std::io::{self, Cursor};
+use std::io;
 
 use crate::batch::ColBatch;
-use crate::native::decode::{decode_next_block, DecodeError, DecodeOptions};
+use crate::native::decode::{block_end, decode_next_block, DecodeError, DecodeOptions};
+use crate::native::varint::ByteReader;
 
 /// Push-based incremental decoder for ClickHouse Native blocks.
 ///
@@ -29,6 +30,13 @@ pub struct StreamDecoder {
     buffer: Vec<u8>,
     /// Byte offset of unconsumed data in `buffer`.
     pos: usize,
+    /// Buffer length at which the last completeness scan found the next block
+    /// still incomplete. While the buffer has not grown past this, no block can
+    /// have completed, so `drain_blocks` skips the re-scan entirely. This elides
+    /// redundant scans on feeds that add no bytes past the high-water mark, such
+    /// as empty feeds and the `finish()` re-drain. Held in current buffer
+    /// coordinates: compaction lowers it by the number of bytes drained.
+    scanned: usize,
     options: DecodeOptions,
     finished: bool,
 }
@@ -38,6 +46,7 @@ impl StreamDecoder {
         Self {
             buffer: Vec::new(),
             pos: 0,
+            scanned: 0,
             options,
             finished: false,
         }
@@ -83,6 +92,13 @@ impl StreamDecoder {
     }
 
     /// Try to decode as many complete blocks as possible from the buffer.
+    ///
+    /// Each iteration first runs the allocation-free [`block_end`] completeness
+    /// scan over the unconsumed bytes. Only when it confirms a whole block is
+    /// buffered do we run the allocating [`decode_next_block`]. A block that
+    /// arrives over several feeds therefore allocates its column buffers exactly
+    /// once, when the last byte lands, instead of allocating and discarding them
+    /// on every partial feed.
     fn drain_blocks(&mut self) -> Result<Vec<ColBatch>, DecodeError> {
         let mut blocks = Vec::new();
 
@@ -92,26 +108,39 @@ impl StreamDecoder {
                 break;
             }
 
-            let mut cursor = Cursor::new(data);
+            // High-water mark: the previous scan found an incomplete block and
+            // consumed all `self.scanned` available bytes reaching for its end.
+            // If the buffer has not grown past that, no block can have completed,
+            // so skip the redundant re-scan from `self.pos`.
+            if self.buffer.len() <= self.scanned {
+                break;
+            }
 
-            match decode_next_block(&mut cursor, &self.options) {
-                Ok(Some(batch)) => {
-                    // Successfully decoded a block. Advance position.
-                    let consumed = cursor.position() as usize;
-                    self.pos += consumed;
-                    blocks.push(batch);
-                    // Try to decode another block from remaining data.
+            match block_end(data, &self.options) {
+                Ok(Some(end)) => {
+                    // A full block is buffered. The allocating decode now reads
+                    // exactly `data[..end]`; completeness was just verified with
+                    // the same framing, so it cannot hit EOF.
+                    let mut reader = ByteReader::new(&data[..end]);
+                    match decode_next_block(&mut reader, &self.options)? {
+                        Some(batch) => blocks.push(batch),
+                        // `block_end` returned `Some`, so a block is present.
+                        None => unreachable!("block_end confirmed a complete block"),
+                    }
+                    self.pos += end;
+                    self.scanned = 0;
+                    // Try to decode another block from the remaining bytes.
                 }
                 Ok(None) => {
-                    // EOF at block boundary — no more complete blocks.
-                    // This happens when remaining data is empty (already
-                    // caught above) or when we're exactly at a boundary.
+                    // Clean end-of-stream at a block boundary: no more blocks.
                     self.pos = self.buffer.len();
                     break;
                 }
                 Err(DecodeError::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    // Not enough data for a complete block yet.
-                    // Keep the buffer as-is and wait for more data.
+                    // Block started but not fully buffered. Remember how far the
+                    // buffer reached so the next feed only re-scans once it has
+                    // grown, then wait for more data.
+                    self.scanned = self.buffer.len();
                     break;
                 }
                 Err(e) => {
@@ -124,6 +153,7 @@ impl StreamDecoder {
         // Compact buffer: remove consumed bytes to prevent unbounded growth.
         if self.pos > 0 {
             self.buffer.drain(..self.pos);
+            self.scanned = self.scanned.saturating_sub(self.pos);
             self.pos = 0;
         }
 
@@ -154,6 +184,23 @@ mod tests {
         // column data
         for &v in values {
             buf.extend_from_slice(&v.to_le_bytes());
+        }
+        buf
+    }
+
+    /// Helper: build a Native format block with one String column (no framing).
+    fn make_string_block(name: &str, values: &[&str]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_varint(&mut buf, 1).unwrap(); // num_cols
+        write_varint(&mut buf, values.len() as u64).unwrap(); // num_rows
+        write_varint(&mut buf, name.len() as u64).unwrap();
+        buf.extend_from_slice(name.as_bytes());
+        let type_name = b"String";
+        write_varint(&mut buf, type_name.len() as u64).unwrap();
+        buf.extend_from_slice(type_name);
+        for &s in values {
+            write_varint(&mut buf, s.len() as u64).unwrap();
+            buf.extend_from_slice(s.as_bytes());
         }
         buf
     }
@@ -308,5 +355,106 @@ mod tests {
                 _ => panic!("expected Int64"),
             }
         }
+    }
+
+    #[test]
+    fn test_string_block_byte_by_byte() {
+        // A String block fed one byte at a time must decode once the final byte
+        // lands. This exercises the String branch of the completeness scan, which
+        // walks the per-value varint length prefixes.
+        let mut dec = StreamDecoder::new(DecodeOptions::default());
+        let data = make_string_block("s", &["user_1", "", "user_2", "13"]);
+
+        let mut total = Vec::new();
+        for byte in &data {
+            total.extend(dec.feed(&[*byte]).unwrap());
+        }
+        total.extend(dec.finish().unwrap());
+
+        assert_eq!(total.len(), 1);
+        assert_eq!(total[0].num_rows, 4);
+        match total[0].column(0) {
+            Column::Utf8(c) => {
+                assert_eq!(c.value(0), b"user_1");
+                assert_eq!(c.value(1), b"");
+                assert_eq!(c.value(2), b"user_2");
+                assert_eq!(c.value(3), b"13");
+            }
+            _ => panic!("expected Utf8"),
+        }
+    }
+
+    #[test]
+    fn test_large_string_block_split_across_many_feeds() {
+        // A large String block split into many small chunks must decode exactly
+        // once, when the last byte arrives. With the completeness scan in place,
+        // the partial feeds never allocate the column buffers.
+        let mut dec = StreamDecoder::new(DecodeOptions::default());
+        let owned: Vec<String> = (0..5_000).map(|i| format!("user_{i}")).collect();
+        let values: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let data = make_string_block("s", &values);
+
+        let mut all = Vec::new();
+        for chunk in data.chunks(64) {
+            all.extend(dec.feed(chunk).unwrap());
+        }
+        all.extend(dec.finish().unwrap());
+
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].num_rows, 5_000);
+        match all[0].column(0) {
+            Column::Utf8(c) => {
+                assert_eq!(c.value(0), b"user_0");
+                assert_eq!(c.value(4_999), b"user_4999");
+            }
+            _ => panic!("expected Utf8"),
+        }
+    }
+
+    #[test]
+    fn test_high_water_mark_skips_redundant_scan() {
+        // White-box check on the high-water mark: a feed that does not complete
+        // the block records `scanned == buffer.len()`, and a subsequent feed of
+        // zero new bytes must not move past it (no re-scan, no progress).
+        let mut dec = StreamDecoder::new(DecodeOptions::default());
+        let data = make_int64_block("n", &[13, 79, 1]);
+
+        // Feed all but the last byte: the block is incomplete.
+        let blocks = dec.feed(&data[..data.len() - 1]).unwrap();
+        assert!(blocks.is_empty());
+        assert_eq!(dec.scanned, dec.buffer.len());
+        let mark = dec.scanned;
+
+        // An empty feed does not grow the buffer, so the scan is skipped and the
+        // high-water mark is unchanged.
+        let blocks = dec.feed(b"").unwrap();
+        assert!(blocks.is_empty());
+        assert_eq!(dec.scanned, mark);
+
+        // The final byte completes the block.
+        let blocks = dec.feed(&data[data.len() - 1..]).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].num_rows, 3);
+        // After consuming the block the mark is reset and the buffer compacted.
+        assert_eq!(dec.scanned, 0);
+        assert_eq!(dec.pos, 0);
+    }
+
+    #[test]
+    fn test_unsupported_type_in_complete_stream_errors() {
+        // An unsupported type inside an otherwise-complete block surfaces as a
+        // DecodeError from the scan, not as "need more bytes".
+        let mut dec = StreamDecoder::new(DecodeOptions::default());
+        let mut data = Vec::new();
+        write_varint(&mut data, 1).unwrap(); // num_cols
+        write_varint(&mut data, 1).unwrap(); // num_rows
+        write_varint(&mut data, 2).unwrap();
+        data.extend_from_slice(b"ts");
+        write_varint(&mut data, 8).unwrap();
+        data.extend_from_slice(b"DateTime");
+        data.extend_from_slice(&0u32.to_le_bytes()); // any 4 bytes of data
+
+        let result = dec.feed(&data);
+        assert!(matches!(result, Err(DecodeError::UnsupportedType { .. })));
     }
 }

@@ -1,10 +1,10 @@
-use std::io::{self, Read};
+use std::io;
 use std::sync::Arc;
 
 use crate::batch::{ChunkedBatch, ColBatch};
 use crate::bitmap::Bitmap;
 use crate::column::{BoolColumn, Column, FixedBinaryColumn, PrimitiveColumn, Utf8Column};
-use crate::native::varint::{read_varint, read_varint_string};
+use crate::native::varint::ByteReader;
 use crate::schema::{ChType, Field, Schema};
 
 /// Errors that can occur during Native format decoding.
@@ -137,17 +137,18 @@ fn parse_ch_type(type_name: &str) -> Option<ChType> {
 // ---------------------------------------------------------------------------
 
 /// Read a null map: 1 byte per row, 0x01 = null.
-fn decode_null_map<R: Read>(reader: &mut R, num_rows: usize) -> io::Result<Bitmap> {
-    let mut null_bytes = vec![0u8; num_rows];
-    reader.read_exact(&mut null_bytes)?;
-    Ok(Bitmap::from_ch_null_map(&null_bytes))
+fn decode_null_map(reader: &mut ByteReader, num_rows: usize) -> io::Result<Bitmap> {
+    let null_bytes = reader.read_slice(num_rows)?;
+    Ok(Bitmap::from_ch_null_map(null_bytes))
 }
 
-/// Decode fixed-width primitives by reading bytes straight into a typed buffer.
+/// Decode fixed-width primitives by reading wire bytes straight into a typed
+/// buffer.
 ///
 /// On little-endian platforms (x86, ARM) the wire bytes already are the
-/// in-memory representation, so we allocate the destination `Vec<T>` and read
-/// the bytes directly into its backing store — no per-element loop, no copy.
+/// in-memory representation, so we allocate the destination `Vec<T>` and copy
+/// the wire bytes directly into its backing store with a single
+/// `copy_nonoverlapping` — no per-element loop, no temporary buffer.
 ///
 /// The destination is allocated as `Vec<T>` (not a `Vec<u8>` reinterpreted as
 /// `Vec<T>`) so the allocation has T's alignment and is freed with T's layout;
@@ -155,31 +156,52 @@ fn decode_null_map<R: Read>(reader: &mut R, num_rows: usize) -> io::Result<Bitma
 macro_rules! decode_primitive {
     ($reader:expr, $num_rows:expr, $ty:ty) => {{
         let num_rows = $num_rows;
-        let total_bytes = num_rows * std::mem::size_of::<$ty>();
+        // A row count from an untrusted header can overflow `usize` when scaled
+        // to bytes. `checked_mul` turns that into an error instead of a wrapping
+        // multiply (and the debug-build overflow panic), so the decoder never
+        // panics on a malformed length.
+        let total_bytes = num_rows
+            .checked_mul(std::mem::size_of::<$ty>())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "primitive column byte length overflows usize",
+                )
+            })?;
+        // Borrow the exact wire bytes first; this bounds-checks the whole run
+        // once and returns `UnexpectedEof` if the buffer is short. Reading
+        // before allocating also caps the `with_capacity` below at the bytes
+        // actually present, so a hostile row count cannot drive a giant
+        // allocation.
+        let src: &[u8] = $reader.read_slice(total_bytes)?;
 
         #[cfg(target_endian = "little")]
         {
             let mut values: Vec<$ty> = Vec::with_capacity(num_rows);
-            // Safety: `with_capacity(num_rows)` reserves exactly
-            // `num_rows * size_of::<$ty>()` bytes, correctly aligned for `$ty`.
-            // We fill every one of those bytes via `read_exact` before calling
-            // `set_len`; on a read error `values` stays length 0 and drops
-            // cleanly with the correct layout.
+            // Safety: `with_capacity(num_rows)` reserves exactly `total_bytes`
+            // bytes (`num_rows * size_of::<$ty>()`), correctly aligned for `$ty`.
+            // `src` is a `&[u8]` of exactly `total_bytes` length returned by
+            // `read_slice`, so the source and destination ranges are both valid
+            // for `total_bytes` and cannot overlap (`src` borrows the input
+            // buffer, `values` is a fresh allocation). We `set_len` to
+            // `num_rows` only after every byte is written; on the EOF path above
+            // we returned before allocating, so there is no partially
+            // initialized `Vec` to drop.
             unsafe {
-                let byte_dst =
-                    std::slice::from_raw_parts_mut(values.as_mut_ptr() as *mut u8, total_bytes);
-                $reader.read_exact(byte_dst)?;
+                std::ptr::copy_nonoverlapping(
+                    src.as_ptr(),
+                    values.as_mut_ptr() as *mut u8,
+                    total_bytes,
+                );
                 values.set_len(num_rows);
             }
             values
         }
 
-        // Big-endian fallback: read raw bytes, byte-swap each element.
+        // Big-endian fallback: byte-swap each little-endian wire element.
         #[cfg(target_endian = "big")]
         {
-            let mut buf = vec![0u8; total_bytes];
-            $reader.read_exact(&mut buf)?;
-            let values: Vec<$ty> = buf
+            let values: Vec<$ty> = src
                 .chunks_exact(std::mem::size_of::<$ty>())
                 .map(|chunk| <$ty>::from_le_bytes(chunk.try_into().unwrap()))
                 .collect();
@@ -188,23 +210,32 @@ macro_rules! decode_primitive {
     }};
 }
 
-fn decode_bool_data<R: Read>(reader: &mut R, num_rows: usize) -> io::Result<BoolColumn> {
-    let mut wire_bytes = vec![0u8; num_rows];
-    reader.read_exact(&mut wire_bytes)?;
-    Ok(BoolColumn::from_wire_bytes(&wire_bytes))
+fn decode_bool_data(reader: &mut ByteReader, num_rows: usize) -> io::Result<BoolColumn> {
+    let wire_bytes = reader.read_slice(num_rows)?;
+    Ok(BoolColumn::from_wire_bytes(wire_bytes))
 }
 
-fn decode_string_data<R: Read>(reader: &mut R, num_rows: usize) -> io::Result<(Vec<i32>, Vec<u8>)> {
+/// Decode a String column into Arrow offsets plus a single data buffer.
+///
+/// Each value is a varint length followed by that many raw bytes (server
+/// `SerializationString::deserializeBinaryBulk`, confirmed at v26.2.4.23-stable).
+/// Each value's bytes are borrowed from the input as a sub-slice and appended to
+/// `data` with one `extend_from_slice`: one copy per string, zero per-row heap
+/// allocations.
+fn decode_string_data(reader: &mut ByteReader, num_rows: usize) -> io::Result<(Vec<i32>, Vec<u8>)> {
     let mut offsets = Vec::with_capacity(num_rows + 1);
-    let mut data = Vec::new();
+    // Reserve a lower bound of one byte per value so the common short-string
+    // case does not start from a zero-capacity buffer and reallocate from
+    // scratch on the first few pushes. `extend_from_slice` still grows it for
+    // longer strings.
+    let mut data = Vec::with_capacity(num_rows);
     let mut offset: i32 = 0;
     offsets.push(offset);
 
     for _ in 0..num_rows {
-        let len = read_varint(reader)? as usize;
-        let mut buf = vec![0u8; len];
-        reader.read_exact(&mut buf)?;
-        data.extend_from_slice(&buf);
+        let len = reader.read_varint()? as usize;
+        let bytes = reader.read_slice(len)?;
+        data.extend_from_slice(bytes);
         offset += len as i32;
         offsets.push(offset);
     }
@@ -212,19 +243,25 @@ fn decode_string_data<R: Read>(reader: &mut R, num_rows: usize) -> io::Result<(V
     Ok((offsets, data))
 }
 
-fn decode_fixed_binary_data<R: Read>(
-    reader: &mut R,
+fn decode_fixed_binary_data(
+    reader: &mut ByteReader,
     num_rows: usize,
     width: usize,
 ) -> io::Result<Vec<u8>> {
-    let mut data = vec![0u8; num_rows * width];
-    reader.read_exact(&mut data)?;
-    Ok(data)
+    // `checked_mul` guards against a row count or width that overflows `usize`;
+    // `read_slice` then bounds the result against the bytes actually present.
+    let total = num_rows.checked_mul(width).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "FixedString column byte length overflows usize",
+        )
+    })?;
+    Ok(reader.read_slice(total)?.to_vec())
 }
 
 /// Decode a single column given its ChType.
-fn decode_column<R: Read>(
-    reader: &mut R,
+fn decode_column(
+    reader: &mut ByteReader,
     ch_type: &ChType,
     num_rows: usize,
 ) -> Result<Column, DecodeError> {
@@ -400,8 +437,8 @@ fn empty_column(ch_type: &ChType) -> Column {
 /// Returns `Ok(false)` if the stream ends cleanly before any block info byte (a
 /// block boundary at end of stream), or `Ok(true)` once a full preamble has been
 /// consumed.
-fn read_block_info<R: Read>(reader: &mut R) -> Result<bool, DecodeError> {
-    let mut field_num = match read_varint(reader) {
+fn read_block_info(reader: &mut ByteReader) -> Result<bool, DecodeError> {
+    let mut field_num = match reader.read_varint() {
         Ok(n) => n,
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
         Err(e) => return Err(e.into()),
@@ -409,22 +446,15 @@ fn read_block_info<R: Read>(reader: &mut R) -> Result<bool, DecodeError> {
 
     while field_num != 0 {
         match field_num {
-            1 => {
-                let mut byte = [0u8; 1];
-                reader.read_exact(&mut byte)?; // is_overflows
-            }
-            2 => {
-                let mut bytes = [0u8; 4];
-                reader.read_exact(&mut bytes)?; // bucket_num (Int32)
-            }
+            1 => reader.skip(1)?, // is_overflows
+            2 => reader.skip(4)?, // bucket_num (Int32)
             3 => {
-                let count = read_varint(reader)? as usize; // out_of_order_buckets
-                let mut bytes = vec![0u8; count * 4];
-                reader.read_exact(&mut bytes)?;
+                let count = reader.read_varint()? as usize; // out_of_order_buckets
+                reader.skip(count.saturating_mul(4))?;
             }
             other => return Err(DecodeError::InvalidBlockInfo { field_num: other }),
         }
-        field_num = read_varint(reader)?;
+        field_num = reader.read_varint()?;
     }
 
     Ok(true)
@@ -434,9 +464,20 @@ fn read_block_info<R: Read>(reader: &mut R) -> Result<bool, DecodeError> {
 // Block decode
 // ---------------------------------------------------------------------------
 
-/// Decode a single Native format block from a reader.
-pub fn decode_next_block<R: Read>(
-    reader: &mut R,
+/// Decode a single Native format block from a slice reader.
+///
+/// `reader` must be positioned at a block boundary. On success the reader has
+/// advanced past exactly one block. If the block is not fully present in the
+/// reader's bytes, the returned error is `DecodeError::Io` with kind
+/// `UnexpectedEof`, which the streaming decoder reads as "need more bytes". A
+/// clean end-of-stream at a block boundary returns `Ok(None)`.
+///
+/// `decode_all_bytes` and `StreamDecoder` both drive the decode through this
+/// entry point. `StreamDecoder` first runs [`block_end`] to confirm a full
+/// block is buffered, so it never reaches the allocating decode for a partial
+/// block.
+pub fn decode_next_block(
+    reader: &mut ByteReader,
     options: &DecodeOptions,
 ) -> Result<Option<ColBatch>, DecodeError> {
     // A BlockInfo preamble precedes each block when the producer used a protocol
@@ -446,60 +487,97 @@ pub fn decode_next_block<R: Read>(
         if !read_block_info(reader)? {
             return Ok(None);
         }
-        let num_cols = read_varint(reader)? as usize;
-        let num_rows = read_varint(reader)? as usize;
+        let num_cols = reader.read_varint()? as usize;
+        let num_rows = reader.read_varint()? as usize;
         return Ok(Some(decode_block_body(
             reader, options, num_cols, num_rows,
         )?));
     }
 
     // No protocol framing. End of stream falls on the column-count varint.
-    let num_cols = match read_varint(reader) {
+    let num_cols = match reader.read_varint() {
         Ok(n) => n as usize,
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let num_rows = read_varint(reader)? as usize;
+    let num_rows = reader.read_varint()? as usize;
     Ok(Some(decode_block_body(
         reader, options, num_cols, num_rows,
     )?))
 }
 
+/// Read one column header: name, type string, and the optional custom
+/// serialization marker. Returns the parsed `ChType` plus the column name.
+///
+/// Shared by the allocating decode and the allocation-free completeness scan so
+/// the two cannot drift on header framing or on which types and serializations
+/// are accepted.
+fn read_column_header(
+    reader: &mut ByteReader,
+    options: &DecodeOptions,
+) -> Result<(String, ChType), DecodeError> {
+    let col_name = reader.read_varint_string()?;
+    let type_name = reader.read_varint_string()?;
+
+    // Per-column custom-serialization marker, present at revision >= 54454, for
+    // every column regardless of row count. One byte: 0 = default. A nonzero
+    // value selects a custom serialization (sparse, detached, ...) whose layout
+    // this crate does not decode, so reject it rather than misread the column
+    // data that follows.
+    if options.protocol_revision >= DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION {
+        let marker = reader.read_u8()?;
+        if marker != 0 {
+            return Err(DecodeError::UnsupportedSerialization {
+                column: col_name,
+                serialization_byte: marker,
+            });
+        }
+    }
+
+    let ch_type = parse_ch_type(&type_name).ok_or_else(|| DecodeError::UnsupportedType {
+        column: col_name.clone(),
+        type_name: type_name.clone(),
+    })?;
+
+    Ok((col_name, ch_type))
+}
+
+/// Reject a row or column count larger than the bytes still available.
+///
+/// `num_cols` and `num_rows` come from an untrusted block header. Every column
+/// header and every row of data occupies at least one byte on the wire, so a
+/// count larger than `reader.remaining()` cannot be satisfied. Catching it here
+/// keeps a hostile count from reaching a `Vec::with_capacity` that would abort
+/// the process on an oversized request, and bounds every capacity reservation
+/// in the block body at the input size. Reported as `UnexpectedEof` so the
+/// streaming decoder treats a truncated stream as "need more bytes".
+fn check_header_count(count: usize, what: &str, reader: &ByteReader) -> Result<(), DecodeError> {
+    let remaining = reader.remaining();
+    if count > remaining {
+        return Err(DecodeError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("{what} ({count}) exceeds remaining bytes ({remaining})"),
+        )));
+    }
+    Ok(())
+}
+
 /// Decode one block body, the per-column headers and data, after the column and
 /// row counts have already been read.
-fn decode_block_body<R: Read>(
-    reader: &mut R,
+fn decode_block_body(
+    reader: &mut ByteReader,
     options: &DecodeOptions,
     num_cols: usize,
     num_rows: usize,
 ) -> Result<ColBatch, DecodeError> {
+    check_header_count(num_cols, "column count", reader)?;
+    check_header_count(num_rows, "row count", reader)?;
+
     let mut fields = Vec::with_capacity(num_cols);
     let mut columns = Vec::with_capacity(num_cols);
 
     for _ in 0..num_cols {
-        let col_name = read_varint_string(reader)?;
-        let type_name = read_varint_string(reader)?;
-
-        // Per-column custom-serialization marker, present at revision >= 54454,
-        // for every column regardless of row count. One byte: 0 = default. A
-        // nonzero value selects a custom serialization (sparse, detached, ...)
-        // whose layout this crate does not decode, so reject it rather than
-        // misread the column data that follows.
-        if options.protocol_revision >= DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION {
-            let mut marker = [0u8; 1];
-            reader.read_exact(&mut marker)?;
-            if marker[0] != 0 {
-                return Err(DecodeError::UnsupportedSerialization {
-                    column: col_name,
-                    serialization_byte: marker[0],
-                });
-            }
-        }
-
-        let ch_type = parse_ch_type(&type_name).ok_or_else(|| DecodeError::UnsupportedType {
-            column: col_name.clone(),
-            type_name: type_name.clone(),
-        })?;
+        let (col_name, ch_type) = read_column_header(reader, options)?;
 
         if num_rows == 0 {
             columns.push(empty_column(&ch_type));
@@ -517,6 +595,94 @@ fn decode_block_body<R: Read>(
     Ok(ColBatch::new(schema, columns, num_rows))
 }
 
+// ---------------------------------------------------------------------------
+// Completeness scan
+// ---------------------------------------------------------------------------
+
+/// Walk the framing of one block without allocating column buffers, and report
+/// where the block ends in `data`.
+///
+/// Returns:
+/// - `Ok(Some(end))`: a complete block occupies `data[..end]`.
+/// - `Ok(None)`: `data` ends cleanly at a block boundary (no block present).
+/// - `Err(Io(UnexpectedEof))`: a block has started but is not fully buffered yet
+///   (the caller should wait for more bytes).
+/// - `Err(_)`: a real decode error (unsupported type/serialization, bad
+///   BlockInfo field, varint overflow, invalid UTF-8 in a header), which is
+///   surfaced even before the whole block is buffered, exactly as the real
+///   decode would surface it.
+///
+/// The streaming decoder calls this before [`decode_next_block`] so it never
+/// allocates and discards column buffers for a block that has not fully arrived.
+/// It shares [`read_block_info`] and [`read_column_header`] with the real
+/// decode; only [`skip_column_data`] is scan specific, and it walks the exact
+/// same wire bytes the per-type decoders consume.
+pub fn block_end(data: &[u8], options: &DecodeOptions) -> Result<Option<usize>, DecodeError> {
+    let mut reader = ByteReader::new(data);
+
+    if options.protocol_revision > 0 {
+        if !read_block_info(&mut reader)? {
+            return Ok(None);
+        }
+    } else if reader.remaining() == 0 {
+        return Ok(None);
+    }
+
+    let num_cols = reader.read_varint()? as usize;
+    let num_rows = reader.read_varint()? as usize;
+
+    for _ in 0..num_cols {
+        let (_name, ch_type) = read_column_header(&mut reader, options)?;
+        if num_rows > 0 {
+            skip_column_data(&mut reader, &ch_type, num_rows)?;
+        }
+    }
+
+    Ok(Some(reader.position()))
+}
+
+/// Advance `reader` past one column's data without materializing it.
+///
+/// Fixed-width types have a computable byte length; String scans the per-value
+/// varint length prefixes. This must consume exactly the bytes the matching
+/// decoder in `decode_column` consumes.
+fn skip_column_data(
+    reader: &mut ByteReader,
+    ch_type: &ChType,
+    num_rows: usize,
+) -> Result<(), DecodeError> {
+    let inner = match ch_type {
+        ChType::Nullable(inner) => {
+            reader.skip(num_rows)?; // null map: 1 byte per row
+            inner.as_ref()
+        }
+        other => other,
+    };
+
+    match inner {
+        ChType::Bool | ChType::Int8 | ChType::UInt8 => reader.skip(num_rows)?,
+        ChType::Int16 | ChType::UInt16 => reader.skip(num_rows.saturating_mul(2))?,
+        ChType::Int32 | ChType::UInt32 | ChType::Float32 => {
+            reader.skip(num_rows.saturating_mul(4))?
+        }
+        ChType::Int64 | ChType::UInt64 | ChType::Float64 => {
+            reader.skip(num_rows.saturating_mul(8))?
+        }
+        ChType::FixedString(width) => reader.skip(num_rows.saturating_mul(*width))?,
+        ChType::String => {
+            for _ in 0..num_rows {
+                let len = reader.read_varint()? as usize;
+                reader.skip(len)?;
+            }
+        }
+        // `read_column_header` already rejected unsupported types, and Nullable
+        // was unwrapped above.
+        ChType::Nullable(_) => unreachable!("Nullable already unwrapped"),
+    }
+
+    Ok(())
+}
+
 /// Decode all blocks from a complete byte buffer into a `ChunkedBatch`.
 ///
 /// Each Native block becomes its own chunk — blocks are NOT concatenated.
@@ -524,11 +690,11 @@ fn decode_block_body<R: Read>(
 /// shares the same schema). Zero-row blocks contribute the schema but are
 /// dropped from the chunk list to keep the chunk stream free of empty batches.
 pub fn decode_all_bytes(data: &[u8], options: &DecodeOptions) -> Result<ChunkedBatch, DecodeError> {
-    let mut cursor = io::Cursor::new(data);
+    let mut reader = ByteReader::new(data);
     let mut schema: Option<Schema> = None;
     let mut chunks: Vec<Arc<ColBatch>> = Vec::new();
 
-    while let Some(batch) = decode_next_block(&mut cursor, options)? {
+    while let Some(batch) = decode_next_block(&mut reader, options)? {
         if schema.is_none() {
             schema = Some(batch.schema.clone());
         }
@@ -884,6 +1050,122 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_string_multi_row_roundtrip() {
+        // Exercise the slice-borrowing string path over many rows, including
+        // empty strings, multi-byte UTF-8, and a length that crosses the
+        // single-byte varint boundary (>= 128 bytes -> two-byte prefix).
+        let long = "x".repeat(200);
+        let values = [
+            "user_1",
+            "",
+            "user_2",
+            "naive_caf\u{00e9}", // multi-byte UTF-8
+            long.as_str(),
+            "13",
+        ];
+        let data = BlockBuilder::new()
+            .header(1, values.len())
+            .column_header("s", "String")
+            .string_data(&values)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Utf8(c) => {
+                assert_eq!(c.len(), values.len());
+                for (i, v) in values.iter().enumerate() {
+                    assert_eq!(c.value(i), v.as_bytes());
+                }
+                // Offsets are monotonic and cover exactly the data buffer.
+                assert_eq!(*c.offsets.last().unwrap() as usize, c.data.len());
+            }
+            _ => panic!("expected Utf8"),
+        }
+    }
+
+    #[test]
+    fn test_decode_nullable_string_roundtrip() {
+        // Nullable(String): null map then the string payload. The null rows
+        // still carry a (here empty) value on the wire.
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("s", "Nullable(String)")
+            .null_map(&[false, true, false])
+            .string_data(&["user_1", "", "user_2"])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Utf8(c) => {
+                assert_eq!(c.len(), 3);
+                assert_eq!(c.null_count(), 1);
+                assert_eq!(c.value(0), b"user_1");
+                assert_eq!(c.value(2), b"user_2");
+            }
+            _ => panic!("expected Utf8"),
+        }
+    }
+
+    #[test]
+    fn test_block_end_scans_string_column() {
+        // The completeness scan must return the exact end offset of a block whose
+        // String column it walks via the per-value length prefixes, and report a
+        // one-byte-short buffer as "need more bytes" (UnexpectedEof).
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("s", "String")
+            .string_data(&["user_1", "", "user_2"])
+            .build();
+
+        let end = block_end(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(end, Some(data.len()));
+
+        let truncated = &data[..data.len() - 1];
+        let err = block_end(truncated, &DecodeOptions::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::Io(ref e) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[test]
+    fn test_block_end_zero_rows() {
+        // A zero-row block is complete once its headers are buffered.
+        let data = BlockBuilder::new()
+            .header(2, 0)
+            .column_header("a", "Int32")
+            .column_header("b", "String")
+            .build();
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len())
+        );
+    }
+
+    #[test]
+    fn test_block_end_rejects_unsupported_type() {
+        // An unsupported type inside an otherwise-complete block must surface as
+        // a DecodeError from the scan, not be silently skipped or reported as
+        // incomplete.
+        let data = BlockBuilder::new()
+            .header(1, 1)
+            .column_header("ts", "DateTime")
+            .build();
+        assert!(matches!(
+            block_end(&data, &DecodeOptions::default()),
+            Err(DecodeError::UnsupportedType { .. })
+        ));
+    }
+
+    #[test]
+    fn test_block_end_no_block_at_clean_boundary() {
+        // No-framing stream: an empty buffer is a clean boundary, not a block.
+        assert_eq!(block_end(&[], &DecodeOptions::default()).unwrap(), None);
+    }
+
+    #[test]
     fn test_unsupported_type() {
         let data = BlockBuilder::new()
             .header(1, 1)
@@ -1103,5 +1385,48 @@ mod tests {
             decode_all_bytes(&data, &options),
             Err(DecodeError::InvalidBlockInfo { field_num: 7 })
         ));
+    }
+
+    // A row/column count that big would make `Vec::with_capacity` abort the
+    // process. The hardened decoder must return an error instead of panicking.
+    // `1 << 61` also overflows the primitive byte-length multiply (`* 8`), so
+    // these cover both the count guard and the `checked_mul` path.
+    const HOSTILE_COUNT: usize = 1 << 61;
+
+    #[test]
+    fn test_oversized_row_count_primitive_rejected() {
+        let data = BlockBuilder::new()
+            .header(1, HOSTILE_COUNT)
+            .column_header("v", "Int64")
+            .build();
+        match decode_all_bytes(&data, &DecodeOptions::default()) {
+            Err(DecodeError::Io(e)) => assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof),
+            other => panic!("expected UnexpectedEof, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_oversized_row_count_string_rejected() {
+        let data = BlockBuilder::new()
+            .header(1, HOSTILE_COUNT)
+            .column_header("s", "String")
+            .build();
+        match decode_all_bytes(&data, &DecodeOptions::default()) {
+            Err(DecodeError::Io(e)) => assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof),
+            other => panic!("expected UnexpectedEof, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_oversized_column_count_rejected() {
+        let data = BlockBuilder::new()
+            .header(HOSTILE_COUNT, 1)
+            .column_header("n", "Int8")
+            .raw_bytes(&[13])
+            .build();
+        match decode_all_bytes(&data, &DecodeOptions::default()) {
+            Err(DecodeError::Io(e)) => assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof),
+            other => panic!("expected UnexpectedEof, got {other:?}"),
+        }
     }
 }
