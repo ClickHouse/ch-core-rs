@@ -190,13 +190,34 @@ fn is_nullable(ch_type: &ChType) -> bool {
     matches!(ch_type, ChType::Nullable(_))
 }
 
+/// Build a C string from a Rust string, dropping any interior NUL bytes.
+///
+/// Arrow C Data names and format strings are NUL-terminated C strings, so an
+/// interior NUL cannot be represented. A column name and a `DateTime`/
+/// `DateTime64` timezone both originate from the untrusted wire stream and are
+/// only validated as UTF-8, so either can carry a NUL byte. `CString::new`
+/// would return `Err` on such input and a `.unwrap()` would panic. That panic
+/// can unwind out of the `extern "C"` stream callbacks (`stream_get_schema`),
+/// which is undefined behavior across the FFI boundary. Strip the NUL bytes so
+/// export stays panic-free; the resulting name/format is best effort for input
+/// that is already malformed.
+fn cstring_lossy(s: &str) -> CString {
+    if s.as_bytes().contains(&0) {
+        let cleaned: Vec<u8> = s.bytes().filter(|&b| b != 0).collect();
+        // `cleaned` has no interior NUL, so this cannot fail.
+        CString::new(cleaned).unwrap_or_default()
+    } else {
+        CString::new(s).unwrap_or_default()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Schema export
 // ---------------------------------------------------------------------------
 
 unsafe fn write_field_schema(out: *mut ArrowSchema, name: &str, ch_type: &ChType) {
-    let format = CString::new(arrow_format(ch_type)).unwrap();
-    let name_cstr = CString::new(name).unwrap();
+    let format = cstring_lossy(&arrow_format(ch_type));
+    let name_cstr = cstring_lossy(name);
 
     let pd = Box::new(SchemaPrivateData {
         format,
@@ -227,6 +248,10 @@ pub unsafe fn export_schema(schema_in: &Schema, out: *mut ArrowSchema) {
 
     let mut child_schemas: Vec<*mut ArrowSchema> = Vec::with_capacity(n_children as usize);
     for field in &schema_in.fields {
+        // Safety: an all-zero `ArrowSchema` is a valid initial value. Every field
+        // is a raw pointer (null is valid), an integer, or `Option<extern fn>`,
+        // whose `None` niche is the all-zero bit pattern. `write_field_schema`
+        // overwrites every field before the struct is observed by a consumer.
         let child_schema = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
         write_field_schema(child_schema, &field.name, &field.ch_type);
         child_schemas.push(child_schema);
@@ -347,6 +372,9 @@ pub unsafe fn export_batch_array(batch: &Arc<ColBatch>, out: *mut ArrowArray) {
 
     let mut child_arrays: Vec<*mut ArrowArray> = Vec::with_capacity(n_children as usize);
     for i in 0..batch.num_columns() {
+        // Safety: an all-zero `ArrowArray` is a valid initial value, same as in
+        // `export_schema`: pointers null, integers zero, `Option<extern fn>` the
+        // all-zero `None` niche. `export_column_array` overwrites every field.
         let child_array = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
         export_column_array(batch, i, child_array);
         child_arrays.push(child_array);
@@ -625,6 +653,39 @@ mod tests {
             }),
             "l"
         );
+    }
+
+    #[test]
+    fn test_export_schema_tolerates_nul_in_wire_names() {
+        // A column name and a timezone both come from the untrusted wire stream
+        // and are only UTF-8 validated, so either can carry an interior NUL.
+        // Exporting must not panic (a panic could unwind across the extern "C"
+        // stream callbacks). The NUL bytes are stripped from the C strings.
+        let schema = Schema::new(vec![
+            Field {
+                name: "a\0b".into(),
+                ch_type: ChType::Int32,
+            },
+            Field {
+                name: "ts".into(),
+                ch_type: ChType::DateTime64 {
+                    precision: 3,
+                    timezone: Some("U\0TC".into()),
+                },
+            },
+        ]);
+        unsafe {
+            let mut out: ArrowSchema = std::mem::zeroed();
+            export_schema(&schema, &mut out);
+
+            let c0 = &**out.children.add(0);
+            assert_eq!(CStr::from_ptr(c0.name).to_str().unwrap(), "ab");
+
+            let c1 = &**out.children.add(1);
+            assert_eq!(CStr::from_ptr(c1.format).to_str().unwrap(), "tsm:UTC");
+
+            (out.release.unwrap())(&mut out);
+        }
     }
 
     #[test]

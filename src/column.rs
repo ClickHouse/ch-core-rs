@@ -51,12 +51,32 @@ impl BoolColumn {
     /// Packs into Arrow-compatible bitmap.
     pub fn from_wire_bytes(bytes: &[u8]) -> Self {
         let len = bytes.len();
-        let mut bitmap = vec![0u8; len.div_ceil(8)];
-        for (i, &b) in bytes.iter().enumerate() {
-            if b != 0 {
-                bitmap[i / 8] |= 1 << (i % 8);
-            }
+        let mut bitmap = Vec::with_capacity(len.div_ceil(8));
+
+        // Pack 8 wire bytes (one per row, nonzero = true) into one Arrow bitmap
+        // byte at a time, LSB-first. Same chunked, branchless pack as the
+        // validity bitmap; here the set bit is `b != 0` rather than `b == 0`.
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            let byte = (c[0] != 0) as u8
+                | (((c[1] != 0) as u8) << 1)
+                | (((c[2] != 0) as u8) << 2)
+                | (((c[3] != 0) as u8) << 3)
+                | (((c[4] != 0) as u8) << 4)
+                | (((c[5] != 0) as u8) << 5)
+                | (((c[6] != 0) as u8) << 6)
+                | (((c[7] != 0) as u8) << 7);
+            bitmap.push(byte);
         }
+        let rem = chunks.remainder();
+        if !rem.is_empty() {
+            let mut byte = 0u8;
+            for (k, &b) in rem.iter().enumerate() {
+                byte |= ((b != 0) as u8) << k;
+            }
+            bitmap.push(byte);
+        }
+
         Self {
             bitmap,
             len,

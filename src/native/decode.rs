@@ -106,11 +106,16 @@ fn parse_ch_type(type_name: &str) -> Option<ChType> {
         }
     }
 
-    // FixedString(N)
+    // FixedString(N). N must be positive: the server rejects FixedString(0) at
+    // table-creation time, and a zero width cannot be represented in the
+    // contiguous `width * num_rows` buffer (row count would be unrecoverable),
+    // so treat it as unsupported rather than decode an inconsistent column.
     if let Some(n_str) = type_name.strip_prefix("FixedString(") {
         if let Some(n_str) = n_str.strip_suffix(')') {
             if let Ok(n) = n_str.trim().parse::<usize>() {
-                return Some(ChType::FixedString(n));
+                if n > 0 {
+                    return Some(ChType::FixedString(n));
+                }
             }
         }
     }
@@ -281,9 +286,26 @@ fn decode_string_data(reader: &mut ByteReader, num_rows: usize) -> io::Result<(V
 
     for _ in 0..num_rows {
         let len = reader.read_varint()? as usize;
+        // Arrow 32-bit offsets cap one chunk's string data at i32::MAX bytes.
+        // Past that, `offset + len` would wrap to a negative value in release
+        // builds (and panic in debug), producing corrupt offsets that then drive
+        // out-of-bounds slicing. Reject it as InvalidData instead. Compute the
+        // new offset from the length prefix before reading the bytes, so an
+        // oversized value is rejected without first copying a >2 GiB payload
+        // into `data`. This is a fatal error, not UnexpectedEof, so the
+        // streaming decoder does not mistake it for "need more bytes". Blocks
+        // stay separate chunks, so the 2 GiB cap is per chunk, not per result.
+        offset = i32::try_from(len)
+            .ok()
+            .and_then(|len_i32| offset.checked_add(len_i32))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "String column chunk exceeds 2 GiB (i32 offset overflow)",
+                )
+            })?;
         let bytes = reader.read_slice(len)?;
         data.extend_from_slice(bytes);
-        offset += len as i32;
         offsets.push(offset);
     }
 
@@ -1679,5 +1701,64 @@ mod tests {
         // Precision above the 0..=9 range is unsupported, surfaced as None so
         // the caller reports UnsupportedType.
         assert_eq!(parse_ch_type("DateTime64(10)"), None);
+    }
+
+    #[test]
+    fn test_fixed_string_zero_width_rejected() {
+        // FixedString(0) is not a valid ClickHouse type and cannot be
+        // represented in the width * num_rows buffer, so it parses to None and
+        // decoding reports UnsupportedType rather than an inconsistent column.
+        assert_eq!(parse_ch_type("FixedString(0)"), None);
+        assert_eq!(
+            parse_ch_type("FixedString(1)"),
+            Some(ChType::FixedString(1))
+        );
+
+        let data = BlockBuilder::new()
+            .header(1, 1)
+            .column_header("fs", "FixedString(0)")
+            .build();
+        assert!(matches!(
+            decode_all_bytes(&data, &DecodeOptions::default()),
+            Err(DecodeError::UnsupportedType { .. })
+        ));
+    }
+
+    #[test]
+    fn test_block_info_out_of_order_buckets_skipped() {
+        // A BlockInfo carrying a nonzero out_of_order_buckets vector (field 3,
+        // present at server revision >= 54480): a varint count then that many
+        // Int32 values, confirmed against BlockInfo::write at v26.2.4.23-stable.
+        // The committed fixtures only ever exercise the empty-vector case, so
+        // assemble a nonzero one by hand and confirm the decoder skips the whole
+        // vector and lands exactly on the block body.
+        let mut data = Vec::new();
+        write_varint(&mut data, 1).unwrap(); // field 1: is_overflows
+        data.push(0x00);
+        write_varint(&mut data, 2).unwrap(); // field 2: bucket_num
+        data.extend_from_slice(&(-1i32).to_le_bytes());
+        write_varint(&mut data, 3).unwrap(); // field 3: out_of_order_buckets
+        write_varint(&mut data, 2).unwrap(); // count = 2
+        data.extend_from_slice(&7i32.to_le_bytes());
+        data.extend_from_slice(&9i32.to_le_bytes());
+        write_varint(&mut data, 0).unwrap(); // terminator
+                                             // Block body: one Int32 column, one row.
+        write_varint(&mut data, 1).unwrap(); // num_cols
+        write_varint(&mut data, 1).unwrap(); // num_rows
+        write_varint(&mut data, 1).unwrap(); // name length
+        data.extend_from_slice(b"n");
+        write_varint(&mut data, 5).unwrap(); // type length
+        data.extend_from_slice(b"Int32");
+        data.push(0x00); // default serialization (revision >= 54454)
+        data.extend_from_slice(&13i32.to_le_bytes());
+
+        let options = DecodeOptions {
+            protocol_revision: DBMS_TCP_PROTOCOL_VERSION,
+        };
+        let cb = decode_all_bytes(&data, &options).unwrap();
+        match cb.chunks[0].column(0) {
+            Column::Int32(c) => assert_eq!(c.values, vec![13]),
+            other => panic!("expected Int32, got {other:?}"),
+        }
     }
 }

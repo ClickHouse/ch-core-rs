@@ -327,7 +327,10 @@ at 0. Data is the concatenated bytes.
 - Empty strings are represented by equal adjacent offsets, not by null. Null and
   empty are distinct.
 - The 32-bit offsets cap a single chunk's data buffer at about 2 GiB. See
-  "Offsets for variable-length data" above.
+  "Offsets for variable-length data" above. A chunk whose running string data
+  would exceed `i32::MAX` is rejected with `DecodeError::Io` of kind
+  `InvalidData` rather than overflowing the offset to a negative value. Blocks
+  stay separate chunks, so this is a per-chunk limit, not a per-result limit.
 
 **Server reference:** `SerializationString::deserializeBinaryBulk` in
 `src/DataTypes/Serializations/SerializationString.cpp`: per row a VarUInt length
@@ -336,7 +339,8 @@ then that many raw bytes, no UTF-8 validation. Confirmed at `v26.2.4.23-stable`.
 ### FixedString(N)
 
 **Type string(s):** `FixedString(N)` where `N` is the byte width, for example
-`FixedString(16)`.
+`FixedString(16)`. `N` must be positive: `FixedString(0)` is not a valid
+ClickHouse type and is rejected as `UnsupportedType`.
 
 **Logical type:** `ChType::FixedString(N)`.
 

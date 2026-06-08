@@ -112,7 +112,12 @@ impl<'a> ByteReader<'a> {
 }
 
 /// Write a LEB128-encoded unsigned integer to a writer.
-pub fn write_varint<W: io::Write>(writer: &mut W, mut value: u64) -> io::Result<()> {
+///
+/// The crate is decode-only today, so this exists only for the in-crate test
+/// builders that synthesize wire bytes, hence `#[cfg(test)]`. When the
+/// insert/encode path lands it can be promoted to real API deliberately.
+#[cfg(test)]
+pub(crate) fn write_varint<W: io::Write>(writer: &mut W, mut value: u64) -> io::Result<()> {
     loop {
         let mut byte = (value & 0x7F) as u8;
         value >>= 7;
