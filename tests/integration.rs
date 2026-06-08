@@ -46,11 +46,32 @@ fixture_tests! {
     },
 }
 
-fn assert_schema(batch: &ChunkedBatch, expected: &[(&str, ChType)]) {
+/// Expected schema entry. Most columns pin an exact `ChType`. The `dt_utc`
+/// column is the one exception: the server emits a different type string for it
+/// depending on the negotiated protocol revision (see `assert_all_types`), so
+/// it is matched against a set of acceptable types instead of one.
+enum Expected<'a> {
+    Exact(&'a str, ChType),
+    AnyOf(&'a str, &'a [ChType]),
+}
+
+fn assert_schema(batch: &ChunkedBatch, expected: &[Expected]) {
     assert_eq!(batch.num_columns(), expected.len());
-    for (field, (name, ch_type)) in batch.schema.fields.iter().zip(expected) {
-        assert_eq!(field.name, *name);
-        assert_eq!(&field.ch_type, ch_type);
+    for (field, exp) in batch.schema.fields.iter().zip(expected) {
+        match exp {
+            Expected::Exact(name, ch_type) => {
+                assert_eq!(field.name, *name);
+                assert_eq!(&field.ch_type, ch_type);
+            }
+            Expected::AnyOf(name, types) => {
+                assert_eq!(field.name, *name);
+                assert!(
+                    types.contains(&field.ch_type),
+                    "column {name}: type {:?} not in {types:?}",
+                    field.ch_type
+                );
+            }
+        }
     }
 }
 
@@ -60,21 +81,58 @@ fn assert_all_types(batch: &ChunkedBatch) {
     assert_schema(
         batch,
         &[
-            ("i8", ChType::Int8),
-            ("i16", ChType::Int16),
-            ("i32", ChType::Int32),
-            ("i64", ChType::Int64),
-            ("u8", ChType::UInt8),
-            ("u16", ChType::UInt16),
-            ("u32", ChType::UInt32),
-            ("u64", ChType::UInt64),
-            ("f32", ChType::Float32),
-            ("f64", ChType::Float64),
-            ("b", ChType::Bool),
-            ("s", ChType::String),
-            ("fs", ChType::FixedString(4)),
-            ("ni32", ChType::Nullable(Box::new(ChType::Int32))),
-            ("ns", ChType::Nullable(Box::new(ChType::String))),
+            Expected::Exact("i8", ChType::Int8),
+            Expected::Exact("i16", ChType::Int16),
+            Expected::Exact("i32", ChType::Int32),
+            Expected::Exact("i64", ChType::Int64),
+            Expected::Exact("u8", ChType::UInt8),
+            Expected::Exact("u16", ChType::UInt16),
+            Expected::Exact("u32", ChType::UInt32),
+            Expected::Exact("u64", ChType::UInt64),
+            Expected::Exact("f32", ChType::Float32),
+            Expected::Exact("f64", ChType::Float64),
+            Expected::Exact("b", ChType::Bool),
+            Expected::Exact("s", ChType::String),
+            Expected::Exact("fs", ChType::FixedString(4)),
+            Expected::Exact("ni32", ChType::Nullable(Box::new(ChType::Int32))),
+            Expected::Exact("ns", ChType::Nullable(Box::new(ChType::String))),
+            // Temporal columns, with the exact type strings this server
+            // (v26.2.4.23-stable) emits. A bare DateTime stays bare. The
+            // DateTime64 columns keep their precision and timezone in both
+            // captures.
+            Expected::Exact("d", ChType::Date),
+            Expected::Exact("d32", ChType::Date32),
+            Expected::Exact("dt", ChType::DateTime { timezone: None }),
+            // dt_utc is declared DateTime('UTC') in the query, but the emitted
+            // type string depends on the negotiated protocol revision: the
+            // rev54483 capture keeps DateTime('UTC'), while the rev0 capture
+            // (HTTP FORMAT Native with no client_protocol_version) drops the
+            // timezone and emits a bare DateTime. Both are what the server
+            // actually wrote, so accept either. The raw seconds are identical
+            // either way, and are asserted below.
+            Expected::AnyOf(
+                "dt_utc",
+                &[
+                    ChType::DateTime {
+                        timezone: Some(String::from("UTC")),
+                    },
+                    ChType::DateTime { timezone: None },
+                ],
+            ),
+            Expected::Exact(
+                "dt64",
+                ChType::DateTime64 {
+                    precision: 3,
+                    timezone: None,
+                },
+            ),
+            Expected::Exact(
+                "dt64_utc",
+                ChType::DateTime64 {
+                    precision: 3,
+                    timezone: Some("UTC".to_string()),
+                },
+            ),
         ],
     );
 
@@ -160,12 +218,46 @@ fn assert_all_types(batch: &ChunkedBatch) {
 
     assert_utf8_values(block.column(14), &[b"user_0" as &[u8], b"", b"user_2", b""]);
     assert_validity(block.column(14), &[true, false, true, false]);
+
+    // Temporal columns. Raw integers were derived independently from the server
+    // (toUInt16/toInt32/toUInt32 of the values, and reinterpretAsInt64 of the
+    // DateTime64 ticks), not by decoding with this crate.
+    match block.column(15) {
+        Column::Date(c) => assert_eq!(c.values.as_slice(), &[0u16, 19737, 49710, 65535]),
+        other => panic!("expected Date, got {other:?}"),
+    }
+    match block.column(16) {
+        Column::Date32(c) => assert_eq!(c.values.as_slice(), &[-7227i32, 0, 19737, 84370]),
+        other => panic!("expected Date32, got {other:?}"),
+    }
+    // The bare DateTime and DateTime('UTC') columns carry identical raw seconds;
+    // timezone is type metadata only, with no effect on the wire bytes.
+    let expected_seconds = &[0u32, 1705322096, 961056000, 4294967295];
+    match block.column(17) {
+        Column::DateTime(c) => assert_eq!(c.values.as_slice(), expected_seconds),
+        other => panic!("expected DateTime, got {other:?}"),
+    }
+    match block.column(18) {
+        Column::DateTime(c) => assert_eq!(c.values.as_slice(), expected_seconds),
+        other => panic!("expected DateTime, got {other:?}"),
+    }
+    // DateTime64(3) ticks are milliseconds since epoch, including a pre-epoch
+    // negative tick. The bare and 'UTC' variants share the same raw ticks.
+    let expected_ticks = &[-877i64, 0, 1705322096789, 4102444799999];
+    match block.column(19) {
+        Column::DateTime64(c) => assert_eq!(c.values.as_slice(), expected_ticks),
+        other => panic!("expected DateTime64, got {other:?}"),
+    }
+    match block.column(20) {
+        Column::DateTime64(c) => assert_eq!(c.values.as_slice(), expected_ticks),
+        other => panic!("expected DateTime64, got {other:?}"),
+    }
 }
 
 fn assert_multi_block(batch: &ChunkedBatch) {
     assert_eq!(batch.num_chunks(), 3);
     assert_eq!(batch.num_rows(), 5);
-    assert_schema(batch, &[("n", ChType::Int32)]);
+    assert_schema(batch, &[Expected::Exact("n", ChType::Int32)]);
 
     assert_int32_chunk(batch, 0, &[13, 14]);
     assert_int32_chunk(batch, 1, &[15, 16]);

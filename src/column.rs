@@ -213,6 +213,13 @@ pub enum Column {
     UInt64(PrimitiveColumn<u64>),
     Float32(PrimitiveColumn<f32>),
     Float64(PrimitiveColumn<f64>),
+    // Temporal types decoded at their faithful native width. No widening or
+    // rescaling happens here; the type metadata (timezone, precision) lives in
+    // the schema's ChType, not in these buffers.
+    Date(PrimitiveColumn<u16>),
+    Date32(PrimitiveColumn<i32>),
+    DateTime(PrimitiveColumn<u32>),
+    DateTime64(PrimitiveColumn<i64>),
     Utf8(Utf8Column),
     FixedBinary(FixedBinaryColumn),
 }
@@ -231,6 +238,10 @@ impl Column {
             Column::UInt64(c) => c.len(),
             Column::Float32(c) => c.len(),
             Column::Float64(c) => c.len(),
+            Column::Date(c) => c.len(),
+            Column::Date32(c) => c.len(),
+            Column::DateTime(c) => c.len(),
+            Column::DateTime64(c) => c.len(),
             Column::Utf8(c) => c.len(),
             Column::FixedBinary(c) => c.len(),
         }
@@ -253,6 +264,10 @@ impl Column {
             Column::UInt64(c) => c.null_count(),
             Column::Float32(c) => c.null_count(),
             Column::Float64(c) => c.null_count(),
+            Column::Date(c) => c.null_count(),
+            Column::Date32(c) => c.null_count(),
+            Column::DateTime(c) => c.null_count(),
+            Column::DateTime64(c) => c.null_count(),
             Column::Utf8(c) => c.null_count(),
             Column::FixedBinary(c) => c.null_count(),
         }
@@ -271,6 +286,10 @@ impl Column {
             Column::UInt64(c) => c.validity.as_ref(),
             Column::Float32(c) => c.validity.as_ref(),
             Column::Float64(c) => c.validity.as_ref(),
+            Column::Date(c) => c.validity.as_ref(),
+            Column::Date32(c) => c.validity.as_ref(),
+            Column::DateTime(c) => c.validity.as_ref(),
+            Column::DateTime64(c) => c.validity.as_ref(),
             Column::Utf8(c) => c.validity.as_ref(),
             Column::FixedBinary(c) => c.validity.as_ref(),
         }

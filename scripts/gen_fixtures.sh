@@ -46,7 +46,25 @@ SELECT
     multiIf(n = 0, '', n = 1, 'user_1', n = 2, unhex('FF00'), 'user_2') AS s,
     CAST(multiIf(n = 0, 'x', n = 1, 'ABCD', n = 2, '', unhex('FF')), 'FixedString(4)') AS fs,
     CAST(multiIf(n = 1, NULL, n = 3, NULL, CAST(toInt32(n) - 7, 'Nullable(Int32)')), 'Nullable(Int32)') AS ni32,
-    CAST(multiIf(n = 1, NULL, n = 3, NULL, CAST(concat('user_', toString(n)), 'Nullable(String)')), 'Nullable(String)') AS ns
+    CAST(multiIf(n = 1, NULL, n = 3, NULL, CAST(concat('user_', toString(n)), 'Nullable(String)')), 'Nullable(String)') AS ns,
+    -- Temporal columns. Values are chosen inside each type's representable
+    -- range; Date32 and DateTime64 each include a pre-epoch value. Timezone and
+    -- precision are type metadata only, with no effect on the wire bytes, so the
+    -- bare and tz-carrying variants share the same raw integers.
+    -- Date: UInt16 days since 1970-01-01 (0 .. 65535 = 1970-01-01 .. 2149-06-06).
+    CAST(multiIf(n = 0, toUInt16(0), n = 1, toUInt16(19737), n = 2, toUInt16(49710), toUInt16(65535)), 'Date') AS d,
+    -- Date32: Int32 days since 1970-01-01, signed, wider range.
+    CAST(multiIf(n = 0, toInt32(-7227), n = 1, toInt32(0), n = 2, toInt32(19737), toInt32(84370)), 'Date32') AS d32,
+    -- DateTime (bare): UInt32 seconds since epoch. CAST of a number is the raw
+    -- seconds, independent of session timezone.
+    CAST(multiIf(n = 0, toUInt32(0), n = 1, toUInt32(1705322096), n = 2, toUInt32(961056000), toUInt32(4294967295)), 'DateTime') AS dt,
+    -- DateTime('UTC'): same UInt32 seconds, timezone is metadata only.
+    CAST(multiIf(n = 0, toUInt32(0), n = 1, toUInt32(1705322096), n = 2, toUInt32(961056000), toUInt32(4294967295)), 'DateTime(\'UTC\')') AS dt_utc,
+    -- DateTime64(3): Int64 ticks at 10^-3 s. fromUnixTimestamp64Milli sets the
+    -- raw ticks directly, so the committed bytes match these integers exactly.
+    multiIf(n = 0, fromUnixTimestamp64Milli(toInt64(-877)), n = 1, fromUnixTimestamp64Milli(toInt64(0)), n = 2, fromUnixTimestamp64Milli(toInt64(1705322096789)), fromUnixTimestamp64Milli(toInt64(4102444799999))) AS dt64,
+    -- DateTime64(3, 'UTC'): same Int64 ticks, timezone is metadata only.
+    fromUnixTimestamp64Milli(multiIf(n = 0, toInt64(-877), n = 1, toInt64(0), n = 2, toInt64(1705322096789), toInt64(4102444799999)), 'UTC') AS dt64_utc
 FROM numbers(4)
 FORMAT Native
 SQL

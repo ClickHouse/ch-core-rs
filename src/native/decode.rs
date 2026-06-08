@@ -115,6 +115,39 @@ fn parse_ch_type(type_name: &str) -> Option<ChType> {
         }
     }
 
+    // DateTime64(P) and DateTime64(P, '<tz>'). Checked before the DateTime(
+    // prefix so a DateTime64(...) string never falls into the DateTime arm.
+    if let Some(inner) = type_name.strip_prefix("DateTime64(") {
+        if let Some(inner) = inner.strip_suffix(')') {
+            // Inner is "P" or "P, '<tz>'". Split on the first comma into the
+            // precision and the optional timezone.
+            let (precision_str, timezone) = match inner.split_once(',') {
+                Some((p, tz)) => (p.trim(), Some(strip_quotes(tz.trim()).to_string())),
+                None => (inner.trim(), None),
+            };
+            // Precision must be a valid DateTime64 scale (0..=9); anything else
+            // surfaces as UnsupportedType rather than a wrong decode.
+            return match precision_str.parse::<u8>() {
+                Ok(precision) if precision <= 9 => Some(ChType::DateTime64 {
+                    precision,
+                    timezone,
+                }),
+                _ => None,
+            };
+        }
+    }
+
+    // DateTime('<tz>'). The bare DateTime is handled by the exact-match block
+    // below. Only the parameterized, timezone-carrying form reaches here.
+    if let Some(inner) = type_name.strip_prefix("DateTime(") {
+        if let Some(inner) = inner.strip_suffix(')') {
+            let timezone = strip_quotes(inner.trim()).to_string();
+            return Some(ChType::DateTime {
+                timezone: Some(timezone),
+            });
+        }
+    }
+
     match type_name {
         "Bool" | "Boolean" => Some(ChType::Bool),
         "Int8" => Some(ChType::Int8),
@@ -127,9 +160,23 @@ fn parse_ch_type(type_name: &str) -> Option<ChType> {
         "UInt64" => Some(ChType::UInt64),
         "Float32" => Some(ChType::Float32),
         "Float64" => Some(ChType::Float64),
+        "Date" => Some(ChType::Date),
+        "Date32" => Some(ChType::Date32),
+        "DateTime" => Some(ChType::DateTime { timezone: None }),
         "String" => Some(ChType::String),
         _ => None,
     }
+}
+
+/// Strip a single pair of surrounding single quotes from a timezone string.
+///
+/// ClickHouse emits timezones inside single quotes, for example
+/// `DateTime('UTC')`. A well-formed server string always has both quotes; if
+/// either is missing the input is returned unchanged rather than guessed at.
+fn strip_quotes(s: &str) -> &str {
+    s.strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .unwrap_or(s)
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +369,26 @@ fn decode_column(
             let values = decode_primitive!(reader, num_rows, f64);
             Column::Float64(PrimitiveColumn { values, validity })
         }
+        // Temporal types are plain bulk integers on the wire; timezone and
+        // precision are type metadata only and do not appear in the bytes. They
+        // decode through the same primitive fast path as the numerics at their
+        // faithful native width.
+        ChType::Date => {
+            let values = decode_primitive!(reader, num_rows, u16);
+            Column::Date(PrimitiveColumn { values, validity })
+        }
+        ChType::Date32 => {
+            let values = decode_primitive!(reader, num_rows, i32);
+            Column::Date32(PrimitiveColumn { values, validity })
+        }
+        ChType::DateTime { .. } => {
+            let values = decode_primitive!(reader, num_rows, u32);
+            Column::DateTime(PrimitiveColumn { values, validity })
+        }
+        ChType::DateTime64 { .. } => {
+            let values = decode_primitive!(reader, num_rows, i64);
+            Column::DateTime64(PrimitiveColumn { values, validity })
+        }
         ChType::String => {
             let (offsets, data) = decode_string_data(reader, num_rows)?;
             match validity {
@@ -397,6 +464,22 @@ fn empty_column(ch_type: &ChType) -> Column {
             validity: empty_validity,
         }),
         ChType::Float64 => Column::Float64(PrimitiveColumn {
+            values: vec![],
+            validity: empty_validity,
+        }),
+        ChType::Date => Column::Date(PrimitiveColumn {
+            values: vec![],
+            validity: empty_validity,
+        }),
+        ChType::Date32 => Column::Date32(PrimitiveColumn {
+            values: vec![],
+            validity: empty_validity,
+        }),
+        ChType::DateTime { .. } => Column::DateTime(PrimitiveColumn {
+            values: vec![],
+            validity: empty_validity,
+        }),
+        ChType::DateTime64 { .. } => Column::DateTime64(PrimitiveColumn {
             values: vec![],
             validity: empty_validity,
         }),
@@ -661,11 +744,13 @@ fn skip_column_data(
 
     match inner {
         ChType::Bool | ChType::Int8 | ChType::UInt8 => reader.skip(num_rows)?,
-        ChType::Int16 | ChType::UInt16 => reader.skip(num_rows.saturating_mul(2))?,
-        ChType::Int32 | ChType::UInt32 | ChType::Float32 => {
-            reader.skip(num_rows.saturating_mul(4))?
-        }
-        ChType::Int64 | ChType::UInt64 | ChType::Float64 => {
+        ChType::Int16 | ChType::UInt16 | ChType::Date => reader.skip(num_rows.saturating_mul(2))?,
+        ChType::Int32
+        | ChType::UInt32
+        | ChType::Float32
+        | ChType::Date32
+        | ChType::DateTime { .. } => reader.skip(num_rows.saturating_mul(4))?,
+        ChType::Int64 | ChType::UInt64 | ChType::Float64 | ChType::DateTime64 { .. } => {
             reader.skip(num_rows.saturating_mul(8))?
         }
         ChType::FixedString(width) => reader.skip(num_rows.saturating_mul(*width))?,
@@ -833,6 +918,13 @@ mod tests {
         }
 
         fn uint32_data(mut self, values: &[u32]) -> Self {
+            for &v in values {
+                self.buf.extend_from_slice(&v.to_le_bytes());
+            }
+            self
+        }
+
+        fn date_data(mut self, values: &[u16]) -> Self {
             for &v in values {
                 self.buf.extend_from_slice(&v.to_le_bytes());
             }
@@ -1151,7 +1243,7 @@ mod tests {
         // incomplete.
         let data = BlockBuilder::new()
             .header(1, 1)
-            .column_header("ts", "DateTime")
+            .column_header("id", "UUID")
             .build();
         assert!(matches!(
             block_end(&data, &DecodeOptions::default()),
@@ -1169,7 +1261,7 @@ mod tests {
     fn test_unsupported_type() {
         let data = BlockBuilder::new()
             .header(1, 1)
-            .column_header("ts", "DateTime")
+            .column_header("id", "UUID")
             .build();
         assert!(matches!(
             decode_all_bytes(&data, &DecodeOptions::default()),
@@ -1428,5 +1520,164 @@ mod tests {
             Err(DecodeError::Io(e)) => assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof),
             other => panic!("expected UnexpectedEof, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Temporal types
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_temporal_plain() {
+        // Date is UInt16 days, Date32 is Int32 days (signed, can be pre-epoch),
+        // DateTime is UInt32 seconds, DateTime64(3) is Int64 ticks (ms here).
+        // Timezone and precision are type metadata only, never in the bytes.
+        let data = BlockBuilder::new()
+            .header(4, 4)
+            .column_header("d", "Date")
+            .date_data(&[0, 19737, 49710, 65535])
+            .column_header("d32", "Date32")
+            .int32_data(&[-7227, 0, 19737, 84370])
+            .column_header("dt", "DateTime")
+            .uint32_data(&[0, 1705322096, 961056000, 4294967295])
+            .column_header("dt64", "DateTime64(3)")
+            .int64_data(&[-877, 0, 1705322096789, 4102444799999])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Date(c) => assert_eq!(c.values, vec![0u16, 19737, 49710, 65535]),
+            other => panic!("expected Date, got {other:?}"),
+        }
+        match batch.column(1) {
+            Column::Date32(c) => assert_eq!(c.values, vec![-7227i32, 0, 19737, 84370]),
+            other => panic!("expected Date32, got {other:?}"),
+        }
+        match batch.column(2) {
+            Column::DateTime(c) => {
+                assert_eq!(c.values, vec![0u32, 1705322096, 961056000, 4294967295])
+            }
+            other => panic!("expected DateTime, got {other:?}"),
+        }
+        match batch.column(3) {
+            Column::DateTime64(c) => {
+                assert_eq!(c.values, vec![-877i64, 0, 1705322096789, 4102444799999])
+            }
+            other => panic!("expected DateTime64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_nullable_datetime64() {
+        // Nullable(DateTime64(3)): null map then the Int64 ticks payload, with
+        // null rows still carrying a placeholder value on the wire.
+        let data = BlockBuilder::new()
+            .header(1, 4)
+            .column_header("ts", "Nullable(DateTime64(3))")
+            .null_map(&[false, true, false, true])
+            .int64_data(&[-877, 0, 1705322096789, 0])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::DateTime64(c) => {
+                assert_eq!(c.null_count(), 2);
+                assert_eq!(c.values, vec![-877i64, 0, 1705322096789, 0]);
+            }
+            other => panic!("expected DateTime64, got {other:?}"),
+        }
+        assert!(batch.column(0).validity().unwrap().is_valid(0));
+        assert!(!batch.column(0).validity().unwrap().is_valid(1));
+    }
+
+    #[test]
+    fn test_decode_temporal_zero_rows() {
+        // A zero-row block carrying a Date and a DateTime column contributes the
+        // schema but no chunks, and the empty columns have length 0.
+        let data = BlockBuilder::new()
+            .header(2, 0)
+            .column_header("d", "Date")
+            .column_header("dt", "DateTime")
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_rows(), 0);
+        assert_eq!(cb.num_chunks(), 0);
+        assert_eq!(cb.num_columns(), 2);
+        assert_eq!(cb.schema.fields[0].ch_type, ChType::Date);
+        assert_eq!(
+            cb.schema.fields[1].ch_type,
+            ChType::DateTime { timezone: None }
+        );
+    }
+
+    #[test]
+    fn test_multi_block_date_kept_as_chunks() {
+        // Date blocks stay separate chunks, never concatenated.
+        let mut data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("d", "Date")
+            .date_data(&[0, 19737])
+            .build();
+        data.extend(
+            BlockBuilder::new()
+                .header(1, 3)
+                .column_header("d", "Date")
+                .date_data(&[49710, 65535, 13])
+                .build(),
+        );
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_chunks(), 2);
+        assert_eq!(cb.num_rows(), 5);
+        match cb.chunks[0].column(0) {
+            Column::Date(c) => assert_eq!(c.values, vec![0u16, 19737]),
+            other => panic!("expected Date, got {other:?}"),
+        }
+        match cb.chunks[1].column(0) {
+            Column::Date(c) => assert_eq!(c.values, vec![49710u16, 65535, 13]),
+            other => panic!("expected Date, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ch_type_temporal() {
+        assert_eq!(parse_ch_type("Date"), Some(ChType::Date));
+        assert_eq!(parse_ch_type("Date32"), Some(ChType::Date32));
+        assert_eq!(
+            parse_ch_type("DateTime"),
+            Some(ChType::DateTime { timezone: None })
+        );
+        assert_eq!(
+            parse_ch_type("DateTime('UTC')"),
+            Some(ChType::DateTime {
+                timezone: Some("UTC".to_string())
+            })
+        );
+        assert_eq!(
+            parse_ch_type("DateTime64(3)"),
+            Some(ChType::DateTime64 {
+                precision: 3,
+                timezone: None
+            })
+        );
+        assert_eq!(
+            parse_ch_type("DateTime64(3, 'UTC')"),
+            Some(ChType::DateTime64 {
+                precision: 3,
+                timezone: Some("UTC".to_string())
+            })
+        );
+        assert_eq!(
+            parse_ch_type("DateTime64(9)"),
+            Some(ChType::DateTime64 {
+                precision: 9,
+                timezone: None
+            })
+        );
+        // Precision above the 0..=9 range is unsupported, surfaced as None so
+        // the caller reports UnsupportedType.
+        assert_eq!(parse_ch_type("DateTime64(10)"), None);
     }
 }

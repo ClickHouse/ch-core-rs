@@ -18,8 +18,9 @@ Implemented:
 - Decode ClickHouse Native blocks from a complete byte buffer.
 - Incrementally decode Native blocks from streamed byte chunks.
 - Preserve ClickHouse blocks as separate columnar chunks.
-- Store primitive values, strings, booleans, and nullability in Arrow-compatible
-  layouts.
+- Store primitive values, strings, booleans, temporal values, and nullability in
+  Arrow-compatible layouts.
+- Decode the temporal types `Date`, `Date32`, `DateTime`, and `DateTime64`.
 - Export decoded chunks as an Arrow C Data stream.
 
 Not implemented yet:
@@ -27,7 +28,7 @@ Not implemented yet:
 - Native encoding for inserts.
 - TCP/native protocol packet framing.
 - Compression framing.
-- Decimal, temporal, LowCardinality, Enum, UUID/IP, Array, Tuple, or Map types.
+- Decimal, LowCardinality, Enum, UUID/IP, Array, Tuple, or Map types.
 - Language-specific materialization policy.
 
 ## Binding Model

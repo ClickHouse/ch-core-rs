@@ -153,6 +153,33 @@ fn arrow_format(ch_type: &ChType) -> String {
         ChType::UInt64 => "L".into(),
         ChType::Float32 => "f".into(),
         ChType::Float64 => "g".into(),
+        // Temporal export is zero-copy: never widen or rescale a buffer. Map to
+        // a real Arrow temporal type only on an exact same-width match, else
+        // expose the raw integer primitive.
+        //
+        // Date is UInt16 days; Arrow has no 16-bit date, so expose raw days as
+        // uint16. Date32 is i32 days, an exact match for Arrow date32. DateTime
+        // is UInt32 seconds; Arrow has no u32-seconds timestamp, so expose raw
+        // seconds as uint32. DateTime64(P) ticks are i64; an Arrow timestamp is
+        // also i64, an exact match, but only for the units Arrow can express
+        // (P in {0,3,6,9} -> s/m/u/n). Other precisions fall back to raw i64.
+        ChType::Date => "S".into(),
+        ChType::Date32 => "tdD".into(),
+        ChType::DateTime { .. } => "I".into(),
+        ChType::DateTime64 {
+            precision,
+            timezone,
+        } => {
+            let unit = match precision {
+                0 => "s",
+                3 => "m",
+                6 => "u",
+                9 => "n",
+                _ => return "l".into(),
+            };
+            let tz = timezone.as_deref().unwrap_or("");
+            format!("ts{unit}:{tz}")
+        }
         ChType::String => "u".into(),
         ChType::FixedString(n) => format!("w:{n}"),
         ChType::Nullable(inner) => arrow_format(inner),
@@ -256,6 +283,10 @@ unsafe fn export_column_array(batch: &Arc<ColBatch>, col_idx: usize, out: *mut A
         Column::UInt64(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
         Column::Float32(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
         Column::Float64(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
+        Column::Date(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
+        Column::Date32(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
+        Column::DateTime(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
+        Column::DateTime64(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
         Column::Utf8(c) => {
             match &c.validity {
                 Some(bm) => buffers.push(bm.as_bytes().as_ptr() as *const c_void),
@@ -570,6 +601,30 @@ mod tests {
 
             (stream.release.unwrap())(&mut stream);
         }
+    }
+
+    #[test]
+    fn test_arrow_format_temporal() {
+        // Zero-copy temporal export: Date32 and the {0,3,6,9}-precision
+        // DateTime64 map to real Arrow temporal formats; Date, DateTime, and
+        // other-precision DateTime64 expose the raw integer.
+        assert_eq!(arrow_format(&ChType::Date), "S");
+        assert_eq!(arrow_format(&ChType::Date32), "tdD");
+        assert_eq!(arrow_format(&ChType::DateTime { timezone: None }), "I");
+        assert_eq!(
+            arrow_format(&ChType::DateTime64 {
+                precision: 3,
+                timezone: Some("UTC".to_string())
+            }),
+            "tsm:UTC"
+        );
+        assert_eq!(
+            arrow_format(&ChType::DateTime64 {
+                precision: 2,
+                timezone: None
+            }),
+            "l"
+        );
     }
 
     #[test]

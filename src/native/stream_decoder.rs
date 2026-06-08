@@ -449,9 +449,9 @@ mod tests {
         write_varint(&mut data, 1).unwrap(); // num_cols
         write_varint(&mut data, 1).unwrap(); // num_rows
         write_varint(&mut data, 2).unwrap();
-        data.extend_from_slice(b"ts");
-        write_varint(&mut data, 8).unwrap();
-        data.extend_from_slice(b"DateTime");
+        data.extend_from_slice(b"id");
+        write_varint(&mut data, 4).unwrap();
+        data.extend_from_slice(b"UUID");
         data.extend_from_slice(&0u32.to_le_bytes()); // any 4 bytes of data
 
         let result = dec.feed(&data);

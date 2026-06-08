@@ -25,10 +25,15 @@ pub enum ChType {
     FixedString(usize),
 
     // Temporal (Phase 2)
-    // Date,
-    // Date32,
-    // DateTime { timezone: Option<String> },
-    // DateTime64 { precision: u8, timezone: Option<String> },
+    Date,
+    Date32,
+    DateTime {
+        timezone: Option<String>,
+    },
+    DateTime64 {
+        precision: u8,
+        timezone: Option<String>,
+    },
 
     // Decimal (Phase 2)
     // Decimal { precision: u8, scale: u8, bits: u16 },

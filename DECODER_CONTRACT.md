@@ -218,6 +218,10 @@ than an error.
 | `Float64`         | `Float64`        | `Float64`         | `g`          | validity, values            | yes      |
 | `String`          | `String`         | `Utf8`            | `u`          | validity, offsets, data     | yes      |
 | `FixedString(N)`  | `FixedString(N)` | `FixedBinary`     | `w:N`        | validity, data              | yes      |
+| `Date`            | `Date`           | `Date`            | `S`          | validity, values            | yes      |
+| `Date32`          | `Date32`         | `Date32`          | `tdD`        | validity, values            | yes      |
+| `DateTime`, `DateTime('<tz>')` | `DateTime { timezone }` | `DateTime` | `I` | validity, values         | yes      |
+| `DateTime64(P)`, `DateTime64(P, '<tz>')` | `DateTime64 { precision, timezone }` | `DateTime64` | `ts{unit}:{tz}` for P in {0,3,6,9}, else `l` | validity, values | yes |
 | `Nullable(T)`     | `Nullable(T)`    | inner T's variant | inner's      | inner's, validity populated | n/a      |
 
 Any type not in this matrix is rejected. See "Unsupported types" below.
@@ -356,6 +360,89 @@ contiguous bytes, no length prefixes. Short values are zero-padded to `N` at
 insert time, so the wire bytes are always `N` per row. Confirmed at
 `v26.2.4.23-stable`.
 
+### Temporal types
+
+This covers `Date`, `Date32`, `DateTime`, and `DateTime64`. All four are plain
+bulk integers on the wire, identical in layout to the corresponding
+`SerializationNumber<T>`. Timezone and precision are type metadata only and have
+zero effect on the wire bytes.
+
+**Type string(s) and per-type details:**
+
+| Type string                              | Logical type                          | Wire element | Column variant | Bytes/row |
+|------------------------------------------|---------------------------------------|--------------|----------------|-----------|
+| `Date`                                   | `ChType::Date`                        | `u16`        | `Date`         | 2         |
+| `Date32`                                 | `ChType::Date32`                      | `i32`        | `Date32`       | 4         |
+| `DateTime`, `DateTime('<tz>')`           | `ChType::DateTime { timezone }`       | `u32`        | `DateTime`     | 4         |
+| `DateTime64(P)`, `DateTime64(P, '<tz>')` | `ChType::DateTime64 { precision, timezone }` | `i64` | `DateTime64`   | 8         |
+
+`parse_ch_type` reads the optional timezone as the single-quoted contents of the
+type string (`None` when absent), and the `DateTime64` precision `P` as the
+integer in `DateTime64(P[, '<tz>')`. A precision outside `0..=9` is rejected as
+`UnsupportedType`.
+
+**Logical meaning of the integer:**
+
+- `Date`: days since 1970-01-01 (Unix epoch), unsigned. Range
+  1970-01-01 .. 2149-06-06.
+- `Date32`: days since 1970-01-01, signed (negative is before the epoch). Wider
+  range than `Date`.
+- `DateTime`: seconds since the Unix epoch, unsigned. Range 1970 .. 2106.
+- `DateTime64(P)`: ticks where one tick is `10^-P` seconds, signed (negative is
+  before the epoch). For example `DateTime64(3)` ticks are milliseconds.
+
+**Wire payload:** `num_rows * bytes_per_row` bytes, little-endian, contiguous,
+no per-row framing. Identical to the matching fixed-width numeric.
+
+**Arrow export:** 2 buffers in order, validity then values, exactly like the
+numerics. The export is zero-copy and never widens or rescales a buffer, so the
+format string maps to a real Arrow temporal type only on an exact same-width
+match, otherwise it exposes the raw integer:
+
+- `Date` -> `S` (Arrow uint16). There is no 16-bit Arrow date, so this is raw
+  days.
+- `Date32` -> `tdD` (Arrow date32, i32 days). Exact match.
+- `DateTime` -> `I` (Arrow uint32). There is no u32-seconds Arrow timestamp, so
+  this is raw seconds.
+- `DateTime64(P)` -> Arrow timestamp `ts{unit}:{tz}` only when `P` is in
+  `{0, 3, 6, 9}`, where `unit` is `s`/`m`/`u`/`n` and `tz` is the timezone or the
+  empty string. Examples: `DateTime64(3, 'UTC')` -> `tsm:UTC`,
+  `DateTime64(0)` -> `tss:`, `DateTime64(6)` -> `tsu:`,
+  `DateTime64(9, 'America/New_York')` -> `tsn:America/New_York`. For any other
+  precision it falls back to `l` (Arrow int64, raw ticks), for example
+  `DateTime64(2)` -> `l`.
+
+**Rust buffer:** `Column::Date(PrimitiveColumn<u16>)`,
+`Column::Date32(PrimitiveColumn<i32>)`,
+`Column::DateTime(PrimitiveColumn<u32>)`, and
+`Column::DateTime64(PrimitiveColumn<i64>)`. Each is `{ values, validity }` at the
+faithful native width. `values` has length `num_rows` and, on little-endian
+targets, is the wire bytes verbatim.
+
+**Notes:** the Arrow export is zero-copy and never widens or rescales. `Date`
+exports as Arrow uint16 (raw days), `DateTime` as uint32 (raw seconds),
+`DateTime64(P)` as an Arrow timestamp only for `P` in `{0, 3, 6, 9}` and as int64
+(raw ticks) otherwise, and `Date32` as Arrow date32. A consumer that wants full
+Arrow temporal semantics for the integer-exported cases (`Date`, `DateTime`, and
+the non-`{0,3,6,9}` `DateTime64` precisions) should request the server's
+`ArrowStream` format instead. The timezone, when present, is preserved in the
+`ChType` and in the `DateTime64` Arrow timestamp format string; it does not
+change the stored integers. The emitted type string for a column declared with an
+explicit timezone can depend on the negotiated protocol revision: at protocol
+revision 0 (for example HTTP `FORMAT Native` with no `client_protocol_version`)
+the server may drop the timezone and emit a bare `DateTime`, while at revision
+54483 it emits `DateTime('<tz>')`. The decoder trusts and reflects whatever type
+string the server actually wrote.
+
+**Server reference:** `SerializationDate` (inherits `SerializationNumber<UInt16>`),
+`SerializationDate32` (inherits `SerializationNumber<Int32>`),
+`SerializationDateTime` (inherits `SerializationNumber<UInt32>`), and
+`SerializationDateTime64` (inherits `SerializationDecimalBase<DateTime64>`, native
+type `Int64`), in `src/DataTypes/Serializations/`. None override the binary bulk
+path, so each is exactly its underlying integer: a single bulk raw read on
+little-endian hosts, byte-swapped per element on big-endian hosts. Confirmed at
+`v26.2.4.23-stable`.
+
 ### Nullable(T)
 
 **Type string(s):** `Nullable(T)` where `T` is any supported non-wrapper type
@@ -418,7 +505,6 @@ fallback. A consumer can treat an unsupported type as a hard decode error.
 
 Not yet supported, tracked as planned phases in `src/schema.rs`:
 
-- Temporal: `Date`, `Date32`, `DateTime`, `DateTime64`.
 - `Decimal`.
 - `UUID`, `IPv4`, `IPv6`.
 - `Enum8`, `Enum16`.
