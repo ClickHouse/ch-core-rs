@@ -104,14 +104,14 @@ inserts, and per-runtime non-Arrow adapters beyond the JS POC.
 Big paths, with rationale. The recommended next step is marked; the ordering is
 a proposal, not settled.
 
-### P1 - Type coverage, the long tail  [recommended next]
+### P1 - Type coverage, the long tail  [in progress]
 
 The core cannot decode most real result sets today, and type fidelity is the
 moat (pillar 2). The repo already has a defined per-type workflow in `AGENTS.md`
 ("Adding A New ClickHouse Type"). Suggested order by how common the type is in
 real schemas, with effort flagged:
 
-- `DateTime`, `DateTime64(p, tz)`, `Date`, `Date32`.
+- `DateTime`, `DateTime64(p, tz)`, `Date`, `Date32`. DONE (2026-06-05).
 - `LowCardinality(T)` (very common as a wrapper; higher effort, has its own
   dictionary and index framing).
 - `Decimal(P, S)`.
@@ -164,6 +164,16 @@ engine. Worth it once types, compression, and inserts justify owning transport.
 - 2026-06-05: Hardened the decode hot path: slice cursor replacing
   `R: Read` + `io::Cursor`, zero-copy string decode, allocation-free streaming
   completeness scan, and malformed-header overflow guards.
+- 2026-06-05: Added temporal types (`Date`, `Date32`, `DateTime`,
+  `DateTime64`), confirmed against v26.2.4.23-stable and verified with
+  live-server fixtures. Found a fidelity caveat: a `DateTime('tz')` column's
+  emitted type string is protocol-revision gated. Over HTTP `FORMAT Native`
+  with no `client_protocol_version` (revision 0) the server drops the timezone
+  and emits a bare `DateTime`; at the negotiated TCP revision it keeps
+  `DateTime('UTC')`. The wire data (UInt32 seconds) is identical either way, so
+  decode is correct, but a client that needs timezone fidelity must negotiate a
+  protocol revision. Not yet confirmed against the server source why, see open
+  questions.
 
 ## Open questions
 
@@ -172,5 +182,10 @@ engine. Worth it once types, compression, and inserts justify owning transport.
   on localhost numbers.
 - Decide whether the core should own transport (P5) or stay a codec that the
   bindings feed. This gates how far pillars 1 and 3 can go.
+- Confirm against the server source why a `DateTime('tz')` column's emitted type
+  string is protocol-revision gated (see the 2026-06-05 decision log entry), and
+  whether any analogous gate affects a type's data layout rather than only its
+  name. The temporal data layouts are revision independent and confirmed, so
+  this is documentation rigor, not a known correctness gap.
 </content>
 </invoke>
