@@ -27,6 +27,12 @@ pub enum DecodeError {
         column: String,
         serialization_byte: u8,
     },
+    /// A later block's schema (column names or types) differs from the first
+    /// block's. Every block of a query result shares one schema, so a
+    /// mismatch means a corrupt or mixed payload. `block_index` is zero-based.
+    BlockSchemaMismatch {
+        block_index: usize,
+    },
 }
 
 impl From<io::Error> for DecodeError {
@@ -56,6 +62,9 @@ impl std::fmt::Display for DecodeError {
                     f,
                     "Unsupported custom serialization (marker {serialization_byte}) for column '{column}'"
                 )
+            }
+            DecodeError::BlockSchemaMismatch { block_index } => {
+                write!(f, "Block {block_index} schema differs from the first block")
             }
         }
     }
@@ -793,21 +802,31 @@ fn skip_column_data(
 /// Decode all blocks from a complete byte buffer into a `ChunkedBatch`.
 ///
 /// Each Native block becomes its own chunk — blocks are NOT concatenated.
-/// The schema is taken from the first decoded block (every block of a query
-/// shares the same schema). Zero-row blocks contribute the schema but are
-/// dropped from the chunk list to keep the chunk stream free of empty batches.
+/// The schema is taken from the first decoded block, and every later block
+/// (including zero-row trailers, which re-emit the column headers) must carry
+/// the same column names and types or decoding fails with
+/// [`DecodeError::BlockSchemaMismatch`]. Zero-row blocks contribute the
+/// schema but are dropped from the chunk list to keep the chunk stream free
+/// of empty batches.
 pub fn decode_all_bytes(data: &[u8], options: &DecodeOptions) -> Result<ChunkedBatch, DecodeError> {
     let mut reader = ByteReader::new(data);
     let mut schema: Option<Schema> = None;
     let mut chunks: Vec<Arc<ColBatch>> = Vec::new();
+    let mut block_index: usize = 0;
 
     while let Some(batch) = decode_next_block(&mut reader, options)? {
-        if schema.is_none() {
-            schema = Some(batch.schema.clone());
+        match &schema {
+            None => schema = Some(batch.schema.clone()),
+            Some(first) => {
+                if batch.schema != *first {
+                    return Err(DecodeError::BlockSchemaMismatch { block_index });
+                }
+            }
         }
         if batch.num_rows > 0 {
             chunks.push(Arc::new(batch));
         }
+        block_index += 1;
     }
 
     let schema = schema.ok_or_else(|| {
@@ -1318,6 +1337,71 @@ mod tests {
             Column::Int32(c) => assert_eq!(c.values, vec![3, 4, 5]),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn test_block_schema_mismatch_rejected() {
+        // Every block of a result shares one schema. A later block with a
+        // different column count, type, or name is a corrupt payload.
+        let first = BlockBuilder::new()
+            .header(2, 1)
+            .column_header("a", "Int32")
+            .int32_data(&[13])
+            .column_header("b", "Int32")
+            .int32_data(&[79])
+            .build();
+
+        let fewer_columns = BlockBuilder::new()
+            .header(1, 1)
+            .column_header("a", "Int32")
+            .int32_data(&[5])
+            .build();
+        let different_type = BlockBuilder::new()
+            .header(2, 1)
+            .column_header("a", "Int32")
+            .int32_data(&[5])
+            .column_header("b", "String")
+            .string_data(&["u1"])
+            .build();
+        let different_name = BlockBuilder::new()
+            .header(2, 1)
+            .column_header("a", "Int32")
+            .int32_data(&[5])
+            .column_header("c", "Int32")
+            .int32_data(&[7])
+            .build();
+
+        for second in [fewer_columns, different_type, different_name] {
+            let mut data = first.clone();
+            data.extend(second);
+            match decode_all_bytes(&data, &DecodeOptions::default()) {
+                Err(DecodeError::BlockSchemaMismatch { block_index }) => {
+                    assert_eq!(block_index, 1)
+                }
+                other => panic!("expected BlockSchemaMismatch, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_zero_row_trailer_with_matching_schema_accepted() {
+        // The server re-emits the column headers in a zero-row trailer block;
+        // a matching trailer must decode cleanly and contribute no chunk.
+        let mut data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("n", "Int32")
+            .int32_data(&[1, 2])
+            .build();
+        data.extend(
+            BlockBuilder::new()
+                .header(1, 0)
+                .column_header("n", "Int32")
+                .build(),
+        );
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_chunks(), 1);
+        assert_eq!(cb.num_rows(), 2);
     }
 
     #[test]

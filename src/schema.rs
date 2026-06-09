@@ -56,14 +56,14 @@ pub enum ChType {
 }
 
 /// A named, typed column descriptor.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Field {
     pub name: String,
     pub ch_type: ChType,
 }
 
 /// Schema describing the columns in a batch.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Schema {
     pub fields: Vec<Field>,
 }

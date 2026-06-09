@@ -20,12 +20,18 @@ use std::io;
 use crate::batch::ColBatch;
 use crate::native::decode::{block_end, decode_next_block, DecodeError, DecodeOptions};
 use crate::native::varint::ByteReader;
+use crate::schema::Schema;
 
 /// Push-based incremental decoder for ClickHouse Native blocks.
 ///
 /// Accumulates bytes via `feed()` and attempts to decode complete blocks
 /// after each feed. Partial blocks are retained in the internal buffer
 /// until enough data arrives.
+///
+/// Every block of a query result shares one schema. The decoder retains the
+/// first block's schema and rejects any later block whose column names or
+/// types differ with [`DecodeError::BlockSchemaMismatch`], matching
+/// `decode_all_bytes`.
 pub struct StreamDecoder {
     buffer: Vec<u8>,
     /// Byte offset of unconsumed data in `buffer`.
@@ -39,6 +45,10 @@ pub struct StreamDecoder {
     scanned: usize,
     options: DecodeOptions,
     finished: bool,
+    /// First block's schema; later blocks must match it.
+    schema: Option<Schema>,
+    /// Blocks decoded so far, for mismatch reporting.
+    blocks_seen: usize,
 }
 
 impl StreamDecoder {
@@ -49,6 +59,8 @@ impl StreamDecoder {
             scanned: 0,
             options,
             finished: false,
+            schema: None,
+            blocks_seen: 0,
         }
     }
 
@@ -130,7 +142,20 @@ impl StreamDecoder {
                     // the same framing, so it cannot hit EOF.
                     let mut reader = ByteReader::new(&data[..end]);
                     match decode_next_block(&mut reader, &self.options)? {
-                        Some(batch) => blocks.push(batch),
+                        Some(batch) => {
+                            match &self.schema {
+                                None => self.schema = Some(batch.schema.clone()),
+                                Some(first) => {
+                                    if batch.schema != *first {
+                                        return Err(DecodeError::BlockSchemaMismatch {
+                                            block_index: self.blocks_seen,
+                                        });
+                                    }
+                                }
+                            }
+                            self.blocks_seen += 1;
+                            blocks.push(batch);
+                        }
                         // `block_end` returned `Some`, so a block is present.
                         None => unreachable!("block_end confirmed a complete block"),
                     }
@@ -292,6 +317,36 @@ mod tests {
         let blocks_b = dec.feed(&combined[split..]).unwrap();
         assert_eq!(blocks_b.len(), 1); // second block complete
         assert_eq!(blocks_b[0].num_rows, 2);
+    }
+
+    #[test]
+    fn test_schema_mismatch_in_one_feed_errors() {
+        // A second block with a different column name is a corrupt payload,
+        // same as decode_all_bytes.
+        let mut dec = StreamDecoder::new(DecodeOptions::default());
+        let mut data = make_int64_block("n", &[1, 2]);
+        data.extend(make_int64_block("m", &[3]));
+
+        let result = dec.feed(&data);
+        assert!(matches!(
+            result,
+            Err(DecodeError::BlockSchemaMismatch { block_index: 1 })
+        ));
+    }
+
+    #[test]
+    fn test_schema_mismatch_across_feeds_errors() {
+        // The first block's schema is retained across feed calls; a later
+        // feed with a different column type fails.
+        let mut dec = StreamDecoder::new(DecodeOptions::default());
+        let blocks = dec.feed(&make_int64_block("n", &[1, 2])).unwrap();
+        assert_eq!(blocks.len(), 1);
+
+        let result = dec.feed(&make_string_block("n", &["user_1"]));
+        assert!(matches!(
+            result,
+            Err(DecodeError::BlockSchemaMismatch { block_index: 1 })
+        ));
     }
 
     #[test]
