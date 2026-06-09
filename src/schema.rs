@@ -78,6 +78,45 @@ impl Schema {
     }
 }
 
+/// Render the canonical ClickHouse type name, the same string `parse_ch_type`
+/// accepts. `Display` is the contract bindings use to report column types, so
+/// any value produced by the parser must round-trip through it. Values that
+/// are constructible but not parser-producible (e.g. `FixedString(0)` or a
+/// `DateTime64` precision above 9) still render, but `parse_ch_type` rejects
+/// them by design.
+impl std::fmt::Display for ChType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChType::Bool => write!(f, "Bool"),
+            ChType::Int8 => write!(f, "Int8"),
+            ChType::Int16 => write!(f, "Int16"),
+            ChType::Int32 => write!(f, "Int32"),
+            ChType::Int64 => write!(f, "Int64"),
+            ChType::UInt8 => write!(f, "UInt8"),
+            ChType::UInt16 => write!(f, "UInt16"),
+            ChType::UInt32 => write!(f, "UInt32"),
+            ChType::UInt64 => write!(f, "UInt64"),
+            ChType::Float32 => write!(f, "Float32"),
+            ChType::Float64 => write!(f, "Float64"),
+            ChType::String => write!(f, "String"),
+            ChType::FixedString(n) => write!(f, "FixedString({n})"),
+            ChType::Date => write!(f, "Date"),
+            ChType::Date32 => write!(f, "Date32"),
+            ChType::DateTime { timezone: None } => write!(f, "DateTime"),
+            ChType::DateTime { timezone: Some(tz) } => write!(f, "DateTime('{tz}')"),
+            ChType::DateTime64 {
+                precision,
+                timezone: None,
+            } => write!(f, "DateTime64({precision})"),
+            ChType::DateTime64 {
+                precision,
+                timezone: Some(tz),
+            } => write!(f, "DateTime64({precision}, '{tz}')"),
+            ChType::Nullable(inner) => write!(f, "Nullable({inner})"),
+        }
+    }
+}
+
 impl ChType {
     /// Whether this type is nullable (wrapped in Nullable).
     pub fn is_nullable(&self) -> bool {

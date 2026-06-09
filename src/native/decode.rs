@@ -1704,6 +1704,55 @@ mod tests {
     }
 
     #[test]
+    fn test_ch_type_display_round_trips_through_parser() {
+        // Display renders the canonical ClickHouse type name, which is the
+        // string bindings hand to users. Every representative variant must
+        // parse back to the exact same ChType.
+        let cases = vec![
+            ChType::Bool,
+            ChType::Int8,
+            ChType::Int16,
+            ChType::Int32,
+            ChType::Int64,
+            ChType::UInt8,
+            ChType::UInt16,
+            ChType::UInt32,
+            ChType::UInt64,
+            ChType::Float32,
+            ChType::Float64,
+            ChType::String,
+            ChType::FixedString(16),
+            ChType::Date,
+            ChType::Date32,
+            ChType::DateTime { timezone: None },
+            ChType::DateTime {
+                timezone: Some("UTC".to_string()),
+            },
+            ChType::DateTime64 {
+                precision: 3,
+                timezone: None,
+            },
+            ChType::DateTime64 {
+                precision: 9,
+                timezone: Some("Asia/Istanbul".to_string()),
+            },
+            ChType::Nullable(Box::new(ChType::String)),
+            ChType::Nullable(Box::new(ChType::DateTime64 {
+                precision: 6,
+                timezone: Some("UTC".to_string()),
+            })),
+        ];
+        for t in cases {
+            let rendered = t.to_string();
+            assert_eq!(
+                parse_ch_type(&rendered),
+                Some(t.clone()),
+                "Display output {rendered:?} did not parse back to {t:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_fixed_string_zero_width_rejected() {
         // FixedString(0) is not a valid ClickHouse type and cannot be
         // represented in the width * num_rows buffer, so it parses to None and

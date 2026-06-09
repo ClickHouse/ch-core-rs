@@ -91,6 +91,13 @@ impl StreamDecoder {
         Ok(blocks)
     }
 
+    /// Number of unconsumed bytes currently buffered, that is, the bytes of a
+    /// partial block waiting for more data. Zero when the stream sits exactly
+    /// on a block boundary.
+    pub fn buffered_bytes(&self) -> usize {
+        self.buffer.len() - self.pos
+    }
+
     /// Try to decode as many complete blocks as possible from the buffer.
     ///
     /// Each iteration first runs the allocation-free [`block_end`] completeness

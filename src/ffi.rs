@@ -51,6 +51,26 @@ pub struct ArrowArrayStream {
     private_data: *mut c_void,
 }
 
+impl ArrowArrayStream {
+    /// Invoke the release callback if present, then clear it. Follows the
+    /// spec's consumer pattern: the callback runs with `release` still set and
+    /// normally clears it itself; clearing afterwards keeps the call
+    /// idempotent even for a callback that does not. A stream already released
+    /// by a consumer has `release` set to null, making this a no-op.
+    ///
+    /// # Safety
+    ///
+    /// `self` must be a stream initialized per the Arrow C Data Interface, for
+    /// example by [`export_chunks_to_stream`], or already released or moved
+    /// from with `release` cleared to `None`.
+    pub unsafe fn release_if_set(&mut self) {
+        if let Some(release) = self.release {
+            release(self as *mut ArrowArrayStream);
+            self.release = None;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Private data for release callbacks
 // ---------------------------------------------------------------------------
@@ -685,6 +705,23 @@ mod tests {
             assert_eq!(CStr::from_ptr(c1.format).to_str().unwrap(), "tsm:UTC");
 
             (out.release.unwrap())(&mut out);
+        }
+    }
+
+    #[test]
+    fn test_stream_release_if_set_is_idempotent() {
+        let batch = make_test_batch();
+        let schema = batch.schema.clone();
+        unsafe {
+            let mut stream: ArrowArrayStream = std::mem::zeroed();
+            export_chunks_to_stream(schema, vec![batch], &mut stream);
+
+            stream.release_if_set();
+            assert!(stream.release.is_none());
+            assert!(stream.private_data.is_null());
+
+            // Second call sees a cleared callback and does nothing.
+            stream.release_if_set();
         }
     }
 
