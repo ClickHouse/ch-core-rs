@@ -67,15 +67,15 @@ End-to-end POCs in the Node and Python clients route real queries through
 each client's full transport stack and decode with this core. Localhost
 medians against each client's existing query paths:
 
-| Client                  | Destination          | Speedup                         |
-| ----------------------- | -------------------- | ------------------------------- |
-| Node (1M rows x 6 cols) | columns              | 8.7x vs JSON (21.1M rows/s)     |
-| Node                    | row arrays / objects | 2.3x / 2.5x vs JSON             |
-| Python                  | rows                 | 1.3-2.7x vs `client.query()`    |
-| Python                  | columns              | 1.7-3.1x                        |
-| Python                  | NumPy                | 3.6-5.8x                        |
-| Python                  | pandas               | 1.4-7.2x                        |
-| Python                  | Arrow                | 2.7-7.7x vs `query_arrow`       |
+| Client                  | Destination          | Speedup                      |
+|-------------------------|----------------------|------------------------------|
+| Node (1M rows x 6 cols) | columns              | 8.7x vs JSON (21.1M rows/s)  |
+| Node                    | row arrays / objects | 2.3x / 2.5x vs JSON          |
+| Python                  | rows                 | 1.3-2.7x vs `client.query()` |
+| Python                  | columns              | 1.7-3.1x                     |
+| Python                  | NumPy                | 3.6-5.8x                     |
+| Python                  | pandas               | 1.4-7.2x                     |
+| Python                  | Arrow                | 2.7-7.7x vs `query_arrow`    |
 
 The Python Arrow path also used 25-42% less peak memory than `query_arrow`.
 
@@ -183,7 +183,7 @@ Pinned git dependency:
 
 ```toml
 [dependencies]
-ch-core-rs = { git = "ssh://git@github.com/ORG/ch-core-rs.git", rev = "<commit>" }
+ch-core-rs = { git = "ssh://git@github.com/ClickHouse/ch-core-rs.git", rev = "<commit>" }
 ```
 
 Use a local `[patch]` in `.cargo/config.toml` to override a pinned git
