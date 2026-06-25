@@ -43,21 +43,21 @@ integration, and the public client API. Bindings are thin adapters over
 buffers the core has already filled.
 
 Implement a ClickHouse type once in the core and every client gets it. The
-buffers follow Arrow layout conventions, so results also export zero-copy
-through the Arrow C Data Interface to anything that speaks Arrow (PyArrow,
-Pandas, Polars, Arrow JS).
+buffers follow Arrow layout conventions, so results can export zero-copy through
+the Arrow C Data or C Stream interfaces in runtimes that can import those
+interfaces in-process.
 
 ## Why this exists
 
 1. One correct implementation, not N. Wire decoding is the highest-risk code
    in a client, and today it is duplicated in every language.
-2. ClickHouse type fidelity. The server's own CH -> Arrow mapping normalizes
-   or drops information such as Enum names, IP semantics, and exact type
-   identity. The core's type model preserves ClickHouse semantics and leaves
-   presentation policy to the bindings.
+2. ClickHouse type fidelity. The core's type model preserves ClickHouse
+   semantics that host or Arrow types can blur, such as `DateTime64` precision
+   and timezone, `FixedString` width, and exact signed/unsigned integer width.
+   Presentation policy stays in the bindings.
 3. Speed. The Rust decode path plus zero-copy delivery into native containers
    outperforms the existing client paths end to end. Numbers below.
-4. Streaming. The decoder accepts socket bytes as they arrive and emits
+4. Streaming. The decoder accepts transport byte chunks as they arrive and emits
    decoded column chunks as each block completes. Decode overlaps the network
    instead of waiting for the full response.
 
@@ -83,9 +83,9 @@ Scope on these numbers: they are localhost measurements against the clients'
 current paths. Part of the Arrow gain comes from streaming with overlapped
 decode, where the existing clients buffer the full response before decoding.
 Under heavy server-side compression on localhost the Arrow lead can invert,
-bounded by server compression throughput. Native is also the most compact
-ClickHouse wire format, which favors it further over a real network. The full
-analysis is in `ARCHITECTURE.md`.
+bounded by server compression throughput. Native's compact columnar wire shape
+can favor it further over a real network. The full analysis is in
+`ARCHITECTURE.md`.
 
 ## How it works
 
@@ -95,15 +95,16 @@ incrementally from streamed chunks, and produces:
 ```text
 ChunkedBatch
   schema                      ClickHouse logical types (ChType)
-  chunks: Vec<Arc<ColBatch>>  one chunk per Native block, never merged
+  chunks: Vec<Arc<ColBatch>>  one chunk per non-empty Native block, never merged
     columns: Vec<Column>      typed values / offsets / data / bitmaps
 ```
 
-Native blocks remain separate chunks. This avoids merging and repacking
-buffers and maps directly onto Arrow record batches. Buffer layouts follow
-Arrow conventions throughout: fixed-width columns are one contiguous typed
-buffer, strings are offsets plus a data buffer, booleans and validity are
-bit-packed bitmaps.
+Non-empty Native blocks remain separate chunks. Zero-row blocks contribute the
+schema but are dropped from `chunks`. This avoids merging and repacking buffers
+and maps directly onto Arrow record batches. Buffer layouts follow Arrow
+conventions throughout: fixed-width columns are one contiguous typed buffer,
+strings are offsets plus a data buffer, booleans and validity are bit-packed
+bitmaps.
 
 Streaming uses a push API:
 
@@ -138,7 +139,9 @@ Not implemented yet:
 - Native encoding for inserts.
 - TCP/native protocol packet framing.
 - Compression framing.
-- Decimal, LowCardinality, Enum, UUID/IP, Array, Tuple, or Map types.
+- Binary-encoded Native type headers.
+- Decimal, LowCardinality, Enum, UUID/IP, Array, Tuple, Map, or wide integer
+  types.
 - Language-specific materialization policy (bindings own this, by design).
 
 ## Supported types
@@ -171,6 +174,7 @@ In rough priority order:
 ## Consuming
 
 Bindings live in the language client repos and depend on this crate.
+See `INTEGRATING.md` for guidance aimed at downstream client maintainers.
 
 Local development:
 
@@ -230,3 +234,4 @@ A working core under active development. The API is not yet stable. The read
 path (Native decode, streaming, Arrow export) is implemented and verified
 against live-server fixtures. Type coverage, compression, and the insert path
 are in progress. `ARCHITECTURE.md` describes how the pieces fit together.
+Deferred correctness and integration follow-ups are tracked in `FINDINGS.md`.

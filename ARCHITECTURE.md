@@ -16,7 +16,7 @@ decide how to expose those buffers to its own runtime.**
 ```
 ClickHouse server
       |
-      |  FORMAT Native bytes (the most compact CH wire format)
+      |  FORMAT Native bytes (compact columnar wire format)
       v
 +---------------------------+
 |        ch-core-rs         |   pure Rust, zero dependencies
@@ -30,7 +30,7 @@ ClickHouse server
       v
 +----------+  +----------+  +-----------------+
 | Python   |  | Node     |  | anything else   |   thin bindings, one per
-| (PyO3)   |  | (napi-rs)|  | (C ABI, Arrow)  |   runtime, each repo owns
+| (PyO3)   |  | (napi-rs)|  | (native wrapper)|   runtime, each repo owns
 +----------+  +----------+  +-----------------+   its own materialization
       |             |               |
    NumPy /       TypedArray /    Arrow C Data
@@ -48,19 +48,19 @@ The division of labor is strict:
 
 Because the output buffers are deliberately Arrow-shaped (contiguous typed
 arrays, offsets-plus-data strings, bit-packed validity), the core can also hand
-the data across an FFI boundary with **zero copies** through the standard
-Arrow C Data Interface, which nearly every data ecosystem (PyArrow, Pandas,
-Polars, DuckDB, Arrow JS) already understands.
+the data across an FFI boundary with **zero copies** through the standard Arrow
+C Data and C Stream interfaces in runtimes that can import those interfaces
+in-process.
 
 Why this is worth a dedicated crate rather than each client doing its own
 thing:
 
 1. **One correct protocol and type implementation, not N.** Wire-format bugs
    produce silently corrupt columns. Auditing one decoder beats auditing five.
-2. **ClickHouse type fidelity.** The server's own CH -> Arrow mapping
-   normalizes or drops information (Enum names, IP semantics, exact type
-   identity). This core preserves ClickHouse semantics in its type model and
-   leaves presentation policy to the bindings.
+2. **ClickHouse type fidelity.** The core preserves ClickHouse semantics in its
+   type model, such as `DateTime64` precision and timezone, `FixedString` width,
+   and exact signed/unsigned integer width. Presentation policy stays in the
+   bindings.
 3. **Non-Arrow zero-copy delivery.** For consumers that want native containers
    (JS `TypedArray`s, NumPy arrays) rather than Arrow, the core's typed
    buffers map directly, with no row-by-row object churn.
@@ -147,9 +147,10 @@ avoids per-row divide/modulo/store. Nullable columns still carry a value slot
 for every row (ClickHouse writes placeholder values for nulls), which is also
 exactly what Arrow expects.
 
-**Results (`batch.rs`).** One decoded Native block becomes one `ColBatch`
-(schema + columns + row count). A whole result is a `ChunkedBatch`: the schema
-plus `Vec<Arc<ColBatch>>`. Blocks are kept as separate chunks on purpose:
+**Results (`batch.rs`).** One decoded non-empty Native block becomes one
+`ColBatch` (schema + columns + row count). A whole result is a `ChunkedBatch`:
+the schema plus `Vec<Arc<ColBatch>>`. Blocks are kept as separate chunks on
+purpose:
 merging would cost O(n) buffer copies and O(n^2)-ish re-packing of bit-aligned
 bool/validity bitmaps, and chunks map one-to-one onto Arrow record batches
 anyway. The chunks are `Arc`ed because the FFI layer hands out shared
@@ -173,7 +174,7 @@ column count, varint row count, then per column: varint-prefixed name,
 varint-prefixed type string, optional custom-serialization marker byte, then
 the column data. Two pieces of framing are protocol-revision gated, and the
 revision is negotiated out of band (TCP handshake), so the caller must pass it
-in via `DecodeOptions::protocol_revision`:
+in via `DecodeOptions.protocol_revision`:
 
 - revision > 0: each block is preceded by a `BlockInfo` preamble, a
   field-tagged structure terminated by field number 0. The decoder parses it
@@ -184,21 +185,24 @@ in via `DecodeOptions::protocol_revision`:
   anything else (sparse, etc.) is a layout this crate does not decode, so it
   is rejected explicitly rather than misread.
 
-Use revision 0 for bare HTTP `FORMAT Native` responses and
-`DBMS_TCP_PROTOCOL_VERSION` for streams produced at the current negotiated TCP
-revision. Wire-format behavior is confirmed against the actual server C++
-source at a pinned tag (cited in the doc comments), per the repo's "server
-behavior is authoritative" rule.
+Use revision 0 for bare HTTP `FORMAT Native` responses and the effective
+negotiated protocol revision for protocol-framed HTTP or native TCP payloads.
+`DBMS_TCP_PROTOCOL_VERSION` is the revision this crate has validated against at
+the pinned server tag, not a substitute for negotiation. Wire-format behavior is
+confirmed against the actual server C++ source at a pinned tag (cited in the doc
+comments), per the repo's "server behavior is authoritative" rule.
 
 **Type strings.** `parse_ch_type` parses the server's type name string
 (`Nullable(DateTime64(3, 'UTC'))`) into a `ChType`. Unsupported or malformed
 type names produce a clean `DecodeError::UnsupportedType`, never a wrong
-decode. One fidelity caveat: the type string the server emits is itself
-revision gated in one known case. Over revision 0 (bare HTTP `FORMAT Native`)
-a `DateTime('tz')` column arrives as plain `DateTime`; at the negotiated TCP
-revision it keeps its timezone. The data bytes (UInt32 seconds) are identical
-either way, so decode is correct regardless, but a client that needs timezone
-fidelity must negotiate a protocol revision.
+decode. This assumes the default string-encoded Native type-header mode;
+binary-encoded type headers are not implemented. One fidelity caveat: the type
+string the server emits is itself revision gated in one known case. Over
+revision 0 (bare HTTP `FORMAT Native`) a `DateTime('tz')` column arrives as
+plain `DateTime`; at the negotiated TCP revision it keeps its timezone. The data
+bytes (UInt32 seconds) are identical either way, so decode is correct
+regardless, but a client that needs timezone fidelity must negotiate a protocol
+revision.
 
 **The primitive hot path.** Fixed-width columns are pure little-endian value
 runs on the wire. The `decode_primitive!` macro reads them by allocating the
@@ -215,6 +219,10 @@ metadata only and never appear in the data bytes).
 the Arrow offsets and the single data buffer in one pass: the value bytes are
 borrowed from the input slice and appended with one `extend_from_slice`, so
 the cost is one copy per string and zero per-row heap allocations.
+ClickHouse `String` is arbitrary bytes, so the current Arrow `utf8` export is
+layout-compatible but not UTF-8-validating. Bindings that expose Arrow should
+decide whether to validate, fall back to bytes, or return a clear error for
+invalid strings.
 
 **Hostile input hardening.** The wire bytes are untrusted, and the rule is
 that malformed input returns `Err`, never panics, and never drives a huge
@@ -277,7 +285,8 @@ just decodes what it is given.
 ### Arrow C Data Interface export (`src/ffi.rs`)
 
 This is how the buffers cross a language boundary with zero copies and zero
-shared dependencies. The Arrow C Data Interface is a tiny C ABI standard:
+shared dependencies. The Arrow C Data Interface is a tiny C-compatible
+interchange standard:
 three `repr(C)` structs (`ArrowSchema`, `ArrowArray`, `ArrowArrayStream`),
 format strings, and release callbacks. The core implements the producer side
 by hand, no Arrow library involved:
@@ -295,7 +304,7 @@ by hand, no Arrow library involved:
 
 Ownership is the subtle part. Each exported array's private data holds an
 `Arc<ColBatch>`, so the decoded buffers stay alive for exactly as long as any
-consumer (PyArrow, Polars, Arrow JS, ...) still holds them, regardless of what
+consumer still holds them, regardless of what
 the Rust side does next. The consumer eventually invokes the `release`
 callback, which drops the `Arc` and frees the bookkeeping. Release callbacks
 are idempotent and null-safe per the spec. Export is also panic-free by

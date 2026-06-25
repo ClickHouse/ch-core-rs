@@ -134,10 +134,11 @@ release.
 
 Native block framing is gated on the server protocol revision, and the revision
 is negotiated out of band, not carried in the Native bytes. The decoder must be
-told it via `DecodeOptions.protocol_revision`. Use `DBMS_TCP_PROTOCOL_VERSION`
-(54483, the revision this crate is validated against) for a stream from a current
-server over native TCP, or 0 for a bare Native stream with no protocol framing,
-for example HTTP `FORMAT Native` with no `client_protocol_version` set.
+told it via `DecodeOptions.protocol_revision`. Use 0 for a bare Native stream
+with no protocol framing, for example HTTP `FORMAT Native` with no
+`client_protocol_version` set. Use the effective negotiated revision for native
+TCP or protocol-framed HTTP payloads. `DBMS_TCP_PROTOCOL_VERSION` is 54483, the
+revision this crate is validated against at the pinned server tag.
 
 This section describes the server layout at `v26.2.4.23-stable`
 (`NativeWriter::write` / `NativeReader::read` in `src/Formats/`, with `BlockInfo`
@@ -152,8 +153,11 @@ Server layout of one block, in order:
    varint field number then the field value; a varint field number of 0
    terminates. The fields, and the protocol revision at which each first appears:
    - field 1, `is_overflows`: 1 byte. Always present.
-   - field 2, `bucket_num`: Int32 little-endian. Always present.
-   - field 3, `out_of_order_buckets`: a varint count then that many Int32 values.
+   - field 2, `bucket_num`: Int32 written with the server's native POD binary
+     helper. On the usual little-endian server builds this is little-endian.
+     Always present.
+   - field 3, `out_of_order_buckets`: a varint count then that many Int32 values,
+     written with the same native POD helper.
      Present at protocol revision >= 54480.
    At v26.2.4 the revision is 54483, so all three fields are written. The
    standard block (not overflows, `bucket_num` -1, empty `out_of_order_buckets`)
@@ -163,7 +167,8 @@ Server layout of one block, in order:
 3. `num_rows` as a varint.
 4. For each column, in order:
    - column name, a varint-length-prefixed string,
-   - type name, a varint-length-prefixed string,
+   - type name, a varint-length-prefixed string in the default Native type-header
+     mode,
    - a custom-serialization marker, 1 byte: 0 for default, nonzero for custom.
      Present at protocol revision >= 54454, for every column regardless of row
      count. When nonzero, serialization-kind bytes follow before the payload. At
@@ -176,6 +181,13 @@ crate supports, including `String` (always the single-stream variant on the
 Native wire at this tag). For a `Nullable(T)` column the payload is the null map
 first, then the inner type's payload. The null map is `num_rows` bytes, one per
 row, 0x00 for present and nonzero for null. See the `Nullable(T)` section.
+
+This contract describes the default string-encoded type-header mode. ClickHouse
+also has an `output_format_native_encode_types_in_binary_format` setting that
+causes the server to write binary type tags instead of the varint-length-prefixed
+type name string. The current core does not decode that header mode. Bindings
+must not enable that setting when routing results through this decoder unless
+binary type-header support is added.
 
 ### How the decoder reads this
 
@@ -323,7 +335,9 @@ at 0. Data is the concatenated bytes.
 - ClickHouse `String` is arbitrary bytes, not guaranteed UTF-8. The decoder does
   not validate or transcode the bytes. They are exported under the Arrow utf8
   format `u` as-is. A consumer that requires valid UTF-8 must validate the bytes
-  itself. The bytes can contain embedded NULs and invalid UTF-8.
+  itself. A strict Arrow consumer may reject the import or fail later validation
+  when invalid UTF-8 is present. The bytes can contain embedded NULs and invalid
+  UTF-8.
 - Empty strings are represented by equal adjacent offsets, not by null. Null and
   empty are distinct.
 - The 32-bit offsets cap a single chunk's data buffer at about 2 GiB. See
