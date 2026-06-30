@@ -239,6 +239,8 @@ than an error.
 | `UUID`            | `Uuid`           | `Uuid`            | `w:16`       | validity, data              | yes      |
 | `IPv4`            | `Ipv4`           | `Ipv4`            | `I`          | validity, values            | yes      |
 | `IPv6`            | `Ipv6`           | `Ipv6`            | `w:16`       | validity, data              | yes      |
+| `Enum8(...)`      | `Enum8 { variants }`  | `Enum8`      | `c`          | validity, values            | yes      |
+| `Enum16(...)`     | `Enum16 { variants }` | `Enum16`     | `s`          | validity, values            | yes      |
 | `Date`            | `Date`           | `Date`            | `S`          | validity, values            | yes      |
 | `Date32`          | `Date32`         | `Date32`          | `tdD`        | validity, values            | yes      |
 | `DateTime`, `DateTime('<tz>')` | `DateTime { timezone }` | `DateTime` | `I` | validity, values         | yes      |
@@ -490,6 +492,70 @@ per row in network byte order, no per-row framing.
 `deserializeBinaryBulkStatePrefix` reads zero bytes and the custom-serialization
 marker is 0x00. Confirmed at `v26.6.1.1193-stable`.
 
+### Enum8 / Enum16
+
+**Type string(s):** `Enum8('name' = N, ...)` and `Enum16('name' = N, ...)`. The
+server always emits the concrete keyword with explicit values, never a bare
+`Enum(...)` (that spelling is creation-time parser sugar only), so those are the
+only two spellings `parse_ch_type` accepts.
+
+**Logical type:** `ChType::Enum8 { variants: Vec<(String, i8)> }` and
+`ChType::Enum16 { variants: Vec<(String, i16)> }`. The `variants` carry the
+name->value mapping in the server's emitted order, which is ascending by value.
+
+**Wire payload:** byte-identical to the underlying integer: `Enum8` is raw
+little-endian `Int8` (1 byte/row), `Enum16` is raw little-endian `Int16` (2
+bytes/row), contiguous, no per-row framing. The name->value mapping is ONLY in
+the type string, never in the per-row data. The per-column bulk-state prefix
+reads zero bytes and the custom-serialization marker is 0x00, same as a plain
+numeric.
+
+**Arrow export:** `c` (Arrow int8) for `Enum8`, `s` (Arrow int16) for `Enum16`.
+2 buffers in order: validity, then values. Zero-copy, exactly like `Int8` /
+`Int16`. Arrow has no native enum type, and ClickHouse enum values are arbitrary
+signed integers (not `0..N-1` dictionary indices), so the export is the raw
+underlying int rather than a dictionary array; a dictionary export would require
+forbidden per-cell remapping. The name->value mapping is carried in the `ChType`
+for bindings; surfacing it as Arrow field metadata is out of scope.
+
+**Rust buffer:** `Column::Enum8(PrimitiveColumn<i8>)` and
+`Column::Enum16(PrimitiveColumn<i16>)`, `{ values, validity }`, length
+`num_rows`. On little-endian targets `values` is the wire bytes verbatim. The
+Column carries only the physical int buffer; the name->value map stays in the
+schema's `ChType`, the same Column-vs-ChType split the temporals use for
+timezone and precision.
+
+**Type-string format and name escaping:** the type string is `Enum8(` followed
+by the `'<name>' = <int>` pairs joined by exactly `, `, with exactly ` = `
+around each integer, then `)`. Pairs are sorted ascending by value in the
+emitted string. Values are explicit and may be negative (`Enum8` is the Int8
+range -128..=127, `Enum16` is the Int16 range -32768..=32767). Inside the single
+quotes the server uses `writeQuotedString` with
+`escape_quote_with_quote=false` and `escape_backslash_with_backslash=true`:
+`'` -> `\'`, `\` -> `\\`, backspace -> `\b`, formfeed -> `\f`, newline -> `\n`,
+CR -> `\r`, tab -> `\t`, NUL -> `\0`, and every other byte (including `,` and
+`=`) passes through unescaped. So the parser cannot split on `,` or `=`; it
+walks the quote-delimited names and unescapes that exact set. `Display`
+round-trips the type string: `parse(display(t)) == t`. An out-of-range value, a
+malformed escape, or any syntax error in this untrusted string surfaces as
+`UnsupportedType`, never a panic.
+
+**Notes:** `LowCardinality(Enum8/16)` is illegal: `DataTypeEnum` does not
+inherit `DataTypeNumberBase`, so `canBeInsideLowCardinality()` is false and the
+server throws `ILLEGAL_TYPE_OF_ARGUMENT` at construction. A
+`LowCardinality(Enum...)` column can therefore never appear on the wire, and the
+decoder keeps rejecting `Enum` as a `LowCardinality` inner.
+
+**Introduction version:** first-class long before the pinned tag (inferred from
+release history); stable at `v26.6.1.1193-stable`.
+
+**Server reference:** `SerializationEnum` (inherits `SerializationNumber<Int8>`
+/ `SerializationNumber<Int16>` and overrides no bulk method; the bulk methods are
+`final`) and `DataTypeEnum` in `src/DataTypes/`. The type-string emission and
+name escaping are `DataTypeEnum::doGetName` / `writeQuotedString`, and
+`canBeInsideLowCardinality()` is false on `DataTypeEnum`. Confirmed at
+`v26.6.1.1193-stable`.
+
 ### Temporal types
 
 This covers `Date`, `Date32`, `DateTime`, and `DateTime64`. All four are plain
@@ -628,12 +694,18 @@ the per-type body decoder.
 This allowlist is exactly `IDataType::canBeInsideLowCardinality()` intersected
 with the types this crate decodes, confirmed against the server source at
 `v26.6.1.1193-stable` (the `DataTypeLowCardinality` constructor checks it after
-`removeNullable`). Two consequences worth calling out:
+`removeNullable`). Three consequences worth calling out:
 
 - `DateTime64` and every `Decimal` are **not** allowed: they are
   `DataTypeDecimalBase` subclasses whose `canBeInsideLowCardinality()` is false,
   so the server never emits `LowCardinality(DateTime64(...))`. The crate decodes
   `DateTime64` as an ordinary column but rejects it as a `LowCardinality` inner.
+- `Enum8` and `Enum16` are **not** allowed either: `DataTypeEnum` does not
+  inherit `DataTypeNumberBase`, so its `canBeInsideLowCardinality()` is false and
+  the server throws `ILLEGAL_TYPE_OF_ARGUMENT` on `LowCardinality(Enum...)` at
+  construction. The crate decodes `Enum8`/`Enum16` as ordinary columns but
+  rejects them as `LowCardinality` inners. This is independent of `Enum` decode
+  support; it is the server forbidding the combination.
 - `UUID`, `IPv4`, and `IPv6` **are** permitted by the server and are now decoded
   by this crate, so a `LowCardinality` over them decodes through the dictionary
   path: a `UUID`/`IPv6` dictionary value column is a `FixedBinary` of width 16 and
@@ -781,14 +853,14 @@ fallback. A consumer can treat an unsupported type as a hard decode error.
 Not yet supported, tracked as planned phases in `src/schema.rs`:
 
 - `Decimal`.
-- `Enum8`, `Enum16`.
 - `LowCardinality(T)` for an inner type outside the allowlist in the
   `LowCardinality(T)` section. The wrapper and its allowed inners (String,
   FixedString, the fixed-width numerics, Bool, Date, Date32, DateTime,
   UUID/IPv4/IPv6, with or without an inner `Nullable`) are supported; any other
-  inner is rejected as `UnsupportedType`. This includes `DateTime64` and every
-  `Decimal` (the server itself forbids them as LC inners), and `Enum` (a
-  server-legal LC inner that this crate does not yet decode in any form).
+  inner is rejected as `UnsupportedType`. This includes `DateTime64`, every
+  `Decimal`, and `Enum8`/`Enum16`, all of which the server itself forbids as LC
+  inners (`canBeInsideLowCardinality()` is false), so they never appear in that
+  position on the wire.
 - Containers: `Array(T)`, `Tuple(...)`, `Map(K, V)`.
 - Wide integers: `Int128`, `UInt128`, `Int256`, `UInt256`.
 

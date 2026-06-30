@@ -42,8 +42,16 @@ pub enum ChType {
     Uuid,
     Ipv4,
     Ipv6,
-    // Enum8 { variants: Vec<(String, i8)> },
-    // Enum16 { variants: Vec<(String, i16)> },
+    // Enums carry only the name->value mapping in the logical type; the wire
+    // payload is the raw underlying Int8/Int16, so the decoded Column stores
+    // just the physical int buffer. The variant order is the server's emitted
+    // order (ascending by value), preserved so Display round-trips.
+    Enum8 {
+        variants: Vec<(String, i8)>,
+    },
+    Enum16 {
+        variants: Vec<(String, i16)>,
+    },
 
     // Wrappers
     Nullable(Box<ChType>),
@@ -114,10 +122,58 @@ impl std::fmt::Display for ChType {
                 precision,
                 timezone: Some(tz),
             } => write!(f, "DateTime64({precision}, '{tz}')"),
+            ChType::Enum8 { variants } => write_enum(f, "Enum8", variants),
+            ChType::Enum16 { variants } => write_enum(f, "Enum16", variants),
             ChType::Nullable(inner) => write!(f, "Nullable({inner})"),
             ChType::LowCardinality(inner) => write!(f, "LowCardinality({inner})"),
         }
     }
+}
+
+/// Render an `Enum8`/`Enum16` type string: the keyword, then the `'name' = N`
+/// pairs joined by `, `, inside one pair of parentheses. The variant order is
+/// preserved as stored (the server emits ascending by value). Each name is
+/// escaped with [`escape_enum_name`], the exact inverse of the parser's
+/// unescape, so `parse(display(x)) == x` holds for any name the parser
+/// accepted.
+fn write_enum<V: std::fmt::Display>(
+    f: &mut std::fmt::Formatter<'_>,
+    keyword: &str,
+    variants: &[(String, V)],
+) -> std::fmt::Result {
+    write!(f, "{keyword}(")?;
+    for (i, (name, value)) in variants.iter().enumerate() {
+        if i > 0 {
+            write!(f, ", ")?;
+        }
+        write!(f, "'{}' = {value}", escape_enum_name(name))?;
+    }
+    write!(f, ")")
+}
+
+/// Escape an enum variant name for emission inside single quotes, the inverse of
+/// the parser's unescape in `parse_ch_type`. This matches the server's
+/// `writeQuotedString` with `escape_quote_with_quote=false` and
+/// `escape_backslash_with_backslash=true`: a backslash and a single quote are
+/// backslash-escaped, the C0 control bytes the server names get their letter
+/// escapes, and every other byte passes through unchanged (notably `,` and `=`,
+/// which is why the parser cannot split on them).
+fn escape_enum_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0C}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\0' => out.push_str("\\0"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 impl ChType {

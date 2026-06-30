@@ -236,6 +236,13 @@ fn arrow_format(ch_type: &ChType) -> String {
         ChType::Ipv4 => "I".into(),
         ChType::Ipv6 => "w:16".into(),
         ChType::Uuid => "w:16".into(),
+        // Enum8/Enum16 export as their underlying signed int (Arrow int8 `c` /
+        // int16 `s`), zero-copy. Arrow has no native enum and ClickHouse enum
+        // values are arbitrary signed ints (not 0..N-1 dictionary indices), so a
+        // dictionary export would require forbidden per-cell remapping. The
+        // name->value map is carried in the ChType for bindings.
+        ChType::Enum8 { .. } => "c".into(),
+        ChType::Enum16 { .. } => "s".into(),
         ChType::Nullable(inner) => arrow_format(inner),
         // A dictionary array's top-level format is the INDEX type. The value
         // type lives in the schema's `dictionary` child. Index width is
@@ -443,6 +450,10 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
         // width-16 fixed binary (validity, then the contiguous 16-byte rows),
         // pushed exactly like the FixedString arm above.
         Column::Ipv4(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
+        // Enum8/Enum16 export the underlying signed int buffer (validity, then
+        // values), exactly like Int8/Int16.
+        Column::Enum8(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
+        Column::Enum16(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
         Column::Ipv6(c) | Column::Uuid(c) => {
             match &c.validity {
                 Some(bm) => buffers.push(bm.as_bytes().as_ptr() as *const c_void),
@@ -1036,6 +1047,60 @@ mod tests {
             assert!(array2.release.is_none());
 
             (stream.release.unwrap())(&mut stream);
+        }
+    }
+
+    #[test]
+    fn test_arrow_format_and_export_enum() {
+        // Enum8 exports as Arrow int8 (`c`), Enum16 as int16 (`s`): the
+        // underlying signed int buffer, zero-copy, like Int8/Int16. No
+        // dictionary child (ClickHouse enum values are arbitrary signed ints,
+        // not 0..N-1 indices).
+        let e8 = ChType::Enum8 {
+            variants: vec![("pending".to_string(), 1), ("closed".to_string(), -1)],
+        };
+        let e16 = ChType::Enum16 {
+            variants: vec![("a".to_string(), 1)],
+        };
+        assert_eq!(arrow_format(&e8), "c");
+        assert_eq!(arrow_format(&e16), "s");
+
+        let schema = Schema::new(vec![
+            Field {
+                name: "e8".into(),
+                ch_type: e8,
+            },
+            Field {
+                name: "e16".into(),
+                ch_type: e16,
+            },
+        ]);
+        let columns = vec![
+            Column::Enum8(PrimitiveColumn::new(vec![1i8, -1, 1])),
+            Column::Enum16(PrimitiveColumn::new(vec![1i16, 1, 1])),
+        ];
+        let batch = Arc::new(ColBatch::new(schema, columns, 3));
+
+        unsafe {
+            let mut schema_out: ArrowSchema = std::mem::zeroed();
+            export_schema(&batch.schema, &mut schema_out);
+            let c0 = &**schema_out.children.add(0);
+            assert_eq!(CStr::from_ptr(c0.format).to_str().unwrap(), "c");
+            assert!(c0.dictionary.is_null(), "enum has no dictionary child");
+            let c1 = &**schema_out.children.add(1);
+            assert_eq!(CStr::from_ptr(c1.format).to_str().unwrap(), "s");
+            (schema_out.release.unwrap())(&mut schema_out);
+
+            let mut array: ArrowArray = std::mem::zeroed();
+            export_batch_array(&batch, &mut array);
+            let a0 = &**array.children.add(0);
+            assert_eq!(a0.length, 3);
+            assert_eq!(a0.n_buffers, 2);
+            assert!((*a0.buffers.add(0)).is_null(), "non-nullable validity null");
+            let vals = *a0.buffers.add(1) as *const i8;
+            assert_eq!(*vals, 1);
+            assert_eq!(*vals.add(1), -1);
+            (array.release.unwrap())(&mut array);
         }
     }
 

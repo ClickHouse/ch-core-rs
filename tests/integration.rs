@@ -151,6 +151,31 @@ fn assert_all_types(batch: &ChunkedBatch) {
             Expected::Exact("ipv4", ChType::Ipv4),
             Expected::Exact("ipv6", ChType::Ipv6),
             Expected::Exact("lc_uuid", ChType::LowCardinality(Box::new(ChType::Uuid))),
+            // Enum8/Enum16. The server emits the variants SORTED ASCENDING BY
+            // VALUE in the type string, regardless of the order given at CREATE,
+            // so the parsed ChType carries west=-1, north=1, south=2 in that
+            // order. The name->value map lives here in the ChType; the per-row
+            // wire data is the raw underlying Int8/Int16 only.
+            Expected::Exact(
+                "e8",
+                ChType::Enum8 {
+                    variants: vec![
+                        ("west".to_string(), -1),
+                        ("north".to_string(), 1),
+                        ("south".to_string(), 2),
+                    ],
+                },
+            ),
+            Expected::Exact(
+                "e16",
+                ChType::Enum16 {
+                    variants: vec![
+                        ("west".to_string(), -1),
+                        ("north".to_string(), 1),
+                        ("south".to_string(), 2),
+                    ],
+                },
+            ),
         ],
     );
 
@@ -378,6 +403,22 @@ fn assert_all_types(batch: &ChunkedBatch) {
             Some(&[0xffu8; 16]),
         ],
     );
+
+    // Enum8/Enum16: the underlying signed int per row. Rows north, south, west,
+    // north map to 1, 2, -1, 1 via the value map (west = -1). The raw ints were
+    // probed directly from the server (CAST(enum AS Int8/Int16)), not produced
+    // by decoding with this crate.
+    match block.column(30) {
+        Column::Enum8(c) => {
+            assert_eq!(c.values.as_slice(), &[1i8, 2, -1, 1]);
+            assert!(c.validity.is_none());
+        }
+        other => panic!("expected Enum8, got {other:?}"),
+    }
+    match block.column(31) {
+        Column::Enum16(c) => assert_eq!(c.values.as_slice(), &[1i16, 2, -1, 1]),
+        other => panic!("expected Enum16, got {other:?}"),
+    }
 }
 
 /// Assert the per-row resolved UUID (16-byte wire) values of a dictionary column.

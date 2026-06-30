@@ -303,6 +303,12 @@ pub enum Column {
     Ipv4(PrimitiveColumn<u32>),
     Ipv6(FixedBinaryColumn),
     Uuid(FixedBinaryColumn),
+    // Enum8/Enum16 carry only the physical signed-int buffer; the name->value
+    // map lives in the schema's ChType, the same Column-vs-ChType split the
+    // temporals use for timezone/precision. Decoded through the primitive
+    // little-endian fast path, identical on the wire to Int8/Int16.
+    Enum8(PrimitiveColumn<i8>),
+    Enum16(PrimitiveColumn<i16>),
     Dictionary(DictionaryColumn),
 }
 
@@ -329,6 +335,8 @@ impl Column {
             Column::Ipv4(c) => c.len(),
             Column::Ipv6(c) => c.len(),
             Column::Uuid(c) => c.len(),
+            Column::Enum8(c) => c.len(),
+            Column::Enum16(c) => c.len(),
             Column::Dictionary(c) => c.len(),
         }
     }
@@ -359,6 +367,8 @@ impl Column {
             Column::Ipv4(c) => c.null_count(),
             Column::Ipv6(c) => c.null_count(),
             Column::Uuid(c) => c.null_count(),
+            Column::Enum8(c) => c.null_count(),
+            Column::Enum16(c) => c.null_count(),
             Column::Dictionary(c) => c.null_count(),
         }
     }
@@ -385,6 +395,8 @@ impl Column {
             Column::Ipv4(c) => c.validity.as_ref(),
             Column::Ipv6(c) => c.validity.as_ref(),
             Column::Uuid(c) => c.validity.as_ref(),
+            Column::Enum8(c) => c.validity.as_ref(),
+            Column::Enum16(c) => c.validity.as_ref(),
             Column::Dictionary(c) => c.validity.as_ref(),
         }
     }

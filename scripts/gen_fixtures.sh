@@ -100,7 +100,14 @@ SELECT
     -- allow_suspicious setting is not required for it, but is harmless). The
     -- dictionary body is raw 16-byte UUID rows. Values repeat so the per-block
     -- dictionary is smaller than the row count.
-    CAST(multiIf(n = 0, '00112233-4455-6677-8899-aabbccddeeff', n = 1, '10203040-5060-7080-90a0-b0c0d0e0f000', n = 2, '00112233-4455-6677-8899-aabbccddeeff', 'ffffffff-ffff-ffff-ffff-ffffffffffff'), 'LowCardinality(UUID)') AS lc_uuid
+    CAST(multiIf(n = 0, '00112233-4455-6677-8899-aabbccddeeff', n = 1, '10203040-5060-7080-90a0-b0c0d0e0f000', n = 2, '00112233-4455-6677-8899-aabbccddeeff', 'ffffffff-ffff-ffff-ffff-ffffffffffff'), 'LowCardinality(UUID)') AS lc_uuid,
+    -- Enum8: raw Int8 on the wire (1 byte/row); the name->value map is in the
+    -- type string only. Values include a negative (-1) so the signed decode is
+    -- exercised. Rows resolve to 1, 2, -1, 1.
+    CAST(multiIf(n = 0, 'north', n = 1, 'south', n = 2, 'west', 'north'), 'Enum8(\'north\' = 1, \'south\' = 2, \'west\' = -1)') AS e8,
+    -- Enum16: raw Int16 on the wire (2 bytes/row), same name->value-in-type-string
+    -- shape, wider value range. Rows resolve to 1, 2, -1, 1.
+    CAST(multiIf(n = 0, 'north', n = 1, 'south', n = 2, 'west', 'north'), 'Enum16(\'north\' = 1, \'south\' = 2, \'west\' = -1)') AS e16
 FROM numbers(4)
 SETTINGS allow_suspicious_low_cardinality_types = 1
 FORMAT Native

@@ -176,6 +176,23 @@ fn parse_ch_type(type_name: &str) -> Option<ChType> {
         }
     }
 
+    // Enum8(...) / Enum16(...). The server always emits the concrete keyword
+    // with explicit values, never a bare `Enum(...)`, so only these two
+    // spellings are parsed. The inner `'name' = value, ...` list is walked by a
+    // quote-aware parser (`parse_enum_variants`) because a name can contain `,`
+    // and `=` unescaped. An out-of-range value or any syntax error returns None
+    // (UnsupportedType) rather than panicking on this untrusted string.
+    if let Some(inner) = type_name.strip_prefix("Enum8(") {
+        if let Some(inner) = inner.strip_suffix(')') {
+            return parse_enum_variants::<i8>(inner).map(|variants| ChType::Enum8 { variants });
+        }
+    }
+    if let Some(inner) = type_name.strip_prefix("Enum16(") {
+        if let Some(inner) = inner.strip_suffix(')') {
+            return parse_enum_variants::<i16>(inner).map(|variants| ChType::Enum16 { variants });
+        }
+    }
+
     // DateTime('<tz>'). The bare DateTime is handled by the exact-match block
     // below. Only the parameterized, timezone-carrying form reaches here.
     if let Some(inner) = type_name.strip_prefix("DateTime(") {
@@ -219,6 +236,130 @@ fn strip_quotes(s: &str) -> &str {
     s.strip_prefix('\'')
         .and_then(|s| s.strip_suffix('\''))
         .unwrap_or(s)
+}
+
+/// Parse the inner `'name' = value, ...` list of an `Enum8`/`Enum16` type
+/// string into `(name, value)` pairs, preserving the server's emitted order
+/// (ascending by value).
+///
+/// The list cannot be split on `,` or `=`: a quoted name passes those bytes
+/// through unescaped (server `writeQuotedString`, confirmed at
+/// v26.6.1.1193-stable). So this walks the string byte by byte: skip spaces,
+/// require `'`, read the name until the closing unescaped `'` unescaping the
+/// server's set (`\\`, `\'`, `\b`, `\f`, `\n`, `\r`, `\t`, `\0`), skip spaces,
+/// require `=`, parse a signed integer that must fit `T` (`i8` for `Enum8`,
+/// `i16` for `Enum16`), then skip spaces and require `,` or end of input.
+///
+/// Returns `None` (-> UnsupportedType) on any malformed escape, out-of-range
+/// value, or syntax error. The type string is untrusted wire input, so this
+/// never panics. An empty list (`Enum8()`) returns an empty `Vec`; the server
+/// does not emit it, but it is harmless and not a decode error.
+fn parse_enum_variants<T: TryFrom<i64>>(inner: &str) -> Option<Vec<(String, T)>> {
+    let bytes = inner.as_bytes();
+    let mut pos = 0usize;
+    let mut variants: Vec<(String, T)> = Vec::new();
+
+    skip_ascii_spaces(bytes, &mut pos);
+    if pos >= bytes.len() {
+        // Empty inner list: `Enum8()`. No variants.
+        return Some(variants);
+    }
+
+    loop {
+        skip_ascii_spaces(bytes, &mut pos);
+
+        // Name: a single-quoted, escaped string.
+        if bytes.get(pos) != Some(&b'\'') {
+            return None;
+        }
+        pos += 1;
+        let name = parse_enum_name(bytes, &mut pos)?;
+
+        // ` = ` separator (spaces optional, the server writes exactly one each
+        // side; accept any run of spaces to stay lenient on the untrusted input).
+        skip_ascii_spaces(bytes, &mut pos);
+        if bytes.get(pos) != Some(&b'=') {
+            return None;
+        }
+        pos += 1;
+        skip_ascii_spaces(bytes, &mut pos);
+
+        // Signed integer value. Parse in i64 first, then narrow to T so an
+        // out-of-range value for the concrete enum width is rejected.
+        let value = parse_enum_value(bytes, &mut pos)?;
+        let value = T::try_from(value).ok()?;
+        variants.push((name, value));
+
+        // Separator or end of input.
+        skip_ascii_spaces(bytes, &mut pos);
+        match bytes.get(pos) {
+            None => return Some(variants),
+            Some(&b',') => pos += 1,
+            Some(_) => return None,
+        }
+    }
+}
+
+/// Advance `pos` past any run of ASCII space (0x20) bytes.
+fn skip_ascii_spaces(bytes: &[u8], pos: &mut usize) {
+    while bytes.get(*pos) == Some(&b' ') {
+        *pos += 1;
+    }
+}
+
+/// Read an enum variant name from `bytes` starting just after the opening `'`,
+/// advancing `pos` past the closing `'`. Applies the server's unescape set; any
+/// unknown escape or a missing closing quote returns `None`.
+fn parse_enum_name(bytes: &[u8], pos: &mut usize) -> Option<String> {
+    let mut name = Vec::new();
+    loop {
+        let b = *bytes.get(*pos)?;
+        *pos += 1;
+        match b {
+            b'\'' => {
+                // Closing quote. The name bytes are UTF-8 (the whole type string
+                // came from a `String` validated as UTF-8 in the header), so
+                // this conversion succeeds for any well-formed input.
+                return String::from_utf8(name).ok();
+            }
+            b'\\' => {
+                let esc = *bytes.get(*pos)?;
+                *pos += 1;
+                let decoded = match esc {
+                    b'\\' => b'\\',
+                    b'\'' => b'\'',
+                    b'b' => 0x08,
+                    b'f' => 0x0C,
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b'0' => 0x00,
+                    _ => return None, // unknown escape
+                };
+                name.push(decoded);
+            }
+            other => name.push(other),
+        }
+    }
+}
+
+/// Parse a signed decimal integer (optional leading `-`) from `bytes`,
+/// advancing `pos` past the digits. Returns `None` on no digits or overflow.
+fn parse_enum_value(bytes: &[u8], pos: &mut usize) -> Option<i64> {
+    let start = *pos;
+    if bytes.get(*pos) == Some(&b'-') {
+        *pos += 1;
+    }
+    let digits_start = *pos;
+    while matches!(bytes.get(*pos), Some(b'0'..=b'9')) {
+        *pos += 1;
+    }
+    if *pos == digits_start {
+        return None; // no digits
+    }
+    // The slice is `[-]?[0-9]+`, all ASCII, so it is valid UTF-8 and parses as
+    // i64 unless it overflows, which `parse` reports as an error.
+    std::str::from_utf8(&bytes[start..*pos]).ok()?.parse().ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -855,6 +996,19 @@ fn decode_column_body(
                 None => Column::Uuid(FixedBinaryColumn::new(data, 16)),
             }
         }
+        // Enum8/Enum16 are byte-identical to Int8/Int16 on the wire
+        // (`SerializationEnum` inherits `SerializationNumber` and overrides no
+        // bulk method; confirmed at v26.6.1.1193-stable). The name->value map is
+        // in the ChType only, so decode is the raw signed int through the same
+        // primitive fast path.
+        ChType::Enum8 { .. } => {
+            let values = decode_primitive!(reader, num_rows, i8);
+            Column::Enum8(PrimitiveColumn { values, validity })
+        }
+        ChType::Enum16 { .. } => {
+            let values = decode_primitive!(reader, num_rows, i16);
+            Column::Enum16(PrimitiveColumn { values, validity })
+        }
         ChType::Nullable(_) => unreachable!("Nullable already unwrapped"),
         ChType::LowCardinality(_) => unreachable!("LowCardinality handled above"),
     };
@@ -957,6 +1111,16 @@ fn empty_column(ch_type: &ChType) -> Column {
         ChType::Uuid => Column::Uuid(match empty_validity {
             Some(bm) => FixedBinaryColumn::new_nullable(vec![], 16, bm),
             None => FixedBinaryColumn::new(vec![], 16),
+        }),
+        // Enum8/Enum16 empty columns are the empty signed-int buffer, like the
+        // matching Int8/Int16; the name->value map stays in the ChType.
+        ChType::Enum8 { .. } => Column::Enum8(PrimitiveColumn {
+            values: vec![],
+            validity: empty_validity,
+        }),
+        ChType::Enum16 { .. } => Column::Enum16(PrimitiveColumn {
+            values: vec![],
+            validity: empty_validity,
         }),
         // A zero-row block reads no LowCardinality prefix or data (the server
         // gates `readData` on having rows), so the empty dictionary column has
@@ -1250,8 +1414,13 @@ fn skip_column_body(
     num_rows: usize,
 ) -> Result<(), DecodeError> {
     match inner_type {
-        ChType::Bool | ChType::Int8 | ChType::UInt8 => reader.skip(num_rows)?,
-        ChType::Int16 | ChType::UInt16 | ChType::Date => reader.skip(num_rows.saturating_mul(2))?,
+        // Enum8 is 1 byte/row (like Int8); Enum16 is 2 bytes/row (like Int16).
+        ChType::Bool | ChType::Int8 | ChType::UInt8 | ChType::Enum8 { .. } => {
+            reader.skip(num_rows)?
+        }
+        ChType::Int16 | ChType::UInt16 | ChType::Date | ChType::Enum16 { .. } => {
+            reader.skip(num_rows.saturating_mul(2))?
+        }
         ChType::Int32
         | ChType::UInt32
         | ChType::Float32
@@ -3672,6 +3841,317 @@ mod tests {
         assert!(matches!(
             err,
             DecodeError::Io(ref e) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Enum8 / Enum16
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_ch_type_enum8() {
+        // Enum8 maps names to Int8 values; the parser preserves order and
+        // accepts negatives. Values must fit i8.
+        assert_eq!(
+            parse_ch_type("Enum8('pending' = 1, 'active' = 2, 'closed' = -1)"),
+            Some(ChType::Enum8 {
+                variants: vec![
+                    ("pending".to_string(), 1),
+                    ("active".to_string(), 2),
+                    ("closed".to_string(), -1),
+                ],
+            })
+        );
+        // i8 range edges decode; one past the edge is rejected.
+        assert_eq!(
+            parse_ch_type("Enum8('lo' = -128, 'hi' = 127)"),
+            Some(ChType::Enum8 {
+                variants: vec![("lo".to_string(), -128), ("hi".to_string(), 127)],
+            })
+        );
+        assert_eq!(parse_ch_type("Enum8('over' = 128)"), None);
+        assert_eq!(parse_ch_type("Enum8('under' = -129)"), None);
+    }
+
+    #[test]
+    fn test_parse_ch_type_enum16() {
+        // Enum16 maps names to Int16 values; same parser, wider range.
+        assert_eq!(
+            parse_ch_type("Enum16('pending' = 1, 'active' = 2, 'closed' = -1)"),
+            Some(ChType::Enum16 {
+                variants: vec![
+                    ("pending".to_string(), 1),
+                    ("active".to_string(), 2),
+                    ("closed".to_string(), -1),
+                ],
+            })
+        );
+        assert_eq!(
+            parse_ch_type("Enum16('lo' = -32768, 'hi' = 32767)"),
+            Some(ChType::Enum16 {
+                variants: vec![("lo".to_string(), -32768), ("hi".to_string(), 32767)],
+            })
+        );
+        assert_eq!(parse_ch_type("Enum16('over' = 32768)"), None);
+    }
+
+    #[test]
+    fn test_parse_ch_type_enum_malformed_rejected() {
+        // Each of these is a syntax error on the untrusted type string and must
+        // surface as None (UnsupportedType), never a panic.
+        for bad in [
+            "Enum8('pending' 1)",       // missing '='
+            "Enum8(pending = 1)",       // name not quoted
+            "Enum8('pending' = )",      // missing value
+            "Enum8('pending' = abc)",   // non-numeric value
+            "Enum8('unterminated = 1)", // name never closed
+            "Enum8('bad\\x' = 1)",      // unknown escape
+            "Enum8('a' = 1 'b' = 2)",   // missing comma between pairs
+        ] {
+            assert_eq!(parse_ch_type(bad), None, "expected None for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_enum_type_string_round_trips_escaping_and_order() {
+        // Display is the inverse of the parser, so parse(display(t)) == t for the
+        // tricky cases: a name containing a comma and an equals sign (both pass
+        // through unescaped on the wire), a name with an escaped quote and a
+        // backslash, negative values, and ascending multi-value ordering.
+        let cases = vec![
+            ChType::Enum8 {
+                variants: vec![
+                    ("closed".to_string(), -1),
+                    ("pending".to_string(), 1),
+                    ("active".to_string(), 2),
+                ],
+            },
+            // A name with a comma and an equals sign: the parser cannot split on
+            // those, it walks the quotes. Display escapes neither.
+            ChType::Enum8 {
+                variants: vec![("a,b=c".to_string(), 7)],
+            },
+            // A name with an escaped quote and a backslash.
+            ChType::Enum16 {
+                variants: vec![
+                    ("x'y".to_string(), -3),
+                    ("back\\slash".to_string(), 4),
+                    ("tab\tnl\n".to_string(), 9),
+                ],
+            },
+        ];
+        for t in cases {
+            let rendered = t.to_string();
+            assert_eq!(
+                parse_ch_type(&rendered),
+                Some(t.clone()),
+                "Display output {rendered:?} did not parse back to {t:?}"
+            );
+        }
+        // Pin the exact rendering of the comma/equals case so a regression in the
+        // escaping (e.g. accidentally escaping `,` or `=`) is caught.
+        assert_eq!(
+            ChType::Enum8 {
+                variants: vec![("a,b=c".to_string(), 7)],
+            }
+            .to_string(),
+            "Enum8('a,b=c' = 7)"
+        );
+        // And the escaped quote / backslash rendering.
+        assert_eq!(
+            ChType::Enum8 {
+                variants: vec![("x'y".to_string(), 1), ("a\\b".to_string(), 2)],
+            }
+            .to_string(),
+            "Enum8('x\\'y' = 1, 'a\\\\b' = 2)"
+        );
+    }
+
+    #[test]
+    fn test_decode_enum8_plain() {
+        // Enum8 is raw Int8 on the wire (1 byte/row); the name->value map is in
+        // the ChType only, never in the per-row data.
+        let data = BlockBuilder::new()
+            .header(1, 4)
+            .column_header(
+                "status",
+                "Enum8('pending' = 1, 'active' = 2, 'closed' = -1)",
+            )
+            .int8_data(&[1, 2, -1, 1])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Enum8(c) => {
+                assert_eq!(c.values, vec![1i8, 2, -1, 1]);
+                assert!(c.validity.is_none());
+            }
+            other => panic!("expected Enum8, got {other:?}"),
+        }
+        // The variants live in the schema ChType.
+        assert_eq!(
+            batch.schema.fields[0].ch_type,
+            ChType::Enum8 {
+                variants: vec![
+                    ("pending".to_string(), 1),
+                    ("active".to_string(), 2),
+                    ("closed".to_string(), -1),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn test_decode_enum16_plain() {
+        // Enum16 is raw Int16 on the wire (2 bytes/row).
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header(
+                "status",
+                "Enum16('pending' = 1, 'active' = 2, 'closed' = -1)",
+            )
+            .int16_data(&[1, -1, 2])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Enum16(c) => assert_eq!(c.values, vec![1i16, -1, 2]),
+            other => panic!("expected Enum16, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_nullable_enum8() {
+        // Nullable(Enum8): the null map first, then the Int8 buffer, exactly like
+        // Nullable(Int8). Null rows still carry a placeholder byte on the wire.
+        let data = BlockBuilder::new()
+            .header(1, 4)
+            .column_header("status", "Nullable(Enum8('pending' = 1, 'active' = 2))")
+            .null_map(&[false, true, false, true])
+            .int8_data(&[1, 0, 2, 0])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Enum8(c) => {
+                assert_eq!(c.null_count(), 2);
+                assert_eq!(c.values, vec![1i8, 0, 2, 0]);
+            }
+            other => panic!("expected Enum8, got {other:?}"),
+        }
+        assert!(batch.column(0).validity().unwrap().is_valid(0));
+        assert!(!batch.column(0).validity().unwrap().is_valid(1));
+        assert_eq!(
+            batch.schema.fields[0].ch_type,
+            ChType::Nullable(Box::new(ChType::Enum8 {
+                variants: vec![("pending".to_string(), 1), ("active".to_string(), 2)],
+            }))
+        );
+    }
+
+    #[test]
+    fn test_decode_enum_zero_rows() {
+        // A zero-row block carrying an Enum8 and an Enum16 contributes the schema
+        // (variants and all) but no chunks, and the empty columns have length 0.
+        let data = BlockBuilder::new()
+            .header(2, 0)
+            .column_header("e8", "Enum8('a' = 1, 'b' = 2)")
+            .column_header("e16", "Enum16('a' = 1, 'b' = -2)")
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_rows(), 0);
+        assert_eq!(cb.num_chunks(), 0);
+        assert_eq!(cb.num_columns(), 2);
+        assert_eq!(
+            cb.schema.fields[0].ch_type,
+            ChType::Enum8 {
+                variants: vec![("a".to_string(), 1), ("b".to_string(), 2)],
+            }
+        );
+        assert_eq!(
+            cb.schema.fields[1].ch_type,
+            ChType::Enum16 {
+                variants: vec![("a".to_string(), 1), ("b".to_string(), -2)],
+            }
+        );
+    }
+
+    #[test]
+    fn test_multi_block_enum8_kept_as_chunks() {
+        // Enum8 blocks stay separate chunks, never concatenated.
+        let type_str = "Enum8('pending' = 1, 'active' = 2, 'closed' = -1)";
+        let mut data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("status", type_str)
+            .int8_data(&[1, 2])
+            .build();
+        data.extend(
+            BlockBuilder::new()
+                .header(1, 3)
+                .column_header("status", type_str)
+                .int8_data(&[-1, 1, 2])
+                .build(),
+        );
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_chunks(), 2);
+        assert_eq!(cb.num_rows(), 5);
+        match cb.chunks[0].column(0) {
+            Column::Enum8(c) => assert_eq!(c.values, vec![1i8, 2]),
+            other => panic!("expected Enum8, got {other:?}"),
+        }
+        match cb.chunks[1].column(0) {
+            Column::Enum8(c) => assert_eq!(c.values, vec![-1i8, 1, 2]),
+            other => panic!("expected Enum8, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_block_end_scans_enum_columns() {
+        // The completeness scan must walk Enum8 (1/row) and Enum16 (2/row) to the
+        // exact block end, and report a one-byte-short buffer as "need more bytes".
+        let data = BlockBuilder::new()
+            .header(2, 3)
+            .column_header("e8", "Enum8('a' = 1, 'b' = 2)")
+            .int8_data(&[1, 2, 1])
+            .column_header("e16", "Enum16('a' = 1, 'b' = -2)")
+            .int16_data(&[1, -2, 1])
+            .build();
+
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len())
+        );
+        let truncated = &data[..data.len() - 1];
+        let err = block_end(truncated, &DecodeOptions::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::Io(ref e) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[test]
+    fn test_enum_rejected_as_low_cardinality_inner() {
+        // The server forbids Enum as a LowCardinality inner
+        // (`canBeInsideLowCardinality()` is false), so it never appears on the
+        // wire and the decoder rejects it as UnsupportedType rather than
+        // mis-decoding. This is independent of Enum decode support.
+        let data = BlockBuilder::new()
+            .header(1, 1)
+            .column_header("e", "LowCardinality(Enum8('a' = 1))")
+            // key-version prefix then an index word; decode rejects before
+            // reaching the body, so the exact trailing bytes do not matter.
+            .raw_bytes(&1u64.to_le_bytes())
+            .raw_bytes(&(LC_HAS_ADDITIONAL_KEYS_BIT).to_le_bytes())
+            .raw_bytes(&0u64.to_le_bytes())
+            .build();
+        assert!(matches!(
+            decode_all_bytes(&data, &DecodeOptions::default()),
+            Err(DecodeError::UnsupportedType { .. })
         ));
     }
 }
