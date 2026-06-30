@@ -219,6 +219,59 @@ impl FixedBinaryColumn {
     }
 }
 
+/// Dictionary-encoded column (Arrow dictionary layout).
+///
+/// Used for `LowCardinality(T)`. The column is a pair of an index array and a
+/// values (dictionary) array: row `i` resolves to `values[indices[i]]`.
+///
+/// - `indices` are 32-bit signed, the index type pyarrow accepts for a
+///   dictionary array, regardless of the native ClickHouse per-block index
+///   width (UInt8..UInt64). Decode widens the native width into i32.
+/// - `validity` is the index array's validity bitmap (Arrow convention: bit 1 =
+///   valid, bit 0 = null). It is `Some` only for a nullable inner type. Nulls
+///   live in the index validity, not as a dictionary entry, matching how Arrow
+///   represents a null in a dictionary array.
+/// - `values` is the per-block dictionary as its own `Column` (a `Utf8Column`
+///   for `LowCardinality(String)`). Each Native block carries its own
+///   dictionary, and blocks stay separate chunks, so the values column is local
+///   to this chunk.
+#[derive(Debug, Clone)]
+pub struct DictionaryColumn {
+    pub indices: Vec<i32>,
+    pub validity: Option<Bitmap>,
+    pub values: Box<Column>,
+}
+
+impl DictionaryColumn {
+    pub fn new(indices: Vec<i32>, values: Column) -> Self {
+        Self {
+            indices,
+            validity: None,
+            values: Box::new(values),
+        }
+    }
+
+    pub fn new_nullable(indices: Vec<i32>, values: Column, validity: Bitmap) -> Self {
+        Self {
+            indices,
+            validity: Some(validity),
+            values: Box::new(values),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+
+    pub fn null_count(&self) -> usize {
+        self.validity.as_ref().map_or(0, |b| b.null_count())
+    }
+}
+
 /// Enum over all supported column types.
 #[derive(Debug, Clone)]
 pub enum Column {
@@ -242,6 +295,7 @@ pub enum Column {
     DateTime64(PrimitiveColumn<i64>),
     Utf8(Utf8Column),
     FixedBinary(FixedBinaryColumn),
+    Dictionary(DictionaryColumn),
 }
 
 impl Column {
@@ -264,6 +318,7 @@ impl Column {
             Column::DateTime64(c) => c.len(),
             Column::Utf8(c) => c.len(),
             Column::FixedBinary(c) => c.len(),
+            Column::Dictionary(c) => c.len(),
         }
     }
 
@@ -290,6 +345,7 @@ impl Column {
             Column::DateTime64(c) => c.null_count(),
             Column::Utf8(c) => c.null_count(),
             Column::FixedBinary(c) => c.null_count(),
+            Column::Dictionary(c) => c.null_count(),
         }
     }
 
@@ -312,6 +368,7 @@ impl Column {
             Column::DateTime64(c) => c.validity.as_ref(),
             Column::Utf8(c) => c.validity.as_ref(),
             Column::FixedBinary(c) => c.validity.as_ref(),
+            Column::Dictionary(c) => c.validity.as_ref(),
         }
     }
 }

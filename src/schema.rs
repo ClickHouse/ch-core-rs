@@ -47,8 +47,7 @@ pub enum ChType {
 
     // Wrappers
     Nullable(Box<ChType>),
-    // LowCardinality(Box<ChType>),  // Phase 3
-
+    LowCardinality(Box<ChType>),
     // Containers (Phase 4)
     // Array(Box<ChType>),
     // Tuple(Vec<(Option<String>, ChType)>),
@@ -113,6 +112,7 @@ impl std::fmt::Display for ChType {
                 timezone: Some(tz),
             } => write!(f, "DateTime64({precision}, '{tz}')"),
             ChType::Nullable(inner) => write!(f, "Nullable({inner})"),
+            ChType::LowCardinality(inner) => write!(f, "LowCardinality({inner})"),
         }
     }
 }

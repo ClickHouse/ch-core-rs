@@ -175,12 +175,18 @@ Server layout of one block, in order:
      v26.2.4 this byte is always present.
    - the column payload, as described in that type's section.
 
-The per-column payload is preceded by no other framing: the server's
-`deserializeBinaryBulkStatePrefix` step reads zero bytes for every type this
-crate supports, including `String` (always the single-stream variant on the
-Native wire at this tag). For a `Nullable(T)` column the payload is the null map
-first, then the inner type's payload. The null map is `num_rows` bytes, one per
-row, 0x00 for present and nonzero for null. See the `Nullable(T)` section.
+The per-column payload is preceded by a per-column bulk-state prefix, the
+server's `deserializeBinaryBulkStatePrefix` step. For every type except
+`LowCardinality` this prefix reads zero bytes, including `String` (always the
+single-stream variant on the Native wire at this tag). `LowCardinality` reads a
+real prefix, an 8-byte little-endian key version; see the `LowCardinality(T)`
+section. The server runs this step once per column per block, immediately before
+that column's payload, and only when the block has rows
+(`NativeReader::readData`, gated by `if (rows)`), so a zero-row block reads no
+prefix and no data for any column. For a `Nullable(T)` column the payload is the
+null map first, then the inner type's payload. The null map is `num_rows` bytes,
+one per row, 0x00 for present and nonzero for null. See the `Nullable(T)`
+section.
 
 This contract describes the default string-encoded type-header mode. ClickHouse
 also has an `output_format_native_encode_types_in_binary_format` setting that
@@ -235,6 +241,7 @@ than an error.
 | `DateTime`, `DateTime('<tz>')` | `DateTime { timezone }` | `DateTime` | `I` | validity, values         | yes      |
 | `DateTime64(P)`, `DateTime64(P, '<tz>')` | `DateTime64 { precision, timezone }` | `DateTime64` | `ts{unit}:{tz}` for P in {0,3,6,9}, else `l` | validity, values | yes |
 | `Nullable(T)`     | `Nullable(T)`    | inner T's variant | inner's      | inner's, validity populated | n/a      |
+| `LowCardinality(String)`, `LowCardinality(Nullable(String))` | `LowCardinality(Box<ChType>)` | `Dictionary` | `i` (index type; values type in the dictionary child) | validity, i32 indices (+ dictionary child) | via inner `Nullable` |
 
 Any type not in this matrix is rejected. See "Unsupported types" below.
 
@@ -496,6 +503,113 @@ in `src/DataTypes/Serializations/SerializationNullable.cpp`: the null map stream
 with all `num_rows` values. The decode verifies the null map and nested column
 have equal length. Confirmed at `v26.2.4.23-stable`.
 
+### LowCardinality(T)
+
+**Type string(s):** `LowCardinality(String)` and
+`LowCardinality(Nullable(String))` are supported today. The parser accepts any
+`LowCardinality(<inner>)` and records it, but decode currently supports only a
+`String` (or `Nullable(String)`) inner type; any other inner type is rejected as
+`UnsupportedType`.
+
+**Logical type:** `ChType::LowCardinality(Box<ChType>)`.
+
+**Introduction version:** `LowCardinality` has been a stable ClickHouse type
+since 19.x (it left experimental in 19.11). It exists and is stable at the
+pinned tag `v26.2.4.23-stable`.
+
+**Wire payload:** the Native wire uses a single flat buffer, so every substream
+(`DictionaryKeys`, `DictionaryIndexes`, the state prefix) resolves to the same
+read buffer and the bytes below are exactly the serializer call order. All the
+multi-byte words here are fixed 8-byte little-endian `u64`, written with the
+server's `writeBinaryLittleEndian`, not varints.
+
+A per-column bulk-state prefix precedes the per-block payload:
+
+```text
+[8 bytes LE u64]  key_version   // must be 1 (SharedDictionariesWithAdditionalKeys); else rejected
+```
+
+Then, per block (when the block has rows):
+
+```text
+[8 bytes LE u64]  index_type_word
+                  //   bits 1:0 = index width: 0=u8 1=u16 2=u32 3=u64
+                  //   bit 8 (0x100) = NeedGlobalDictionaryBit -> must be CLEAR in Native; rejected if set
+                  //   bit 9 (0x200) = HasAdditionalKeysBit    -> set in Native
+                  //   higher bits (e.g. bit 10 = NeedUpdateDictionary) may be set; the decoder masks only the bits it acts on and ignores the rest
+[8 bytes LE u64]  num_keys      // dictionary entry count for THIS block
+[num_keys values] dictionary    // inner type serialized; for String each is varint len + raw bytes
+[8 bytes LE u64]  num_rows      // re-stated; must equal the block row count
+[num_rows * w]    indexes       // raw LE array (NOT varint), w = index width, each an index into this block's dictionary
+```
+
+The dictionary is per block (additional keys). This core never concatenates
+blocks, so each chunk gets its own dictionary and indexes resolve against that
+chunk's dictionary, never a shared global one. `NeedGlobalDictionaryBit` is
+never set in Native (the server rejects it for `native_format`), so the decoder
+rejects it as well.
+
+Important divergence from the abstract serialization model: although
+`deserializeBinaryBulkStatePrefix` is conceptually a once-per-column step, the
+Native reader creates a fresh deserialize state for every column in every block
+(`NativeReader::readData`), so the `key_version` prefix is emitted per block per
+column, immediately before that block's index payload. A zero-row block reads no
+prefix and no data for the column.
+
+For `LowCardinality(Nullable(String))` the dictionary value type after
+removeNullable is plain `String`. The wire transmits `num_keys` string values;
+dictionary index 0 is the NULL sentinel and its on-wire value is the inner
+default, an empty string. Rows whose index is 0 are NULL.
+
+**Arrow export:** Arrow `dictionary(i32, utf8)`. The schema field's own format
+string is the index type `i` (int32) and the value type lives in the schema's
+`dictionary` child (`u`, utf8). The nullable flag is set on the field when the
+inner type is `Nullable`. The array carries 2 index buffers in order: validity
+then the i32 index data, and its `dictionary` child array holds the dictionary
+values exported as a `String` column (validity, offsets, data).
+
+Index-width decision: ClickHouse picks the index width (u8..u64) per block from
+that block's dictionary size, but the decoder normalizes every index to a single
+signed `i32`, widening the native width during decode. This matches the index
+type pyarrow accepts for a dictionary array and keeps the `Column` model and the
+Arrow export single-shaped rather than branching the index format per chunk. A
+per-block dictionary large enough to overflow `i32` is not a real Native payload
+and is rejected.
+
+Null-representation decision: in Arrow a null in a dictionary array lives in the
+indices validity bitmap, not as a dictionary entry. The decoder maps each
+wire-index-0 row (the ClickHouse NULL sentinel) to a null bit in the index
+validity bitmap and leaves that row's i32 index at 0 (pointing at the harmless
+sentinel entry, never read). The dictionary `values` column still contains the
+`num_keys` entries the wire carried, including the empty-string sentinel at slot
+0. A plain (non-nullable) `LowCardinality(String)` has no validity bitmap; the
+server still reserves dictionary slot 0 with an empty string, but it is never
+referenced (the indexes start at 1), so it carries no null sentinel.
+
+**Rust buffer:** `Column::Dictionary(DictionaryColumn)` where `DictionaryColumn`
+is `{ indices: Vec<i32>, validity: Option<Bitmap>, values: Box<Column> }`.
+`indices` has length `num_rows`. `validity` is `Some` only for a nullable inner
+type. `values` is the per-block dictionary as its own `Column` (a `Utf8Column`
+for the String case).
+
+**Notes:**
+
+- The dictionary is local to each chunk. Two chunks of one result can have
+  different dictionaries and different (normalized away) native index widths.
+- A null row's i32 index is 0; always consult the validity bitmap before reading
+  the value, exactly as for `Nullable(T)`.
+
+**Server reference:** `SerializationLowCardinality::deserializeBinaryBulkStatePrefix`
+(reads the `key_version`) and
+`SerializationLowCardinality::deserializeBinaryBulkWithMultipleStreams` (the
+per-block index word, additional-keys dictionary, row count, and index array) in
+`src/DataTypes/Serializations/SerializationLowCardinality.cpp`, with the
+per-column-per-block state and the `if (rows)` gate in
+`NativeReader::readData` (`src/Formats/NativeReader.cpp`). The index word layout
+and the index-0 NULL sentinel are in `IndexesSerializationType` and
+`read_additional_keys` in the same serialization file. Confirmed at
+`v26.2.4.23-stable`.
+
 ---
 
 ## Zero-row output
@@ -509,6 +623,8 @@ directly (`empty_column` in `src/native/decode.rs`), the empty shapes are:
   data.
 - `FixedString(N)`: empty data, width preserved.
 - `Nullable(T)`: as above with an empty validity bitmap.
+- `LowCardinality(T)`: empty indices, an empty values dictionary column, and (for
+  a nullable inner type) an empty index validity bitmap.
 
 In all cases length is 0 and `null_count` is 0.
 
@@ -526,9 +642,17 @@ Not yet supported, tracked as planned phases in `src/schema.rs`:
 - `Decimal`.
 - `UUID`, `IPv4`, `IPv6`.
 - `Enum8`, `Enum16`.
-- `LowCardinality(T)`.
+- `LowCardinality(T)` for any inner type other than `String` or
+  `Nullable(String)`. The wrapper itself is supported (see the
+  `LowCardinality(T)` section); only the String inner type is decoded so far,
+  and any other inner type is rejected as `UnsupportedType`.
 - Containers: `Array(T)`, `Tuple(...)`, `Map(K, V)`.
 - Wide integers: `Int128`, `UInt128`, `Int256`, `UInt256`.
+
+A malformed `LowCardinality` payload (a bad key version, the
+`NeedGlobalDictionaryBit` set, an index width tag outside `0..=3`, an out-of-range
+index, or a row count that disagrees with the block header) fails with
+`DecodeError::InvalidLowCardinality` rather than `UnsupportedType`.
 
 When one of these is implemented, move it into the support matrix and add a type
 section here.

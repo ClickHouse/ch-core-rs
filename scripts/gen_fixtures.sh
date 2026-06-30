@@ -64,7 +64,14 @@ SELECT
     -- raw ticks directly, so the committed bytes match these integers exactly.
     multiIf(n = 0, fromUnixTimestamp64Milli(toInt64(-877)), n = 1, fromUnixTimestamp64Milli(toInt64(0)), n = 2, fromUnixTimestamp64Milli(toInt64(1705322096789)), fromUnixTimestamp64Milli(toInt64(4102444799999))) AS dt64,
     -- DateTime64(3, 'UTC'): same Int64 ticks, timezone is metadata only.
-    fromUnixTimestamp64Milli(multiIf(n = 0, toInt64(-877), n = 1, toInt64(0), n = 2, toInt64(1705322096789), toInt64(4102444799999)), 'UTC') AS dt64_utc
+    fromUnixTimestamp64Milli(multiIf(n = 0, toInt64(-877), n = 1, toInt64(0), n = 2, toInt64(1705322096789), toInt64(4102444799999)), 'UTC') AS dt64_utc,
+    -- LowCardinality(String): dictionary-encoded strings with repeats so the
+    -- per-block dictionary has fewer entries than rows. Values picked so the
+    -- four rows reference three distinct dictionary entries.
+    CAST(multiIf(n = 0, 'user_1', n = 1, 'user_2', n = 2, 'user_1', 'user_3'), 'LowCardinality(String)') AS lc,
+    -- LowCardinality(Nullable(String)): the dictionary's index 0 is the NULL
+    -- sentinel; rows 1 and 3 are NULL, rows 0 and 2 are real values.
+    CAST(multiIf(n = 1, NULL, n = 3, NULL, CAST(concat('user_', toString(n)), 'Nullable(String)')), 'LowCardinality(Nullable(String))') AS lcn
 FROM numbers(4)
 FORMAT Native
 SQL

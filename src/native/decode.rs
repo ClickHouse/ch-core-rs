@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use crate::batch::{ChunkedBatch, ColBatch};
 use crate::bitmap::Bitmap;
-use crate::column::{BoolColumn, Column, FixedBinaryColumn, PrimitiveColumn, Utf8Column};
+use crate::column::{
+    BoolColumn, Column, DictionaryColumn, FixedBinaryColumn, PrimitiveColumn, Utf8Column,
+};
 use crate::native::varint::ByteReader;
 use crate::schema::{ChType, Field, Schema};
 
@@ -32,6 +34,15 @@ pub enum DecodeError {
     /// mismatch means a corrupt or mixed payload. `block_index` is zero-based.
     BlockSchemaMismatch {
         block_index: usize,
+    },
+    /// A `LowCardinality` column carried a dictionary or index layout this
+    /// decoder does not accept for the Native format: a key version other than
+    /// 1 (`SharedDictionariesWithAdditionalKeys`), the `NeedGlobalDictionaryBit`
+    /// set (Native never uses a shared global dictionary), an index width tag
+    /// outside `0..=3`, or an index value that does not fit Arrow's i32 index.
+    InvalidLowCardinality {
+        column: String,
+        reason: &'static str,
     },
 }
 
@@ -65,6 +76,12 @@ impl std::fmt::Display for DecodeError {
             }
             DecodeError::BlockSchemaMismatch { block_index } => {
                 write!(f, "Block {block_index} schema differs from the first block")
+            }
+            DecodeError::InvalidLowCardinality { column, reason } => {
+                write!(
+                    f,
+                    "Invalid LowCardinality layout for column '{column}': {reason}"
+                )
             }
         }
     }
@@ -112,6 +129,14 @@ fn parse_ch_type(type_name: &str) -> Option<ChType> {
     if let Some(inner) = type_name.strip_prefix("Nullable(") {
         if let Some(inner) = inner.strip_suffix(')') {
             return parse_ch_type(inner).map(|t| ChType::Nullable(Box::new(t)));
+        }
+    }
+
+    // LowCardinality wrapper. The inner type is parsed recursively, so
+    // LowCardinality(Nullable(String)) yields LowCardinality(Nullable(String)).
+    if let Some(inner) = type_name.strip_prefix("LowCardinality(") {
+        if let Some(inner) = inner.strip_suffix(')') {
+            return parse_ch_type(inner).map(|t| ChType::LowCardinality(Box::new(t)));
         }
     }
 
@@ -337,12 +362,290 @@ fn decode_fixed_binary_data(
     Ok(reader.read_slice(total)?.to_vec())
 }
 
+// ---------------------------------------------------------------------------
+// Bulk-state prefix
+// ---------------------------------------------------------------------------
+
+/// Consume a column's per-block `deserializeBinaryBulkStatePrefix` bytes.
+///
+/// In the Native format the server runs `readData` once per column per block,
+/// which calls `deserializeBinaryBulkStatePrefix` immediately before the column
+/// payload, and only when the block has rows (`NativeReader::readData`, gated by
+/// `if (rows)`). Every currently supported type reads zero prefix bytes;
+/// `LowCardinality` is the first that reads a real prefix, the 8-byte key
+/// version. Centralizing it here means a later type with a real prefix (Array,
+/// Map, and so on) declares its prefix in one place rather than special-casing
+/// the per-column loop.
+///
+/// Returns the parsed key version for `LowCardinality` (so the decoder does not
+/// re-read it), `None` for every other type.
+fn read_state_prefix(
+    reader: &mut ByteReader,
+    ch_type: &ChType,
+    column: &str,
+) -> Result<Option<u64>, DecodeError> {
+    match ch_type {
+        ChType::LowCardinality(_) => {
+            let key_version = reader.read_u64_le()?;
+            if key_version != LOW_CARDINALITY_KEY_VERSION {
+                return Err(DecodeError::InvalidLowCardinality {
+                    column: column.to_string(),
+                    reason: "key version is not 1 (SharedDictionariesWithAdditionalKeys)",
+                });
+            }
+            Ok(Some(key_version))
+        }
+        _ => Ok(None),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LowCardinality
+// ---------------------------------------------------------------------------
+
+/// Key serialization version this decoder accepts. The Native format always
+/// uses `SharedDictionariesWithAdditionalKeys` (server
+/// `KeysSerializationVersion`).
+const LOW_CARDINALITY_KEY_VERSION: u64 = 1;
+
+/// `NeedGlobalDictionaryBit` of the per-block index type word. Native never sets
+/// it (the server rejects it for `native_format`), so the decoder rejects it too.
+const LC_NEED_GLOBAL_DICTIONARY_BIT: u64 = 1 << 8;
+/// `HasAdditionalKeysBit` of the per-block index type word. Always set in Native:
+/// each block carries its own dictionary as "additional keys".
+const LC_HAS_ADDITIONAL_KEYS_BIT: u64 = 1 << 9;
+
+/// Decode one `LowCardinality(T)` column block into a dictionary `Column`.
+///
+/// Wire layout per block (server `SerializationLowCardinality`, confirmed at
+/// v26.2.4.23-stable; the per-column key-version prefix was already consumed by
+/// [`read_state_prefix`]):
+///
+/// ```text
+/// [8 bytes LE u64]  index_type_word   // bits 1:0 = index width (0=u8..3=u64),
+///                                     // bit 9 = HasAdditionalKeysBit (set),
+///                                     // bit 8 = NeedGlobalDictionaryBit (clear).
+///                                     // Higher bits exist and are ignored on
+///                                     // purpose: real payloads also set bit 10
+///                                     // (NeedUpdateDictionary), so the decoder
+///                                     // masks only the bits it acts on rather
+///                                     // than rejecting a word it does not fully
+///                                     // model.
+/// [8 bytes LE u64]  num_keys          // dictionary entry count for THIS block
+/// [num_keys values] dictionary        // inner-type serialized (String: varint
+///                                     // len + bytes)
+/// [8 bytes LE u64]  num_rows
+/// [num_rows * w]    indexes           // raw LE, each an index into the block
+///                                     // dictionary
+/// ```
+///
+/// The dictionary is per block (additional keys); this core never concatenates
+/// blocks, so each chunk gets its own dictionary as the `values` column.
+///
+/// For `LowCardinality(Nullable(T))` the removeNullable inner type is decoded
+/// for the dictionary, and dictionary index 0 is the NULL sentinel (its on-wire
+/// value is the inner default). Rows whose index is 0 become null in the Arrow
+/// index validity bitmap, matching how Arrow represents a null in a dictionary
+/// array, rather than carrying a dictionary entry.
+fn decode_low_cardinality(
+    reader: &mut ByteReader,
+    inner: &ChType,
+    num_rows: usize,
+    column: &str,
+) -> Result<Column, DecodeError> {
+    // Unwrap an inner Nullable. ClickHouse always nests Nullable inside
+    // LowCardinality, never the reverse, so this is the only nullable form.
+    let (nullable, dict_value_type) = match inner {
+        ChType::Nullable(t) => (true, t.as_ref()),
+        other => (false, other),
+    };
+
+    // Index type word. Native must not request a global dictionary, and must
+    // request additional keys (the per-block dictionary). The low two bits are
+    // the index width.
+    let index_word = reader.read_u64_le()?;
+    if index_word & LC_NEED_GLOBAL_DICTIONARY_BIT != 0 {
+        return Err(DecodeError::InvalidLowCardinality {
+            column: column.to_string(),
+            reason: "NeedGlobalDictionaryBit is set; Native never uses a global dictionary",
+        });
+    }
+    if index_word & LC_HAS_ADDITIONAL_KEYS_BIT == 0 {
+        return Err(DecodeError::InvalidLowCardinality {
+            column: column.to_string(),
+            reason: "HasAdditionalKeysBit is clear; Native always carries a per-block dictionary",
+        });
+    }
+    let index_width = match index_word & 0xFF {
+        0 => 1usize, // UInt8
+        1 => 2,      // UInt16
+        2 => 4,      // UInt32
+        3 => 8,      // UInt64
+        _ => {
+            return Err(DecodeError::InvalidLowCardinality {
+                column: column.to_string(),
+                reason: "index width tag is outside 0..=3",
+            })
+        }
+    };
+
+    // Per-block dictionary ("additional keys"): a count then that many inner
+    // values. The dictionary value count comes from the wire, so bound it by the
+    // bytes available before reserving, like the block header counts.
+    let num_keys = usize::try_from(reader.read_u64_le()?).map_err(|_| {
+        DecodeError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "LowCardinality dictionary size overflows usize",
+        ))
+    })?;
+    check_header_count(num_keys, "LowCardinality dictionary size", reader)?;
+    let values = decode_low_cardinality_dictionary(reader, dict_value_type, num_keys, column)?;
+
+    // num_rows for this block, written again in the indexes stream. The block
+    // header num_rows is authoritative; this must match it.
+    let wire_rows = usize::try_from(reader.read_u64_le()?).map_err(|_| {
+        DecodeError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "LowCardinality row count overflows usize",
+        ))
+    })?;
+    if wire_rows != num_rows {
+        return Err(DecodeError::InvalidLowCardinality {
+            column: column.to_string(),
+            reason: "indexes row count disagrees with the block row count",
+        });
+    }
+
+    // Indexes: a raw LE array of `index_width` bytes per row.
+    let (indices, validity) =
+        decode_low_cardinality_indices(reader, index_width, num_rows, num_keys, nullable, column)?;
+
+    let dict = match validity {
+        Some(bm) => DictionaryColumn::new_nullable(indices, values, bm),
+        None => DictionaryColumn::new(indices, values),
+    };
+    Ok(Column::Dictionary(dict))
+}
+
+/// Decode the per-block dictionary values. For `LowCardinality(String)` the
+/// dictionary is a plain String column (the removeNullable inner type), so this
+/// reuses the String decode path. Other inner types are not yet supported.
+fn decode_low_cardinality_dictionary(
+    reader: &mut ByteReader,
+    dict_value_type: &ChType,
+    num_keys: usize,
+    column: &str,
+) -> Result<Column, DecodeError> {
+    match dict_value_type {
+        ChType::String => {
+            let (offsets, data) = decode_string_data(reader, num_keys)?;
+            Ok(Column::Utf8(Utf8Column::new(offsets, data)))
+        }
+        _ => Err(DecodeError::UnsupportedType {
+            column: column.to_string(),
+            type_name: format!("LowCardinality({dict_value_type})"),
+        }),
+    }
+}
+
+/// Read the raw index array and widen each native-width index into i32.
+///
+/// For a nullable inner type, wire index 0 is the NULL sentinel: those rows
+/// become null in the returned validity bitmap, and their index is left at 0
+/// (pointing at the harmless sentinel dictionary entry). An index value that
+/// does not fit i32 is rejected, since Arrow dictionary indices are i32 and a
+/// per-block dictionary that large is not a real Native payload.
+fn decode_low_cardinality_indices(
+    reader: &mut ByteReader,
+    index_width: usize,
+    num_rows: usize,
+    num_keys: usize,
+    nullable: bool,
+    column: &str,
+) -> Result<(Vec<i32>, Option<Bitmap>), DecodeError> {
+    let total = num_rows.checked_mul(index_width).ok_or_else(|| {
+        DecodeError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "LowCardinality index byte length overflows usize",
+        ))
+    })?;
+    let raw = reader.read_slice(total)?;
+
+    let mut indices = Vec::with_capacity(num_rows);
+    // Per-row null map, only allocated for the nullable inner type. One byte per
+    // row, 0x00 = present, 0x01 = null, the same encoding `from_ch_null_map`
+    // consumes, so wire-index-0 rows are turned into Arrow nulls.
+    let mut null_map = if nullable {
+        Some(vec![0u8; num_rows])
+    } else {
+        None
+    };
+
+    for (row, chunk) in raw.chunks_exact(index_width).enumerate() {
+        let raw_index: u64 = match index_width {
+            1 => chunk[0] as u64,
+            2 => u16::from_le_bytes([chunk[0], chunk[1]]) as u64,
+            4 => u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as u64,
+            8 => u64::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ]),
+            // index_width came from the validated width tag; nothing else reaches here.
+            _ => unreachable!("index width validated to 1/2/4/8"),
+        };
+        // Compare in u64 space: `num_keys` is a usize but `raw_index` can be a
+        // full u64 (width 8), so an `as usize` cast on the index would truncate
+        // on a 32-bit target and could let an out-of-range index slip the bound.
+        if raw_index >= num_keys as u64 {
+            return Err(DecodeError::InvalidLowCardinality {
+                column: column.to_string(),
+                reason: "index value points outside the block dictionary",
+            });
+        }
+        if nullable && raw_index == 0 {
+            // Sentinel: row is null. Keep the i32 index at 0; the validity
+            // bitmap marks it null and the value is never read.
+            if let Some(nm) = null_map.as_mut() {
+                nm[row] = 0x01;
+            }
+            indices.push(0);
+        } else {
+            // Bounded by num_keys above, which `check_header_count` capped at the
+            // remaining bytes, so this fits i32 for any real Native payload.
+            let idx = i32::try_from(raw_index).map_err(|_| DecodeError::InvalidLowCardinality {
+                column: column.to_string(),
+                reason: "index value exceeds i32::MAX",
+            })?;
+            indices.push(idx);
+        }
+    }
+
+    let validity = null_map.map(|nm| Bitmap::from_ch_null_map(&nm));
+    Ok((indices, validity))
+}
+
 /// Decode a single column given its ChType.
+///
+/// Called only for blocks with `num_rows > 0`. The server runs
+/// `deserializeBinaryBulkStatePrefix` per column per block, gated on the block
+/// having rows, so the per-column state prefix is consumed here, not in the
+/// zero-row path.
 fn decode_column(
     reader: &mut ByteReader,
     ch_type: &ChType,
     num_rows: usize,
+    column: &str,
 ) -> Result<Column, DecodeError> {
+    // Per-column bulk-state prefix. Zero bytes for every type except
+    // LowCardinality, which reads its key version here.
+    read_state_prefix(reader, ch_type, column)?;
+
+    // LowCardinality carries its own dictionary, indexes, and (for a Nullable
+    // inner type) null handling, so it is decoded as a unit rather than going
+    // through the Nullable null-map unwrap below.
+    if let ChType::LowCardinality(inner) = ch_type {
+        return decode_low_cardinality(reader, inner, num_rows, column);
+    }
+
     let (nullable, inner) = match ch_type {
         ChType::Nullable(inner) => (true, inner.as_ref()),
         other => (false, other),
@@ -435,6 +738,7 @@ fn decode_column(
             }
         }
         ChType::Nullable(_) => unreachable!("Nullable already unwrapped"),
+        ChType::LowCardinality(_) => unreachable!("LowCardinality handled above"),
     };
 
     Ok(column)
@@ -522,6 +826,23 @@ fn empty_column(ch_type: &ChType) -> Column {
             Some(bm) => FixedBinaryColumn::new_nullable(vec![], *width, bm),
             None => FixedBinaryColumn::new(vec![], *width),
         }),
+        // A zero-row block reads no LowCardinality prefix or data (the server
+        // gates `readData` on having rows), so the empty dictionary column has
+        // no indices and an empty values dictionary. The values column is an
+        // empty String column; a nullable inner type carries an empty index
+        // validity bitmap, matching the other nullable empties.
+        ChType::LowCardinality(lc_inner) => {
+            let empty_values = match lc_inner.as_ref() {
+                ChType::Nullable(t) => empty_column(t),
+                other => empty_column(other),
+            };
+            let nullable_inner = matches!(lc_inner.as_ref(), ChType::Nullable(_));
+            Column::Dictionary(if nullable_inner {
+                DictionaryColumn::new_nullable(vec![], empty_values, Bitmap::from_ch_null_map(&[]))
+            } else {
+                DictionaryColumn::new(vec![], empty_values)
+            })
+        }
         ChType::Nullable(_) => unreachable!(),
     }
 }
@@ -696,7 +1017,7 @@ fn decode_block_body(
         if num_rows == 0 {
             columns.push(empty_column(&ch_type));
         } else {
-            columns.push(decode_column(reader, &ch_type, num_rows)?);
+            columns.push(decode_column(reader, &ch_type, num_rows, &col_name)?);
         }
 
         fields.push(Field {
@@ -759,12 +1080,21 @@ pub fn block_end(data: &[u8], options: &DecodeOptions) -> Result<Option<usize>, 
 ///
 /// Fixed-width types have a computable byte length; String scans the per-value
 /// varint length prefixes. This must consume exactly the bytes the matching
-/// decoder in `decode_column` consumes.
+/// decoder in `decode_column` consumes, including the per-column state prefix.
+/// Called only for blocks with `num_rows > 0`, matching `decode_column`.
 fn skip_column_data(
     reader: &mut ByteReader,
     ch_type: &ChType,
     num_rows: usize,
 ) -> Result<(), DecodeError> {
+    // Per-column bulk-state prefix, the same step `decode_column` runs. Zero
+    // bytes for every type except LowCardinality.
+    read_state_prefix(reader, ch_type, "")?;
+
+    if let ChType::LowCardinality(inner) = ch_type {
+        return skip_low_cardinality_data(reader, inner, num_rows);
+    }
+
     let inner = match ch_type {
         ChType::Nullable(inner) => {
             reader.skip(num_rows)?; // null map: 1 byte per row
@@ -791,11 +1121,68 @@ fn skip_column_data(
                 reader.skip(len)?;
             }
         }
-        // `read_column_header` already rejected unsupported types, and Nullable
-        // was unwrapped above.
+        // `read_column_header` already rejected unsupported types, Nullable was
+        // unwrapped above, and LowCardinality was handled above.
         ChType::Nullable(_) => unreachable!("Nullable already unwrapped"),
+        ChType::LowCardinality(_) => unreachable!("LowCardinality handled above"),
     }
 
+    Ok(())
+}
+
+/// Walk one `LowCardinality(T)` column block (after its key-version prefix) in
+/// the completeness scan, consuming exactly what [`decode_low_cardinality`]
+/// reads: the index type word, the per-block dictionary, the row count, and the
+/// raw index array. Mirrors the decode path so the two cannot drift.
+fn skip_low_cardinality_data(
+    reader: &mut ByteReader,
+    inner: &ChType,
+    num_rows: usize,
+) -> Result<(), DecodeError> {
+    let dict_value_type = match inner {
+        ChType::Nullable(t) => t.as_ref(),
+        other => other,
+    };
+
+    let index_word = reader.read_u64_le()?;
+    let index_width = match index_word & 0xFF {
+        0 => 1usize,
+        1 => 2,
+        2 => 4,
+        3 => 8,
+        _ => {
+            return Err(DecodeError::InvalidLowCardinality {
+                column: String::new(),
+                reason: "index width tag is outside 0..=3",
+            })
+        }
+    };
+
+    // Per-block dictionary: a count then that many inner values.
+    let num_keys = usize::try_from(reader.read_u64_le()?).map_err(|_| {
+        DecodeError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "LowCardinality dictionary size overflows usize",
+        ))
+    })?;
+    match dict_value_type {
+        ChType::String => {
+            for _ in 0..num_keys {
+                let len = reader.read_varint()? as usize;
+                reader.skip(len)?;
+            }
+        }
+        _ => {
+            return Err(DecodeError::UnsupportedType {
+                column: String::new(),
+                type_name: format!("LowCardinality({dict_value_type})"),
+            })
+        }
+    }
+
+    // Row count word, then the raw index array.
+    reader.skip(8)?; // num_rows (re-stated in the indexes stream)
+    reader.skip(num_rows.saturating_mul(index_width))?;
     Ok(())
 }
 
@@ -997,6 +1384,54 @@ mod tests {
         fn null_map(mut self, nulls: &[bool]) -> Self {
             for &is_null in nulls {
                 self.buf.push(if is_null { 0x01 } else { 0x00 });
+            }
+            self
+        }
+
+        /// Append a full `LowCardinality(String)` column block payload: the
+        /// per-column key-version prefix, the index type word with the chosen
+        /// index width, the per-block dictionary, the row count, and the raw
+        /// index array. `index_width` is 1/2/4/8 bytes (UInt8..UInt64); indices
+        /// are written little-endian at that width.
+        fn low_cardinality_string(
+            mut self,
+            dictionary: &[&str],
+            indices: &[u64],
+            index_width: usize,
+        ) -> Self {
+            // Per-column state prefix: key version = 1.
+            self.buf.extend_from_slice(&1u64.to_le_bytes());
+
+            // Index type word: width tag in the low bits, HasAdditionalKeysBit set.
+            let width_tag: u64 = match index_width {
+                1 => 0,
+                2 => 1,
+                4 => 2,
+                8 => 3,
+                other => panic!("unsupported test index width {other}"),
+            };
+            let index_word = width_tag | LC_HAS_ADDITIONAL_KEYS_BIT;
+            self.buf.extend_from_slice(&index_word.to_le_bytes());
+
+            // Per-block dictionary: count then each value as varint len + bytes.
+            self.buf
+                .extend_from_slice(&(dictionary.len() as u64).to_le_bytes());
+            for &s in dictionary {
+                write_varint(&mut self.buf, s.len() as u64).unwrap();
+                self.buf.extend_from_slice(s.as_bytes());
+            }
+
+            // Row count, then the raw index array at the chosen width.
+            self.buf
+                .extend_from_slice(&(indices.len() as u64).to_le_bytes());
+            for &idx in indices {
+                match index_width {
+                    1 => self.buf.push(idx as u8),
+                    2 => self.buf.extend_from_slice(&(idx as u16).to_le_bytes()),
+                    4 => self.buf.extend_from_slice(&(idx as u32).to_le_bytes()),
+                    8 => self.buf.extend_from_slice(&idx.to_le_bytes()),
+                    _ => unreachable!(),
+                }
             }
             self
         }
@@ -1893,5 +2328,326 @@ mod tests {
             Column::Int32(c) => assert_eq!(c.values, vec![13]),
             other => panic!("expected Int32, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // LowCardinality
+    // -----------------------------------------------------------------------
+
+    /// Resolve a dictionary column's row `i` to its dictionary value bytes,
+    /// treating a null index as `None`. Used by the LowCardinality tests to
+    /// assert the observable per-row values the way a consumer would read them.
+    fn lc_value(col: &Column, row: usize) -> Option<Vec<u8>> {
+        match col {
+            Column::Dictionary(d) => {
+                if let Some(bm) = &d.validity {
+                    if !bm.is_valid(row) {
+                        return None;
+                    }
+                }
+                let idx = d.indices[row] as usize;
+                match d.values.as_ref() {
+                    Column::Utf8(v) => Some(v.value(idx).to_vec()),
+                    other => panic!("expected Utf8 dictionary values, got {other:?}"),
+                }
+            }
+            other => panic!("expected Dictionary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ch_type_low_cardinality() {
+        assert_eq!(
+            parse_ch_type("LowCardinality(String)"),
+            Some(ChType::LowCardinality(Box::new(ChType::String)))
+        );
+        assert_eq!(
+            parse_ch_type("LowCardinality(Nullable(String))"),
+            Some(ChType::LowCardinality(Box::new(ChType::Nullable(
+                Box::new(ChType::String)
+            ))))
+        );
+    }
+
+    #[test]
+    fn test_ch_type_display_round_trips_low_cardinality() {
+        for t in [
+            ChType::LowCardinality(Box::new(ChType::String)),
+            ChType::LowCardinality(Box::new(ChType::Nullable(Box::new(ChType::String)))),
+        ] {
+            assert_eq!(parse_ch_type(&t.to_string()), Some(t.clone()));
+        }
+    }
+
+    #[test]
+    fn test_decode_low_cardinality_string() {
+        // Six rows over the dictionary the server actually emits: even for a
+        // non-nullable inner type the wire reserves slot 0 with an empty string
+        // (the ColumnUnique default), and the per-row indexes start at 1. Slot 0
+        // is simply never referenced here; it is not a null sentinel. This
+        // mirrors the live `lc` fixture (`['', 'user_1', ...]`, indices from 1)
+        // rather than a slot-0-less layout the server never produces.
+        let dictionary = ["", "user_1", "user_2", "user_3"];
+        let indices = [1u64, 2, 3, 1, 2, 1];
+        let data = BlockBuilder::new()
+            .header(1, indices.len())
+            .column_header("lc", "LowCardinality(String)")
+            .low_cardinality_string(&dictionary, &indices, 1)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Dictionary(d) => {
+                assert_eq!(d.len(), 6);
+                assert_eq!(d.null_count(), 0);
+                assert!(d.validity.is_none());
+                assert_eq!(d.indices, vec![1, 2, 3, 1, 2, 1]);
+                match d.values.as_ref() {
+                    Column::Utf8(v) => {
+                        assert_eq!(v.len(), 4);
+                        assert_eq!(v.value(0), b"");
+                        assert_eq!(v.value(1), b"user_1");
+                        assert_eq!(v.value(2), b"user_2");
+                        assert_eq!(v.value(3), b"user_3");
+                    }
+                    other => panic!("expected Utf8 values, got {other:?}"),
+                }
+            }
+            other => panic!("expected Dictionary, got {other:?}"),
+        }
+        let expected: [&[u8]; 6] = [
+            b"user_1", b"user_2", b"user_3", b"user_1", b"user_2", b"user_1",
+        ];
+        for (row, want) in expected.iter().enumerate() {
+            assert_eq!(lc_value(batch.column(0), row).as_deref(), Some(*want));
+        }
+    }
+
+    #[test]
+    fn test_decode_low_cardinality_nullable_string() {
+        // For Nullable(String) the dictionary's index 0 is the NULL sentinel,
+        // with an empty-string on-wire value. Rows whose index is 0 are null.
+        let dictionary = ["", "user_1", "user_2"];
+        let indices = [1u64, 0, 2, 0, 1];
+        let data = BlockBuilder::new()
+            .header(1, indices.len())
+            .column_header("lc", "LowCardinality(Nullable(String))")
+            .low_cardinality_string(&dictionary, &indices, 1)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Dictionary(d) => {
+                assert_eq!(d.len(), 5);
+                assert_eq!(d.null_count(), 2);
+                let bm = d.validity.as_ref().expect("nullable dictionary validity");
+                assert!(bm.is_valid(0));
+                assert!(!bm.is_valid(1));
+                assert!(bm.is_valid(2));
+                assert!(!bm.is_valid(3));
+                assert!(bm.is_valid(4));
+            }
+            other => panic!("expected Dictionary, got {other:?}"),
+        }
+        assert_eq!(
+            lc_value(batch.column(0), 0).as_deref(),
+            Some(b"user_1" as &[u8])
+        );
+        assert_eq!(lc_value(batch.column(0), 1), None);
+        assert_eq!(
+            lc_value(batch.column(0), 2).as_deref(),
+            Some(b"user_2" as &[u8])
+        );
+        assert_eq!(lc_value(batch.column(0), 3), None);
+        assert_eq!(
+            lc_value(batch.column(0), 4).as_deref(),
+            Some(b"user_1" as &[u8])
+        );
+    }
+
+    #[test]
+    fn test_decode_low_cardinality_zero_rows() {
+        // A zero-row block reads no LowCardinality prefix or data; it contributes
+        // the schema and an empty dictionary column.
+        let data = BlockBuilder::new()
+            .header(2, 0)
+            .column_header("lc", "LowCardinality(String)")
+            .column_header("lcn", "LowCardinality(Nullable(String))")
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_rows(), 0);
+        assert_eq!(cb.num_chunks(), 0);
+        assert_eq!(cb.num_columns(), 2);
+        assert_eq!(
+            cb.schema.fields[0].ch_type,
+            ChType::LowCardinality(Box::new(ChType::String))
+        );
+        assert_eq!(
+            cb.schema.fields[1].ch_type,
+            ChType::LowCardinality(Box::new(ChType::Nullable(Box::new(ChType::String))))
+        );
+    }
+
+    #[test]
+    fn test_multi_block_low_cardinality_separate_dictionaries() {
+        // Each Native block carries its own per-block dictionary. The two blocks
+        // here use DIFFERENT dictionaries and different index widths, and stay
+        // separate chunks. A consumer must resolve each chunk against its own
+        // dictionary, never a shared one.
+        let mut data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("lc", "LowCardinality(String)")
+            .low_cardinality_string(&["red", "green"], &[0, 1, 0], 1)
+            .build();
+        data.extend(
+            BlockBuilder::new()
+                .header(1, 2)
+                .column_header("lc", "LowCardinality(String)")
+                .low_cardinality_string(&["blue", "amber"], &[1, 0], 2)
+                .build(),
+        );
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_chunks(), 2);
+        assert_eq!(cb.num_rows(), 5);
+
+        let chunk0 = &cb.chunks[0];
+        assert_eq!(
+            lc_value(chunk0.column(0), 0).as_deref(),
+            Some(b"red" as &[u8])
+        );
+        assert_eq!(
+            lc_value(chunk0.column(0), 1).as_deref(),
+            Some(b"green" as &[u8])
+        );
+        assert_eq!(
+            lc_value(chunk0.column(0), 2).as_deref(),
+            Some(b"red" as &[u8])
+        );
+
+        let chunk1 = &cb.chunks[1];
+        assert_eq!(
+            lc_value(chunk1.column(0), 0).as_deref(),
+            Some(b"amber" as &[u8])
+        );
+        assert_eq!(
+            lc_value(chunk1.column(0), 1).as_deref(),
+            Some(b"blue" as &[u8])
+        );
+    }
+
+    #[test]
+    fn test_low_cardinality_wider_index() {
+        // A u32-wide index array (width tag 2) must widen correctly into i32.
+        let dictionary = ["a", "b", "c"];
+        let indices = [2u64, 0, 1];
+        let data = BlockBuilder::new()
+            .header(1, indices.len())
+            .column_header("lc", "LowCardinality(String)")
+            .low_cardinality_string(&dictionary, &indices, 4)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        match cb.chunks[0].column(0) {
+            Column::Dictionary(d) => assert_eq!(d.indices, vec![2, 0, 1]),
+            other => panic!("expected Dictionary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_low_cardinality_rejects_bad_key_version() {
+        // Key version != 1 is rejected (only SharedDictionariesWithAdditionalKeys
+        // is valid in Native).
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&2u64.to_le_bytes()); // bad key version
+        let data = BlockBuilder::new()
+            .header(1, 1)
+            .column_header("lc", "LowCardinality(String)")
+            .raw_bytes(&payload)
+            .build();
+        assert!(matches!(
+            decode_all_bytes(&data, &DecodeOptions::default()),
+            Err(DecodeError::InvalidLowCardinality { .. })
+        ));
+    }
+
+    #[test]
+    fn test_low_cardinality_rejects_global_dictionary_bit() {
+        // NeedGlobalDictionaryBit must be clear in Native; set it and the decoder
+        // must reject rather than misread.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u64.to_le_bytes()); // key version
+        let index_word = LC_HAS_ADDITIONAL_KEYS_BIT | LC_NEED_GLOBAL_DICTIONARY_BIT;
+        payload.extend_from_slice(&index_word.to_le_bytes());
+        let data = BlockBuilder::new()
+            .header(1, 1)
+            .column_header("lc", "LowCardinality(String)")
+            .raw_bytes(&payload)
+            .build();
+        assert!(matches!(
+            decode_all_bytes(&data, &DecodeOptions::default()),
+            Err(DecodeError::InvalidLowCardinality { .. })
+        ));
+    }
+
+    #[test]
+    fn test_low_cardinality_rejects_out_of_range_index() {
+        // An index value past the block dictionary size is corrupt data.
+        let data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("lc", "LowCardinality(String)")
+            .low_cardinality_string(&["x", "y"], &[0, 5], 1)
+            .build();
+        assert!(matches!(
+            decode_all_bytes(&data, &DecodeOptions::default()),
+            Err(DecodeError::InvalidLowCardinality { .. })
+        ));
+    }
+
+    #[test]
+    fn test_low_cardinality_modern_framing_roundtrip() {
+        // Full v26.2.4.23 framing (BlockInfo + per-column custom-serialization
+        // byte) ahead of the LowCardinality payload.
+        let data = BlockBuilder::new()
+            .revision(DBMS_TCP_PROTOCOL_VERSION)
+            .header(1, 4)
+            .column_header("lc", "LowCardinality(String)")
+            .low_cardinality_string(&["alpha", "beta"], &[0, 1, 1, 0], 1)
+            .build();
+
+        let options = DecodeOptions {
+            protocol_revision: DBMS_TCP_PROTOCOL_VERSION,
+        };
+        let cb = decode_all_bytes(&data, &options).unwrap();
+        let batch = &cb.chunks[0];
+        let expected: [&[u8]; 4] = [b"alpha", b"beta", b"beta", b"alpha"];
+        for (row, want) in expected.iter().enumerate() {
+            assert_eq!(lc_value(batch.column(0), row).as_deref(), Some(*want));
+        }
+    }
+
+    #[test]
+    fn test_block_end_scans_low_cardinality() {
+        // The completeness scan must walk a LowCardinality column to the exact
+        // block end, and report a one-byte-short buffer as "need more bytes".
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("lc", "LowCardinality(String)")
+            .low_cardinality_string(&["user_1", "user_2"], &[0, 1, 0], 1)
+            .build();
+
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len())
+        );
+        let truncated = &data[..data.len() - 1];
+        let err = block_end(truncated, &DecodeOptions::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::Io(ref e) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
     }
 }

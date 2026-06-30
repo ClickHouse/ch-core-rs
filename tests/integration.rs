@@ -133,6 +133,11 @@ fn assert_all_types(batch: &ChunkedBatch) {
                     timezone: Some("UTC".to_string()),
                 },
             ),
+            Expected::Exact("lc", ChType::LowCardinality(Box::new(ChType::String))),
+            Expected::Exact(
+                "lcn",
+                ChType::LowCardinality(Box::new(ChType::Nullable(Box::new(ChType::String)))),
+            ),
         ],
     );
 
@@ -251,6 +256,51 @@ fn assert_all_types(batch: &ChunkedBatch) {
     match block.column(20) {
         Column::DateTime64(c) => assert_eq!(c.values.as_slice(), expected_ticks),
         other => panic!("expected DateTime64, got {other:?}"),
+    }
+
+    // LowCardinality(String): rows resolve to user_1, user_2, user_1, user_3
+    // against the per-block dictionary. No nulls.
+    assert_dictionary_string_values(
+        block.column(21),
+        &[
+            Some(b"user_1" as &[u8]),
+            Some(b"user_2"),
+            Some(b"user_1"),
+            Some(b"user_3"),
+        ],
+    );
+    // LowCardinality(Nullable(String)): rows 1 and 3 are NULL (wire index 0 maps
+    // to the null sentinel), rows 0 and 2 are real values.
+    assert_dictionary_string_values(
+        block.column(22),
+        &[Some(b"user_0" as &[u8]), None, Some(b"user_2"), None],
+    );
+    assert_validity(block.column(22), &[true, false, true, false]);
+}
+
+/// Assert the per-row resolved string values of a dictionary (`LowCardinality`)
+/// column, treating a null index as `None`, the way a consumer reads them.
+fn assert_dictionary_string_values(column: &Column, expected: &[Option<&[u8]>]) {
+    match column {
+        Column::Dictionary(d) => {
+            assert_eq!(d.len(), expected.len());
+            let values = match d.values.as_ref() {
+                Column::Utf8(v) => v,
+                other => panic!("expected Utf8 dictionary values, got {other:?}"),
+            };
+            for (row, want) in expected.iter().enumerate() {
+                let is_null = d.validity.as_ref().is_some_and(|bm| !bm.is_valid(row));
+                match want {
+                    None => assert!(is_null, "row {row} expected null"),
+                    Some(bytes) => {
+                        assert!(!is_null, "row {row} expected a value, got null");
+                        let idx = d.indices[row] as usize;
+                        assert_eq!(values.value(idx), *bytes, "row {row}");
+                    }
+                }
+            }
+        }
+        other => panic!("expected Dictionary, got {other:?}"),
     }
 }
 

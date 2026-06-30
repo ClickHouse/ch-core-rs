@@ -74,6 +74,20 @@ impl<'a> ByteReader<'a> {
         Ok(())
     }
 
+    /// Read a fixed 8-byte little-endian `u64`.
+    ///
+    /// `LowCardinality` framing words (the key version, the index type word, the
+    /// dictionary size, and the per-block row count) are written with the
+    /// server's fixed-width `writeBinaryLittleEndian`, not as varints.
+    #[inline]
+    pub fn read_u64_le(&mut self) -> io::Result<u64> {
+        let bytes = self.read_slice(8)?;
+        // `read_slice(8)` returns exactly 8 bytes, so the conversion cannot fail.
+        Ok(u64::from_le_bytes(
+            bytes.try_into().map_err(|_| unexpected_eof())?,
+        ))
+    }
+
     /// Read a LEB128-encoded unsigned integer.
     ///
     /// A shift of 64 bits or more (a 10th continuation byte) is rejected as

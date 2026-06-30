@@ -80,6 +80,10 @@ struct SchemaPrivateData {
     name: CString,
     children: Vec<*mut ArrowSchema>,
     _child_data: Vec<SchemaPrivateData>,
+    /// The dictionary value-type child schema for a `LowCardinality(T)` field,
+    /// owned here so it is freed when this field's schema is released. Null for
+    /// every non-dictionary field.
+    dictionary: *mut ArrowSchema,
 }
 
 struct ArrayPrivateData {
@@ -87,6 +91,10 @@ struct ArrayPrivateData {
     children: Vec<*mut ArrowArray>,
     _batch: Arc<ColBatch>,
     _child_data: Vec<ArrayPrivateData>,
+    /// The dictionary values child array for a `LowCardinality(T)` column, owned
+    /// here so it is freed when this column's array is released. Null for every
+    /// non-dictionary column.
+    dictionary: *mut ArrowArray,
 }
 
 struct StreamPrivateData {
@@ -117,6 +125,15 @@ unsafe extern "C" fn release_schema(schema: *mut ArrowSchema) {
         }
         let _ = Box::from_raw(*child_ptr);
     }
+    // Release and free the dictionary value-type child, if this is a dictionary
+    // field. Heap-allocated and owned the same way as the children above.
+    if !pd.dictionary.is_null() {
+        let dict = &mut *pd.dictionary;
+        if let Some(release_fn) = dict.release {
+            release_fn(pd.dictionary);
+        }
+        let _ = Box::from_raw(pd.dictionary);
+    }
     drop(pd);
     s.release = None;
     s.private_data = ptr::null_mut();
@@ -137,6 +154,15 @@ unsafe extern "C" fn release_array(array: *mut ArrowArray) {
             release_fn(*child_ptr);
         }
         let _ = Box::from_raw(*child_ptr);
+    }
+    // Release and free the dictionary values child, if this is a dictionary
+    // column. Heap-allocated and owned the same way as the children above.
+    if !pd.dictionary.is_null() {
+        let dict = &mut *pd.dictionary;
+        if let Some(release_fn) = dict.release {
+            release_fn(pd.dictionary);
+        }
+        let _ = Box::from_raw(pd.dictionary);
     }
     drop(pd);
     a.release = None;
@@ -203,11 +229,44 @@ fn arrow_format(ch_type: &ChType) -> String {
         ChType::String => "u".into(),
         ChType::FixedString(n) => format!("w:{n}"),
         ChType::Nullable(inner) => arrow_format(inner),
+        // A dictionary array's top-level format is the INDEX type. The value
+        // type lives in the schema's `dictionary` child. Index width is
+        // normalized to i32 by the decoder, so the index format is always `i`.
+        ChType::LowCardinality(_) => "i".into(),
     }
 }
 
-fn is_nullable(ch_type: &ChType) -> bool {
-    matches!(ch_type, ChType::Nullable(_))
+/// Whether a type exports as an Arrow dictionary array (a `LowCardinality(T)`).
+/// Such a type needs the schema/array `dictionary` child populated, unlike the
+/// flat types whose `dictionary` pointer stays null.
+fn is_dictionary(ch_type: &ChType) -> bool {
+    matches!(ch_type, ChType::LowCardinality(_))
+}
+
+/// The Arrow value type of a `LowCardinality(T)` dictionary, i.e. the type of
+/// the entries in the dictionary `values` column. The inner `Nullable` is
+/// transparent here: nulls live in the index validity, so the dictionary value
+/// type is always the non-nullable inner type.
+fn dictionary_value_type(ch_type: &ChType) -> &ChType {
+    match ch_type {
+        ChType::LowCardinality(inner) => match inner.as_ref() {
+            ChType::Nullable(t) => t,
+            other => other,
+        },
+        other => other,
+    }
+}
+
+/// Whether a column exports with the Arrow nullable flag set. A bare
+/// `Nullable(T)` is nullable, and a `LowCardinality(Nullable(T))` is nullable
+/// at the index level (nulls live in the index validity bitmap). A plain
+/// `LowCardinality(T)` is not nullable.
+fn field_is_nullable(ch_type: &ChType) -> bool {
+    match ch_type {
+        ChType::Nullable(_) => true,
+        ChType::LowCardinality(inner) => matches!(inner.as_ref(), ChType::Nullable(_)),
+        _ => false,
+    }
 }
 
 /// Build a C string from a Rust string, dropping any interior NUL bytes.
@@ -239,21 +298,37 @@ unsafe fn write_field_schema(out: *mut ArrowSchema, name: &str, ch_type: &ChType
     let format = cstring_lossy(&arrow_format(ch_type));
     let name_cstr = cstring_lossy(name);
 
+    // For a dictionary field the value type goes in a `dictionary` child schema;
+    // the field's own format string is the index type. The child is allocated
+    // and owned by this field's private data so it is freed on release.
+    let dictionary = if is_dictionary(ch_type) {
+        // Safety: an all-zero `ArrowSchema` is a valid initial value (pointers
+        // null, integers zero, `Option<extern fn>` the all-zero `None` niche),
+        // and `write_field_schema` overwrites every field before any consumer
+        // observes it.
+        let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+        write_field_schema(child, "", dictionary_value_type(ch_type));
+        child
+    } else {
+        ptr::null_mut()
+    };
+
     let pd = Box::new(SchemaPrivateData {
         format,
         name: name_cstr,
         children: Vec::new(),
         _child_data: Vec::new(),
+        dictionary,
     });
 
     let schema = &mut *out;
     schema.format = pd.format.as_ptr();
     schema.name = pd.name.as_ptr();
     schema.metadata = ptr::null();
-    schema.flags = if is_nullable(ch_type) { 2 } else { 0 };
+    schema.flags = if field_is_nullable(ch_type) { 2 } else { 0 };
     schema.n_children = 0;
     schema.children = ptr::null_mut();
-    schema.dictionary = ptr::null_mut();
+    schema.dictionary = pd.dictionary;
     schema.release = Some(release_schema);
     schema.private_data = Box::into_raw(pd) as *mut c_void;
 }
@@ -285,6 +360,7 @@ pub unsafe fn export_schema(schema_in: &Schema, out: *mut ArrowSchema) {
         name,
         children: child_schemas.clone(),
         _child_data: Vec::new(),
+        dictionary: ptr::null_mut(),
     });
 
     let schema = &mut *out;
@@ -304,11 +380,19 @@ pub unsafe fn export_schema(schema_in: &Schema, out: *mut ArrowSchema) {
 // ---------------------------------------------------------------------------
 
 unsafe fn export_column_array(batch: &Arc<ColBatch>, col_idx: usize, out: *mut ArrowArray) {
-    let col = &batch.columns[col_idx];
-    let num_rows = batch.num_rows as i64;
+    export_one_column(batch, &batch.columns[col_idx], out);
+}
+
+/// Export an arbitrary `Column` into `out`. Recursive: the dictionary `values`
+/// column of a `LowCardinality(T)` is exported through the same path into the
+/// array's `dictionary` child. `batch` is kept alive in private data so all the
+/// borrowed buffers stay valid until release.
+unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut ArrowArray) {
+    let length = col.len() as i64;
     let null_count = col.null_count() as i64;
 
     let mut buffers: Vec<*const c_void> = Vec::new();
+    let mut dictionary: *mut ArrowArray = ptr::null_mut();
 
     match col {
         Column::Bool(c) => {
@@ -347,6 +431,24 @@ unsafe fn export_column_array(batch: &Arc<ColBatch>, col_idx: usize, out: *mut A
             }
             buffers.push(c.data.as_ptr() as *const c_void);
         }
+        Column::Dictionary(c) => {
+            // A dictionary array carries the INDEX buffers (validity, then the
+            // i32 indices). The dictionary VALUES live in the array's
+            // `dictionary` child, exported recursively below.
+            match &c.validity {
+                Some(bm) => buffers.push(bm.as_bytes().as_ptr() as *const c_void),
+                None => buffers.push(ptr::null()),
+            }
+            buffers.push(c.indices.as_ptr() as *const c_void);
+
+            // Safety: an all-zero `ArrowArray` is a valid initial value, the
+            // same niche argument as the children in `export_batch_array`.
+            // `export_one_column` overwrites every field before any consumer
+            // observes it.
+            let dict_child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+            export_one_column(batch, &c.values, dict_child);
+            dictionary = dict_child;
+        }
     }
 
     let pd = Box::new(ArrayPrivateData {
@@ -354,17 +456,18 @@ unsafe fn export_column_array(batch: &Arc<ColBatch>, col_idx: usize, out: *mut A
         children: Vec::new(),
         _batch: Arc::clone(batch),
         _child_data: Vec::new(),
+        dictionary,
     });
 
     let array = &mut *out;
-    array.length = num_rows;
+    array.length = length;
     array.null_count = null_count;
     array.offset = 0;
     array.n_buffers = pd.buffers.len() as i64;
     array.buffers = pd.buffers.as_ptr() as *mut *const c_void;
     array.n_children = 0;
     array.children = ptr::null_mut();
-    array.dictionary = ptr::null_mut();
+    array.dictionary = pd.dictionary;
     array.release = Some(release_array);
     array.private_data = Box::into_raw(pd) as *mut c_void;
 }
@@ -405,6 +508,7 @@ pub unsafe fn export_batch_array(batch: &Arc<ColBatch>, out: *mut ArrowArray) {
         children: child_arrays.clone(),
         _batch: Arc::clone(batch),
         _child_data: Vec::new(),
+        dictionary: ptr::null_mut(),
     });
 
     let array = &mut *out;
@@ -620,6 +724,107 @@ mod tests {
 
             (schema_out.release.unwrap())(&mut schema_out);
         }
+    }
+
+    fn make_dictionary_batch(nullable: bool) -> Arc<ColBatch> {
+        use crate::bitmap::Bitmap;
+        use crate::column::DictionaryColumn;
+
+        let inner = if nullable {
+            ChType::Nullable(Box::new(ChType::String))
+        } else {
+            ChType::String
+        };
+        let schema = Schema::new(vec![Field {
+            name: "lc".into(),
+            ch_type: ChType::LowCardinality(Box::new(inner)),
+        }]);
+        // values dictionary: 3 entries, indices over 4 rows.
+        let values = Column::Utf8(Utf8Column::new(
+            vec![0, 5, 11, 17],
+            b"user_user_1user_2".to_vec(),
+        ));
+        let dict = if nullable {
+            // Row 1 is null (validity bit 0); the rest are valid.
+            let validity = Bitmap::from_ch_null_map(&[0x00, 0x01, 0x00, 0x00]);
+            DictionaryColumn::new_nullable(vec![0, 0, 1, 2], values, validity)
+        } else {
+            DictionaryColumn::new(vec![0, 1, 2, 0], values)
+        };
+        let columns = vec![Column::Dictionary(dict)];
+        Arc::new(ColBatch::new(schema, columns, 4))
+    }
+
+    #[test]
+    fn test_export_low_cardinality_schema() {
+        // Dictionary schema: the field format is the index type (`i`), the
+        // dictionary child carries the value type (`u`), and the nullable flag
+        // tracks the inner Nullable.
+        let batch = make_dictionary_batch(true);
+        unsafe {
+            let mut schema_out: ArrowSchema = std::mem::zeroed();
+            export_schema(&batch.schema, &mut schema_out);
+
+            let c0 = &**schema_out.children.add(0);
+            assert_eq!(CStr::from_ptr(c0.format).to_str().unwrap(), "i");
+            assert_eq!(c0.flags & 2, 2, "nullable flag set for LC(Nullable(...))");
+            assert!(!c0.dictionary.is_null(), "dictionary child present");
+            let dict = &*c0.dictionary;
+            assert_eq!(CStr::from_ptr(dict.format).to_str().unwrap(), "u");
+
+            (schema_out.release.unwrap())(&mut schema_out);
+        }
+
+        // A non-nullable LowCardinality has the flag clear.
+        let batch = make_dictionary_batch(false);
+        unsafe {
+            let mut schema_out: ArrowSchema = std::mem::zeroed();
+            export_schema(&batch.schema, &mut schema_out);
+            let c0 = &**schema_out.children.add(0);
+            assert_eq!(c0.flags & 2, 0, "nullable flag clear for LC(String)");
+            (schema_out.release.unwrap())(&mut schema_out);
+        }
+    }
+
+    #[test]
+    fn test_export_low_cardinality_array() {
+        // Dictionary array: 2 index buffers (validity + i32 indices), a length
+        // equal to the row count, and a dictionary child holding the values.
+        let batch = make_dictionary_batch(true);
+        unsafe {
+            let mut array: ArrowArray = std::mem::zeroed();
+            export_batch_array(&batch, &mut array);
+
+            let c0 = &**array.children.add(0);
+            assert_eq!(c0.length, 4);
+            assert_eq!(c0.null_count, 1);
+            assert_eq!(c0.n_buffers, 2);
+            assert!(!(*c0.buffers.add(0)).is_null(), "validity buffer present");
+            let idx = *c0.buffers.add(1) as *const i32;
+            assert_eq!(*idx, 0);
+            assert_eq!(*idx.add(2), 1);
+
+            assert!(!c0.dictionary.is_null(), "dictionary child array present");
+            let dict = &*c0.dictionary;
+            assert_eq!(dict.length, 3, "dictionary holds 3 entries");
+            assert_eq!(dict.n_buffers, 3, "utf8 values: validity, offsets, data");
+
+            (array.release.unwrap())(&mut array);
+        }
+    }
+
+    #[test]
+    fn test_arrow_format_low_cardinality() {
+        assert_eq!(
+            arrow_format(&ChType::LowCardinality(Box::new(ChType::String))),
+            "i"
+        );
+        assert_eq!(
+            arrow_format(&ChType::LowCardinality(Box::new(ChType::Nullable(
+                Box::new(ChType::String)
+            )))),
+            "i"
+        );
     }
 
     #[test]
