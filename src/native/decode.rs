@@ -90,10 +90,10 @@ impl std::fmt::Display for DecodeError {
 impl std::error::Error for DecodeError {}
 
 /// Server protocol revision this crate has been validated against
-/// (ClickHouse v26.2.4.23-stable). Pass this as `DecodeOptions::protocol_revision`
+/// (ClickHouse v26.6.1.1193-stable). Pass this as `DecodeOptions::protocol_revision`
 /// when decoding a Native stream produced by a current server over the native
 /// TCP protocol.
-pub const DBMS_TCP_PROTOCOL_VERSION: u64 = 54483;
+pub const DBMS_TCP_PROTOCOL_VERSION: u64 = 54485;
 
 /// Protocol revision at which every column header carries a one-byte
 /// custom-serialization marker before its data (server constant
@@ -307,7 +307,7 @@ fn decode_bool_data(reader: &mut ByteReader, num_rows: usize) -> io::Result<Bool
 /// Decode a String column into Arrow offsets plus a single data buffer.
 ///
 /// Each value is a varint length followed by that many raw bytes (server
-/// `SerializationString::deserializeBinaryBulk`, confirmed at v26.2.4.23-stable).
+/// `SerializationString::deserializeBinaryBulk`, confirmed at v26.6.1.1193-stable).
 /// Each value's bytes are borrowed from the input as a sub-slice and appended to
 /// `data` with one `extend_from_slice`: one copy per string, zero per-row heap
 /// allocations.
@@ -421,7 +421,7 @@ const LC_HAS_ADDITIONAL_KEYS_BIT: u64 = 1 << 9;
 /// Decode one `LowCardinality(T)` column block into a dictionary `Column`.
 ///
 /// Wire layout per block (server `SerializationLowCardinality`, confirmed at
-/// v26.2.4.23-stable; the per-column key-version prefix was already consumed by
+/// v26.6.1.1193-stable; the per-column key-version prefix was already consumed by
 /// [`read_state_prefix`]):
 ///
 /// ```text
@@ -537,7 +537,7 @@ fn decode_low_cardinality(
 /// ClickHouse gates LowCardinality inners on
 /// `IDataType::canBeInsideLowCardinality()`, checked in the
 /// `DataTypeLowCardinality` constructor after `removeNullable` (confirmed at
-/// v26.2.4.23-stable). That predicate is true for `String`, `FixedString`, the
+/// v26.6.1.1193-stable). That predicate is true for `String`, `FixedString`, the
 /// fixed-width numerics, and the number-backed temporals `Date`/`Date32`/
 /// `DateTime` (`Bool` is a `UInt8`-backed number and also qualifies). It is false
 /// for `DateTime64` and every `Decimal`, which are `DataTypeDecimalBase`
@@ -582,7 +582,7 @@ fn is_low_cardinality_inner(dict_value_type: &ChType) -> bool {
 ///
 /// The dictionary is a plain column of the removeNullable inner type, serialized
 /// with the inner type's `serializeBinaryBulk` (confirmed against
-/// `SerializationLowCardinality` at v26.2.4.23-stable): the same body bytes as a
+/// `SerializationLowCardinality` at v26.6.1.1193-stable): the same body bytes as a
 /// normal column of T, carrying no per-column state prefix and no null map
 /// (nullability is the index-0 sentinel in the index stream). So this defers to
 /// the shared [`decode_column_body`] with `validity: None`, for any inner type in
@@ -821,7 +821,7 @@ fn decode_column_body(
         }
         // IPv4 is a UInt32 in bulk: `SerializationIP<IPv4>` in
         // SerializationIPv4andIPv6.cpp serializes identically to
-        // SerializationNumber<UInt32> (confirmed at v26.2.4.23-stable). Reading 4
+        // SerializationNumber<UInt32> (confirmed at v26.6.1.1193-stable). Reading 4
         // bytes as a little-endian u32 yields the standard IPv4 numeric value
         // (a<<24 | b<<16 | c<<8 | d), so it decodes through the same primitive
         // fast path as the numerics.
@@ -831,7 +831,7 @@ fn decode_column_body(
         }
         // IPv6 is num_rows * 16 raw bytes in network byte order (in6_addr,
         // big-endian), no per-row framing (`SerializationIP<IPv6>`, confirmed at
-        // v26.2.4.23-stable). The bytes pass through verbatim into a width-16
+        // v26.6.1.1193-stable). The bytes pass through verbatim into a width-16
         // FixedBinaryColumn; byte reordering and host address objects are a
         // binding concern.
         ChType::Ipv6 => {
@@ -843,7 +843,7 @@ fn decode_column_body(
         }
         // UUID is num_rows * 16 raw bytes, a POD dump of the UInt128 (items[0]
         // then items[1], each little-endian on LE servers), NOT RFC-4122 byte
-        // order (`SerializationUUID.cpp`, confirmed at v26.2.4.23-stable). Decode
+        // order (`SerializationUUID.cpp`, confirmed at v26.6.1.1193-stable). Decode
         // is raw passthrough: the 16 wire bytes go into a width-16
         // FixedBinaryColumn unchanged, no reordering. The wire->RFC mapping
         // (rfc[i] = wire[7-i] for i in 0..7, rfc[i] = wire[23-i] for i in 8..15)
@@ -985,7 +985,7 @@ fn empty_column(ch_type: &ChType) -> Column {
 
 /// Consume the `BlockInfo` preamble that precedes each block when the producer
 /// used a protocol revision > 0 (server `BlockInfo::read` in
-/// `src/Core/BlockInfo.cpp`, confirmed at v26.2.4.23-stable).
+/// `src/Core/BlockInfo.cpp`, confirmed at v26.6.1.1193-stable).
 ///
 /// `BlockInfo` is a self-describing, field-tagged structure: each field is a
 /// varint field number followed by the field value, and a field number of 0
@@ -2131,7 +2131,7 @@ mod tests {
 
     #[test]
     fn test_modern_framing_roundtrip() {
-        // Full v26.2.4.23 framing: a BlockInfo preamble plus a per-column
+        // Full v26.6.1.1193 framing: a BlockInfo preamble plus a per-column
         // custom-serialization byte (0 = default) ahead of the data.
         let data = BlockBuilder::new()
             .revision(DBMS_TCP_PROTOCOL_VERSION)
@@ -2535,7 +2535,7 @@ mod tests {
     fn test_block_info_out_of_order_buckets_skipped() {
         // A BlockInfo carrying a nonzero out_of_order_buckets vector (field 3,
         // present at server revision >= 54480): a varint count then that many
-        // Int32 values, confirmed against BlockInfo::write at v26.2.4.23-stable.
+        // Int32 values, confirmed against BlockInfo::write at v26.6.1.1193-stable.
         // The committed fixtures only ever exercise the empty-vector case, so
         // assemble a nonzero one by hand and confirm the decoder skips the whole
         // vector and lands exactly on the block body.
@@ -2848,7 +2848,7 @@ mod tests {
 
     #[test]
     fn test_low_cardinality_modern_framing_roundtrip() {
-        // Full v26.2.4.23 framing (BlockInfo + per-column custom-serialization
+        // Full v26.6.1.1193 framing (BlockInfo + per-column custom-serialization
         // byte) ahead of the LowCardinality payload.
         let data = BlockBuilder::new()
             .revision(DBMS_TCP_PROTOCOL_VERSION)
@@ -3117,7 +3117,7 @@ mod tests {
     #[test]
     fn test_decode_low_cardinality_bool_and_date32_inner() {
         // Bool (UInt8-backed) and Date32 (Int32-backed) are number-backed types
-        // whose canBeInsideLowCardinality is true at v26.2.4.23-stable, so both
+        // whose canBeInsideLowCardinality is true at v26.6.1.1193-stable, so both
         // are legal LowCardinality inners and decode through the shared body.
         let data = BlockBuilder::new()
             .header(2, 3)
@@ -3272,7 +3272,7 @@ mod tests {
     /// i in 0..7 and `rfc[i] = wire[23-i]` for i in 8..15 (reverse the first 8
     /// bytes, reverse the last 8). The decoder itself does no reordering; these
     /// are the bytes the server emits and the bytes the decoder must return.
-    /// Confirmed against the live server at v26.2.4.23-stable.
+    /// Confirmed against the live server at v26.6.1.1193-stable.
     const UUID_00112233_WIRE: [u8; 16] = [
         0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00, 0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99,
         0x88,

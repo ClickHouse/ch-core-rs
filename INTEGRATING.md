@@ -109,7 +109,7 @@ Native block framing is partly controlled by the negotiated protocol revision, a
 
 This matters because framed Native blocks can include a `BlockInfo` preamble, and modern revisions include a per-column custom-serialization marker. Passing the wrong revision can shift the decoder by one or more bytes and corrupt the whole block.
 
-The repo's `all_types_rev54483.native` fixture is an HTTP `FORMAT Native` capture with `client_protocol_version=54483` against the pinned `v26.2.4.23-stable` server; it exercises both the `BlockInfo` preamble and the modern per-column marker. That is the concrete shape bindings should reproduce when they request protocol-framed Native over HTTP at that revision.
+The repo's `all_types_rev54485.native` fixture is an HTTP `FORMAT Native` capture with `client_protocol_version=54485` against the pinned `v26.6.1.1193-stable` server; it exercises both the `BlockInfo` preamble and the modern per-column marker. That is the concrete shape bindings should reproduce when they request protocol-framed Native over HTTP at that revision.
 
 ## Output Model
 

@@ -34,8 +34,8 @@ fixture_tests! {
         protocol_revision: 0,
         assert: assert_all_types,
     },
-    all_types_rev54483: {
-        file: "all_types_rev54483.native",
+    all_types_rev54485: {
+        file: "all_types_rev54485.native",
         protocol_revision: DBMS_TCP_PROTOCOL_VERSION,
         assert: assert_all_types,
     },
@@ -97,7 +97,7 @@ fn assert_all_types(batch: &ChunkedBatch) {
             Expected::Exact("ni32", ChType::Nullable(Box::new(ChType::Int32))),
             Expected::Exact("ns", ChType::Nullable(Box::new(ChType::String))),
             // Temporal columns, with the exact type strings this server
-            // (v26.2.4.23-stable) emits. A bare DateTime stays bare. The
+            // (v26.6.1.1193-stable) emits. A bare DateTime stays bare. The
             // DateTime64 columns keep their precision and timezone in both
             // captures.
             Expected::Exact("d", ChType::Date),
@@ -105,7 +105,7 @@ fn assert_all_types(batch: &ChunkedBatch) {
             Expected::Exact("dt", ChType::DateTime { timezone: None }),
             // dt_utc is declared DateTime('UTC') in the query, but the emitted
             // type string depends on the negotiated protocol revision: the
-            // rev54483 capture keeps DateTime('UTC'), while the rev0 capture
+            // rev54485 capture keeps DateTime('UTC'), while the rev0 capture
             // (HTTP FORMAT Native with no client_protocol_version) drops the
             // timezone and emits a bare DateTime. Both are what the server
             // actually wrote, so accept either. The raw seconds are identical

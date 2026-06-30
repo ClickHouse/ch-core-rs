@@ -130,8 +130,8 @@ capture() {
 }
 
 capture "all_types_rev0.native" "${all_types_query}"
-capture "all_types_rev54483.native" "${all_types_query}" \
-  --data-urlencode "client_protocol_version=54483"
+capture "all_types_rev54485.native" "${all_types_query}" \
+  --data-urlencode "client_protocol_version=54485"
 capture "multi_block_rev0.native" "${multi_block_query}"
 
 echo "Wrote fixtures to ${fixture_dir}"
