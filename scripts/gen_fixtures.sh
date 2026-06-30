@@ -71,8 +71,23 @@ SELECT
     CAST(multiIf(n = 0, 'user_1', n = 1, 'user_2', n = 2, 'user_1', 'user_3'), 'LowCardinality(String)') AS lc,
     -- LowCardinality(Nullable(String)): the dictionary's index 0 is the NULL
     -- sentinel; rows 1 and 3 are NULL, rows 0 and 2 are real values.
-    CAST(multiIf(n = 1, NULL, n = 3, NULL, CAST(concat('user_', toString(n)), 'Nullable(String)')), 'LowCardinality(Nullable(String))') AS lcn
+    CAST(multiIf(n = 1, NULL, n = 3, NULL, CAST(concat('user_', toString(n)), 'Nullable(String)')), 'LowCardinality(Nullable(String))') AS lcn,
+    -- LowCardinality over non-String inners. ClickHouse only allows these with
+    -- allow_suspicious_low_cardinality_types=1 (set in SETTINGS below), a
+    -- server-side creation guard; the wire bytes are unaffected. The dictionary
+    -- values are the inner type serialized as a plain column body (raw LE
+    -- primitives), not varint strings.
+    -- LowCardinality(UInt32): repeats so the per-block dictionary is smaller than
+    -- the row count. Values: 13, 79, 13, 4294967295.
+    CAST(multiIf(n = 0, 13, n = 1, 79, n = 2, 13, 4294967295), 'LowCardinality(UInt32)') AS lc_u32,
+    -- LowCardinality(Date): UInt16 days, with a repeat. Days: 19737, 49710,
+    -- 19737, 0.
+    CAST(multiIf(n = 0, 19737, n = 1, 49710, n = 2, 19737, 0), 'LowCardinality(Date)') AS lc_date,
+    -- LowCardinality(Nullable(UInt32)): rows 1 and 3 NULL (wire index 0), rows 0
+    -- and 2 real values 13 and 79.
+    CAST(multiIf(n = 1, NULL, n = 3, NULL, n = 0, 13, 79), 'LowCardinality(Nullable(UInt32))') AS lcn_u32
 FROM numbers(4)
+SETTINGS allow_suspicious_low_cardinality_types = 1
 FORMAT Native
 SQL
 )

@@ -138,6 +138,14 @@ fn assert_all_types(batch: &ChunkedBatch) {
                 "lcn",
                 ChType::LowCardinality(Box::new(ChType::Nullable(Box::new(ChType::String)))),
             ),
+            // LowCardinality over non-String inners, captured with
+            // allow_suspicious_low_cardinality_types=1.
+            Expected::Exact("lc_u32", ChType::LowCardinality(Box::new(ChType::UInt32))),
+            Expected::Exact("lc_date", ChType::LowCardinality(Box::new(ChType::Date))),
+            Expected::Exact(
+                "lcn_u32",
+                ChType::LowCardinality(Box::new(ChType::Nullable(Box::new(ChType::UInt32)))),
+            ),
         ],
     );
 
@@ -276,6 +284,75 @@ fn assert_all_types(batch: &ChunkedBatch) {
         &[Some(b"user_0" as &[u8]), None, Some(b"user_2"), None],
     );
     assert_validity(block.column(22), &[true, false, true, false]);
+
+    // LowCardinality(UInt32): a primitive dictionary body (raw 4-byte LE), with a
+    // repeated value so the dictionary is smaller than the row count. Rows resolve
+    // to 13, 79, 13, 4294967295.
+    assert_dictionary_u32_values(
+        block.column(23),
+        &[Some(13), Some(79), Some(13), Some(u32::MAX)],
+    );
+    // LowCardinality(Date): a UInt16 dictionary body. Rows resolve to the raw days
+    // 19737, 49710, 19737, 0.
+    assert_dictionary_date_values(
+        block.column(24),
+        &[Some(19737), Some(49710), Some(19737), Some(0)],
+    );
+    // LowCardinality(Nullable(UInt32)): rows 1 and 3 NULL via the index-0
+    // sentinel, rows 0 and 2 the values 13 and 79.
+    assert_dictionary_u32_values(block.column(25), &[Some(13), None, Some(79), None]);
+    assert_validity(block.column(25), &[true, false, true, false]);
+}
+
+/// Assert the per-row resolved `UInt32` values of a dictionary column, treating a
+/// null index as `None`, the way a consumer reads them.
+fn assert_dictionary_u32_values(column: &Column, expected: &[Option<u32>]) {
+    match column {
+        Column::Dictionary(d) => {
+            assert_eq!(d.len(), expected.len());
+            let values = match d.values.as_ref() {
+                Column::UInt32(v) => v,
+                other => panic!("expected UInt32 dictionary values, got {other:?}"),
+            };
+            for (row, want) in expected.iter().enumerate() {
+                let is_null = d.validity.as_ref().is_some_and(|bm| !bm.is_valid(row));
+                match want {
+                    None => assert!(is_null, "row {row} expected null"),
+                    Some(v) => {
+                        assert!(!is_null, "row {row} expected a value, got null");
+                        let idx = d.indices[row] as usize;
+                        assert_eq!(values.values[idx], *v, "row {row}");
+                    }
+                }
+            }
+        }
+        other => panic!("expected Dictionary, got {other:?}"),
+    }
+}
+
+/// Assert the per-row resolved `Date` (UInt16 days) values of a dictionary column.
+fn assert_dictionary_date_values(column: &Column, expected: &[Option<u16>]) {
+    match column {
+        Column::Dictionary(d) => {
+            assert_eq!(d.len(), expected.len());
+            let values = match d.values.as_ref() {
+                Column::Date(v) => v,
+                other => panic!("expected Date dictionary values, got {other:?}"),
+            };
+            for (row, want) in expected.iter().enumerate() {
+                let is_null = d.validity.as_ref().is_some_and(|bm| !bm.is_valid(row));
+                match want {
+                    None => assert!(is_null, "row {row} expected null"),
+                    Some(v) => {
+                        assert!(!is_null, "row {row} expected a value, got null");
+                        let idx = d.indices[row] as usize;
+                        assert_eq!(values.values[idx], *v, "row {row}");
+                    }
+                }
+            }
+        }
+        other => panic!("expected Dictionary, got {other:?}"),
+    }
 }
 
 /// Assert the per-row resolved string values of a dictionary (`LowCardinality`)

@@ -250,7 +250,13 @@ preserve:
 ## Adding A New ClickHouse Type
 
 New type support is the main way this crate grows. Implement a type once here and
-every binding gets it. The workflow:
+every binding gets it.
+
+`COMPLETENESS.md` is the decode-parity tracker: the checklist of what still needs
+support to fully replace the Python client's Native decoding, plus a Context
+Handoff block describing current state and what to do next. Read it first when
+picking up type work, work its next unchecked item, then update its handoff block
+and check the item off as part of the same change. The per-type workflow:
 
 1. Make sure the server source checkout exists at the tag in `.server-ref`,
    shallow cloning it per "Local server source checkout" if missing. This

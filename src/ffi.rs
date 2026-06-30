@@ -828,6 +828,58 @@ mod tests {
     }
 
     #[test]
+    fn test_export_low_cardinality_uint32() {
+        use crate::column::DictionaryColumn;
+
+        // A non-String dictionary value type still exports as dictionary(i32, T):
+        // the field format is the index type `i`, and the dictionary child format
+        // is the value type, here `I` (uint32). The dictionary export path is
+        // generic over the value column, so a UInt32 values column flows through
+        // unchanged. This mirrors the String case but pins the child format for a
+        // primitive inner.
+        let schema = Schema::new(vec![Field {
+            name: "lc".into(),
+            ch_type: ChType::LowCardinality(Box::new(ChType::UInt32)),
+        }]);
+        // Dictionary slot 0 is the reserved default; the 3 rows index into 1..=3.
+        let values = Column::UInt32(PrimitiveColumn::new(vec![0, 13, 79, 4_294_967_295]));
+        let dict = DictionaryColumn::new(vec![1, 2, 3], values);
+        let batch = Arc::new(ColBatch::new(schema, vec![Column::Dictionary(dict)], 3));
+
+        unsafe {
+            // Schema: field format `i`, flag clear (non-nullable), child `I`.
+            let mut schema_out: ArrowSchema = std::mem::zeroed();
+            export_schema(&batch.schema, &mut schema_out);
+            let c0 = &**schema_out.children.add(0);
+            assert_eq!(CStr::from_ptr(c0.format).to_str().unwrap(), "i");
+            assert_eq!(c0.flags & 2, 0, "non-nullable LC has the flag clear");
+            assert!(!c0.dictionary.is_null(), "dictionary child present");
+            let dict_schema = &*c0.dictionary;
+            assert_eq!(CStr::from_ptr(dict_schema.format).to_str().unwrap(), "I");
+            (schema_out.release.unwrap())(&mut schema_out);
+
+            // Array: 2 index buffers (validity, i32 indices), dictionary child
+            // holding 4 uint32 entries with 2 buffers (validity, values).
+            let mut array: ArrowArray = std::mem::zeroed();
+            export_batch_array(&batch, &mut array);
+            let c0 = &**array.children.add(0);
+            assert_eq!(c0.length, 3);
+            assert_eq!(c0.n_buffers, 2);
+            let idx = *c0.buffers.add(1) as *const i32;
+            assert_eq!(*idx, 1);
+            assert_eq!(*idx.add(2), 3);
+            assert!(!c0.dictionary.is_null(), "dictionary child array present");
+            let dict_array = &*c0.dictionary;
+            assert_eq!(dict_array.length, 4, "dictionary holds 4 entries");
+            assert_eq!(dict_array.n_buffers, 2, "uint32 values: validity, values");
+            let vals = *dict_array.buffers.add(1) as *const u32;
+            assert_eq!(*vals.add(1), 13);
+            assert_eq!(*vals.add(3), 4_294_967_295);
+            (array.release.unwrap())(&mut array);
+        }
+    }
+
+    #[test]
     fn test_stream_yields_one_batch_then_ends() {
         let batch = make_test_batch();
         let schema = batch.schema.clone();

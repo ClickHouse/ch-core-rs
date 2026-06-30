@@ -241,7 +241,7 @@ than an error.
 | `DateTime`, `DateTime('<tz>')` | `DateTime { timezone }` | `DateTime` | `I` | validity, values         | yes      |
 | `DateTime64(P)`, `DateTime64(P, '<tz>')` | `DateTime64 { precision, timezone }` | `DateTime64` | `ts{unit}:{tz}` for P in {0,3,6,9}, else `l` | validity, values | yes |
 | `Nullable(T)`     | `Nullable(T)`    | inner T's variant | inner's      | inner's, validity populated | n/a      |
-| `LowCardinality(String)`, `LowCardinality(Nullable(String))` | `LowCardinality(Box<ChType>)` | `Dictionary` | `i` (index type; values type in the dictionary child) | validity, i32 indices (+ dictionary child) | via inner `Nullable` |
+| `LowCardinality(T)` for an allowed inner `T` (see the type section) | `LowCardinality(Box<ChType>)` | `Dictionary` | `i` (index type; values type in the dictionary child) | validity, i32 indices (+ dictionary child) | via inner `Nullable` |
 
 Any type not in this matrix is rejected. See "Unsupported types" below.
 
@@ -505,11 +505,38 @@ have equal length. Confirmed at `v26.2.4.23-stable`.
 
 ### LowCardinality(T)
 
-**Type string(s):** `LowCardinality(String)` and
-`LowCardinality(Nullable(String))` are supported today. The parser accepts any
-`LowCardinality(<inner>)` and records it, but decode currently supports only a
-`String` (or `Nullable(String)`) inner type; any other inner type is rejected as
-`UnsupportedType`.
+**Type string(s):** `LowCardinality(T)` and `LowCardinality(Nullable(T))` for
+any inner type `T` in the allowlist below. The parser accepts any
+`LowCardinality(<inner>)` and records it; decode then accepts the inner types
+ClickHouse permits inside `LowCardinality` that this crate already decodes, and
+rejects any other inner as `UnsupportedType`.
+
+**Allowed inner types (after `removeNullable`):** `String`, `FixedString(N)`,
+the fixed-width numerics (`Int8`/`Int16`/`Int32`/`Int64`,
+`UInt8`/`UInt16`/`UInt32`/`UInt64`, `Float32`/`Float64`), `Bool`, and the
+number-backed temporals `Date`, `Date32`, and `DateTime`. The dictionary values
+are that inner type serialized as a plain column body (varint-length strings for
+`String`, raw fixed-width bytes otherwise), so support follows directly from the
+per-type body decoder.
+
+This allowlist is exactly `IDataType::canBeInsideLowCardinality()` intersected
+with the types this crate decodes, confirmed against the server source at
+`v26.2.4.23-stable` (the `DataTypeLowCardinality` constructor checks it after
+`removeNullable`). Two consequences worth calling out:
+
+- `DateTime64` and every `Decimal` are **not** allowed: they are
+  `DataTypeDecimalBase` subclasses whose `canBeInsideLowCardinality()` is false,
+  so the server never emits `LowCardinality(DateTime64(...))`. The crate decodes
+  `DateTime64` as an ordinary column but rejects it as a `LowCardinality` inner.
+- `UUID`, `IPv4`, and `IPv6` **are** permitted by the server but are not yet
+  decoded by this crate, so a `LowCardinality` over them is rejected as
+  `UnsupportedType` like the bare types.
+
+The fixed-width numeric and temporal inners require the server setting
+`allow_suspicious_low_cardinality_types=1` at table-creation time. That is a
+server-side creation guard only: it has no effect on the wire bytes and is not
+needed to decode a column the server already produced. `String`, `FixedString`,
+and `UUID` are allowed unconditionally.
 
 **Logical type:** `ChType::LowCardinality(Box<ChType>)`.
 
@@ -538,7 +565,7 @@ Then, per block (when the block has rows):
                   //   bit 9 (0x200) = HasAdditionalKeysBit    -> set in Native
                   //   higher bits (e.g. bit 10 = NeedUpdateDictionary) may be set; the decoder masks only the bits it acts on and ignores the rest
 [8 bytes LE u64]  num_keys      // dictionary entry count for THIS block
-[num_keys values] dictionary    // inner type serialized; for String each is varint len + raw bytes
+[num_keys values] dictionary    // inner type's plain serializeBinaryBulk body: varint len + raw bytes for String, raw fixed-width LE bytes otherwise
 [8 bytes LE u64]  num_rows      // re-stated; must equal the block row count
 [num_rows * w]    indexes       // raw LE array (NOT varint), w = index width, each an index into this block's dictionary
 ```
@@ -556,17 +583,20 @@ Native reader creates a fresh deserialize state for every column in every block
 column, immediately before that block's index payload. A zero-row block reads no
 prefix and no data for the column.
 
-For `LowCardinality(Nullable(String))` the dictionary value type after
-removeNullable is plain `String`. The wire transmits `num_keys` string values;
+For `LowCardinality(Nullable(T))` the dictionary value type after
+removeNullable is the bare `T`. The wire transmits `num_keys` values of `T`;
 dictionary index 0 is the NULL sentinel and its on-wire value is the inner
-default, an empty string. Rows whose index is 0 are NULL.
+default (an empty string for `String`, a zero for the fixed-width inners). Rows
+whose index is 0 are NULL.
 
-**Arrow export:** Arrow `dictionary(i32, utf8)`. The schema field's own format
-string is the index type `i` (int32) and the value type lives in the schema's
-`dictionary` child (`u`, utf8). The nullable flag is set on the field when the
-inner type is `Nullable`. The array carries 2 index buffers in order: validity
-then the i32 index data, and its `dictionary` child array holds the dictionary
-values exported as a `String` column (validity, offsets, data).
+**Arrow export:** Arrow `dictionary(i32, V)` where `V` is the inner value type's
+Arrow format. The schema field's own format string is the index type `i` (int32)
+and the value type lives in the schema's `dictionary` child (`u` for a `String`
+inner, `I` for `UInt32`, `S` for `Date`, `w:N` for `FixedString(N)`, and so on:
+the same per-type format the bare inner exports). The nullable flag is set on the
+field when the inner type is `Nullable`. The array carries 2 index buffers in
+order: validity then the i32 index data, and its `dictionary` child array holds
+the dictionary values exported as a column of the inner type.
 
 Index-width decision: ClickHouse picks the index width (u8..u64) per block from
 that block's dictionary size, but the decoder normalizes every index to a single
@@ -581,16 +611,18 @@ indices validity bitmap, not as a dictionary entry. The decoder maps each
 wire-index-0 row (the ClickHouse NULL sentinel) to a null bit in the index
 validity bitmap and leaves that row's i32 index at 0 (pointing at the harmless
 sentinel entry, never read). The dictionary `values` column still contains the
-`num_keys` entries the wire carried, including the empty-string sentinel at slot
-0. A plain (non-nullable) `LowCardinality(String)` has no validity bitmap; the
-server still reserves dictionary slot 0 with an empty string, but it is never
+`num_keys` entries the wire carried, including the inner-default sentinel at slot
+0. A plain (non-nullable) `LowCardinality(T)` has no validity bitmap; the server
+still reserves dictionary slot 0 with the inner default, but it is never
 referenced (the indexes start at 1), so it carries no null sentinel.
 
 **Rust buffer:** `Column::Dictionary(DictionaryColumn)` where `DictionaryColumn`
 is `{ indices: Vec<i32>, validity: Option<Bitmap>, values: Box<Column> }`.
 `indices` has length `num_rows`. `validity` is `Some` only for a nullable inner
-type. `values` is the per-block dictionary as its own `Column` (a `Utf8Column`
-for the String case).
+type. `values` is the per-block dictionary as its own `Column` of the inner type:
+a `Utf8Column` for `String`, a `FixedBinaryColumn` for `FixedString(N)`, or the
+matching `PrimitiveColumn<T>` (for example `Column::UInt32` or `Column::Date`)
+for a numeric or temporal inner.
 
 **Notes:**
 
@@ -642,10 +674,13 @@ Not yet supported, tracked as planned phases in `src/schema.rs`:
 - `Decimal`.
 - `UUID`, `IPv4`, `IPv6`.
 - `Enum8`, `Enum16`.
-- `LowCardinality(T)` for any inner type other than `String` or
-  `Nullable(String)`. The wrapper itself is supported (see the
-  `LowCardinality(T)` section); only the String inner type is decoded so far,
-  and any other inner type is rejected as `UnsupportedType`.
+- `LowCardinality(T)` for an inner type outside the allowlist in the
+  `LowCardinality(T)` section. The wrapper and its allowed inners (String,
+  FixedString, the fixed-width numerics, Bool, Date, Date32, DateTime, with or
+  without an inner `Nullable`) are supported; any other inner is rejected as
+  `UnsupportedType`. This includes `DateTime64` and every `Decimal` (the server
+  itself forbids them as LC inners), and `UUID`/`IPv4`/`IPv6`/`Enum` (server-legal
+  LC inners that this crate does not yet decode in any form).
 - Containers: `Array(T)`, `Tuple(...)`, `Map(K, V)`.
 - Wide integers: `Int128`, `UInt128`, `Int256`, `UInt256`.
 
