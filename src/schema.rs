@@ -39,9 +39,9 @@ pub enum ChType {
     // Decimal { precision: u8, scale: u8, bits: u16 },
 
     // Special (Phase 3-4)
-    // Uuid,
-    // Ipv4,
-    // Ipv6,
+    Uuid,
+    Ipv4,
+    Ipv6,
     // Enum8 { variants: Vec<(String, i8)> },
     // Enum16 { variants: Vec<(String, i16)> },
 
@@ -99,6 +99,9 @@ impl std::fmt::Display for ChType {
             ChType::Float64 => write!(f, "Float64"),
             ChType::String => write!(f, "String"),
             ChType::FixedString(n) => write!(f, "FixedString({n})"),
+            ChType::Uuid => write!(f, "UUID"),
+            ChType::Ipv4 => write!(f, "IPv4"),
+            ChType::Ipv6 => write!(f, "IPv6"),
             ChType::Date => write!(f, "Date"),
             ChType::Date32 => write!(f, "Date32"),
             ChType::DateTime { timezone: None } => write!(f, "DateTime"),

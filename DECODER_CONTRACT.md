@@ -236,6 +236,9 @@ than an error.
 | `Float64`         | `Float64`        | `Float64`         | `g`          | validity, values            | yes      |
 | `String`          | `String`         | `Utf8`            | `u`          | validity, offsets, data     | yes      |
 | `FixedString(N)`  | `FixedString(N)` | `FixedBinary`     | `w:N`        | validity, data              | yes      |
+| `UUID`            | `Uuid`           | `Uuid`            | `w:16`       | validity, data              | yes      |
+| `IPv4`            | `Ipv4`           | `Ipv4`            | `I`          | validity, values            | yes      |
+| `IPv6`            | `Ipv6`           | `Ipv6`            | `w:16`       | validity, data              | yes      |
 | `Date`            | `Date`           | `Date`            | `S`          | validity, values            | yes      |
 | `Date32`          | `Date32`         | `Date32`          | `tdD`        | validity, values            | yes      |
 | `DateTime`, `DateTime('<tz>')` | `DateTime { timezone }` | `DateTime` | `I` | validity, values         | yes      |
@@ -385,6 +388,108 @@ contiguous bytes, no length prefixes. Short values are zero-padded to `N` at
 insert time, so the wire bytes are always `N` per row. Confirmed at
 `v26.2.4.23-stable`.
 
+### UUID
+
+**Type string(s):** `UUID`.
+
+**Logical type:** `ChType::Uuid`.
+
+**Wire payload:** `num_rows * 16` raw bytes, contiguous, no per-row framing. Each
+row is a 16-byte POD dump of the server's `UInt128` (`items[0]` then `items[1]`,
+each little-endian on the usual little-endian server builds). This is **not**
+RFC-4122 byte order.
+
+**Arrow export:** format `w:16` (Arrow fixed-size binary of width 16). 2 buffers
+in order: validity, then data. There is no offsets buffer; row `i` is
+`data[i * 16 .. (i + 1) * 16]`. The core emits plain `w:16`; it does **not** claim
+the `arrow.uuid` extension type.
+
+**Rust buffer:** `Column::Uuid(FixedBinaryColumn)` with `width == 16`, the same
+backing struct as `FixedString`. The bytes are the wire bytes verbatim.
+
+**Notes:**
+
+- **Decode is raw passthrough.** The 16 wire bytes are stored unchanged; the
+  decoder does no reordering and does no per-cell work. Any conversion to a host
+  `uuid.UUID` (or to RFC-4122 byte order) is a binding concern, out of scope here.
+- **Wire -> RFC byte mapping (for bindings).** The wire order is the reverse of
+  RFC-4122 within each 8-byte half: `rfc[i] = wire[7 - i]` for `i` in `0..=7`, and
+  `rfc[i] = wire[23 - i]` for `i` in `8..=15` (reverse the first 8 bytes, reverse
+  the last 8). Concrete example: RFC UUID
+  `00112233-4455-6677-8899-aabbccddeeff` serializes on the wire as the 16 bytes
+  `77 66 55 44 33 22 11 00 ff ee dd cc bb aa 99 88`. The crate's round-trip and
+  live-server tests assert exactly these bytes.
+
+**Introduction version:** first-class since approximately v21.1 (inferred from
+release notes; predates the pinned tag). Stable at `v26.2.4.23-stable`.
+
+**Server reference:** `SerializationUUID::serializeBinaryBulk` /
+`deserializeBinaryBulk` in `src/DataTypes/Serializations/SerializationUUID.cpp`: a
+POD dump of the `UInt128`, 16 contiguous bytes per row, no per-row framing, with
+the half-reversed (non-RFC) byte order above. `deserializeBinaryBulkStatePrefix`
+reads zero bytes and the custom-serialization marker is 0x00. Confirmed at
+`v26.2.4.23-stable`.
+
+### IPv4
+
+**Type string(s):** `IPv4`.
+
+**Logical type:** `ChType::Ipv4`.
+
+**Wire payload:** `num_rows * 4` bytes, little-endian, contiguous, no per-row
+framing. Identical to `SerializationNumber<UInt32>` in bulk. Reading 4 bytes as a
+little-endian `u32` yields the standard IPv4 numeric value
+(`a<<24 | b<<16 | c<<8 | d`); for example `192.0.2.235` decodes to `3221226219`.
+
+**Arrow export:** format `I` (Arrow uint32). 2 buffers in order: validity, then
+values. Zero-copy, exactly like `DateTime` and `UInt32`.
+
+**Rust buffer:** `Column::Ipv4(PrimitiveColumn<u32>)`, `{ values, validity }`,
+length `num_rows`. On little-endian targets `values` is the wire bytes verbatim.
+
+**Notes:** the stored integer is the canonical IPv4 numeric value, not a
+dotted-quad string. Rendering it as `a.b.c.d` (or to a host address object) is a
+binding concern.
+
+**Introduction version:** first-class since approximately v21.1 (inferred from
+release notes; predates the pinned tag). Stable at `v26.2.4.23-stable`.
+
+**Server reference:** `SerializationIP<IPv4>` in
+`src/DataTypes/Serializations/SerializationIPv4andIPv6.cpp`, which serializes
+identically to `SerializationNumber<UInt32>` in bulk: a single bulk raw read into
+the column buffer on little-endian hosts, byte-swapped per element on big-endian
+hosts. `deserializeBinaryBulkStatePrefix` reads zero bytes and the
+custom-serialization marker is 0x00. Confirmed at `v26.2.4.23-stable`.
+
+### IPv6
+
+**Type string(s):** `IPv6`.
+
+**Logical type:** `ChType::Ipv6`.
+
+**Wire payload:** `num_rows * 16` raw bytes, contiguous, no per-row framing. Each
+row is the 16-byte `in6_addr` in network byte order (big-endian), exactly as a
+standard IPv6 address is stored on the wire.
+
+**Arrow export:** format `w:16` (Arrow fixed-size binary of width 16). 2 buffers
+in order: validity, then data. Row `i` is `data[i * 16 .. (i + 1) * 16]`.
+
+**Rust buffer:** `Column::Ipv6(FixedBinaryColumn)` with `width == 16`, the same
+backing struct as `FixedString`. The bytes are the wire bytes verbatim.
+
+**Notes:** the bytes are network-order `in6_addr` bytes, passed through unchanged.
+Decode does no reordering and no per-cell work. Converting to a host IPv6 address
+object (or to a textual form) is a binding concern.
+
+**Introduction version:** first-class since approximately v21.1 (inferred from
+release notes; predates the pinned tag). Stable at `v26.2.4.23-stable`.
+
+**Server reference:** `SerializationIP<IPv6>` in
+`src/DataTypes/Serializations/SerializationIPv4andIPv6.cpp`: 16 contiguous bytes
+per row in network byte order, no per-row framing.
+`deserializeBinaryBulkStatePrefix` reads zero bytes and the custom-serialization
+marker is 0x00. Confirmed at `v26.2.4.23-stable`.
+
 ### Temporal types
 
 This covers `Date`, `Date32`, `DateTime`, and `DateTime64`. All four are plain
@@ -513,11 +618,12 @@ rejects any other inner as `UnsupportedType`.
 
 **Allowed inner types (after `removeNullable`):** `String`, `FixedString(N)`,
 the fixed-width numerics (`Int8`/`Int16`/`Int32`/`Int64`,
-`UInt8`/`UInt16`/`UInt32`/`UInt64`, `Float32`/`Float64`), `Bool`, and the
-number-backed temporals `Date`, `Date32`, and `DateTime`. The dictionary values
-are that inner type serialized as a plain column body (varint-length strings for
-`String`, raw fixed-width bytes otherwise), so support follows directly from the
-per-type body decoder.
+`UInt8`/`UInt16`/`UInt32`/`UInt64`, `Float32`/`Float64`), `Bool`, the
+number-backed temporals `Date`, `Date32`, and `DateTime`, and `UUID`/`IPv4`/`IPv6`.
+The dictionary values are that inner type serialized as a plain column body
+(varint-length strings for `String`, raw fixed-width bytes otherwise: 4 bytes per
+`IPv4` entry, 16 bytes per `UUID`/`IPv6` entry), so support follows directly from
+the per-type body decoder.
 
 This allowlist is exactly `IDataType::canBeInsideLowCardinality()` intersected
 with the types this crate decodes, confirmed against the server source at
@@ -528,13 +634,14 @@ with the types this crate decodes, confirmed against the server source at
   `DataTypeDecimalBase` subclasses whose `canBeInsideLowCardinality()` is false,
   so the server never emits `LowCardinality(DateTime64(...))`. The crate decodes
   `DateTime64` as an ordinary column but rejects it as a `LowCardinality` inner.
-- `UUID`, `IPv4`, and `IPv6` **are** permitted by the server but are not yet
-  decoded by this crate, so a `LowCardinality` over them is rejected as
-  `UnsupportedType` like the bare types.
+- `UUID`, `IPv4`, and `IPv6` **are** permitted by the server and are now decoded
+  by this crate, so a `LowCardinality` over them decodes through the dictionary
+  path: a `UUID`/`IPv6` dictionary value column is a `FixedBinary` of width 16 and
+  an `IPv4` dictionary value column is a `UInt32`-backed column.
 
-The fixed-width numeric and temporal inners require the server setting
-`allow_suspicious_low_cardinality_types=1` at table-creation time. That is a
-server-side creation guard only: it has no effect on the wire bytes and is not
+The fixed-width numeric and temporal inners, and `IPv4`/`IPv6`, require the server
+setting `allow_suspicious_low_cardinality_types=1` at table-creation time. That is
+a server-side creation guard only: it has no effect on the wire bytes and is not
 needed to decode a column the server already produced. `String`, `FixedString`,
 and `UUID` are allowed unconditionally.
 
@@ -650,10 +757,12 @@ When a block has `num_rows == 0` the chunk is dropped from `chunks`, but the
 schema is still established. If a consumer constructs or inspects an empty column
 directly (`empty_column` in `src/native/decode.rs`), the empty shapes are:
 
-- Numerics and `Bool`: empty value or bit buffer, length 0.
+- Numerics and `Bool`: empty value or bit buffer, length 0. `IPv4` (a `u32`
+  primitive) is the same.
 - `String`: `offsets == [0]` (length 1, the required leading zero) and empty
   data.
-- `FixedString(N)`: empty data, width preserved.
+- `FixedString(N)`: empty data, width preserved. `UUID` and `IPv6` are the same
+  with width 16.
 - `Nullable(T)`: as above with an empty validity bitmap.
 - `LowCardinality(T)`: empty indices, an empty values dictionary column, and (for
   a nullable inner type) an empty index validity bitmap.
@@ -672,15 +781,14 @@ fallback. A consumer can treat an unsupported type as a hard decode error.
 Not yet supported, tracked as planned phases in `src/schema.rs`:
 
 - `Decimal`.
-- `UUID`, `IPv4`, `IPv6`.
 - `Enum8`, `Enum16`.
 - `LowCardinality(T)` for an inner type outside the allowlist in the
   `LowCardinality(T)` section. The wrapper and its allowed inners (String,
-  FixedString, the fixed-width numerics, Bool, Date, Date32, DateTime, with or
-  without an inner `Nullable`) are supported; any other inner is rejected as
-  `UnsupportedType`. This includes `DateTime64` and every `Decimal` (the server
-  itself forbids them as LC inners), and `UUID`/`IPv4`/`IPv6`/`Enum` (server-legal
-  LC inners that this crate does not yet decode in any form).
+  FixedString, the fixed-width numerics, Bool, Date, Date32, DateTime,
+  UUID/IPv4/IPv6, with or without an inner `Nullable`) are supported; any other
+  inner is rejected as `UnsupportedType`. This includes `DateTime64` and every
+  `Decimal` (the server itself forbids them as LC inners), and `Enum` (a
+  server-legal LC inner that this crate does not yet decode in any form).
 - Containers: `Array(T)`, `Tuple(...)`, `Map(K, V)`.
 - Wide integers: `Int128`, `UInt128`, `Int256`, `UInt256`.
 

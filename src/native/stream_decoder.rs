@@ -505,16 +505,19 @@ mod tests {
     #[test]
     fn test_unsupported_type_in_complete_stream_errors() {
         // An unsupported type inside an otherwise-complete block surfaces as a
-        // DecodeError from the scan, not as "need more bytes".
+        // DecodeError from the scan, not as "need more bytes". Decimal is not
+        // decoded yet, so it serves as the unsupported example (UUID/IPv4/IPv6
+        // are decoded now).
         let mut dec = StreamDecoder::new(DecodeOptions::default());
         let mut data = Vec::new();
         write_varint(&mut data, 1).unwrap(); // num_cols
         write_varint(&mut data, 1).unwrap(); // num_rows
         write_varint(&mut data, 2).unwrap();
         data.extend_from_slice(b"id");
-        write_varint(&mut data, 4).unwrap();
-        data.extend_from_slice(b"UUID");
-        data.extend_from_slice(&0u32.to_le_bytes()); // any 4 bytes of data
+        let type_name = b"Decimal64(4)";
+        write_varint(&mut data, type_name.len() as u64).unwrap();
+        data.extend_from_slice(type_name);
+        data.extend_from_slice(&0u64.to_le_bytes()); // any 8 bytes of data
 
         let result = dec.feed(&data);
         assert!(matches!(result, Err(DecodeError::UnsupportedType { .. })));

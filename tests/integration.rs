@@ -146,6 +146,11 @@ fn assert_all_types(batch: &ChunkedBatch) {
                 "lcn_u32",
                 ChType::LowCardinality(Box::new(ChType::Nullable(Box::new(ChType::UInt32)))),
             ),
+            // UUID/IPv4/IPv6 and a LowCardinality(UUID).
+            Expected::Exact("uuid", ChType::Uuid),
+            Expected::Exact("ipv4", ChType::Ipv4),
+            Expected::Exact("ipv6", ChType::Ipv6),
+            Expected::Exact("lc_uuid", ChType::LowCardinality(Box::new(ChType::Uuid))),
         ],
     );
 
@@ -302,6 +307,102 @@ fn assert_all_types(batch: &ChunkedBatch) {
     // sentinel, rows 0 and 2 the values 13 and 79.
     assert_dictionary_u32_values(block.column(25), &[Some(13), None, Some(79), None]);
     assert_validity(block.column(25), &[true, false, true, false]);
+
+    // UUID: 16 raw wire bytes per row, a POD dump of the UInt128 (NOT RFC-4122
+    // byte order). Row 1 is the documented 00112233-4455-6677-8899-aabbccddeeff,
+    // whose exact wire bytes the server emits are asserted below. The decoder
+    // does no reordering; the wire->RFC mapping (rfc[i] = wire[7-i] for i in
+    // 0..7, rfc[i] = wire[23-i] for i in 8..15) is a binding concern. These
+    // wire bytes were probed directly from the server, not produced by this
+    // crate.
+    let uuid_00112233: [u8; 16] = [
+        0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00, 0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99,
+        0x88,
+    ];
+    let uuid_10203040: [u8; 16] = [
+        0x80, 0x70, 0x60, 0x50, 0x40, 0x30, 0x20, 0x10, 0x00, 0xf0, 0xe0, 0xd0, 0xc0, 0xb0, 0xa0,
+        0x90,
+    ];
+    match block.column(26) {
+        Column::Uuid(c) => {
+            assert_eq!(c.width, 16);
+            assert_eq!(c.len(), 4);
+            assert_eq!(c.value(0), [0u8; 16]); // nil UUID
+            assert_eq!(c.value(1), uuid_00112233);
+            assert_eq!(c.value(2), uuid_10203040);
+            assert_eq!(c.value(3), [0xffu8; 16]);
+        }
+        other => panic!("expected Uuid, got {other:?}"),
+    }
+
+    // IPv4: the standard UInt32 numeric value. 192.0.2.235 = 3221226219,
+    // 10.20.30.40 = 169090600. Numbers probed from the server.
+    match block.column(27) {
+        Column::Ipv4(c) => {
+            assert_eq!(c.values.as_slice(), &[0, 3221226219, 169090600, u32::MAX]);
+        }
+        other => panic!("expected Ipv4, got {other:?}"),
+    }
+
+    // IPv6: 16 raw bytes in network byte order, verbatim. Bytes probed from the
+    // server (the unspecified ::, 2001:db8::68, fe80::1, ::ffff:192.0.2.235).
+    let ipv6_db8: [u8; 16] = [
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x68,
+    ];
+    let ipv6_fe80: [u8; 16] = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
+    let ipv6_v4mapped: [u8; 16] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0xc0, 0x00, 0x02, 0xeb,
+    ];
+    match block.column(28) {
+        Column::Ipv6(c) => {
+            assert_eq!(c.width, 16);
+            assert_eq!(c.len(), 4);
+            assert_eq!(c.value(0), [0u8; 16]);
+            assert_eq!(c.value(1), ipv6_db8);
+            assert_eq!(c.value(2), ipv6_fe80);
+            assert_eq!(c.value(3), ipv6_v4mapped);
+        }
+        other => panic!("expected Ipv6, got {other:?}"),
+    }
+
+    // LowCardinality(UUID): a 16-byte fixed-binary dictionary body, with a repeat
+    // so the per-block dictionary is smaller than the row count. Rows resolve to
+    // the wire bytes 00112233..., 10203040..., 00112233..., ffffffff... in wire
+    // order (the core never reorders).
+    assert_dictionary_uuid_values(
+        block.column(29),
+        &[
+            Some(&uuid_00112233),
+            Some(&uuid_10203040),
+            Some(&uuid_00112233),
+            Some(&[0xffu8; 16]),
+        ],
+    );
+}
+
+/// Assert the per-row resolved UUID (16-byte wire) values of a dictionary column.
+fn assert_dictionary_uuid_values(column: &Column, expected: &[Option<&[u8; 16]>]) {
+    match column {
+        Column::Dictionary(d) => {
+            assert_eq!(d.len(), expected.len());
+            let values = match d.values.as_ref() {
+                Column::Uuid(v) => v,
+                other => panic!("expected Uuid dictionary values, got {other:?}"),
+            };
+            for (row, want) in expected.iter().enumerate() {
+                let is_null = d.validity.as_ref().is_some_and(|bm| !bm.is_valid(row));
+                match want {
+                    None => assert!(is_null, "row {row} expected null"),
+                    Some(bytes) => {
+                        assert!(!is_null, "row {row} expected a value, got null");
+                        let idx = d.indices[row] as usize;
+                        assert_eq!(values.value(idx), bytes.as_slice(), "row {row}");
+                    }
+                }
+            }
+        }
+        other => panic!("expected Dictionary, got {other:?}"),
+    }
 }
 
 /// Assert the per-row resolved `UInt32` values of a dictionary column, treating a

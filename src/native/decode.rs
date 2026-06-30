@@ -203,6 +203,9 @@ fn parse_ch_type(type_name: &str) -> Option<ChType> {
         "Date32" => Some(ChType::Date32),
         "DateTime" => Some(ChType::DateTime { timezone: None }),
         "String" => Some(ChType::String),
+        "UUID" => Some(ChType::Uuid),
+        "IPv4" => Some(ChType::Ipv4),
+        "IPv6" => Some(ChType::Ipv6),
         _ => None,
     }
 }
@@ -539,13 +542,17 @@ fn decode_low_cardinality(
 /// `DateTime` (`Bool` is a `UInt8`-backed number and also qualifies). It is false
 /// for `DateTime64` and every `Decimal`, which are `DataTypeDecimalBase`
 /// subclasses, so those are rejected here even though the crate decodes them as
-/// ordinary columns. `UUID`/`IPv4`/`IPv6` are permitted by the server but not yet
-/// decoded by this crate, so they are absent and rejected as unsupported.
+/// ordinary columns. `UUID`/`IPv4`/`IPv6` are permitted by the server and decoded
+/// by this crate, so they are in the allowlist: the dictionary body is the inner
+/// type's plain bulk form (4 raw bytes per entry for `IPv4`, 16 raw bytes per
+/// entry for `UUID`/`IPv6`), decoded through the shared per-type body decoder.
 ///
 /// The fixed-width numeric and temporal inners require the server's
 /// `allow_suspicious_low_cardinality_types=1` at table-creation time; that is a
 /// server-side creation guard only and has no effect on the wire bytes or on
-/// decoding a column the server already produced.
+/// decoding a column the server already produced. `UUID` (like `String` and
+/// `FixedString`) is allowed unconditionally; `IPv4`/`IPv6` need the suspicious
+/// setting at creation, again with no wire effect.
 fn is_low_cardinality_inner(dict_value_type: &ChType) -> bool {
     matches!(
         dict_value_type,
@@ -565,6 +572,9 @@ fn is_low_cardinality_inner(dict_value_type: &ChType) -> bool {
             | ChType::Date
             | ChType::Date32
             | ChType::DateTime { .. }
+            | ChType::Uuid
+            | ChType::Ipv4
+            | ChType::Ipv6
     )
 }
 
@@ -809,6 +819,42 @@ fn decode_column_body(
                 None => Column::FixedBinary(FixedBinaryColumn::new(data, *width)),
             }
         }
+        // IPv4 is a UInt32 in bulk: `SerializationIP<IPv4>` in
+        // SerializationIPv4andIPv6.cpp serializes identically to
+        // SerializationNumber<UInt32> (confirmed at v26.2.4.23-stable). Reading 4
+        // bytes as a little-endian u32 yields the standard IPv4 numeric value
+        // (a<<24 | b<<16 | c<<8 | d), so it decodes through the same primitive
+        // fast path as the numerics.
+        ChType::Ipv4 => {
+            let values = decode_primitive!(reader, num_rows, u32);
+            Column::Ipv4(PrimitiveColumn { values, validity })
+        }
+        // IPv6 is num_rows * 16 raw bytes in network byte order (in6_addr,
+        // big-endian), no per-row framing (`SerializationIP<IPv6>`, confirmed at
+        // v26.2.4.23-stable). The bytes pass through verbatim into a width-16
+        // FixedBinaryColumn; byte reordering and host address objects are a
+        // binding concern.
+        ChType::Ipv6 => {
+            let data = decode_fixed_binary_data(reader, num_rows, 16)?;
+            match validity {
+                Some(bm) => Column::Ipv6(FixedBinaryColumn::new_nullable(data, 16, bm)),
+                None => Column::Ipv6(FixedBinaryColumn::new(data, 16)),
+            }
+        }
+        // UUID is num_rows * 16 raw bytes, a POD dump of the UInt128 (items[0]
+        // then items[1], each little-endian on LE servers), NOT RFC-4122 byte
+        // order (`SerializationUUID.cpp`, confirmed at v26.2.4.23-stable). Decode
+        // is raw passthrough: the 16 wire bytes go into a width-16
+        // FixedBinaryColumn unchanged, no reordering. The wire->RFC mapping
+        // (rfc[i] = wire[7-i] for i in 0..7, rfc[i] = wire[23-i] for i in 8..15)
+        // is documented in DECODER_CONTRACT.md for bindings only.
+        ChType::Uuid => {
+            let data = decode_fixed_binary_data(reader, num_rows, 16)?;
+            match validity {
+                Some(bm) => Column::Uuid(FixedBinaryColumn::new_nullable(data, 16, bm)),
+                None => Column::Uuid(FixedBinaryColumn::new(data, 16)),
+            }
+        }
         ChType::Nullable(_) => unreachable!("Nullable already unwrapped"),
         ChType::LowCardinality(_) => unreachable!("LowCardinality handled above"),
     };
@@ -897,6 +943,20 @@ fn empty_column(ch_type: &ChType) -> Column {
         ChType::FixedString(width) => Column::FixedBinary(match empty_validity {
             Some(bm) => FixedBinaryColumn::new_nullable(vec![], *width, bm),
             None => FixedBinaryColumn::new(vec![], *width),
+        }),
+        ChType::Ipv4 => Column::Ipv4(PrimitiveColumn {
+            values: vec![],
+            validity: empty_validity,
+        }),
+        // IPv6 and UUID are width-16 fixed binary; the empty column keeps the
+        // width and the (nullable) empty validity bitmap, like FixedString.
+        ChType::Ipv6 => Column::Ipv6(match empty_validity {
+            Some(bm) => FixedBinaryColumn::new_nullable(vec![], 16, bm),
+            None => FixedBinaryColumn::new(vec![], 16),
+        }),
+        ChType::Uuid => Column::Uuid(match empty_validity {
+            Some(bm) => FixedBinaryColumn::new_nullable(vec![], 16, bm),
+            None => FixedBinaryColumn::new(vec![], 16),
         }),
         // A zero-row block reads no LowCardinality prefix or data (the server
         // gates `readData` on having rows), so the empty dictionary column has
@@ -1196,11 +1256,15 @@ fn skip_column_body(
         | ChType::UInt32
         | ChType::Float32
         | ChType::Date32
-        | ChType::DateTime { .. } => reader.skip(num_rows.saturating_mul(4))?,
+        | ChType::DateTime { .. }
+        | ChType::Ipv4 => reader.skip(num_rows.saturating_mul(4))?,
         ChType::Int64 | ChType::UInt64 | ChType::Float64 | ChType::DateTime64 { .. } => {
             reader.skip(num_rows.saturating_mul(8))?
         }
         ChType::FixedString(width) => reader.skip(num_rows.saturating_mul(*width))?,
+        // UUID and IPv6 are 16 raw bytes per row, the same body shape as
+        // FixedString(16).
+        ChType::Uuid | ChType::Ipv6 => reader.skip(num_rows.saturating_mul(16))?,
         ChType::String => {
             for _ in 0..num_rows {
                 let len = reader.read_varint()? as usize;
@@ -1462,6 +1526,21 @@ mod tests {
             self
         }
 
+        /// IPv4 column body: raw 4-byte LE UInt32 per row, exactly the UInt32
+        /// body, so it shares `uint32_data`'s shape.
+        fn ipv4_data(self, values: &[u32]) -> Self {
+            self.uint32_data(values)
+        }
+
+        /// UUID / IPv6 column body: raw 16-byte rows, no length prefix, exactly
+        /// a FixedString(16) body. Each entry must be 16 bytes.
+        fn fixed16_data(mut self, values: &[[u8; 16]]) -> Self {
+            for v in values {
+                self.buf.extend_from_slice(v);
+            }
+            self
+        }
+
         fn null_map(mut self, nulls: &[bool]) -> Self {
             for &is_null in nulls {
                 self.buf.push(if is_null { 0x01 } else { 0x00 });
@@ -1574,6 +1653,21 @@ mod tests {
         ) -> Self {
             let mut dict_bytes = Vec::new();
             for &entry in dictionary {
+                dict_bytes.extend_from_slice(entry);
+            }
+            self.low_cardinality_block(dictionary.len(), &dict_bytes, indices, index_width)
+        }
+
+        /// `LowCardinality(UUID)` / `LowCardinality(IPv6)` block: dictionary
+        /// entries are raw 16-byte rows, exactly a plain UUID/IPv6 column body.
+        fn low_cardinality_fixed16(
+            self,
+            dictionary: &[[u8; 16]],
+            indices: &[u64],
+            index_width: usize,
+        ) -> Self {
+            let mut dict_bytes = Vec::new();
+            for entry in dictionary {
                 dict_bytes.extend_from_slice(entry);
             }
             self.low_cardinality_block(dictionary.len(), &dict_bytes, indices, index_width)
@@ -1859,10 +1953,10 @@ mod tests {
     fn test_block_end_rejects_unsupported_type() {
         // An unsupported type inside an otherwise-complete block must surface as
         // a DecodeError from the scan, not be silently skipped or reported as
-        // incomplete.
+        // incomplete. Decimal is not decoded yet, so it serves as the example.
         let data = BlockBuilder::new()
             .header(1, 1)
-            .column_header("id", "UUID")
+            .column_header("id", "Decimal(10, 2)")
             .build();
         assert!(matches!(
             block_end(&data, &DecodeOptions::default()),
@@ -1878,9 +1972,11 @@ mod tests {
 
     #[test]
     fn test_unsupported_type() {
+        // Decimal is not decoded yet, so it serves as the unsupported example
+        // now that UUID/IPv4/IPv6 are decoded.
         let data = BlockBuilder::new()
             .header(1, 1)
-            .column_header("id", "UUID")
+            .column_header("id", "Decimal(10, 2)")
             .build();
         assert!(matches!(
             decode_all_bytes(&data, &DecodeOptions::default()),
@@ -3150,6 +3246,421 @@ mod tests {
             .header(1, 3)
             .column_header("lc", "LowCardinality(UInt32)")
             .low_cardinality_u32(&[0, 13, 79], &[1, 2, 1], 1)
+            .build();
+
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len())
+        );
+        let truncated = &data[..data.len() - 1];
+        let err = block_end(truncated, &DecodeOptions::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::Io(ref e) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // UUID / IPv4 / IPv6
+    // -----------------------------------------------------------------------
+
+    /// The 16 wire bytes for RFC UUID `00112233-4455-6677-8899-aabbccddeeff`.
+    ///
+    /// ClickHouse `SerializationUUID` dumps the UInt128 POD (items[0] then
+    /// items[1], each little-endian on LE servers), which is NOT RFC-4122 byte
+    /// order. The wire->RFC mapping a binding applies is `rfc[i] = wire[7-i]` for
+    /// i in 0..7 and `rfc[i] = wire[23-i]` for i in 8..15 (reverse the first 8
+    /// bytes, reverse the last 8). The decoder itself does no reordering; these
+    /// are the bytes the server emits and the bytes the decoder must return.
+    /// Confirmed against the live server at v26.2.4.23-stable.
+    const UUID_00112233_WIRE: [u8; 16] = [
+        0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00, 0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99,
+        0x88,
+    ];
+
+    #[test]
+    fn test_parse_ch_type_uuid_ipv4_ipv6() {
+        assert_eq!(parse_ch_type("UUID"), Some(ChType::Uuid));
+        assert_eq!(parse_ch_type("IPv4"), Some(ChType::Ipv4));
+        assert_eq!(parse_ch_type("IPv6"), Some(ChType::Ipv6));
+    }
+
+    #[test]
+    fn test_ch_type_display_round_trips_uuid_ipv4_ipv6() {
+        for t in [ChType::Uuid, ChType::Ipv4, ChType::Ipv6] {
+            assert_eq!(parse_ch_type(&t.to_string()), Some(t.clone()));
+        }
+        assert_eq!(ChType::Uuid.to_string(), "UUID");
+        assert_eq!(ChType::Ipv4.to_string(), "IPv4");
+        assert_eq!(ChType::Ipv6.to_string(), "IPv6");
+    }
+
+    #[test]
+    fn test_decode_uuid_byte_order_passthrough() {
+        // Decode is raw passthrough: the 16 wire bytes for RFC UUID
+        // 00112233-4455-6677-8899-aabbccddeeff come back unchanged, in wire order
+        // (NOT RFC order). A binding applies the wire->RFC mapping; the core does
+        // not reorder. The second row is all-zero (the nil UUID).
+        let nil = [0u8; 16];
+        let data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("u", "UUID")
+            .fixed16_data(&[UUID_00112233_WIRE, nil])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Uuid(c) => {
+                assert_eq!(c.width, 16);
+                assert_eq!(c.len(), 2);
+                assert_eq!(c.value(0), UUID_00112233_WIRE);
+                assert_eq!(c.value(1), nil);
+            }
+            other => panic!("expected Uuid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_nullable_uuid() {
+        // Nullable(UUID): null map first, then the 16-byte rows (null rows still
+        // carry placeholder bytes on the wire).
+        let nil = [0u8; 16];
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("u", "Nullable(UUID)")
+            .null_map(&[false, true, false])
+            .fixed16_data(&[UUID_00112233_WIRE, nil, [0xffu8; 16]])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Uuid(c) => {
+                assert_eq!(c.len(), 3);
+                assert_eq!(c.null_count(), 1);
+                assert_eq!(c.value(0), UUID_00112233_WIRE);
+                assert_eq!(c.value(2), [0xffu8; 16]);
+            }
+            other => panic!("expected Uuid, got {other:?}"),
+        }
+        assert!(batch.column(0).validity().unwrap().is_valid(0));
+        assert!(!batch.column(0).validity().unwrap().is_valid(1));
+        assert!(batch.column(0).validity().unwrap().is_valid(2));
+    }
+
+    #[test]
+    fn test_decode_uuid_zero_rows() {
+        // A zero-row UUID block contributes the schema and an empty width-16
+        // column.
+        let data = BlockBuilder::new()
+            .header(1, 0)
+            .column_header("u", "UUID")
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_rows(), 0);
+        assert_eq!(cb.num_chunks(), 0);
+        assert_eq!(cb.schema.fields[0].ch_type, ChType::Uuid);
+    }
+
+    #[test]
+    fn test_multi_block_uuid_kept_as_chunks() {
+        // UUID blocks stay separate chunks, never concatenated.
+        let a = [0x01u8; 16];
+        let b = [0x02u8; 16];
+        let c = [0x03u8; 16];
+        let mut data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("u", "UUID")
+            .fixed16_data(&[a, b])
+            .build();
+        data.extend(
+            BlockBuilder::new()
+                .header(1, 1)
+                .column_header("u", "UUID")
+                .fixed16_data(&[c])
+                .build(),
+        );
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_chunks(), 2);
+        assert_eq!(cb.num_rows(), 3);
+        match cb.chunks[0].column(0) {
+            Column::Uuid(col) => {
+                assert_eq!(col.value(0), a);
+                assert_eq!(col.value(1), b);
+            }
+            other => panic!("expected Uuid, got {other:?}"),
+        }
+        match cb.chunks[1].column(0) {
+            Column::Uuid(col) => assert_eq!(col.value(0), c),
+            other => panic!("expected Uuid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_ipv4_plain() {
+        // IPv4 is a UInt32 in bulk; reading 4 LE bytes yields the standard IPv4
+        // numeric value (a<<24 | b<<16 | c<<8 | d). 192.0.2.235 = 3221226219.
+        let values = [0u32, 3221226219, 169090600, u32::MAX];
+        let data = BlockBuilder::new()
+            .header(1, values.len())
+            .column_header("ip", "IPv4")
+            .ipv4_data(&values)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Ipv4(c) => {
+                assert_eq!(c.values, vec![0, 3221226219, 169090600, u32::MAX]);
+                assert!(c.validity.is_none());
+            }
+            other => panic!("expected Ipv4, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_nullable_ipv4() {
+        // Nullable(IPv4): null map first, then the UInt32 payload.
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("ip", "Nullable(IPv4)")
+            .null_map(&[false, true, false])
+            .ipv4_data(&[3221226219, 0, 169090600])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Ipv4(c) => {
+                assert_eq!(c.null_count(), 1);
+                assert_eq!(c.values, vec![3221226219, 0, 169090600]);
+            }
+            other => panic!("expected Ipv4, got {other:?}"),
+        }
+        assert!(!batch.column(0).validity().unwrap().is_valid(1));
+    }
+
+    #[test]
+    fn test_decode_ipv4_zero_rows() {
+        let data = BlockBuilder::new()
+            .header(1, 0)
+            .column_header("ip", "IPv4")
+            .build();
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_rows(), 0);
+        assert_eq!(cb.num_chunks(), 0);
+        assert_eq!(cb.schema.fields[0].ch_type, ChType::Ipv4);
+    }
+
+    #[test]
+    fn test_multi_block_ipv4_kept_as_chunks() {
+        let mut data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("ip", "IPv4")
+            .ipv4_data(&[0, 3221226219])
+            .build();
+        data.extend(
+            BlockBuilder::new()
+                .header(1, 3)
+                .column_header("ip", "IPv4")
+                .ipv4_data(&[169090600, u32::MAX, 13])
+                .build(),
+        );
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_chunks(), 2);
+        assert_eq!(cb.num_rows(), 5);
+        match cb.chunks[0].column(0) {
+            Column::Ipv4(c) => assert_eq!(c.values, vec![0, 3221226219]),
+            other => panic!("expected Ipv4, got {other:?}"),
+        }
+        match cb.chunks[1].column(0) {
+            Column::Ipv4(c) => assert_eq!(c.values, vec![169090600, u32::MAX, 13]),
+            other => panic!("expected Ipv4, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_ipv6_plain() {
+        // IPv6 is 16 raw bytes in network byte order, passed through verbatim.
+        // 2001:db8::68 and the all-zero (::) address.
+        let db8: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x68,
+        ];
+        let unspecified = [0u8; 16];
+        let data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("ip", "IPv6")
+            .fixed16_data(&[db8, unspecified])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Ipv6(c) => {
+                assert_eq!(c.width, 16);
+                assert_eq!(c.len(), 2);
+                assert_eq!(c.value(0), db8);
+                assert_eq!(c.value(1), unspecified);
+            }
+            other => panic!("expected Ipv6, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_nullable_ipv6() {
+        let db8: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x68,
+        ];
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("ip", "Nullable(IPv6)")
+            .null_map(&[false, true, false])
+            .fixed16_data(&[db8, [0u8; 16], [0xffu8; 16]])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Ipv6(c) => {
+                assert_eq!(c.null_count(), 1);
+                assert_eq!(c.value(0), db8);
+                assert_eq!(c.value(2), [0xffu8; 16]);
+            }
+            other => panic!("expected Ipv6, got {other:?}"),
+        }
+        assert!(!batch.column(0).validity().unwrap().is_valid(1));
+    }
+
+    #[test]
+    fn test_decode_ipv6_zero_rows() {
+        let data = BlockBuilder::new()
+            .header(1, 0)
+            .column_header("ip", "IPv6")
+            .build();
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_rows(), 0);
+        assert_eq!(cb.num_chunks(), 0);
+        assert_eq!(cb.schema.fields[0].ch_type, ChType::Ipv6);
+    }
+
+    #[test]
+    fn test_multi_block_ipv6_kept_as_chunks() {
+        let a = [0x0au8; 16];
+        let b = [0x0bu8; 16];
+        let c = [0x0cu8; 16];
+        let mut data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("ip", "IPv6")
+            .fixed16_data(&[a, b])
+            .build();
+        data.extend(
+            BlockBuilder::new()
+                .header(1, 1)
+                .column_header("ip", "IPv6")
+                .fixed16_data(&[c])
+                .build(),
+        );
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_chunks(), 2);
+        assert_eq!(cb.num_rows(), 3);
+        match cb.chunks[1].column(0) {
+            Column::Ipv6(col) => assert_eq!(col.value(0), c),
+            other => panic!("expected Ipv6, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_low_cardinality_uuid() {
+        // UUID is a legal LowCardinality inner (unconditionally allowed by the
+        // server). The dictionary body is raw 16-byte UUID rows, decoded as a
+        // FixedBinary (width 16) values column via the shared per-type body. Slot
+        // 0 is the reserved default (all-zero); the per-row indexes start at 1.
+        let nil = [0u8; 16];
+        let one = [0x11u8; 16];
+        let dictionary = [nil, UUID_00112233_WIRE, one];
+        let indices = [1u64, 2, 1, 2];
+        let data = BlockBuilder::new()
+            .header(1, indices.len())
+            .column_header("u", "LowCardinality(UUID)")
+            .low_cardinality_fixed16(&dictionary, &indices, 1)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Dictionary(d) => {
+                assert_eq!(d.len(), 4);
+                assert!(d.validity.is_none());
+                assert_eq!(d.indices, vec![1, 2, 1, 2]);
+                match d.values.as_ref() {
+                    Column::Uuid(v) => {
+                        assert_eq!(v.width, 16);
+                        assert_eq!(v.len(), 3);
+                        assert_eq!(v.value(0), nil);
+                        assert_eq!(v.value(1), UUID_00112233_WIRE);
+                        assert_eq!(v.value(2), one);
+                        // Row 0 resolves to the 00112233... UUID, in wire order.
+                        assert_eq!(v.value(d.indices[0] as usize), UUID_00112233_WIRE);
+                    }
+                    other => panic!("expected Uuid dictionary values, got {other:?}"),
+                }
+            }
+            other => panic!("expected Dictionary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_low_cardinality_nullable_uuid() {
+        // LowCardinality(Nullable(UUID)): dictionary slot 0 is the NULL sentinel
+        // (all-zero on the wire). Rows whose index is 0 are null.
+        let nil = [0u8; 16];
+        let dictionary = [nil, UUID_00112233_WIRE, [0x22u8; 16]];
+        let indices = [1u64, 0, 2, 0];
+        let data = BlockBuilder::new()
+            .header(1, indices.len())
+            .column_header("u", "LowCardinality(Nullable(UUID))")
+            .low_cardinality_fixed16(&dictionary, &indices, 1)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Dictionary(d) => {
+                assert_eq!(d.null_count(), 2);
+                let bm = d.validity.as_ref().expect("nullable dictionary validity");
+                assert!(bm.is_valid(0));
+                assert!(!bm.is_valid(1));
+                assert!(bm.is_valid(2));
+                assert!(!bm.is_valid(3));
+                match d.values.as_ref() {
+                    Column::Uuid(v) => {
+                        assert_eq!(v.value(d.indices[0] as usize), UUID_00112233_WIRE)
+                    }
+                    other => panic!("expected Uuid values, got {other:?}"),
+                }
+            }
+            other => panic!("expected Dictionary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_block_end_scans_uuid_ipv4_ipv6() {
+        // The completeness scan must walk UUID (16/row), IPv4 (4/row), and IPv6
+        // (16/row) to the exact block end, and report a one-byte-short buffer as
+        // "need more bytes".
+        let data = BlockBuilder::new()
+            .header(3, 2)
+            .column_header("u", "UUID")
+            .fixed16_data(&[UUID_00112233_WIRE, [0u8; 16]])
+            .column_header("ip4", "IPv4")
+            .ipv4_data(&[3221226219, 0])
+            .column_header("ip6", "IPv6")
+            .fixed16_data(&[[0x20u8; 16], [0u8; 16]])
             .build();
 
         assert_eq!(

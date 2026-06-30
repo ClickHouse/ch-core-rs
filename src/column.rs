@@ -295,6 +295,14 @@ pub enum Column {
     DateTime64(PrimitiveColumn<i64>),
     Utf8(Utf8Column),
     FixedBinary(FixedBinaryColumn),
+    // IPv4 is a UInt32 on the wire (the standard IPv4 numeric form), decoded at
+    // its faithful native width like the other numerics. IPv6 and UUID are raw
+    // 16-byte blobs stored verbatim in a FixedBinaryColumn (width 16); the host
+    // value policy (in6_addr / uuid.UUID, any byte reordering) lives in the
+    // bindings, never here.
+    Ipv4(PrimitiveColumn<u32>),
+    Ipv6(FixedBinaryColumn),
+    Uuid(FixedBinaryColumn),
     Dictionary(DictionaryColumn),
 }
 
@@ -318,6 +326,9 @@ impl Column {
             Column::DateTime64(c) => c.len(),
             Column::Utf8(c) => c.len(),
             Column::FixedBinary(c) => c.len(),
+            Column::Ipv4(c) => c.len(),
+            Column::Ipv6(c) => c.len(),
+            Column::Uuid(c) => c.len(),
             Column::Dictionary(c) => c.len(),
         }
     }
@@ -345,6 +356,9 @@ impl Column {
             Column::DateTime64(c) => c.null_count(),
             Column::Utf8(c) => c.null_count(),
             Column::FixedBinary(c) => c.null_count(),
+            Column::Ipv4(c) => c.null_count(),
+            Column::Ipv6(c) => c.null_count(),
+            Column::Uuid(c) => c.null_count(),
             Column::Dictionary(c) => c.null_count(),
         }
     }
@@ -368,6 +382,9 @@ impl Column {
             Column::DateTime64(c) => c.validity.as_ref(),
             Column::Utf8(c) => c.validity.as_ref(),
             Column::FixedBinary(c) => c.validity.as_ref(),
+            Column::Ipv4(c) => c.validity.as_ref(),
+            Column::Ipv6(c) => c.validity.as_ref(),
+            Column::Uuid(c) => c.validity.as_ref(),
             Column::Dictionary(c) => c.validity.as_ref(),
         }
     }

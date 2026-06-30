@@ -228,6 +228,14 @@ fn arrow_format(ch_type: &ChType) -> String {
         }
         ChType::String => "u".into(),
         ChType::FixedString(n) => format!("w:{n}"),
+        // IPv4 is the standard UInt32 numeric value, exported as Arrow uint32
+        // (`I`), zero-copy like DateTime. IPv6 and UUID are raw 16-byte blobs,
+        // exported as Arrow fixed-size binary of width 16 (`w:16`). The bytes are
+        // verbatim wire bytes; this crate does not claim the `arrow.uuid`
+        // extension type. Any host value mapping is a binding concern.
+        ChType::Ipv4 => "I".into(),
+        ChType::Ipv6 => "w:16".into(),
+        ChType::Uuid => "w:16".into(),
         ChType::Nullable(inner) => arrow_format(inner),
         // A dictionary array's top-level format is the INDEX type. The value
         // type lives in the schema's `dictionary` child. Index width is
@@ -425,6 +433,17 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
             buffers.push(c.data.as_ptr() as *const c_void);
         }
         Column::FixedBinary(c) => {
+            match &c.validity {
+                Some(bm) => buffers.push(bm.as_bytes().as_ptr() as *const c_void),
+                None => buffers.push(ptr::null()),
+            }
+            buffers.push(c.data.as_ptr() as *const c_void);
+        }
+        // IPv4 is a uint32 primitive (validity, then values). UUID and IPv6 are
+        // width-16 fixed binary (validity, then the contiguous 16-byte rows),
+        // pushed exactly like the FixedString arm above.
+        Column::Ipv4(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
+        Column::Ipv6(c) | Column::Uuid(c) => {
             match &c.validity {
                 Some(bm) => buffers.push(bm.as_bytes().as_ptr() as *const c_void),
                 None => buffers.push(ptr::null()),
@@ -875,6 +894,118 @@ mod tests {
             let vals = *dict_array.buffers.add(1) as *const u32;
             assert_eq!(*vals.add(1), 13);
             assert_eq!(*vals.add(3), 4_294_967_295);
+            (array.release.unwrap())(&mut array);
+        }
+    }
+
+    #[test]
+    fn test_arrow_format_uuid_ipv4_ipv6() {
+        // IPv4 exports as Arrow uint32 (`I`), zero-copy. UUID and IPv6 export as
+        // Arrow fixed-size binary of width 16 (`w:16`); the crate emits plain
+        // `w:16`, not the `arrow.uuid` extension.
+        assert_eq!(arrow_format(&ChType::Ipv4), "I");
+        assert_eq!(arrow_format(&ChType::Uuid), "w:16");
+        assert_eq!(arrow_format(&ChType::Ipv6), "w:16");
+        // LowCardinality(UUID) exports as dictionary(i32, w:16): the field format
+        // is the index type `i` and the dictionary child carries `w:16`.
+        assert_eq!(
+            arrow_format(&ChType::LowCardinality(Box::new(ChType::Uuid))),
+            "i"
+        );
+    }
+
+    #[test]
+    fn test_export_uuid_ipv4_ipv6_schema_and_buffers() {
+        use crate::column::FixedBinaryColumn;
+
+        let schema = Schema::new(vec![
+            Field {
+                name: "ip4".into(),
+                ch_type: ChType::Ipv4,
+            },
+            Field {
+                name: "u".into(),
+                ch_type: ChType::Uuid,
+            },
+            Field {
+                name: "ip6".into(),
+                ch_type: ChType::Ipv6,
+            },
+        ]);
+        let uuid_bytes = vec![0xaau8; 32]; // 2 rows of width 16
+        let ip6_bytes = vec![0xbbu8; 32];
+        let columns = vec![
+            Column::Ipv4(PrimitiveColumn::new(vec![3221226219u32, 0])),
+            Column::Uuid(FixedBinaryColumn::new(uuid_bytes, 16)),
+            Column::Ipv6(FixedBinaryColumn::new(ip6_bytes, 16)),
+        ];
+        let batch = Arc::new(ColBatch::new(schema, columns, 2));
+
+        unsafe {
+            let mut schema_out: ArrowSchema = std::mem::zeroed();
+            export_schema(&batch.schema, &mut schema_out);
+
+            let c0 = &**schema_out.children.add(0);
+            assert_eq!(CStr::from_ptr(c0.format).to_str().unwrap(), "I");
+            let c1 = &**schema_out.children.add(1);
+            assert_eq!(CStr::from_ptr(c1.format).to_str().unwrap(), "w:16");
+            let c2 = &**schema_out.children.add(2);
+            assert_eq!(CStr::from_ptr(c2.format).to_str().unwrap(), "w:16");
+            (schema_out.release.unwrap())(&mut schema_out);
+
+            let mut array: ArrowArray = std::mem::zeroed();
+            export_batch_array(&batch, &mut array);
+
+            // IPv4: 2 buffers (validity, u32 values).
+            let a0 = &**array.children.add(0);
+            assert_eq!(a0.length, 2);
+            assert_eq!(a0.n_buffers, 2);
+            let ip4 = *a0.buffers.add(1) as *const u32;
+            assert_eq!(*ip4, 3221226219);
+
+            // UUID and IPv6: 2 buffers (validity, data), like FixedString.
+            let a1 = &**array.children.add(1);
+            assert_eq!(a1.length, 2);
+            assert_eq!(a1.n_buffers, 2);
+            let a2 = &**array.children.add(2);
+            assert_eq!(a2.length, 2);
+            assert_eq!(a2.n_buffers, 2);
+
+            (array.release.unwrap())(&mut array);
+        }
+    }
+
+    #[test]
+    fn test_export_low_cardinality_uuid_child_format() {
+        use crate::column::{DictionaryColumn, FixedBinaryColumn};
+
+        // LowCardinality(UUID) exports as dictionary(i32, w:16): field format `i`,
+        // dictionary child format `w:16`.
+        let schema = Schema::new(vec![Field {
+            name: "lc".into(),
+            ch_type: ChType::LowCardinality(Box::new(ChType::Uuid)),
+        }]);
+        let values = Column::Uuid(FixedBinaryColumn::new(vec![0u8; 48], 16)); // 3 entries
+        let dict = DictionaryColumn::new(vec![1, 2, 1], values);
+        let batch = Arc::new(ColBatch::new(schema, vec![Column::Dictionary(dict)], 3));
+
+        unsafe {
+            let mut schema_out: ArrowSchema = std::mem::zeroed();
+            export_schema(&batch.schema, &mut schema_out);
+            let c0 = &**schema_out.children.add(0);
+            assert_eq!(CStr::from_ptr(c0.format).to_str().unwrap(), "i");
+            assert!(!c0.dictionary.is_null(), "dictionary child present");
+            let dict_schema = &*c0.dictionary;
+            assert_eq!(CStr::from_ptr(dict_schema.format).to_str().unwrap(), "w:16");
+            (schema_out.release.unwrap())(&mut schema_out);
+
+            let mut array: ArrowArray = std::mem::zeroed();
+            export_batch_array(&batch, &mut array);
+            let c0 = &**array.children.add(0);
+            assert!(!c0.dictionary.is_null(), "dictionary child array present");
+            let dict_array = &*c0.dictionary;
+            assert_eq!(dict_array.length, 3, "dictionary holds 3 entries");
+            assert_eq!(dict_array.n_buffers, 2, "fixed binary: validity, data");
             (array.release.unwrap())(&mut array);
         }
     }

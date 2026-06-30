@@ -85,7 +85,22 @@ SELECT
     CAST(multiIf(n = 0, 19737, n = 1, 49710, n = 2, 19737, 0), 'LowCardinality(Date)') AS lc_date,
     -- LowCardinality(Nullable(UInt32)): rows 1 and 3 NULL (wire index 0), rows 0
     -- and 2 real values 13 and 79.
-    CAST(multiIf(n = 1, NULL, n = 3, NULL, n = 0, 13, 79), 'LowCardinality(Nullable(UInt32))') AS lcn_u32
+    CAST(multiIf(n = 1, NULL, n = 3, NULL, n = 0, 13, 79), 'LowCardinality(Nullable(UInt32))') AS lcn_u32,
+    -- UUID: 16 raw bytes, a POD dump of the UInt128 (NOT RFC-4122 byte order).
+    -- Row 1 uses the documented 00112233-4455-6677-8899-aabbccddeeff so the
+    -- committed bytes can be asserted exactly: on the wire that is
+    -- 77 66 55 44 33 22 11 00 ff ee dd cc bb aa 99 88. Row 0 is the nil UUID.
+    CAST(multiIf(n = 0, '00000000-0000-0000-0000-000000000000', n = 1, '00112233-4455-6677-8899-aabbccddeeff', n = 2, '10203040-5060-7080-90a0-b0c0d0e0f000', 'ffffffff-ffff-ffff-ffff-ffffffffffff'), 'UUID') AS uuid,
+    -- IPv4: a UInt32 on the wire (standard IPv4 numeric value). Decoded numbers:
+    -- 0, 3221226219 (192.0.2.235), 169090600 (10.20.30.40), 4294967295.
+    CAST(multiIf(n = 0, '0.0.0.0', n = 1, '192.0.2.235', n = 2, '10.20.30.40', '255.255.255.255'), 'IPv4') AS ipv4,
+    -- IPv6: 16 raw bytes in network byte order, passed through verbatim.
+    CAST(multiIf(n = 0, '::', n = 1, '2001:db8::68', n = 2, 'fe80::1', '::ffff:192.0.2.235'), 'IPv6') AS ipv6,
+    -- LowCardinality(UUID): UUID is an unconditional LowCardinality inner (the
+    -- allow_suspicious setting is not required for it, but is harmless). The
+    -- dictionary body is raw 16-byte UUID rows. Values repeat so the per-block
+    -- dictionary is smaller than the row count.
+    CAST(multiIf(n = 0, '00112233-4455-6677-8899-aabbccddeeff', n = 1, '10203040-5060-7080-90a0-b0c0d0e0f000', n = 2, '00112233-4455-6677-8899-aabbccddeeff', 'ffffffff-ffff-ffff-ffff-ffffffffffff'), 'LowCardinality(UUID)') AS lc_uuid
 FROM numbers(4)
 SETTINGS allow_suspicious_low_cardinality_types = 1
 FORMAT Native
