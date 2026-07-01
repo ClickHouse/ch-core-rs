@@ -9,14 +9,14 @@
 //! `src/Core/BlockInfo.cpp`, and `src/Processors/Formats/Impl/NativeFormat.cpp`
 //! at v26.6.1.1193-stable).
 //!
-//! Scope: this encodes the fixed-width numeric types (`Int8`..`Int64`,
-//! `UInt8`..`UInt64`, `Float32`, `Float64`), plus `String` and `FixedString(N)`.
-//! Every other column, and any `Nullable` wrapper, returns
-//! [`EncodeError::UnsupportedType`] until its encoder lands, the same
-//! one-type-at-a-time growth the decode path follows.
+//! Scope: this encodes `Bool`, the fixed-width numeric types (`Int8`..`Int64`,
+//! `UInt8`..`UInt64`, `Float32`, `Float64`), `String`, and `FixedString(N)`, each
+//! also inside a `Nullable(T)` wrapper (a per-row null map precedes the inner
+//! values). Every other column type returns [`EncodeError::UnsupportedType`] until
+//! its encoder lands, the same one-type-at-a-time growth the decode path follows.
 
 use crate::batch::{ChunkedBatch, ColBatch};
-use crate::column::{Column, FixedBinaryColumn, Utf8Column};
+use crate::column::{BoolColumn, Column, FixedBinaryColumn, Utf8Column};
 use crate::schema::{ChType, Field};
 
 use super::decode::DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION;
@@ -59,8 +59,8 @@ pub struct EncodeOptions {
 /// or a column type the encoder does not yet support.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EncodeError {
-    /// A column this encoder cannot yet write (an unsupported physical type, or a
-    /// `Nullable` wrapper before nullable-encode support lands). Grows narrower as
+    /// A column this encoder cannot yet write: an unsupported physical type, or a
+    /// `Nullable(T)` whose inner type is not yet encodable. Grows narrower as
     /// encode coverage catches up to decode coverage.
     UnsupportedType { column: String, ch_type: ChType },
     /// The batch is internally inconsistent: the column count does not match the
@@ -142,6 +142,41 @@ fn encode_block_into(
                     column.len()
                 ),
             });
+        }
+        // A `Nullable` column's validity bitmap is written verbatim as the per-row
+        // null map, so it must cover exactly `num_rows`. A `None` bitmap means
+        // all-valid and is fine. Validating here keeps `encode_null_map` infallible
+        // and its `is_valid` reads in range.
+        if matches!(field.ch_type, ChType::Nullable(_)) {
+            if let Some(validity) = column.validity() {
+                if validity.len() != num_rows {
+                    return Err(EncodeError::InconsistentBatch {
+                        detail: format!(
+                            "column {:?} declares {num_rows} rows but its validity bitmap covers {}",
+                            field.name,
+                            validity.len()
+                        ),
+                    });
+                }
+            }
+        }
+        // A `Bool` column is unpacked from its packed bitmap positionally, so the
+        // bitmap must hold at least `len.div_ceil(8)` bytes. `BoolColumn`'s fields
+        // are public and `ColBatch::new` only debug-asserts, so a release-mode
+        // caller could hand over a `len` that overruns the bitmap; reject it as an
+        // inconsistent batch rather than letting `encode_bool_data` panic.
+        if let Column::Bool(c) = column {
+            let needed = c.len.div_ceil(8);
+            if c.bitmap.len() < needed {
+                return Err(EncodeError::InconsistentBatch {
+                    detail: format!(
+                        "column {:?} declares {} bool rows but its bitmap holds only {} bytes ({needed} needed)",
+                        field.name,
+                        c.len,
+                        c.bitmap.len()
+                    ),
+                });
+            }
         }
     }
 
@@ -226,20 +261,65 @@ macro_rules! encode_primitive {
     }};
 }
 
-/// Encode one column's data body (no header) into `buf`.
+/// Encode one column into `buf` (no header): the `Nullable` null map if the
+/// declared type is a wrapper, then the value body.
 ///
-/// Matches on the `(ch_type, column)` pair so the on-wire type string (written
-/// from `field.ch_type`) and the body (written from the `Column` buffer) can
-/// never disagree. A supported numeric declared under a mismatched buffer variant
-/// (e.g. `Int64` paired with a `Column::Int32`) is an [`EncodeError::InconsistentBatch`],
-/// not a wrong-width column on the wire. A `Nullable` wrapper or any not-yet-supported
-/// type falls through to [`EncodeError::UnsupportedType`].
+/// A `Nullable(T)` is the inverse of [`super::decode::decode_column`]: the per-row
+/// null map is written first, then the inner type's body from the same physical
+/// column buffer, which carries the inner variant plus the validity bitmap. A
+/// plain type goes straight to its body.
 fn encode_column_data(
     buf: &mut Vec<u8>,
     field: &Field,
     column: &Column,
 ) -> Result<(), EncodeError> {
-    match (&field.ch_type, column) {
+    if let ChType::Nullable(inner) = &field.ch_type {
+        encode_null_map(buf, column);
+        return encode_column_body(buf, field, inner, column);
+    }
+    encode_column_body(buf, field, &field.ch_type, column)
+}
+
+/// Encode a `Nullable(T)` null map: one byte per row, 0x00 = valid, 0x01 = NULL,
+/// written before the inner values, the inverse of
+/// [`super::decode::decode_null_map`].
+///
+/// [`crate::bitmap::Bitmap::from_ch_null_map`] packs that per-row byte into the
+/// Arrow validity convention (bit 1 = valid), so here we unpack it and flip the
+/// polarity back: valid -> 0x00, NULL -> 0x01. A column with no validity bitmap is
+/// all-valid, so an all-zero map is written. The bitmap length is validated
+/// against `num_rows` in [`encode_block_into`] before any bytes are written, so
+/// `is_valid` cannot go out of range here.
+fn encode_null_map(buf: &mut Vec<u8>, column: &Column) {
+    let num_rows = column.len();
+    match column.validity() {
+        None => buf.resize(buf.len() + num_rows, 0x00),
+        Some(validity) => {
+            for row in 0..num_rows {
+                buf.push(u8::from(!validity.is_valid(row)));
+            }
+        }
+    }
+}
+
+/// Encode one column's value body (no header, no null map) into `buf`.
+///
+/// Matches on the `(ch_type, column)` pair so the on-wire type string (written
+/// from `field.ch_type`) and the body (written from the `Column` buffer) can
+/// never disagree. `ch_type` is the concrete value type: for a `Nullable(T)`
+/// column it is the already-unwrapped inner `T`, so a null map is never handled
+/// here. A supported type declared under a mismatched buffer variant (e.g.
+/// `Int64` paired with a `Column::Int32`) is an [`EncodeError::InconsistentBatch`],
+/// not a wrong-width column on the wire. Any not-yet-supported type falls through
+/// to [`EncodeError::UnsupportedType`].
+fn encode_column_body(
+    buf: &mut Vec<u8>,
+    field: &Field,
+    ch_type: &ChType,
+    column: &Column,
+) -> Result<(), EncodeError> {
+    match (ch_type, column) {
+        (ChType::Bool, Column::Bool(c)) => encode_bool_data(buf, c),
         (ChType::Int8, Column::Int8(c)) => encode_primitive!(buf, &c.values, i8),
         (ChType::Int16, Column::Int16(c)) => encode_primitive!(buf, &c.values, i16),
         (ChType::Int32, Column::Int32(c)) => encode_primitive!(buf, &c.values, i32),
@@ -254,9 +334,36 @@ fn encode_column_data(
         (ChType::FixedString(n), Column::FixedBinary(c)) => {
             encode_fixed_string_data(buf, field, c, *n)?
         }
-        _ => return Err(column_error(field)),
+        _ => return Err(column_error(field, ch_type)),
     }
     Ok(())
+}
+
+/// Encode a `Bool` column body: one byte per row, 0x00 = false, 0x01 = true, the
+/// inverse of [`BoolColumn::from_wire_bytes`] packing per-row bytes into the Arrow
+/// bitmap. Reads each bit back out LSB-first and writes the canonical 0/1 byte;
+/// the decoder treats any nonzero byte as true, but the server emits 0/1, so we do
+/// too.
+///
+/// Walks the packed bitmap one byte at a time rather than one row at a time, so
+/// the per-row `index / 8` and `index % 8` recompute is amortized to one shift per
+/// bit. [`encode_block_into`] validates `col.bitmap.len() >= col.len.div_ceil(8)`
+/// before any bytes are written, so every index read here is in range.
+fn encode_bool_data(buf: &mut Vec<u8>, col: &BoolColumn) {
+    buf.reserve(col.len);
+    let full_bytes = col.len / 8;
+    for &byte in &col.bitmap[..full_bytes] {
+        for bit in 0..8 {
+            buf.push((byte >> bit) & 1);
+        }
+    }
+    let trailing = col.len % 8;
+    if trailing > 0 {
+        let byte = col.bitmap[full_bytes];
+        for bit in 0..trailing {
+            buf.push((byte >> bit) & 1);
+        }
+    }
 }
 
 /// Encode a `String` column body: one varint length prefix then the raw value
@@ -305,13 +412,15 @@ fn encode_fixed_string_data(
 
 /// Classify a column that did not match any supported `(ch_type, column)` pair.
 ///
-/// If the declared type is one this encoder supports, the buffer must have been
-/// the wrong variant, so the type string and body would disagree: that is an
-/// [`EncodeError::InconsistentBatch`]. Otherwise the type itself is not yet
-/// supported (a `Nullable` wrapper, or a type whose encoder has not landed), which
-/// is an [`EncodeError::UnsupportedType`].
-fn column_error(field: &Field) -> EncodeError {
-    if is_encodable(&field.ch_type) {
+/// `ch_type` is the concrete value type the body match failed on (the unwrapped
+/// inner for a `Nullable(T)`). If that type is one this encoder supports, the
+/// buffer must have been the wrong variant, so the type string and body would
+/// disagree: that is an [`EncodeError::InconsistentBatch`]. Otherwise the type
+/// itself is not yet supported (a type whose encoder has not landed, possibly
+/// under a `Nullable` wrapper), which is an [`EncodeError::UnsupportedType`]
+/// reporting the full declared type.
+fn column_error(field: &Field, ch_type: &ChType) -> EncodeError {
+    if is_encodable(ch_type) {
         EncodeError::InconsistentBatch {
             detail: format!(
                 "column {:?} is declared {} but its buffer is a mismatched column variant",
@@ -326,15 +435,18 @@ fn column_error(field: &Field) -> EncodeError {
     }
 }
 
-/// The types this encoder can write. Encode coverage is kept a subset of decode
-/// coverage, and this predicate is the single place that lists it, so
-/// [`column_error`] can tell a wrong-buffer mismatch (`InconsistentBatch`) apart
-/// from a genuinely unsupported type (`UnsupportedType`). Extend it as each new
-/// type's arm lands in [`encode_column_data`].
+/// The concrete value types this encoder can write. Encode coverage is kept a
+/// subset of decode coverage, and this predicate is the single place that lists
+/// it, so [`column_error`] can tell a wrong-buffer mismatch (`InconsistentBatch`)
+/// apart from a genuinely unsupported type (`UnsupportedType`). It lists the
+/// unwrapped value types only; the `Nullable` wrapper composes with any type here
+/// via [`encode_null_map`]. Extend it as each new type's arm lands in
+/// [`encode_column_body`].
 fn is_encodable(ch_type: &ChType) -> bool {
     matches!(
         ch_type,
-        ChType::Int8
+        ChType::Bool
+            | ChType::Int8
             | ChType::Int16
             | ChType::Int32
             | ChType::Int64
@@ -352,6 +464,7 @@ fn is_encodable(ch_type: &ChType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bitmap::Bitmap;
     use crate::column::PrimitiveColumn;
     use crate::native::decode::{decode_all_bytes, DecodeOptions, DBMS_TCP_PROTOCOL_VERSION};
     use crate::schema::Schema;
@@ -469,6 +582,53 @@ mod tests {
         ColBatch::new(Schema::new(fields), columns, 4)
     }
 
+    /// A single `Bool` column over five rows (a non-multiple of 8 so the packed
+    /// bitmap's trailing partial byte is exercised).
+    fn bool_batch() -> ColBatch {
+        let fields = vec![Field {
+            name: "b".into(),
+            ch_type: ChType::Bool,
+        }];
+        let columns = vec![Column::Bool(BoolColumn::from_wire_bytes(&[1, 0, 1, 1, 0]))];
+        ColBatch::new(Schema::new(fields), columns, 5)
+    }
+
+    /// A `Nullable` numeric, string, and bool over four rows. The null pattern is
+    /// valid, null, valid, null, so the null map exercises both states and the
+    /// inner-value buffers still carry a (placeholder) value for the null rows.
+    fn nullable_batch() -> ColBatch {
+        // 0x00 = valid, 0x01 = null (ClickHouse null-map polarity).
+        let validity = || Bitmap::from_ch_null_map(&[0, 1, 0, 1]);
+        let fields = vec![
+            Field {
+                name: "ni32".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::Int32)),
+            },
+            Field {
+                name: "ns".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::String)),
+            },
+            Field {
+                name: "nb".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::Bool)),
+            },
+        ];
+        let mut ns = utf8_column(&[b"user_1", b"", b"user_2", b""]);
+        ns.validity = Some(validity());
+        let columns = vec![
+            Column::Int32(PrimitiveColumn::new_nullable(
+                vec![13, 0, 79, 0],
+                validity(),
+            )),
+            Column::Utf8(ns),
+            Column::Bool(BoolColumn::from_wire_bytes_nullable(
+                &[1, 0, 1, 0],
+                validity(),
+            )),
+        ];
+        ColBatch::new(Schema::new(fields), columns, 4)
+    }
+
     /// Compare two batches column by column for the types this encoder covers
     /// (the numerics, `String`, `FixedString`). Panics on any other variant so a
     /// wrong decode is loud.
@@ -487,6 +647,12 @@ mod tests {
                 };
             }
             match (a, b) {
+                (Column::Bool(x), Column::Bool(y)) => {
+                    assert_eq!(x.len, y.len, "column {i} bool len differs");
+                    for row in 0..x.len {
+                        assert_eq!(x.get(row), y.get(row), "column {i} bool row {row} differs");
+                    }
+                }
                 (Column::Int8(x), Column::Int8(y)) => eq!(x, y),
                 (Column::Int16(x), Column::Int16(y)) => eq!(x, y),
                 (Column::Int32(x), Column::Int32(y)) => eq!(x, y),
@@ -506,6 +672,26 @@ mod tests {
                     assert_eq!(x.data, y.data, "column {i} data differ");
                 }
                 (other_a, other_b) => panic!("column {i}: unexpected {other_a:?} vs {other_b:?}"),
+            }
+            // Validity (the null map) must survive the round-trip too. Both sides
+            // must agree on presence and on every row's valid/null bit.
+            match (a.validity(), b.validity()) {
+                (None, None) => {}
+                (Some(x), Some(y)) => {
+                    assert_eq!(x.len(), y.len(), "column {i} validity len differs");
+                    for row in 0..x.len() {
+                        assert_eq!(
+                            x.is_valid(row),
+                            y.is_valid(row),
+                            "column {i} validity row {row} differs"
+                        );
+                    }
+                }
+                (x, y) => panic!(
+                    "column {i} validity presence differs: {} vs {}",
+                    x.is_some(),
+                    y.is_some()
+                ),
             }
         }
     }
@@ -549,6 +735,26 @@ mod tests {
     #[test]
     fn roundtrip_strings_tcp_revision() {
         roundtrip(&string_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_bool_rev0() {
+        roundtrip(&bool_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_bool_tcp_revision() {
+        roundtrip(&bool_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_nullable_rev0() {
+        roundtrip(&nullable_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_nullable_tcp_revision() {
+        roundtrip(&nullable_batch(), DBMS_TCP_PROTOCOL_VERSION);
     }
 
     #[test]
@@ -682,38 +888,46 @@ mod tests {
     }
 
     #[test]
-    fn nullable_column_is_unsupported() {
+    fn nullable_unsupported_inner_is_unsupported() {
+        // `Nullable` is a supported wrapper now, but its inner type must also be
+        // encodable. `Date` is decoded yet not encodable, so `Nullable(Date)` is
+        // still rejected, and the reported type is the full `Nullable(Date)`.
         let batch = ColBatch::new(
             Schema::new(vec![Field {
-                name: "ni32".into(),
-                ch_type: ChType::Nullable(Box::new(ChType::Int32)),
+                name: "nd".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::Date)),
             }]),
-            vec![Column::Int32(PrimitiveColumn::new_nullable(
-                vec![13],
-                crate::bitmap::Bitmap::from_ch_null_map(&[0]),
+            vec![Column::Date(PrimitiveColumn::new_nullable(
+                vec![19000u16],
+                Bitmap::from_ch_null_map(&[0]),
             ))],
             1,
         );
-        let err = encode_block(&batch, &EncodeOptions::default()).unwrap_err();
-        assert!(matches!(err, EncodeError::UnsupportedType { .. }));
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::UnsupportedType { column, ch_type } => {
+                assert_eq!(column, "nd");
+                assert_eq!(ch_type, ChType::Nullable(Box::new(ChType::Date)));
+            }
+            other => panic!("expected UnsupportedType, got {other:?}"),
+        }
     }
 
     #[test]
     fn unsupported_type_reports_column_and_type() {
-        // `Bool` is decoded but not yet encodable, so it still reports
-        // UnsupportedType with the column name and type.
+        // `Date` is decoded but not yet encodable, so it reports UnsupportedType
+        // with the column name and type.
         let batch = ColBatch::new(
             Schema::new(vec![Field {
-                name: "b".into(),
-                ch_type: ChType::Bool,
+                name: "d".into(),
+                ch_type: ChType::Date,
             }]),
-            vec![Column::Bool(crate::column::BoolColumn::empty())],
+            vec![Column::Date(PrimitiveColumn::new(vec![]))],
             0,
         );
         match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
             EncodeError::UnsupportedType { column, ch_type } => {
-                assert_eq!(column, "b");
-                assert_eq!(ch_type, ChType::Bool);
+                assert_eq!(column, "d");
+                assert_eq!(ch_type, ChType::Date);
             }
             other => panic!("expected UnsupportedType, got {other:?}"),
         }
@@ -764,6 +978,108 @@ mod tests {
             b'r', b'o', b'a', b'd', // 4 raw bytes, no length prefix
         ];
         assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn rev0_frames_bool_bytes() {
+        // Pin the Bool body framing: one byte per row, 0x01 = true, 0x00 = false.
+        // One Bool column "b" over three rows: true, false, true.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "b".into(),
+                ch_type: ChType::Bool,
+            }]),
+            vec![Column::Bool(BoolColumn::from_wire_bytes(&[1, 0, 1]))],
+            3,
+        );
+        let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+        let expected = [
+            0x01, // num_cols = 1
+            0x03, // num_rows = 3
+            0x01, b'b', // name "b"
+            0x04, b'B', b'o', b'o', b'l', // type "Bool"
+            0x01, 0x00, 0x01, // one byte per row: true, false, true
+        ];
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn rev0_frames_nullable_bytes() {
+        // Pin the Nullable framing: the per-row null map (0x00 valid, 0x01 null)
+        // precedes the inner values. One Nullable(Int32) column "n" over two rows:
+        // 13 (valid), then a null row (inner value 0).
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "n".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::Int32)),
+            }]),
+            vec![Column::Int32(PrimitiveColumn::new_nullable(
+                vec![13, 0],
+                Bitmap::from_ch_null_map(&[0, 1]),
+            ))],
+            2,
+        );
+        let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+        let expected = [
+            0x01, // num_cols = 1
+            0x02, // num_rows = 2
+            0x01, b'n', // name "n"
+            0x0F, b'N', b'u', b'l', b'l', b'a', b'b', b'l', b'e', b'(', b'I', b'n', b't', b'3',
+            b'2', b')', // type "Nullable(Int32)"
+            0x00, 0x01, // null map: row 0 valid, row 1 null
+            0x0D, 0x00, 0x00, 0x00, // Int32 13, little-endian
+            0x00, 0x00, 0x00, 0x00, // Int32 placeholder for the null row
+        ];
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn nullable_validity_length_mismatch_is_rejected() {
+        // A Nullable column whose validity bitmap does not cover num_rows would
+        // write a null map of the wrong length; reject it as InconsistentBatch
+        // before any bytes are written.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "n".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::Int32)),
+            }]),
+            vec![Column::Int32(PrimitiveColumn::new_nullable(
+                vec![13, 79],
+                Bitmap::from_ch_null_map(&[0]), // covers one row, not two
+            ))],
+            2,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bool_bitmap_length_mismatch_is_rejected() {
+        // A Bool column whose `len` overruns its packed bitmap would panic when
+        // unpacked positionally; reject it as InconsistentBatch before any bytes
+        // are written. Construct the malformed column directly: `len` claims 100
+        // rows but the bitmap holds one byte (room for 8). Row count is consistent
+        // (`len` == num_rows), so it passes the row-count check and reaches the
+        // bitmap-length guard.
+        let col = BoolColumn {
+            bitmap: vec![0x01],
+            len: 100,
+            validity: None,
+        };
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "b".into(),
+                ch_type: ChType::Bool,
+            }]),
+            vec![Column::Bool(col)],
+            100,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
     }
 
     #[test]

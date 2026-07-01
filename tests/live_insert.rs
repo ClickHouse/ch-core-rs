@@ -27,7 +27,8 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use ch_core_rs::batch::ColBatch;
-use ch_core_rs::column::{Column, FixedBinaryColumn, PrimitiveColumn, Utf8Column};
+use ch_core_rs::bitmap::Bitmap;
+use ch_core_rs::column::{BoolColumn, Column, FixedBinaryColumn, PrimitiveColumn, Utf8Column};
 use ch_core_rs::native::decode::{decode_all_bytes, DecodeOptions};
 use ch_core_rs::native::encode::{encode_block, EncodeOptions};
 use ch_core_rs::schema::{ChType, Field, Schema};
@@ -58,9 +59,11 @@ fn fixed_binary_column(width: usize, values: &[&[u8]]) -> FixedBinaryColumn {
 }
 
 /// The batch to insert: every encodable type over four rows (the ten fixed-width
-/// numerics plus `String` and `FixedString(4)`). The `i32` column is strictly
-/// ascending so `ORDER BY i32` on read-back is deterministic and matches
-/// insertion order, which lets the string columns line up row-for-row too.
+/// numerics, `String`, `FixedString(4)`, `Bool`, and three `Nullable` columns).
+/// The `i32` column is strictly ascending so `ORDER BY i32` on read-back is
+/// deterministic and matches insertion order, which lets the other columns line up
+/// row-for-row too. The `Nullable` columns use the null pattern valid, null, valid,
+/// null so the server round-trips the null map, not just the values.
 fn sample_batch() -> ColBatch {
     let fields = vec![
         ("i8", ChType::Int8),
@@ -75,6 +78,10 @@ fn sample_batch() -> ColBatch {
         ("f64", ChType::Float64),
         ("s", ChType::String),
         ("fs", ChType::FixedString(4)),
+        ("b", ChType::Bool),
+        ("ni32", ChType::Nullable(Box::new(ChType::Int32))),
+        ("ns", ChType::Nullable(Box::new(ChType::String))),
+        ("nb", ChType::Nullable(Box::new(ChType::Bool))),
     ]
     .into_iter()
     .map(|(name, ch_type)| Field {
@@ -82,6 +89,11 @@ fn sample_batch() -> ColBatch {
         ch_type,
     })
     .collect();
+
+    // 0x00 = valid, 0x01 = null (ClickHouse null-map polarity): valid, null, valid, null.
+    let validity = || Bitmap::from_ch_null_map(&[0, 1, 0, 1]);
+    let mut ns = utf8_column(&[b"user_1", b"", b"user_2", b""]);
+    ns.validity = Some(validity());
 
     let columns = vec![
         Column::Int8(PrimitiveColumn::new(vec![i8::MIN, -13, 0, i8::MAX])),
@@ -98,6 +110,16 @@ fn sample_batch() -> ColBatch {
         Column::FixedBinary(fixed_binary_column(
             4,
             &[b"road", b"1234", b"\x00\x00\x00\x00", b"n\x00\x00\x00"],
+        )),
+        Column::Bool(BoolColumn::from_wire_bytes(&[1, 0, 1, 0])),
+        Column::Int32(PrimitiveColumn::new_nullable(
+            vec![13, 0, 79, 0],
+            validity(),
+        )),
+        Column::Utf8(ns),
+        Column::Bool(BoolColumn::from_wire_bytes_nullable(
+            &[1, 0, 1, 0],
+            validity(),
         )),
     ];
 
@@ -214,25 +236,37 @@ impl Server {
 }
 
 /// Gather every value of column `col` across all chunks, in chunk order, as a
-/// debug string, so the supported types can be compared uniformly.
+/// debug string, so the supported types can be compared uniformly. A null row
+/// renders as `"NULL"` regardless of the placeholder value in the buffer, so an
+/// inverted or dropped null map is caught, not just wrong values.
 fn column_repr(batch: &ch_core_rs::batch::ChunkedBatch, col: usize) -> Vec<String> {
     let mut out = Vec::new();
     for chunk in &batch.chunks {
-        match chunk.column(col) {
-            Column::Int8(c) => out.extend(c.values.iter().map(|v| v.to_string())),
-            Column::Int16(c) => out.extend(c.values.iter().map(|v| v.to_string())),
-            Column::Int32(c) => out.extend(c.values.iter().map(|v| v.to_string())),
-            Column::Int64(c) => out.extend(c.values.iter().map(|v| v.to_string())),
-            Column::UInt8(c) => out.extend(c.values.iter().map(|v| v.to_string())),
-            Column::UInt16(c) => out.extend(c.values.iter().map(|v| v.to_string())),
-            Column::UInt32(c) => out.extend(c.values.iter().map(|v| v.to_string())),
-            Column::UInt64(c) => out.extend(c.values.iter().map(|v| v.to_string())),
-            Column::Float32(c) => out.extend(c.values.iter().map(|v| v.to_bits().to_string())),
-            Column::Float64(c) => out.extend(c.values.iter().map(|v| v.to_bits().to_string())),
-            Column::Utf8(c) => out.extend((0..c.len()).map(|i| format!("{:?}", c.value(i)))),
-            Column::FixedBinary(c) => out.extend((0..c.len()).map(|i| format!("{:?}", c.value(i)))),
+        let column = chunk.column(col);
+        let mut vals: Vec<String> = match column {
+            Column::Int8(c) => c.values.iter().map(|v| v.to_string()).collect(),
+            Column::Int16(c) => c.values.iter().map(|v| v.to_string()).collect(),
+            Column::Int32(c) => c.values.iter().map(|v| v.to_string()).collect(),
+            Column::Int64(c) => c.values.iter().map(|v| v.to_string()).collect(),
+            Column::UInt8(c) => c.values.iter().map(|v| v.to_string()).collect(),
+            Column::UInt16(c) => c.values.iter().map(|v| v.to_string()).collect(),
+            Column::UInt32(c) => c.values.iter().map(|v| v.to_string()).collect(),
+            Column::UInt64(c) => c.values.iter().map(|v| v.to_string()).collect(),
+            Column::Float32(c) => c.values.iter().map(|v| v.to_bits().to_string()).collect(),
+            Column::Float64(c) => c.values.iter().map(|v| v.to_bits().to_string()).collect(),
+            Column::Bool(c) => (0..c.len()).map(|i| c.get(i).to_string()).collect(),
+            Column::Utf8(c) => (0..c.len()).map(|i| format!("{:?}", c.value(i))).collect(),
+            Column::FixedBinary(c) => (0..c.len()).map(|i| format!("{:?}", c.value(i))).collect(),
             other => panic!("unexpected column {col} variant: {other:?}"),
+        };
+        if let Some(validity) = column.validity() {
+            for (i, s) in vals.iter_mut().enumerate() {
+                if !validity.is_valid(i) {
+                    *s = "NULL".to_string();
+                }
+            }
         }
+        out.extend(vals);
     }
     out
 }
@@ -250,7 +284,9 @@ fn insert_roundtrips_through_server() {
          i8 Int8, i16 Int16, i32 Int32, i64 Int64, \
          u8 UInt8, u16 UInt16, u32 UInt32, u64 UInt64, \
          f32 Float32, f64 Float64, \
-         s String, fs FixedString(4)) ENGINE = Memory"
+         s String, fs FixedString(4), \
+         b Bool, \
+         ni32 Nullable(Int32), ns Nullable(String), nb Nullable(Bool)) ENGINE = Memory"
     ));
 
     // Encode at revision 0: HTTP INSERT parses the body with server_revision 0,
@@ -268,7 +304,7 @@ fn insert_roundtrips_through_server() {
     // crate. ORDER BY i32 is deterministic (i32 is strictly ascending), so the
     // decoded rows line up with the inserted rows.
     let native = server.select(&format!(
-        "SELECT i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, s, fs \
+        "SELECT i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, s, fs, b, ni32, ns, nb \
          FROM {TABLE} ORDER BY i32 FORMAT Native"
     ));
     let decoded = decode_all_bytes(
