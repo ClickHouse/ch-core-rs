@@ -20,17 +20,11 @@ use crate::batch::{ChunkedBatch, ColBatch};
 use crate::column::{BoolColumn, Column, FixedBinaryColumn, Utf8Column};
 use crate::schema::{ChType, Field};
 
-use super::decode::DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION;
+use super::decode::{
+    parse_ch_type, DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION,
+    DBMS_MIN_REVISION_WITH_OUT_OF_ORDER_BUCKETS,
+};
 use super::varint::write_varint;
-
-/// Protocol revision at which a data block's `BlockInfo` carries the
-/// `out_of_order_buckets` field (server
-/// `DBMS_MIN_REVISION_WITH_OUT_OF_ORDER_BUCKETS_IN_AGGREGATION` in
-/// `src/Core/ProtocolDefines.h`). At or above it, `BlockInfo::write` emits field
-/// 3 with an empty vector for a plain data block, so the encoder does too, to
-/// stay byte-identical to the server writer and to round-trip through the
-/// decoder's `read_block_info`.
-const DBMS_MIN_REVISION_WITH_OUT_OF_ORDER_BUCKETS: u64 = 54480;
 
 /// Options for Native format encoding, the mirror of
 /// [`super::decode::DecodeOptions`].
@@ -89,6 +83,12 @@ impl std::error::Error for EncodeError {}
 /// The result is a complete, standalone Native block: the optional `BlockInfo`
 /// preamble, the column and row counts, then each column's header and data. It is
 /// exactly what [`super::decode::decode_next_block`] reads at the same revision.
+///
+/// A not-yet-encodable column type is rejected at every row count, including zero.
+/// This is deliberately asymmetric with the decoder, whose `empty_column` builds an
+/// empty column for any decodable type in a zero-row block: encode coverage is a
+/// subset of decode coverage, and the encoder fails fast and consistently rather
+/// than emitting a header for a type it cannot write rows of.
 pub fn encode_block(batch: &ColBatch, options: &EncodeOptions) -> Result<Vec<u8>, EncodeError> {
     let mut buf = Vec::new();
     encode_block_into(&mut buf, batch, options)?;
@@ -109,19 +109,44 @@ pub fn encode_chunked(
     batch: &ChunkedBatch,
     options: &EncodeOptions,
 ) -> Result<Vec<u8>, EncodeError> {
+    // Validate every chunk before writing anything: each chunk must carry the
+    // batch's schema (an inconsistent chunk would encode a stream the server
+    // rejects mid-insert) and pass its own per-column checks. Doing this up front
+    // means a rejected `ChunkedBatch` leaves no partial stream behind.
+    for (i, chunk) in batch.chunks.iter().enumerate() {
+        if chunk.schema != batch.schema {
+            return Err(EncodeError::InconsistentBatch {
+                detail: format!("chunk {i} schema differs from the batch schema"),
+            });
+        }
+        validate_block(chunk)?;
+    }
     let mut buf = Vec::new();
     for chunk in &batch.chunks {
-        encode_block_into(&mut buf, chunk, options)?;
+        write_block_into(&mut buf, chunk, options)?;
     }
     Ok(buf)
 }
 
 /// Append one framed Native block for `batch` to `buf`.
+///
+/// [`validate_block`] runs fully before any bytes are written, so a rejected batch
+/// leaves `buf` untouched and [`write_block_into`] cannot fail on a structural
+/// problem it already checked.
 fn encode_block_into(
     buf: &mut Vec<u8>,
     batch: &ColBatch,
     options: &EncodeOptions,
 ) -> Result<(), EncodeError> {
+    validate_block(batch)?;
+    write_block_into(buf, batch, options)
+}
+
+/// Validate that `batch` can be encoded, without writing anything. Every rejection
+/// condition lives here, so a caller can validate a whole [`ChunkedBatch`] up front
+/// (see [`encode_chunked`]) and then write every block knowing none will fail
+/// partway and leave a partial stream.
+fn validate_block(batch: &ColBatch) -> Result<(), EncodeError> {
     let num_cols = batch.schema.num_fields();
     if num_cols != batch.columns.len() {
         return Err(EncodeError::InconsistentBatch {
@@ -131,68 +156,245 @@ fn encode_block_into(
             ),
         });
     }
-    let num_rows = batch.num_rows;
-    // Validate every column before writing any bytes, so a rejected batch leaves
-    // `buf` unchanged rather than half-written.
     for (field, column) in batch.schema.fields.iter().zip(&batch.columns) {
-        if column.len() != num_rows {
+        validate_column(field, column, batch.num_rows)?;
+    }
+    Ok(())
+}
+
+/// Validate one column against its field and the block row count.
+///
+/// All per-column rejection logic is here so [`write_block_into`] is structurally
+/// infallible once validation passes. Runs at every row count, including zero: a
+/// not-yet-encodable type is rejected even in a zero-row block (see the note on
+/// [`encode_block`]).
+fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<(), EncodeError> {
+    // Row count: the column must carry exactly the rows the block declares.
+    if column.len() != num_rows {
+        return Err(EncodeError::InconsistentBatch {
+            detail: format!(
+                "column {:?} has {} rows but the block declares {num_rows}",
+                field.name,
+                column.len()
+            ),
+        });
+    }
+
+    // The concrete value type is the inner of a `Nullable`, else the type itself.
+    let value_type = field.ch_type.inner();
+
+    // Supported, matching (type, buffer) pair. A not-yet-encodable type, or a
+    // supported type under a mismatched buffer variant, is rejected here rather
+    // than during the write, so a rejected batch never leaves partial bytes. This
+    // runs before the round-trip check below so a genuinely unsupported type is
+    // reported as `UnsupportedType`, not misclassified as a bad-type-string
+    // `InconsistentBatch` when its rendered string also fails to round-trip (e.g.
+    // `Decimal { precision: 100, .. }`).
+    if !column_variant_matches(value_type, column) {
+        return Err(column_error(field, value_type));
+    }
+
+    // The rendered type string must round-trip through the decoder's parser. Some
+    // `ChType`s are constructible that render a header this crate's own parser and
+    // the server reject (`FixedString(0)`, a `DateTime64` precision above 9, a
+    // timezone whose bytes break the type grammar); catching it here fails at the
+    // source rather than letting `decode(encode(x))` fail downstream. Reached only
+    // for an encodable, buffer-matched type, so any failure is a bad parameter on a
+    // supported type, which `InconsistentBatch` describes correctly. This validates
+    // the type inside a `Nullable` wrapper too, since `Display`/`parse` are total on
+    // the wrapper.
+    let rendered = field.ch_type.to_string();
+    if parse_ch_type(&rendered).as_ref() != Some(&field.ch_type) {
+        return Err(EncodeError::InconsistentBatch {
+            detail: format!(
+                "column {:?} type {rendered} does not round-trip through the type parser; the server would reject this header",
+                field.name
+            ),
+        });
+    }
+
+    // The round-trip check above does NOT catch a `DateTime`/`DateTime64` timezone
+    // that contains a single quote. `ChType::Display` renders the timezone
+    // unescaped (`DateTime('{tz}')`), and `strip_quotes` on decode only strips the
+    // outer pair, so a timezone like `UTC')` renders `DateTime('UTC')')` and the
+    // crate's own lenient parser recovers the same timezone, passing the round-trip.
+    // But that header closes its quote early and is syntactically broken for the
+    // server. A valid IANA timezone name never contains a quote, so reject one here.
+    if let ChType::DateTime { timezone: Some(tz) }
+    | ChType::DateTime64 {
+        timezone: Some(tz), ..
+    } = value_type
+    {
+        if tz.contains('\'') {
             return Err(EncodeError::InconsistentBatch {
                 detail: format!(
-                    "column {:?} has {} rows but the block declares {num_rows}",
-                    field.name,
-                    column.len()
+                    "column {:?} timezone {tz:?} contains a quote, which renders a malformed type header the server rejects",
+                    field.name
                 ),
             });
         }
-        // A `Nullable` column's validity bitmap is written verbatim as the per-row
-        // null map, so it must cover exactly `num_rows`. A `None` bitmap means
-        // all-valid and is fine. Validating here keeps `encode_null_map` infallible
-        // and its `is_valid` reads in range.
-        if matches!(field.ch_type, ChType::Nullable(_)) {
-            if let Some(validity) = column.validity() {
-                if validity.len() != num_rows {
-                    return Err(EncodeError::InconsistentBatch {
-                        detail: format!(
-                            "column {:?} declares {num_rows} rows but its validity bitmap covers {}",
-                            field.name,
-                            validity.len()
-                        ),
-                    });
-                }
-            }
+    }
+
+    // Any present validity bitmap must have a backing buffer long enough for its
+    // own bit length. `Bitmap::from_raw` is `pub` and only debug-asserts this, so a
+    // release-mode caller could hand over a short buffer that would then panic when
+    // `null_count()` counts it below or `encode_null_map` unpacks it. Reject it, the
+    // same way the `Bool` bitmap is guarded further down.
+    if let Some(validity) = column.validity() {
+        let needed = validity.len().div_ceil(8);
+        if validity.as_bytes().len() < needed {
+            return Err(EncodeError::InconsistentBatch {
+                detail: format!(
+                    "column {:?} validity bitmap covers {} rows but its buffer holds only {} bytes ({needed} needed)",
+                    field.name,
+                    validity.len(),
+                    validity.as_bytes().len()
+                ),
+            });
         }
-        // A `Bool` column is unpacked from its packed bitmap positionally, so the
-        // bitmap must hold at least `len.div_ceil(8)` bytes. `BoolColumn`'s fields
-        // are public and `ColBatch::new` only debug-asserts, so a release-mode
-        // caller could hand over a `len` that overruns the bitmap; reject it as an
-        // inconsistent batch rather than letting `encode_bool_data` panic.
-        if let Column::Bool(c) = column {
-            let needed = c.len.div_ceil(8);
-            if c.bitmap.len() < needed {
+    }
+
+    // Nullability. A `Nullable` field writes a per-row null map from the validity
+    // bitmap, so the bitmap (when present) must cover exactly `num_rows`; this also
+    // keeps `encode_null_map`'s reads in range. A non-`Nullable` field writes no
+    // null map, so a null in its validity bitmap would be silently dropped and the
+    // row's placeholder value encoded as real data; reject that.
+    if matches!(field.ch_type, ChType::Nullable(_)) {
+        if let Some(validity) = column.validity() {
+            if validity.len() != num_rows {
                 return Err(EncodeError::InconsistentBatch {
                     detail: format!(
-                        "column {:?} declares {} bool rows but its bitmap holds only {} bytes ({needed} needed)",
+                        "column {:?} declares {num_rows} rows but its validity bitmap covers {}",
                         field.name,
-                        c.len,
-                        c.bitmap.len()
+                        validity.len()
                     ),
                 });
             }
         }
+    } else if column.null_count() > 0 {
+        return Err(EncodeError::InconsistentBatch {
+            detail: format!(
+                "column {:?} is not Nullable but its validity bitmap marks {} rows null; the null map is not written, so those rows would encode a placeholder value as real data",
+                field.name,
+                column.null_count()
+            ),
+        });
     }
 
+    // A `Bool` column is unpacked from its packed bitmap positionally, so the
+    // bitmap must hold at least `len.div_ceil(8)` bytes. `BoolColumn`'s fields are
+    // public and `ColBatch::new` only debug-asserts, so a release-mode caller could
+    // hand over a `len` that overruns the bitmap; reject it rather than let
+    // `encode_bool_data` panic.
+    if let Column::Bool(c) = column {
+        let needed = c.len.div_ceil(8);
+        if c.bitmap.len() < needed {
+            return Err(EncodeError::InconsistentBatch {
+                detail: format!(
+                    "column {:?} declares {} bool rows but its bitmap holds only {} bytes ({needed} needed)",
+                    field.name,
+                    c.len,
+                    c.bitmap.len()
+                ),
+            });
+        }
+    }
+
+    // A `FixedString(N)` body is the contiguous `N * num_rows` data buffer written
+    // verbatim, with no per-row framing, so the reader consumes exactly `N` bytes
+    // per row. `FixedBinaryColumn::len()` is `data.len() / width` (truncating), so a
+    // buffer whose length is not exactly `N * num_rows` still reports `num_rows`
+    // rows and passes the row-count check above, yet would put a different number of
+    // bytes on the wire: a silently misframed stream. The stored `width` must also
+    // equal the declared `N`, or a truthful type string would sit over a
+    // wrong-bytes-per-row body.
+    if let (ChType::FixedString(width), Column::FixedBinary(c)) = (value_type, column) {
+        if c.width != *width {
+            return Err(EncodeError::InconsistentBatch {
+                detail: format!(
+                    "column {:?} is declared FixedString({width}) but its buffer stores {}-byte rows",
+                    field.name, c.width
+                ),
+            });
+        }
+        if width.checked_mul(num_rows) != Some(c.data.len()) {
+            return Err(EncodeError::InconsistentBatch {
+                detail: format!(
+                    "column {:?} is FixedString({width}) over {num_rows} rows so its body must be {} bytes, but the buffer holds {}",
+                    field.name,
+                    width.saturating_mul(num_rows),
+                    c.data.len()
+                ),
+            });
+        }
+    }
+
+    // A `String` body is written by slicing `data[offsets[i]..offsets[i+1]]` per
+    // row. Validate the Arrow offset invariants so a hand-built column cannot make
+    // that slice panic or silently drop leading/trailing bytes.
+    if let (ChType::String, Column::Utf8(c)) = (value_type, column) {
+        validate_utf8_column(field, c, num_rows)?;
+    }
+
+    Ok(())
+}
+
+/// Whether `value_type` (the unwrapped inner value type) and `column` form a
+/// supported, matching pair this encoder can write.
+///
+/// This must list exactly the matching arms of [`encode_column_body`]; keep the two
+/// in sync the same way [`is_encodable`] is. [`validate_column`] uses it to reject a
+/// wrong-buffer or not-yet-encodable column before any bytes are written, which is
+/// what lets [`write_block_into`] treat the body match as structurally infallible.
+fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
+    matches!(
+        (value_type, column),
+        (ChType::Bool, Column::Bool(_))
+            | (ChType::Int8, Column::Int8(_))
+            | (ChType::Int16, Column::Int16(_))
+            | (ChType::Int32, Column::Int32(_))
+            | (ChType::Int64, Column::Int64(_))
+            | (ChType::UInt8, Column::UInt8(_))
+            | (ChType::UInt16, Column::UInt16(_))
+            | (ChType::UInt32, Column::UInt32(_))
+            | (ChType::UInt64, Column::UInt64(_))
+            | (ChType::Float32, Column::Float32(_))
+            | (ChType::Float64, Column::Float64(_))
+            | (ChType::Date, Column::Date(_))
+            | (ChType::Date32, Column::Date32(_))
+            | (ChType::DateTime { .. }, Column::DateTime(_))
+            | (ChType::DateTime64 { .. }, Column::DateTime64(_))
+            | (ChType::String, Column::Utf8(_))
+            | (ChType::FixedString(_), Column::FixedBinary(_))
+    )
+}
+
+/// Write one framed Native block for `batch` to `buf`.
+///
+/// Assumes `batch` has passed [`validate_block`]: the type string round-trips, and
+/// the `(type, buffer)` pair matches a real arm of [`encode_column_body`], so no
+/// structural error can occur partway through the write. The `Result` is retained
+/// only for the defensive fall-through in [`encode_column_body`], which cannot fire
+/// after validation, so this keeps the encoder panic-free without a partial-stream
+/// window in practice.
+fn write_block_into(
+    buf: &mut Vec<u8>,
+    batch: &ColBatch,
+    options: &EncodeOptions,
+) -> Result<(), EncodeError> {
     // BlockInfo preamble, only at revision > 0 (server `NativeWriter::write` gates
     // `block.info.write` on `client_revision > 0`).
     if options.protocol_revision > 0 {
         write_block_info(buf, options.protocol_revision);
     }
-    write_varint(buf, num_cols as u64);
-    write_varint(buf, num_rows as u64);
+    write_varint(buf, batch.schema.num_fields() as u64);
+    write_varint(buf, batch.num_rows as u64);
 
     for (field, column) in batch.schema.fields.iter().zip(&batch.columns) {
         write_string(buf, field.name.as_bytes());
-        // The type string is the canonical name `ChType::Display` renders, the
-        // same string `parse_ch_type` accepts on decode.
+        // The type string is the canonical name `ChType::Display` renders, the same
+        // string `parse_ch_type` accepts on decode; `validate_block` confirmed it
+        // round-trips.
         write_string(buf, field.ch_type.to_string().as_bytes());
         // Custom-serialization marker: one byte, 0 = default serialization,
         // written for every column even at zero rows, present only at
@@ -288,16 +490,34 @@ fn encode_column_data(
 /// [`crate::bitmap::Bitmap::from_ch_null_map`] packs that per-row byte into the
 /// Arrow validity convention (bit 1 = valid), so here we unpack it and flip the
 /// polarity back: valid -> 0x00, NULL -> 0x01. A column with no validity bitmap is
-/// all-valid, so an all-zero map is written. The bitmap length is validated
-/// against `num_rows` in [`encode_block_into`] before any bytes are written, so
-/// `is_valid` cannot go out of range here.
+/// all-valid, so an all-zero map is written. The bitmap length is validated against
+/// `num_rows` in [`validate_column`] before any bytes are written, so every byte
+/// read here is in range.
+///
+/// Walks the packed validity bitmap one byte at a time rather than one row at a
+/// time (the same shape as [`encode_bool_data`] and the inverse of
+/// [`crate::bitmap::Bitmap::from_ch_null_map`]), so the per-row `index / 8` and
+/// `index % 8` recompute is amortized to one shift per bit.
 fn encode_null_map(buf: &mut Vec<u8>, column: &Column) {
     let num_rows = column.len();
+    buf.reserve(num_rows);
     match column.validity() {
         None => buf.resize(buf.len() + num_rows, 0x00),
         Some(validity) => {
-            for row in 0..num_rows {
-                buf.push(u8::from(!validity.is_valid(row)));
+            let bytes = validity.as_bytes();
+            let full_bytes = num_rows / 8;
+            for &byte in &bytes[..full_bytes] {
+                for bit in 0..8 {
+                    // Arrow bit 1 = valid; the null map is 0x01 = NULL, so flip.
+                    buf.push(((byte >> bit) & 1) ^ 1);
+                }
+            }
+            let trailing = num_rows % 8;
+            if trailing > 0 {
+                let byte = bytes[full_bytes];
+                for bit in 0..trailing {
+                    buf.push(((byte >> bit) & 1) ^ 1);
+                }
             }
         }
     }
@@ -342,9 +562,12 @@ fn encode_column_body(
             encode_primitive!(buf, &c.values, i64)
         }
         (ChType::String, Column::Utf8(c)) => encode_string_data(buf, c),
-        (ChType::FixedString(n), Column::FixedBinary(c)) => {
-            encode_fixed_string_data(buf, field, c, *n)?
-        }
+        (ChType::FixedString(_), Column::FixedBinary(c)) => encode_fixed_string_data(buf, c),
+        // Defensive: `validate_column` rejects every unsupported type and every
+        // mismatched `(type, buffer)` pair before the write phase, so this arm
+        // cannot occur for a validated batch. It returns the same error validation
+        // would rather than panic, so the encoder stays panic-free even if a caller
+        // reaches `encode_column_body` without validating first.
         _ => return Err(column_error(field, ch_type)),
     }
     Ok(())
@@ -358,8 +581,8 @@ fn encode_column_body(
 ///
 /// Walks the packed bitmap one byte at a time rather than one row at a time, so
 /// the per-row `index / 8` and `index % 8` recompute is amortized to one shift per
-/// bit. [`encode_block_into`] validates `col.bitmap.len() >= col.len.div_ceil(8)`
-/// before any bytes are written, so every index read here is in range.
+/// bit. [`validate_column`] checks `col.bitmap.len() >= col.len.div_ceil(8)` before
+/// any bytes are written, so every index read here is in range.
 fn encode_bool_data(buf: &mut Vec<u8>, col: &BoolColumn) {
     buf.reserve(col.len);
     let full_bytes = col.len / 8;
@@ -377,6 +600,83 @@ fn encode_bool_data(buf: &mut Vec<u8>, col: &BoolColumn) {
     }
 }
 
+/// Validate a `Utf8Column`'s Arrow offsets before its body is written.
+///
+/// [`encode_string_data`] slices `data[offsets[i]..offsets[i+1]]` per row, so a
+/// caller-constructed column with non-monotonic offsets, an offset past
+/// `data.len()`, or a negative offset (which `as usize` wraps to a huge value)
+/// would panic mid-write, and offsets that do not cover `data` exactly would
+/// silently drop leading or trailing bytes from the wire. `Column` fields are
+/// public and bindings build these by hand for the insert path, so reject all of
+/// these as [`EncodeError::InconsistentBatch`] here rather than trust the buffer.
+/// This is O(num_rows) once per column, off the per-byte write path.
+fn validate_utf8_column(
+    field: &Field,
+    col: &Utf8Column,
+    num_rows: usize,
+) -> Result<(), EncodeError> {
+    let reject = |detail: String| Err(EncodeError::InconsistentBatch { detail });
+
+    // A zero-row column carries no data and either the single sentinel `[0]` (what
+    // the decoder emits) or no offsets at all. Accept both, reject anything else.
+    if num_rows == 0 {
+        let well_formed_empty =
+            col.data.is_empty() && (col.offsets.is_empty() || col.offsets == [0]);
+        if well_formed_empty {
+            return Ok(());
+        }
+        return reject(format!(
+            "column {:?} declares 0 rows but carries {} offsets and {} data bytes",
+            field.name,
+            col.offsets.len(),
+            col.data.len()
+        ));
+    }
+
+    // Arrow layout: one offset per row plus a trailing end offset. This is already
+    // implied by the `column.len() == num_rows` check earlier in `validate_column`
+    // (`Utf8Column::len()` is `offsets.len() - 1`), but assert it explicitly so the
+    // `offsets[num_rows]` index below is in range regardless of check ordering.
+    if col.offsets.len() != num_rows + 1 {
+        return reject(format!(
+            "column {:?} declares {num_rows} rows so it needs {} offsets, but carries {}",
+            field.name,
+            num_rows + 1,
+            col.offsets.len()
+        ));
+    }
+    // Offsets must start at 0 (Arrow convention) and be monotonic non-decreasing.
+    // Checking monotonicity from a zero start also proves every offset is
+    // non-negative, so the `as usize` casts in `encode_string_data` cannot wrap.
+    if col.offsets[0] != 0 {
+        return reject(format!(
+            "column {:?} has a nonzero first offset {}; Arrow string offsets start at 0",
+            field.name, col.offsets[0]
+        ));
+    }
+    for pair in col.offsets.windows(2) {
+        if pair[1] < pair[0] {
+            return reject(format!(
+                "column {:?} has non-monotonic offsets ({} then {})",
+                field.name, pair[0], pair[1]
+            ));
+        }
+    }
+    // The final offset must cover the data buffer exactly: a smaller value would
+    // leave trailing bytes that never reach the wire (silent data loss), a larger
+    // one would slice out of bounds. `offsets[0] == 0` and monotonicity above make
+    // this final offset non-negative, so the cast is sound.
+    let end = col.offsets[num_rows];
+    if end as usize != col.data.len() {
+        return reject(format!(
+            "column {:?} offsets end at {end} but the data buffer holds {} bytes",
+            field.name,
+            col.data.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Encode a `String` column body: one varint length prefix then the raw value
 /// bytes, per row, the inverse of [`super::decode::decode_string_data`].
 ///
@@ -385,10 +685,14 @@ fn encode_bool_data(buf: &mut Vec<u8>, col: &BoolColumn) {
 /// bytes are copied exactly once. A zero-row column has `offsets == [0]`, so
 /// `windows(2)` yields nothing and no body is written.
 fn encode_string_data(buf: &mut Vec<u8>, col: &Utf8Column) {
+    // One varint length prefix (>= 1 byte) per value plus the value bytes, so this
+    // is a tight lower bound on the body size and avoids reallocating for the
+    // common short-string case.
+    buf.reserve(col.data.len() + col.offsets.len());
+    // `validate_column` validated these offsets via `validate_utf8_column`: they
+    // start at 0, are monotonic non-decreasing, and end at `data.len()`, so every
+    // sub-slice is in range and the `as usize` casts cannot wrap.
     for pair in col.offsets.windows(2) {
-        // Offsets are monotonic and bounded by `data.len()` for any column this
-        // crate produces (the decoder builds them that way and they are not wire
-        // input), so the slice is always in range.
         let value = &col.data[pair[0] as usize..pair[1] as usize];
         write_varint(buf, value.len() as u64);
         buf.extend_from_slice(value);
@@ -400,25 +704,11 @@ fn encode_string_data(buf: &mut Vec<u8>, col: &Utf8Column) {
 /// [`super::decode::decode_fixed_binary_data`]. There is no per-row framing; the
 /// width lives only in the type string.
 ///
-/// The column's stored `width` must equal the declared `N`. A mismatch would put
-/// a body with the wrong bytes-per-row under a truthful type string, so it is an
-/// [`EncodeError::InconsistentBatch`] rather than a corrupt wire column.
-fn encode_fixed_string_data(
-    buf: &mut Vec<u8>,
-    field: &Field,
-    col: &FixedBinaryColumn,
-    declared_width: usize,
-) -> Result<(), EncodeError> {
-    if col.width != declared_width {
-        return Err(EncodeError::InconsistentBatch {
-            detail: format!(
-                "column {:?} is declared FixedString({declared_width}) but its buffer stores {}-byte rows",
-                field.name, col.width
-            ),
-        });
-    }
+/// [`validate_column`] already confirmed `col.width == N` and
+/// `col.data.len() == N * num_rows`, so the buffer is exactly the wire body and
+/// this is a single verbatim copy.
+fn encode_fixed_string_data(buf: &mut Vec<u8>, col: &FixedBinaryColumn) {
     buf.extend_from_slice(&col.data);
-    Ok(())
 }
 
 /// Classify a column that did not match any supported `(ch_type, column)` pair.
@@ -1210,6 +1500,151 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(debug_assertions))]
+    fn short_validity_buffer_is_rejected() {
+        // A caller can build a `Bitmap` whose backing buffer is too short for its
+        // bit length via the public `Bitmap::from_raw`, which only debug-asserts the
+        // invariant. In a release build that bitmap would panic when
+        // `encode_null_map` unpacks it (index out of bounds), so `validate_column`
+        // must reject it as an inconsistent batch first. This test is release-only:
+        // in a debug build `from_raw`'s `debug_assert!` fires at construction, so the
+        // malformed state cannot be reached through the public API. 100 rows need 13
+        // bitmap bytes; the buffer holds 1.
+        let batch = ColBatch {
+            schema: Schema::new(vec![Field {
+                name: "n".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::Int32)),
+            }]),
+            columns: vec![Column::Int32(PrimitiveColumn::new_nullable(
+                vec![0i32; 100],
+                Bitmap::from_raw(vec![0u8; 1], 100),
+            ))],
+            num_rows: 100,
+        };
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fixed_string_ragged_data_is_rejected() {
+        // A FixedString(4) column whose data buffer is not a multiple of the width
+        // (7 bytes) reports len() == 1 via truncating division, so it passes the
+        // row-count check, but writing it verbatim would put 7 bytes where the
+        // reader consumes 4, silently misframing the stream. Reject it before
+        // writing. Construct directly so `ColBatch::new`'s debug_assert (which uses
+        // the same truncating len()) does not mask it.
+        let batch = ColBatch {
+            schema: Schema::new(vec![Field {
+                name: "fs".into(),
+                ch_type: ChType::FixedString(4),
+            }]),
+            columns: vec![Column::FixedBinary(FixedBinaryColumn::new(
+                b"road12X".to_vec(),
+                4,
+            ))],
+            num_rows: 1,
+        };
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nullable_fixed_string_ragged_data_is_rejected() {
+        // The same ragged-buffer misframe under a `Nullable(FixedString(4))` must
+        // also be rejected: the value type is unwrapped before the width and
+        // byte-count checks, so the guard applies inside the wrapper too.
+        let batch = ColBatch {
+            schema: Schema::new(vec![Field {
+                name: "fs".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::FixedString(4))),
+            }]),
+            columns: vec![Column::FixedBinary(FixedBinaryColumn::new_nullable(
+                b"road12X".to_vec(),
+                4,
+                Bitmap::from_ch_null_map(&[0]),
+            ))],
+            num_rows: 1,
+        };
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    /// Build a one-column `String` batch directly from raw offsets and data so a
+    /// malformed offset array reaches the encoder (the `utf8_column` helper always
+    /// builds well-formed offsets). `num_rows` is set from the offsets so only the
+    /// offset invariants, not the row-count check, are exercised.
+    fn string_batch_from_parts(offsets: Vec<i32>, data: Vec<u8>, num_rows: usize) -> ColBatch {
+        ColBatch {
+            schema: Schema::new(vec![Field {
+                name: "s".into(),
+                ch_type: ChType::String,
+            }]),
+            columns: vec![Column::Utf8(Utf8Column::new(offsets, data))],
+            num_rows,
+        }
+    }
+
+    #[test]
+    fn non_monotonic_string_offsets_are_rejected() {
+        // Offsets that decrease would make `encode_string_data` slice `data[3..1]`,
+        // which panics. Reject before writing.
+        let batch = string_batch_from_parts(vec![0, 3, 1], b"abc".to_vec(), 2);
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn string_offset_past_data_is_rejected() {
+        // A final offset past `data.len()` would slice out of bounds and panic.
+        let batch = string_batch_from_parts(vec![0, 10], b"abc".to_vec(), 1);
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn negative_string_offset_is_rejected() {
+        // A negative offset wraps to a huge `usize` in `encode_string_data`. The
+        // monotonic check (from a zero start) catches it before that can happen.
+        let batch = string_batch_from_parts(vec![0, -1], Vec::new(), 1);
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trailing_string_data_is_rejected() {
+        // Offsets that end before `data.len()` would silently drop the trailing
+        // bytes from the wire. Reject rather than lose data (review item 4).
+        let batch = string_batch_from_parts(vec![0, 2], b"abcd".to_vec(), 1);
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn leading_string_slack_is_rejected() {
+        // A nonzero first offset would silently drop the leading data bytes and
+        // violates the Arrow convention that offsets start at 0.
+        let batch = string_batch_from_parts(vec![2, 4], b"abcd".to_vec(), 1);
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn type_string_buffer_mismatch_is_rejected() {
         // A supported numeric declared under a mismatched buffer variant must
         // error, never emit a wrong-width body under a truthful type string.
@@ -1225,6 +1660,169 @@ mod tests {
             num_rows: 1,
         };
         match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unrepresentable_type_string_is_rejected() {
+        // A `DateTime64` precision above 9 and a `FixedString(0)` are constructible
+        // `ChType`s whose rendered type string this crate's parser and the server
+        // both reject. Encoding must fail at the source (InconsistentBatch) rather
+        // than emit a header that fails to decode downstream.
+        let dt64 = ColBatch {
+            schema: Schema::new(vec![Field {
+                name: "t".into(),
+                ch_type: ChType::DateTime64 {
+                    precision: 200,
+                    timezone: None,
+                },
+            }]),
+            columns: vec![Column::DateTime64(PrimitiveColumn::new(vec![0]))],
+            num_rows: 1,
+        };
+        match encode_block(&dt64, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch for DateTime64(200), got {other:?}"),
+        }
+
+        let fs0 = ColBatch {
+            schema: Schema::new(vec![Field {
+                name: "fs".into(),
+                ch_type: ChType::FixedString(0),
+            }]),
+            columns: vec![Column::FixedBinary(FixedBinaryColumn::new(vec![], 0))],
+            num_rows: 0,
+        };
+        match encode_block(&fs0, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch for FixedString(0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timezone_with_quote_is_rejected() {
+        // A DateTime/DateTime64 timezone containing a single quote renders a
+        // malformed header (`DateTime('UTC')')`) that the crate's lenient parser
+        // round-trips but the server rejects. It must be caught at the source. Both
+        // the bare and Nullable forms, and both temporal types, are covered.
+        let cases = [
+            ChType::DateTime {
+                timezone: Some("UTC')".into()),
+            },
+            ChType::Nullable(Box::new(ChType::DateTime {
+                timezone: Some("UTC')".into()),
+            })),
+            ChType::DateTime64 {
+                precision: 3,
+                timezone: Some("UTC')".into()),
+            },
+        ];
+        for ch_type in cases {
+            let is_nullable = matches!(ch_type, ChType::Nullable(_));
+            let column = match ch_type.inner() {
+                ChType::DateTime { .. } => {
+                    let p = PrimitiveColumn::new(vec![0u32]);
+                    Column::DateTime(p)
+                }
+                ChType::DateTime64 { .. } => Column::DateTime64(PrimitiveColumn::new(vec![0i64])),
+                other => panic!("unexpected inner {other:?}"),
+            };
+            // Give a nullable case an all-valid bitmap so only the timezone check fires.
+            let column = if is_nullable {
+                match column {
+                    Column::DateTime(mut p) => {
+                        p.validity = Some(Bitmap::from_ch_null_map(&[0]));
+                        Column::DateTime(p)
+                    }
+                    other => other,
+                }
+            } else {
+                column
+            };
+            let batch = ColBatch {
+                schema: Schema::new(vec![Field {
+                    name: "t".into(),
+                    ch_type,
+                }]),
+                columns: vec![column],
+                num_rows: 1,
+            };
+            match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+                EncodeError::InconsistentBatch { .. } => {}
+                other => panic!("expected InconsistentBatch, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn non_nullable_with_nulls_is_rejected() {
+        // A non-Nullable field with a validity bitmap that marks a row null writes
+        // no null map, so the null would be silently dropped and its placeholder
+        // value encoded as real data. Reject it.
+        let batch = ColBatch {
+            schema: Schema::new(vec![Field {
+                name: "n".into(),
+                ch_type: ChType::Int32,
+            }]),
+            columns: vec![Column::Int32(PrimitiveColumn::new_nullable(
+                vec![13, 79],
+                Bitmap::from_ch_null_map(&[0, 1]), // row 1 null under a non-Nullable field
+            ))],
+            num_rows: 2,
+        };
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_nullable_all_valid_bitmap_is_accepted() {
+        // A validity bitmap with no nulls under a non-Nullable field carries no null
+        // information to lose, so it encodes fine (and round-trips: the decoder
+        // produces a non-nullable column with no validity).
+        let batch = ColBatch {
+            schema: Schema::new(vec![Field {
+                name: "n".into(),
+                ch_type: ChType::Int32,
+            }]),
+            columns: vec![Column::Int32(PrimitiveColumn::new_nullable(
+                vec![13, 79],
+                Bitmap::from_ch_null_map(&[0, 0]), // all valid
+            ))],
+            num_rows: 2,
+        };
+        let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+        let decoded = decode_all_bytes(&bytes, &DecodeOptions::default()).unwrap();
+        match decoded.chunks[0].column(0) {
+            Column::Int32(c) => assert_eq!(c.values, vec![13, 79]),
+            other => panic!("expected Int32, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_chunked_rejects_mismatched_chunk_schema() {
+        // A chunk whose schema differs from the batch schema would encode a block
+        // the server rejects mid-insert. Reject before writing anything.
+        let field = |name: &str| Field {
+            name: name.into(),
+            ch_type: ChType::Int32,
+        };
+        let chunk = |name: &str, vals: Vec<i32>| {
+            let n = vals.len();
+            std::sync::Arc::new(ColBatch::new(
+                Schema::new(vec![field(name)]),
+                vec![Column::Int32(PrimitiveColumn::new(vals))],
+                n,
+            ))
+        };
+        let batch = ChunkedBatch {
+            schema: Schema::new(vec![field("n")]),
+            chunks: vec![chunk("n", vec![13, 14]), chunk("m", vec![15])],
+        };
+        match encode_chunked(&batch, &EncodeOptions::default()).unwrap_err() {
             EncodeError::InconsistentBatch { .. } => {}
             other => panic!("expected InconsistentBatch, got {other:?}"),
         }

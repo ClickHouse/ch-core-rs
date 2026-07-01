@@ -101,6 +101,14 @@ pub const DBMS_TCP_PROTOCOL_VERSION: u64 = 54485;
 /// `DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION`).
 pub const DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION: u64 = 54454;
 
+/// Protocol revision at which a data block's `BlockInfo` carries the
+/// `out_of_order_buckets` field (server
+/// `DBMS_MIN_REVISION_WITH_OUT_OF_ORDER_BUCKETS_IN_AGGREGATION` in
+/// `src/Core/ProtocolDefines.h`). At or above it, `BlockInfo::write` emits field 3
+/// with an empty vector for a plain data block, which [`read_block_info`] consumes
+/// and [`super::encode`] re-emits, so both stay byte-identical to the server writer.
+pub(crate) const DBMS_MIN_REVISION_WITH_OUT_OF_ORDER_BUCKETS: u64 = 54480;
+
 /// Options for Native format decoding.
 #[derive(Default)]
 pub struct DecodeOptions {
@@ -125,11 +133,26 @@ pub struct DecodeOptions {
 // ---------------------------------------------------------------------------
 
 /// Parse a ClickHouse type name string into a ChType.
-fn parse_ch_type(type_name: &str) -> Option<ChType> {
-    // Nullable wrapper
+///
+/// `pub(crate)` so the encoder can confirm a rendered type string round-trips
+/// (a header this parser rejects is one the server rejects too).
+pub(crate) fn parse_ch_type(type_name: &str) -> Option<ChType> {
+    // Nullable wrapper. ClickHouse forbids a `Nullable` or a `LowCardinality`
+    // directly inside a `Nullable`: the only legal nesting with LowCardinality is
+    // `LowCardinality(Nullable(T))`, never the reverse, and `Nullable(Nullable(T))`
+    // does not exist at all. An honest server never emits either, but the type
+    // string is untrusted wire input, so reject both here. `decode_column` and
+    // `skip_column_data` unwrap exactly one `Nullable` and handle `LowCardinality`
+    // only at the top level; accepting a nested wrapper would let those inner
+    // wrappers reach an `unreachable!` on malformed bytes (AGENTS.md invariant 2:
+    // no panics on malformed input).
     if let Some(inner) = type_name.strip_prefix("Nullable(") {
         if let Some(inner) = inner.strip_suffix(')') {
-            return parse_ch_type(inner).map(|t| ChType::Nullable(Box::new(t)));
+            let inner_type = parse_ch_type(inner)?;
+            if matches!(inner_type, ChType::Nullable(_) | ChType::LowCardinality(_)) {
+                return None;
+            }
+            return Some(ChType::Nullable(Box::new(inner_type)));
         }
     }
 
@@ -306,7 +329,11 @@ fn strip_quotes(s: &str) -> &str {
 /// Returns `None` (-> UnsupportedType) on any malformed escape, out-of-range
 /// value, or syntax error. The type string is untrusted wire input, so this
 /// never panics. An empty list (`Enum8()`) returns an empty `Vec`; the server
-/// does not emit it, but it is harmless and not a decode error.
+/// does not emit it, but it is harmless and not a decode error. Duplicate names or
+/// values are accepted as written rather than rejected: the variants are metadata
+/// carried on the `ChType` only (the wire payload is the raw underlying int), so a
+/// duplicate cannot corrupt a decoded column, and a server that emits one is
+/// preserved for faithful round-tripping through `Display`.
 fn parse_enum_variants<T: TryFrom<i64>>(inner: &str) -> Option<Vec<(String, T)>> {
     let bytes = inner.as_bytes();
     let mut pos = 0usize;
@@ -516,7 +543,7 @@ fn decode_string_data(reader: &mut ByteReader, num_rows: usize) -> io::Result<(V
     offsets.push(offset);
 
     for _ in 0..num_rows {
-        let len = reader.read_varint()? as usize;
+        let len = varint_usize(reader.read_varint()?, "String value length")?;
         // Arrow 32-bit offsets cap one chunk's string data at i32::MAX bytes.
         // Past that, `offset + len` would wrap to a negative value in release
         // builds (and panic in debug), producing corrupt offsets that then drive
@@ -1086,8 +1113,18 @@ fn decode_column_body(
                 None => Column::Decimal(DecimalColumn::new(data, width, *precision, *scale)),
             }
         }
-        ChType::Nullable(_) => unreachable!("Nullable already unwrapped"),
-        ChType::LowCardinality(_) => unreachable!("LowCardinality handled above"),
+        // Defense in depth: `parse_ch_type` rejects a `Nullable`/`LowCardinality`
+        // nested where the single-level unwrap in `decode_column` cannot handle it,
+        // and both wrappers are stripped by the callers before reaching here, so
+        // these arms cannot occur for any type this decoder produces. Return an
+        // error rather than panic so a future regression degrades to a clean decode
+        // error instead of undefined behavior at an FFI boundary.
+        ChType::Nullable(_) | ChType::LowCardinality(_) => {
+            return Err(DecodeError::UnsupportedType {
+                column: String::new(),
+                type_name: inner_type.to_string(),
+            })
+        }
     };
 
     Ok(column)
@@ -1213,10 +1250,11 @@ fn empty_column(ch_type: &ChType) -> Column {
             })
         }
         // A zero-row block reads no LowCardinality prefix or data (the server
-        // gates `readData` on having rows), so the empty dictionary column has
-        // no indices and an empty values dictionary. The values column is an
-        // empty String column; a nullable inner type carries an empty index
-        // validity bitmap, matching the other nullable empties.
+        // gates `readData` on having rows), so the empty dictionary column has no
+        // indices and an empty values dictionary. The values column is an empty
+        // column of the (removeNullable) inner type, built by recursing here; a
+        // nullable inner type carries an empty index validity bitmap, matching the
+        // other nullable empties.
         ChType::LowCardinality(lc_inner) => {
             let empty_values = match lc_inner.as_ref() {
                 ChType::Nullable(t) => empty_column(t),
@@ -1229,7 +1267,14 @@ fn empty_column(ch_type: &ChType) -> Column {
                 DictionaryColumn::new(vec![], empty_values)
             })
         }
-        ChType::Nullable(_) => unreachable!(),
+        // The outer `Nullable` was unwrapped above, and `parse_ch_type` never
+        // produces a `Nullable` directly inside a `Nullable`, so `inner` is never
+        // `Nullable` here. Unlike the decode and scan paths this constructor is
+        // infallible (it returns a `Column`, not a `Result`), so the invariant is
+        // asserted rather than surfaced as an error.
+        ChType::Nullable(_) => {
+            unreachable!("Nullable inner already unwrapped; parse_ch_type rejects nested Nullable")
+        }
     }
 }
 
@@ -1270,7 +1315,8 @@ fn read_block_info(reader: &mut ByteReader) -> Result<bool, DecodeError> {
             1 => reader.skip(1)?, // is_overflows
             2 => reader.skip(4)?, // bucket_num (Int32)
             3 => {
-                let count = reader.read_varint()? as usize; // out_of_order_buckets
+                // out_of_order_buckets: a varint count then that many Int32 values.
+                let count = varint_usize(reader.read_varint()?, "out_of_order_buckets count")?;
                 reader.skip(count.saturating_mul(4))?;
             }
             other => return Err(DecodeError::InvalidBlockInfo { field_num: other }),
@@ -1308,8 +1354,8 @@ pub fn decode_next_block(
         if !read_block_info(reader)? {
             return Ok(None);
         }
-        let num_cols = reader.read_varint()? as usize;
-        let num_rows = reader.read_varint()? as usize;
+        let num_cols = varint_usize(reader.read_varint()?, "column count")?;
+        let num_rows = varint_usize(reader.read_varint()?, "row count")?;
         return Ok(Some(decode_block_body(
             reader, options, num_cols, num_rows,
         )?));
@@ -1317,11 +1363,11 @@ pub fn decode_next_block(
 
     // No protocol framing. End of stream falls on the column-count varint.
     let num_cols = match reader.read_varint() {
-        Ok(n) => n as usize,
+        Ok(n) => varint_usize(n, "column count")?,
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let num_rows = reader.read_varint()? as usize;
+    let num_rows = varint_usize(reader.read_varint()?, "row count")?;
     Ok(Some(decode_block_body(
         reader, options, num_cols, num_rows,
     )?))
@@ -1360,7 +1406,52 @@ fn read_column_header(
         type_name: type_name.clone(),
     })?;
 
+    validate_header_type(&col_name, &ch_type)?;
+
     Ok((col_name, ch_type))
+}
+
+/// Reject a header type this crate parses but cannot decode, at header-read time.
+///
+/// Currently this is a `LowCardinality` whose (removeNullable) inner type is not in
+/// [`is_low_cardinality_inner`]. Checking here, in the header path shared by the
+/// allocating decode, the completeness scan, and the zero-row `empty_column` path,
+/// makes all three agree on which columns are accepted. Without it a zero-row
+/// `LowCardinality(Decimal(9, 4))` block would decode (its `empty_column` never
+/// consults the allowlist) while the same type with rows errors, an inconsistency
+/// the streaming decoder could hit as a block fills.
+fn validate_header_type(col_name: &str, ch_type: &ChType) -> Result<(), DecodeError> {
+    if let ChType::LowCardinality(inner) = ch_type {
+        let dict_value_type = match inner.as_ref() {
+            ChType::Nullable(t) => t.as_ref(),
+            other => other,
+        };
+        if !is_low_cardinality_inner(dict_value_type) {
+            return Err(DecodeError::UnsupportedType {
+                column: col_name.to_string(),
+                type_name: format!("LowCardinality({dict_value_type})"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Narrow a `u64` varint (a count or length read from the wire) to `usize`.
+///
+/// On a 32-bit target a value above `usize::MAX` would truncate under a raw `as
+/// usize` cast and then misalign the row or byte walk instead of erroring cleanly;
+/// `try_from` turns that into an error. Reported as `UnexpectedEof` (matching the
+/// LowCardinality counts, which already do this): a value that large can never be
+/// satisfied by the bytes present, and the streaming decoder treats it as "need
+/// more bytes" rather than a corruption it must surface. On 64-bit targets this is
+/// a no-op conversion the compiler removes.
+fn varint_usize(value: u64, what: &str) -> io::Result<usize> {
+    usize::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("{what} overflows usize"),
+        )
+    })
 }
 
 /// Reject a row or column count larger than the bytes still available.
@@ -1449,13 +1540,13 @@ pub fn block_end(data: &[u8], options: &DecodeOptions) -> Result<Option<usize>, 
         return Ok(None);
     }
 
-    let num_cols = reader.read_varint()? as usize;
-    let num_rows = reader.read_varint()? as usize;
+    let num_cols = varint_usize(reader.read_varint()?, "column count")?;
+    let num_rows = varint_usize(reader.read_varint()?, "row count")?;
 
     for _ in 0..num_cols {
-        let (_name, ch_type) = read_column_header(&mut reader, options)?;
+        let (name, ch_type) = read_column_header(&mut reader, options)?;
         if num_rows > 0 {
-            skip_column_data(&mut reader, &ch_type, num_rows)?;
+            skip_column_data(&mut reader, &ch_type, num_rows, &name)?;
         }
     }
 
@@ -1472,13 +1563,14 @@ fn skip_column_data(
     reader: &mut ByteReader,
     ch_type: &ChType,
     num_rows: usize,
+    column: &str,
 ) -> Result<(), DecodeError> {
     // Per-column bulk-state prefix, the same step `decode_column` runs. Zero
     // bytes for every type except LowCardinality.
-    read_state_prefix(reader, ch_type, "")?;
+    read_state_prefix(reader, ch_type, column)?;
 
     if let ChType::LowCardinality(inner) = ch_type {
-        return skip_low_cardinality_data(reader, inner, num_rows);
+        return skip_low_cardinality_data(reader, inner, num_rows, column);
     }
 
     let inner = match ch_type {
@@ -1531,14 +1623,22 @@ fn skip_column_body(
         }
         ChType::String => {
             for _ in 0..num_rows {
-                let len = reader.read_varint()? as usize;
+                let len = varint_usize(reader.read_varint()?, "String value length")?;
                 reader.skip(len)?;
             }
         }
         // `read_column_header` already rejected unsupported types, Nullable is
-        // unwrapped by the callers, and LowCardinality is handled above.
-        ChType::Nullable(_) => unreachable!("Nullable already unwrapped"),
-        ChType::LowCardinality(_) => unreachable!("LowCardinality handled above"),
+        // unwrapped by the callers, and LowCardinality is handled above. Defense in
+        // depth: `parse_ch_type` also rejects a wrapper nested where the callers'
+        // single-level unwrap cannot reach it, so these arms cannot occur. Return an
+        // error rather than panic to keep the streaming scan panic-free even if that
+        // guarantee ever regresses (a panic here is undefined behavior across FFI).
+        ChType::Nullable(_) | ChType::LowCardinality(_) => {
+            return Err(DecodeError::UnsupportedType {
+                column: String::new(),
+                type_name: inner_type.to_string(),
+            })
+        }
     }
 
     Ok(())
@@ -1552,13 +1652,33 @@ fn skip_low_cardinality_data(
     reader: &mut ByteReader,
     inner: &ChType,
     num_rows: usize,
+    column: &str,
 ) -> Result<(), DecodeError> {
     let dict_value_type = match inner {
         ChType::Nullable(t) => t.as_ref(),
         other => other,
     };
 
+    // Index type word. Mirror the decode-side rejections
+    // ([`decode_low_cardinality`]) exactly, not just the index width: a hostile
+    // flags word that sets `NeedGlobalDictionaryBit` or clears
+    // `HasAdditionalKeysBit` would make the scan walk framing the decode refuses,
+    // so the scan would either misreport the block length or stall the
+    // `StreamDecoder` with a misleading truncation error instead of surfacing the
+    // same `InvalidLowCardinality` the decode returns.
     let index_word = reader.read_u64_le()?;
+    if index_word & LC_NEED_GLOBAL_DICTIONARY_BIT != 0 {
+        return Err(DecodeError::InvalidLowCardinality {
+            column: column.to_string(),
+            reason: "NeedGlobalDictionaryBit is set; Native never uses a global dictionary",
+        });
+    }
+    if index_word & LC_HAS_ADDITIONAL_KEYS_BIT == 0 {
+        return Err(DecodeError::InvalidLowCardinality {
+            column: column.to_string(),
+            reason: "HasAdditionalKeysBit is clear; Native always carries a per-block dictionary",
+        });
+    }
     let index_width = match index_word & 0xFF {
         0 => 1usize,
         1 => 2,
@@ -1566,7 +1686,7 @@ fn skip_low_cardinality_data(
         3 => 8,
         _ => {
             return Err(DecodeError::InvalidLowCardinality {
-                column: String::new(),
+                column: column.to_string(),
                 reason: "index width tag is outside 0..=3",
             })
         }
@@ -1583,7 +1703,7 @@ fn skip_low_cardinality_data(
     })?;
     if !is_low_cardinality_inner(dict_value_type) {
         return Err(DecodeError::UnsupportedType {
-            column: String::new(),
+            column: column.to_string(),
             type_name: format!("LowCardinality({dict_value_type})"),
         });
     }
@@ -1707,7 +1827,7 @@ mod tests {
             buf.push(0x00); // is_overflows = false
             write_varint(buf, 2);
             buf.extend_from_slice(&(-1i32).to_le_bytes()); // bucket_num = -1
-            if revision >= 54480 {
+            if revision >= DBMS_MIN_REVISION_WITH_OUT_OF_ORDER_BUCKETS {
                 write_varint(buf, 3);
                 write_varint(buf, 0); // empty out_of_order_buckets
             }
@@ -2257,6 +2377,82 @@ mod tests {
             decode_all_bytes(&data, &DecodeOptions::default()),
             Err(DecodeError::UnsupportedType { .. })
         ));
+    }
+
+    #[test]
+    fn test_nested_nullable_type_is_rejected() {
+        // `Nullable(Nullable(T))` is not a type ClickHouse emits, and the
+        // single-`Nullable` unwrap in decode/scan cannot handle it, so it must be
+        // rejected at header parse time rather than panic on the inner wrapper.
+        // Exercise both a row-bearing and a zero-row block, and both the allocating
+        // decode and the completeness scan, since the review found a distinct panic
+        // site on each path.
+        for num_rows in [0usize, 1] {
+            let data = BlockBuilder::new()
+                .header(1, num_rows)
+                .column_header("n", "Nullable(Nullable(Int32))")
+                .build();
+            assert!(
+                matches!(
+                    decode_all_bytes(&data, &DecodeOptions::default()),
+                    Err(DecodeError::UnsupportedType { .. })
+                ),
+                "decode should reject nested Nullable at {num_rows} rows"
+            );
+            assert!(
+                matches!(
+                    block_end(&data, &DecodeOptions::default()),
+                    Err(DecodeError::UnsupportedType { .. })
+                ),
+                "scan should reject nested Nullable at {num_rows} rows"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nullable_low_cardinality_type_is_rejected() {
+        // `Nullable(LowCardinality(T))` is the illegal nesting direction (only
+        // `LowCardinality(Nullable(T))` is legal). The inner `LowCardinality` is
+        // checked only at the top level, so accepting this shape would reach an
+        // `unreachable!`; it must be rejected at header parse time instead.
+        for num_rows in [0usize, 1] {
+            let data = BlockBuilder::new()
+                .header(1, num_rows)
+                .column_header("n", "Nullable(LowCardinality(String))")
+                .build();
+            assert!(
+                matches!(
+                    decode_all_bytes(&data, &DecodeOptions::default()),
+                    Err(DecodeError::UnsupportedType { .. })
+                ),
+                "decode should reject Nullable(LowCardinality) at {num_rows} rows"
+            );
+            assert!(
+                matches!(
+                    block_end(&data, &DecodeOptions::default()),
+                    Err(DecodeError::UnsupportedType { .. })
+                ),
+                "scan should reject Nullable(LowCardinality) at {num_rows} rows"
+            );
+        }
+    }
+
+    #[test]
+    fn test_low_cardinality_nullable_still_accepted() {
+        // The legal direction, `LowCardinality(Nullable(T))`, must still parse: the
+        // parse-time rejection only refuses wrappers nested inside `Nullable`, not
+        // this one. A zero-row block is enough to prove the type parses and is
+        // decodable without needing a full dictionary body.
+        let data = BlockBuilder::new()
+            .header(1, 0)
+            .column_header("lc", "LowCardinality(Nullable(String))")
+            .build();
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(
+            cb.schema.fields[0].ch_type,
+            ChType::LowCardinality(Box::new(ChType::Nullable(Box::new(ChType::String))))
+        );
+        assert!(block_end(&data, &DecodeOptions::default()).is_ok());
     }
 
     #[test]
@@ -3263,6 +3459,128 @@ mod tests {
         for (row, want) in expected.iter().enumerate() {
             assert_eq!(lc_u32_value(batch.column(0), row), Some(*want));
         }
+    }
+
+    #[test]
+    fn test_decode_low_cardinality_ipv4() {
+        // IPv4 is allowlisted inside LowCardinality and its dictionary body is a
+        // plain UInt32 column body (raw 4-byte LE), so it shares the UInt32 layout.
+        // Slot 0 is the reserved default; the per-row indexes start at 1.
+        let dictionary = [0u32, 0x7F00_0001, 0x0808_0808];
+        let indices = [1u64, 2, 1];
+        let data = BlockBuilder::new()
+            .header(1, indices.len())
+            .column_header("lc", "LowCardinality(IPv4)")
+            .low_cardinality_u32(&dictionary, &indices, 1)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        match cb.chunks[0].column(0) {
+            Column::Dictionary(d) => {
+                assert_eq!(d.indices, vec![1, 2, 1]);
+                assert!(d.validity.is_none());
+                match d.values.as_ref() {
+                    Column::Ipv4(v) => {
+                        assert_eq!(v.values, vec![0, 0x7F00_0001, 0x0808_0808]);
+                    }
+                    other => panic!("expected Ipv4 values, got {other:?}"),
+                }
+            }
+            other => panic!("expected Dictionary, got {other:?}"),
+        }
+        // The scan must consume exactly the same bytes.
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len())
+        );
+    }
+
+    #[test]
+    fn test_decode_low_cardinality_ipv6() {
+        // IPv6 is allowlisted inside LowCardinality; its dictionary body is raw
+        // 16-byte rows, the same shape as UUID and FixedString(16).
+        let zero = [0u8; 16];
+        let loopback = {
+            let mut v = [0u8; 16];
+            v[15] = 1;
+            v
+        };
+        let dictionary = [zero, loopback];
+        let indices = [1u64, 0, 1];
+        let data = BlockBuilder::new()
+            .header(1, indices.len())
+            .column_header("lc", "LowCardinality(IPv6)")
+            .low_cardinality_fixed16(&dictionary, &indices, 1)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        match cb.chunks[0].column(0) {
+            Column::Dictionary(d) => {
+                assert_eq!(d.indices, vec![1, 0, 1]);
+                assert!(d.validity.is_none());
+                match d.values.as_ref() {
+                    Column::Ipv6(v) => {
+                        assert_eq!(v.width, 16);
+                        assert_eq!(v.value(0), &zero);
+                        assert_eq!(v.value(1), &loopback);
+                    }
+                    other => panic!("expected Ipv6 values, got {other:?}"),
+                }
+            }
+            other => panic!("expected Dictionary, got {other:?}"),
+        }
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len())
+        );
+    }
+
+    #[test]
+    fn test_scan_low_cardinality_rejects_bad_flags() {
+        // The completeness scan must reject the same index-type-word bits the decode
+        // rejects (NeedGlobalDictionaryBit set, HasAdditionalKeysBit clear), so a
+        // hostile flags word cannot make the scan walk framing the decode refuses
+        // and stall the StreamDecoder with a misleading truncation error.
+        for index_word in [
+            LC_HAS_ADDITIONAL_KEYS_BIT | LC_NEED_GLOBAL_DICTIONARY_BIT,
+            0, // HasAdditionalKeysBit clear
+        ] {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&1u64.to_le_bytes()); // key version
+            payload.extend_from_slice(&index_word.to_le_bytes());
+            let data = BlockBuilder::new()
+                .header(1, 1)
+                .column_header("lc", "LowCardinality(String)")
+                .raw_bytes(&payload)
+                .build();
+            assert!(
+                matches!(
+                    block_end(&data, &DecodeOptions::default()),
+                    Err(DecodeError::InvalidLowCardinality { .. })
+                ),
+                "scan should reject index word {index_word:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_low_cardinality_bad_inner_rejected_at_zero_rows() {
+        // A zero-row LowCardinality(Decimal(9, 4)) must be rejected as consistently
+        // as the row-bearing form: the inner allowlist is checked at header time, so
+        // the zero-row `empty_column` path no longer silently accepts an inner the
+        // row-bearing decode rejects.
+        let data = BlockBuilder::new()
+            .header(1, 0)
+            .column_header("lc", "LowCardinality(Decimal(9, 4))")
+            .build();
+        assert!(matches!(
+            decode_all_bytes(&data, &DecodeOptions::default()),
+            Err(DecodeError::UnsupportedType { .. })
+        ));
+        assert!(matches!(
+            block_end(&data, &DecodeOptions::default()),
+            Err(DecodeError::UnsupportedType { .. })
+        ));
     }
 
     #[test]

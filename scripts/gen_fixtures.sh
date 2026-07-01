@@ -126,7 +126,18 @@ SELECT
     CAST(multiIf(n = 0, '0.00000000000000000001', n = 1, '-0.00000000000000000001', n = 2, '0', '0.00000000000000000079'), 'Decimal128(20)') AS dec128,
     -- Decimal256(50) -> Decimal(76, 50): unscaled is value*10^50. Rows:
     -- 1e-50 -> 1, -1e-50 -> -1, 0 -> 0, 2.58e-48 -> 258.
-    CAST(multiIf(n = 0, '0.00000000000000000000000000000000000000000000000001', n = 1, '-0.00000000000000000000000000000000000000000000000001', n = 2, '0', '0.00000000000000000000000000000000000000000000000258'), 'Decimal256(50)') AS dec256
+    CAST(multiIf(n = 0, '0.00000000000000000000000000000000000000000000000001', n = 1, '-0.00000000000000000000000000000000000000000000000001', n = 2, '0', '0.00000000000000000000000000000000000000000000000258'), 'Decimal256(50)') AS dec256,
+    -- LowCardinality(IPv4): IPv4 is a UInt32 on the wire, so the dictionary body
+    -- is a plain UInt32 column body (raw 4-byte LE). Needs
+    -- allow_suspicious_low_cardinality_types at creation (set in SETTINGS below);
+    -- the wire bytes are unaffected. Values repeat so the per-block dictionary is
+    -- smaller than the row count. Decoded numbers: 3221226219 (192.0.2.235),
+    -- 169090600 (10.20.30.40), 3221226219, 4294967295.
+    CAST(multiIf(n = 0, '192.0.2.235', n = 1, '10.20.30.40', n = 2, '192.0.2.235', '255.255.255.255'), 'LowCardinality(IPv4)') AS lc_ipv4,
+    -- LowCardinality(IPv6): 16 raw bytes per dictionary entry in network byte
+    -- order, the same body shape as LowCardinality(UUID). Values repeat. Rows
+    -- resolve to 2001:db8::68, fe80::1, 2001:db8::68, ::ffff:192.0.2.235.
+    CAST(multiIf(n = 0, '2001:db8::68', n = 1, 'fe80::1', n = 2, '2001:db8::68', '::ffff:192.0.2.235'), 'LowCardinality(IPv6)') AS lc_ipv6
 FROM numbers(4)
 SETTINGS allow_suspicious_low_cardinality_types = 1
 FORMAT Native

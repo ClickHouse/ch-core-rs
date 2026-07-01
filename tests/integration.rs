@@ -213,6 +213,11 @@ fn assert_all_types(batch: &ChunkedBatch) {
                     bits: 256,
                 },
             ),
+            // LowCardinality over IPv4/IPv6, captured with
+            // allow_suspicious_low_cardinality_types=1. IPv4's dictionary body is a
+            // plain UInt32 column body; IPv6's is raw 16-byte rows.
+            Expected::Exact("lc_ipv4", ChType::LowCardinality(Box::new(ChType::Ipv4))),
+            Expected::Exact("lc_ipv6", ChType::LowCardinality(Box::new(ChType::Ipv6))),
         ],
     );
 
@@ -540,6 +545,33 @@ fn assert_all_types(batch: &ChunkedBatch) {
             other => panic!("expected Decimal, got {other:?}"),
         }
     }
+
+    // LowCardinality(IPv4): a UInt32 dictionary body, with a repeat so the
+    // per-block dictionary is smaller than the row count. Rows resolve to the
+    // standard IPv4 numeric values 3221226219 (192.0.2.235), 169090600
+    // (10.20.30.40), 3221226219, 4294967295. Numbers match the plain `ipv4` column.
+    assert_dictionary_ipv4_values(
+        block.column(36),
+        &[
+            Some(3221226219),
+            Some(169090600),
+            Some(3221226219),
+            Some(u32::MAX),
+        ],
+    );
+
+    // LowCardinality(IPv6): a 16-byte fixed-binary dictionary body, network byte
+    // order, with a repeat. Rows resolve to the same wire bytes as the plain `ipv6`
+    // column: 2001:db8::68, fe80::1, 2001:db8::68, ::ffff:192.0.2.235.
+    assert_dictionary_ipv6_values(
+        block.column(37),
+        &[
+            Some(&ipv6_db8),
+            Some(&ipv6_fe80),
+            Some(&ipv6_db8),
+            Some(&ipv6_v4mapped),
+        ],
+    );
 }
 
 /// Read row `index` of a 4-byte (Decimal32-backed) decimal column as the raw
@@ -571,6 +603,56 @@ fn assert_dictionary_uuid_values(column: &Column, expected: &[Option<&[u8; 16]>]
                         assert!(!is_null, "row {row} expected a value, got null");
                         let idx = d.indices[row] as usize;
                         assert_eq!(values.value(idx), bytes.as_slice(), "row {row}");
+                    }
+                }
+            }
+        }
+        other => panic!("expected Dictionary, got {other:?}"),
+    }
+}
+
+/// Assert the per-row resolved IPv6 (16-byte wire) values of a dictionary column.
+fn assert_dictionary_ipv6_values(column: &Column, expected: &[Option<&[u8; 16]>]) {
+    match column {
+        Column::Dictionary(d) => {
+            assert_eq!(d.len(), expected.len());
+            let values = match d.values.as_ref() {
+                Column::Ipv6(v) => v,
+                other => panic!("expected Ipv6 dictionary values, got {other:?}"),
+            };
+            for (row, want) in expected.iter().enumerate() {
+                let is_null = d.validity.as_ref().is_some_and(|bm| !bm.is_valid(row));
+                match want {
+                    None => assert!(is_null, "row {row} expected null"),
+                    Some(bytes) => {
+                        assert!(!is_null, "row {row} expected a value, got null");
+                        let idx = d.indices[row] as usize;
+                        assert_eq!(values.value(idx), bytes.as_slice(), "row {row}");
+                    }
+                }
+            }
+        }
+        other => panic!("expected Dictionary, got {other:?}"),
+    }
+}
+
+/// Assert the per-row resolved IPv4 (UInt32 numeric) values of a dictionary column.
+fn assert_dictionary_ipv4_values(column: &Column, expected: &[Option<u32>]) {
+    match column {
+        Column::Dictionary(d) => {
+            assert_eq!(d.len(), expected.len());
+            let values = match d.values.as_ref() {
+                Column::Ipv4(v) => v,
+                other => panic!("expected Ipv4 dictionary values, got {other:?}"),
+            };
+            for (row, want) in expected.iter().enumerate() {
+                let is_null = d.validity.as_ref().is_some_and(|bm| !bm.is_valid(row));
+                match want {
+                    None => assert!(is_null, "row {row} expected null"),
+                    Some(v) => {
+                        assert!(!is_null, "row {row} expected a value, got null");
+                        let idx = d.indices[row] as usize;
+                        assert_eq!(values.values[idx], *v, "row {row}");
                     }
                 }
             }
