@@ -176,6 +176,43 @@ fn assert_all_types(batch: &ChunkedBatch) {
                     ],
                 },
             ),
+            // Decimal(P, S): the server always emits the canonical Decimal(P, S)
+            // type string, so the creation-time Decimal32(4)/Decimal64(9)/
+            // Decimal128(20)/Decimal256(50) come back normalized to
+            // Decimal(9, 4)/Decimal(18, 9)/Decimal(38, 20)/Decimal(76, 50), with
+            // the bit width derived from the precision (32/64/128/256).
+            Expected::Exact(
+                "dec32",
+                ChType::Decimal {
+                    precision: 9,
+                    scale: 4,
+                    bits: 32,
+                },
+            ),
+            Expected::Exact(
+                "dec64",
+                ChType::Decimal {
+                    precision: 18,
+                    scale: 9,
+                    bits: 64,
+                },
+            ),
+            Expected::Exact(
+                "dec128",
+                ChType::Decimal {
+                    precision: 38,
+                    scale: 20,
+                    bits: 128,
+                },
+            ),
+            Expected::Exact(
+                "dec256",
+                ChType::Decimal {
+                    precision: 76,
+                    scale: 50,
+                    bits: 256,
+                },
+            ),
         ],
     );
 
@@ -419,6 +456,102 @@ fn assert_all_types(batch: &ChunkedBatch) {
         Column::Enum16(c) => assert_eq!(c.values.as_slice(), &[1i16, 2, -1, 1]),
         other => panic!("expected Enum16, got {other:?}"),
     }
+
+    // Decimal columns: a raw little-endian two's-complement fixed-width integer
+    // per row, byte width derived from the precision. The unscaled integers and
+    // the wide-width raw byte patterns were probed directly from the server
+    // (reinterpretAsInt32/Int64 and hex(reinterpretAsFixedString)), not produced
+    // by decoding with this crate.
+    //
+    // Decimal32(4) -> Decimal(9, 4): 4-byte LE Int32. Unscaled ints from the
+    // values 0.0013, -0.0001, 0, 1.2345 are 13, -1, 0, 12345. -1 is all-0xFF
+    // bytes of the width.
+    match block.column(32) {
+        Column::Decimal(c) => {
+            assert_eq!(c.width, 4);
+            assert_eq!(c.precision, 9);
+            assert_eq!(c.scale, 4);
+            assert_eq!(c.len(), 4);
+            assert_eq!(decimal_le_i32(c, 0), 13);
+            assert_eq!(decimal_le_i32(c, 1), -1);
+            assert_eq!(c.value(1), &[0xFF, 0xFF, 0xFF, 0xFF]);
+            assert_eq!(decimal_le_i32(c, 2), 0);
+            assert_eq!(decimal_le_i32(c, 3), 12345);
+        }
+        other => panic!("expected Decimal, got {other:?}"),
+    }
+    // Decimal64(9) -> Decimal(18, 9): 8-byte LE Int64. Unscaled ints from
+    // 0.000000079, -0.000000001, 0, 1.5 are 79, -1, 0, 1500000000.
+    match block.column(33) {
+        Column::Decimal(c) => {
+            assert_eq!(c.width, 8);
+            assert_eq!(c.precision, 18);
+            assert_eq!(c.scale, 9);
+            assert_eq!(decimal_le_i64(c, 0), 79);
+            assert_eq!(decimal_le_i64(c, 1), -1);
+            assert_eq!(c.value(1), &[0xFF; 8]);
+            assert_eq!(decimal_le_i64(c, 2), 0);
+            assert_eq!(decimal_le_i64(c, 3), 1_500_000_000);
+        }
+        other => panic!("expected Decimal, got {other:?}"),
+    }
+    // Decimal128(20) -> Decimal(38, 20): 16-byte LE Int128. The core has no
+    // native i128, so assert the raw little-endian byte pattern. Unscaled ints
+    // are 1, -1, 0, 79: row 0 is 0x01 then zeros, row 1 is all 0xFF, row 2 is all
+    // zero, row 3 is 0x4F (79) then zeros.
+    {
+        let mut one128 = [0u8; 16];
+        one128[0] = 0x01;
+        let mut seventy_nine128 = [0u8; 16];
+        seventy_nine128[0] = 0x4F;
+        match block.column(34) {
+            Column::Decimal(c) => {
+                assert_eq!(c.width, 16);
+                assert_eq!(c.precision, 38);
+                assert_eq!(c.scale, 20);
+                assert_eq!(c.value(0), one128);
+                assert_eq!(c.value(1), [0xFFu8; 16]);
+                assert_eq!(c.value(2), [0u8; 16]);
+                assert_eq!(c.value(3), seventy_nine128);
+            }
+            other => panic!("expected Decimal, got {other:?}"),
+        }
+    }
+    // Decimal256(50) -> Decimal(76, 50): 32-byte LE Int256. Assert the raw
+    // little-endian byte pattern. Unscaled ints are 1, -1, 0, 258: row 0 is 0x01
+    // then zeros, row 1 is all 0xFF, row 2 is all zero, row 3 is 0x02 0x01 (0x0102
+    // = 258) then zeros.
+    {
+        let mut one256 = [0u8; 32];
+        one256[0] = 0x01;
+        let mut two_fifty_eight256 = [0u8; 32];
+        two_fifty_eight256[0] = 0x02;
+        two_fifty_eight256[1] = 0x01;
+        match block.column(35) {
+            Column::Decimal(c) => {
+                assert_eq!(c.width, 32);
+                assert_eq!(c.precision, 76);
+                assert_eq!(c.scale, 50);
+                assert_eq!(c.value(0), one256);
+                assert_eq!(c.value(1), [0xFFu8; 32]);
+                assert_eq!(c.value(2), [0u8; 32]);
+                assert_eq!(c.value(3), two_fifty_eight256);
+            }
+            other => panic!("expected Decimal, got {other:?}"),
+        }
+    }
+}
+
+/// Read row `index` of a 4-byte (Decimal32-backed) decimal column as the raw
+/// little-endian unscaled `i32`.
+fn decimal_le_i32(c: &ch_core_rs::column::DecimalColumn, index: usize) -> i32 {
+    i32::from_le_bytes(c.value(index).try_into().unwrap())
+}
+
+/// Read row `index` of an 8-byte (Decimal64-backed) decimal column as the raw
+/// little-endian unscaled `i64`.
+fn decimal_le_i64(c: &ch_core_rs::column::DecimalColumn, index: usize) -> i64 {
+    i64::from_le_bytes(c.value(index).try_into().unwrap())
 }
 
 /// Assert the per-row resolved UUID (16-byte wire) values of a dictionary column.

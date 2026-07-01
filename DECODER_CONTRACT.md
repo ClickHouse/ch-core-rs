@@ -241,6 +241,7 @@ than an error.
 | `IPv6`            | `Ipv6`           | `Ipv6`            | `w:16`       | validity, data              | yes      |
 | `Enum8(...)`      | `Enum8 { variants }`  | `Enum8`      | `c`          | validity, values            | yes      |
 | `Enum16(...)`     | `Enum16 { variants }` | `Enum16`     | `s`          | validity, values            | yes      |
+| `Decimal(P, S)`   | `Decimal { precision, scale, bits }` | `Decimal` | `d:P,S` (128-bit) or `d:P,S,bits` (32/64/256-bit) | validity, data | yes |
 | `Date`            | `Date`           | `Date`            | `S`          | validity, values            | yes      |
 | `Date32`          | `Date32`         | `Date32`          | `tdD`        | validity, values            | yes      |
 | `DateTime`, `DateTime('<tz>')` | `DateTime { timezone }` | `DateTime` | `I` | validity, values         | yes      |
@@ -556,6 +557,84 @@ name escaping are `DataTypeEnum::doGetName` / `writeQuotedString`, and
 `canBeInsideLowCardinality()` is false on `DataTypeEnum`. Confirmed at
 `v26.6.1.1193-stable`.
 
+### Decimal(P, S)
+
+**Type string(s):** `Decimal(P, S)` where `P` is the precision (1..=76) and `S`
+is the scale (0..=P). The server always emits this canonical, comma-space form
+on the wire via `DataTypeDecimal::doGetName`, with both fields always present.
+It never emits the creation-time spellings `Decimal32(S)`, `Decimal64(S)`,
+`Decimal128(S)`, or `Decimal256(S)`, so `parse_ch_type` accepts only
+`Decimal(P, S)` (mirroring the decision to accept only the concrete `Enum8(` /
+`Enum16(` forms). The byte width is derived from `P`, not carried on the wire.
+
+**Logical type:** `ChType::Decimal { precision: u8, scale: u8, bits: u16 }`.
+`bits` is in `{32, 64, 128, 256}`, derived from `P` at parse time:
+
+- `P` in  1..=9  -> 32 bits (backed by Int32, 4 bytes/row)
+- `P` in 10..=18 -> 64 bits (backed by Int64, 8 bytes/row)
+- `P` in 19..=38 -> 128 bits (backed by Int128, 16 bytes/row)
+- `P` in 39..=76 -> 256 bits (backed by Int256, 32 bytes/row)
+
+`Display` renders the canonical `Decimal(P, S)` (not `bits`), so
+`parse(display(t)) == t`.
+
+**Wire payload:** `num_rows * (bits / 8)` bytes, little-endian two's-complement,
+contiguous, no per-row framing. Each row is one fixed-width signed integer of
+4/8/16/32 bytes by precision: the unscaled value, equal to the decimal value
+times `10^S`. Precision and scale are type metadata only and never appear in the
+per-row data. The per-column bulk-state prefix reads zero bytes and the
+custom-serialization marker is 0x00, same as a plain numeric.
+
+**Arrow export:** the Arrow C Data decimal format string over the contiguous
+fixed-width buffer, zero-copy. The 128-bit case is the bare `d:P,S` (the Arrow
+spec default width); the other widths carry the bit width as a third field,
+`d:P,S,bits` (for example `d:9,4,32`, `d:18,9,64`, `d:50,10,256`). 2 buffers in
+order: validity, then the data buffer. There is no offsets buffer; row `i` is
+`data[i * (bits / 8) .. (i + 1) * (bits / 8)]`. The buffer is exported verbatim
+at its native width; the core deliberately does NOT widen a narrow decimal to
+128 bits, which would cost a forbidden per-value copy in the decode loop.
+
+Note: Arrow `decimal32` / `decimal64` / `decimal256` are newer in the Arrow C
+Data Interface than `decimal128`. The `d:P,S,bits` spelling is the documented
+form, but consumer support for the non-128 widths varies by Arrow
+implementation and version. A binding that needs broad consumer compatibility
+for the narrow or 256-bit decimals should confirm the consumer accepts the
+native-width format string, or widen on its own side.
+
+**Rust buffer:** `Column::Decimal(DecimalColumn)` where `DecimalColumn` is
+`{ data: Vec<u8>, width: usize, precision: u8, scale: u8, validity: Option<Bitmap> }`.
+`width` is `bits / 8`. The physical buffer is identical to a `FixedBinaryColumn`
+of that width; `precision` and `scale` are carried on the column for bindings
+that read the buffers directly, the same Column-vs-ChType split the temporals
+use. `data` is the wire bytes verbatim.
+
+**Notes:**
+
+- **Decode is a host-agnostic raw passthrough.** The fixed-width bytes are
+  stored unchanged, with no reinterpretation into a native integer, so the
+  buffer stays correct on big-endian hosts and the core needs no native `i128`
+  or `i256`. The host representation (a Python `Decimal`, a JS `BigInt`, and so
+  on) is a binding concern, out of scope here. The unscaled value is `data` for
+  a row read as a little-endian signed integer of `width` bytes; the decimal
+  value is that divided by `10^scale`.
+- A negative unscaled value is two's-complement at the full width: an unscaled
+  `-1` is all-`0xFF` bytes of the width.
+- `LowCardinality(Decimal(...))` is illegal: `DataTypeDecimal` is a
+  `DataTypeDecimalBase` subclass whose `canBeInsideLowCardinality()` is false, so
+  the server throws at construction and such a column never appears on the wire.
+  The decoder keeps rejecting `Decimal` as a `LowCardinality` inner.
+
+**Introduction version:** first-class long before the pinned tag (inferred from
+release history); stable at `v26.6.1.1193-stable`.
+
+**Server reference:** `SerializationDecimalBase` (its `final`
+`serializeBinaryBulk` / `deserializeBinaryBulk` do a single contiguous read of
+`sizeof(FieldType) * num_rows` bytes, byte-swapping only on big-endian hosts) and
+`DataTypesDecimal` / `DataTypeDecimal::doGetName` (the canonical `Decimal(P, S)`
+type string and the precision-to-width mapping), in `src/DataTypes/`.
+`deserializeBinaryBulkStatePrefix` reads zero bytes and the custom-serialization
+marker is 0x00. Confirmed at `v26.6.1.1193-stable`.
+
 ### Temporal types
 
 This covers `Date`, `Date32`, `DateTime`, and `DateTime64`. All four are plain
@@ -835,6 +914,8 @@ directly (`empty_column` in `src/native/decode.rs`), the empty shapes are:
   data.
 - `FixedString(N)`: empty data, width preserved. `UUID` and `IPv6` are the same
   with width 16.
+- `Decimal(P, S)`: empty data, width (`bits / 8`), precision, and scale
+  preserved, like `FixedString(N)`.
 - `Nullable(T)`: as above with an empty validity bitmap.
 - `LowCardinality(T)`: empty indices, an empty values dictionary column, and (for
   a nullable inner type) an empty index validity bitmap.
@@ -852,7 +933,6 @@ fallback. A consumer can treat an unsupported type as a hard decode error.
 
 Not yet supported, tracked as planned phases in `src/schema.rs`:
 
-- `Decimal`.
 - `LowCardinality(T)` for an inner type outside the allowlist in the
   `LowCardinality(T)` section. The wrapper and its allowed inners (String,
   FixedString, the fixed-width numerics, Bool, Date, Date32, DateTime,

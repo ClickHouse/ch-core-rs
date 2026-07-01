@@ -243,6 +243,32 @@ fn arrow_format(ch_type: &ChType) -> String {
         // name->value map is carried in the ChType for bindings.
         ChType::Enum8 { .. } => "c".into(),
         ChType::Enum16 { .. } => "s".into(),
+        // Decimal(P, S) exports with the Arrow C Data decimal format string
+        // `d:precision,scale,bitwidth` over the contiguous little-endian
+        // two's-complement buffer, zero-copy. The Arrow C Data spec defines
+        // `d:P,S` as 128-bit and `d:P,S,bits` for an explicit bit width, so the
+        // 128-bit case is emitted as bare `d:P,S` and the others carry the width.
+        // The buffer is exported verbatim at its native width (4/8/16/32 bytes);
+        // we deliberately do NOT widen narrow decimals to 128 bits, which would
+        // cost a forbidden per-value copy in the hot path.
+        //
+        // NOTE for the arrow-ffi-specialist: `decimal32`/`decimal64`/`decimal256`
+        // are newer in the Arrow C Data Interface than `decimal128`. The
+        // `d:P,S,bits` spelling is the documented form, but consumer support for
+        // the non-128 widths varies by Arrow implementation/version. Confirm the
+        // exact format-string spelling and consumer compatibility before relying
+        // on the 32/64/256-bit exports downstream.
+        ChType::Decimal {
+            precision,
+            scale,
+            bits,
+        } => {
+            if *bits == 128 {
+                format!("d:{precision},{scale}")
+            } else {
+                format!("d:{precision},{scale},{bits}")
+            }
+        }
         ChType::Nullable(inner) => arrow_format(inner),
         // A dictionary array's top-level format is the INDEX type. The value
         // type lives in the schema's `dictionary` child. Index width is
@@ -455,6 +481,17 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
         Column::Enum8(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
         Column::Enum16(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
         Column::Ipv6(c) | Column::Uuid(c) => {
+            match &c.validity {
+                Some(bm) => buffers.push(bm.as_bytes().as_ptr() as *const c_void),
+                None => buffers.push(ptr::null()),
+            }
+            buffers.push(c.data.as_ptr() as *const c_void);
+        }
+        // Decimal exports 2 buffers (validity, then the contiguous fixed-width
+        // little-endian data), exactly like a fixed-size binary buffer of width
+        // bits/8. Arrow decimal layout is a single data buffer of the native
+        // width, so this is a zero-copy handoff.
+        Column::Decimal(c) => {
             match &c.validity {
                 Some(bm) => buffers.push(bm.as_bytes().as_ptr() as *const c_void),
                 None => buffers.push(ptr::null()),
@@ -1100,6 +1137,82 @@ mod tests {
             let vals = *a0.buffers.add(1) as *const i8;
             assert_eq!(*vals, 1);
             assert_eq!(*vals.add(1), -1);
+            (array.release.unwrap())(&mut array);
+        }
+    }
+
+    #[test]
+    fn test_arrow_format_and_export_decimal() {
+        use crate::column::DecimalColumn;
+
+        // Decimal exports with the Arrow decimal format string. The 128-bit case
+        // is bare `d:P,S`; the other widths carry the bit width as the third
+        // field (`d:P,S,bits`). The buffer is the native-width contiguous
+        // little-endian data, zero-copy, never widened to 128.
+        assert_eq!(
+            arrow_format(&ChType::Decimal {
+                precision: 9,
+                scale: 4,
+                bits: 32,
+            }),
+            "d:9,4,32"
+        );
+        assert_eq!(
+            arrow_format(&ChType::Decimal {
+                precision: 18,
+                scale: 9,
+                bits: 64,
+            }),
+            "d:18,9,64"
+        );
+        assert_eq!(
+            arrow_format(&ChType::Decimal {
+                precision: 38,
+                scale: 10,
+                bits: 128,
+            }),
+            "d:38,10"
+        );
+        assert_eq!(
+            arrow_format(&ChType::Decimal {
+                precision: 50,
+                scale: 10,
+                bits: 256,
+            }),
+            "d:50,10,256"
+        );
+
+        // Export a Decimal128 column (2 rows): schema format `d:20,2`, array with
+        // 2 buffers (validity null for non-nullable, then the 32-byte data).
+        let schema = Schema::new(vec![Field {
+            name: "d".into(),
+            ch_type: ChType::Decimal {
+                precision: 20,
+                scale: 2,
+                bits: 128,
+            },
+        }]);
+        let mut data = vec![0u8; 32]; // 2 rows of width 16
+        data[0] = 0x01; // row 0 unscaled = 1
+        let columns = vec![Column::Decimal(DecimalColumn::new(data, 16, 20, 2))];
+        let batch = Arc::new(ColBatch::new(schema, columns, 2));
+
+        unsafe {
+            let mut schema_out: ArrowSchema = std::mem::zeroed();
+            export_schema(&batch.schema, &mut schema_out);
+            let c0 = &**schema_out.children.add(0);
+            assert_eq!(CStr::from_ptr(c0.format).to_str().unwrap(), "d:20,2");
+            assert!(c0.dictionary.is_null(), "decimal has no dictionary child");
+            (schema_out.release.unwrap())(&mut schema_out);
+
+            let mut array: ArrowArray = std::mem::zeroed();
+            export_batch_array(&batch, &mut array);
+            let a0 = &**array.children.add(0);
+            assert_eq!(a0.length, 2);
+            assert_eq!(a0.n_buffers, 2);
+            assert!((*a0.buffers.add(0)).is_null(), "non-nullable validity null");
+            let bytes = *a0.buffers.add(1) as *const u8;
+            assert_eq!(*bytes, 0x01, "row 0 first byte is the unscaled 1");
             (array.release.unwrap())(&mut array);
         }
     }

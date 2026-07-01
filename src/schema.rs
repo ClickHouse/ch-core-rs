@@ -35,8 +35,19 @@ pub enum ChType {
         timezone: Option<String>,
     },
 
-    // Decimal (Phase 2)
-    // Decimal { precision: u8, scale: u8, bits: u16 },
+    // Decimal(P, S). The server always emits the canonical `Decimal(P, S)` form
+    // on the wire (never `Decimal32(S)` etc.), so that is the only spelling
+    // parsed. The wire payload is a raw little-endian two's-complement
+    // fixed-width integer whose byte width is derived from the precision P:
+    // P in 1..=9 -> 32 bits (Int32), 10..=18 -> 64, 19..=38 -> 128, 39..=76 ->
+    // 256. `bits` is stored so the Column and the Arrow export can size the
+    // contiguous buffer without re-deriving it. Precision and scale are type
+    // metadata only and never appear in the per-row data.
+    Decimal {
+        precision: u8,
+        scale: u8,
+        bits: u16,
+    },
 
     // Special (Phase 3-4)
     Uuid,
@@ -122,6 +133,12 @@ impl std::fmt::Display for ChType {
                 precision,
                 timezone: Some(tz),
             } => write!(f, "DateTime64({precision}, '{tz}')"),
+            // Render the canonical `Decimal(P, S)` the server emits, comma-space
+            // separated, both fields always present, so it round-trips the wire
+            // string. `bits` is derived from P and is not part of the name.
+            ChType::Decimal {
+                precision, scale, ..
+            } => write!(f, "Decimal({precision}, {scale})"),
             ChType::Enum8 { variants } => write_enum(f, "Enum8", variants),
             ChType::Enum16 { variants } => write_enum(f, "Enum16", variants),
             ChType::Nullable(inner) => write!(f, "Nullable({inner})"),
@@ -211,5 +228,30 @@ mod tests {
         assert_eq!(schema.fields[0].name, "id");
         assert!(!schema.fields[0].ch_type.is_nullable());
         assert!(schema.fields[1].ch_type.is_nullable());
+    }
+
+    #[test]
+    fn test_decimal_display_is_canonical() {
+        // Display emits the canonical `Decimal(P, S)` the server writes on the
+        // wire (comma-space, both fields present), not the bit width, so it
+        // round-trips the type string. bits is metadata only.
+        assert_eq!(
+            ChType::Decimal {
+                precision: 9,
+                scale: 4,
+                bits: 32,
+            }
+            .to_string(),
+            "Decimal(9, 4)"
+        );
+        assert_eq!(
+            ChType::Decimal {
+                precision: 50,
+                scale: 0,
+                bits: 256,
+            }
+            .to_string(),
+            "Decimal(50, 0)"
+        );
     }
 }

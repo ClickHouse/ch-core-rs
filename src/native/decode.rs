@@ -4,7 +4,8 @@ use std::sync::Arc;
 use crate::batch::{ChunkedBatch, ColBatch};
 use crate::bitmap::Bitmap;
 use crate::column::{
-    BoolColumn, Column, DictionaryColumn, FixedBinaryColumn, PrimitiveColumn, Utf8Column,
+    BoolColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn, PrimitiveColumn,
+    Utf8Column,
 };
 use crate::native::varint::ByteReader;
 use crate::schema::{ChType, Field, Schema};
@@ -193,6 +194,35 @@ fn parse_ch_type(type_name: &str) -> Option<ChType> {
         }
     }
 
+    // Decimal(P, S). The server always emits the canonical `Decimal(P, S)` form
+    // on the wire via `DataTypeDecimal::doGetName` (comma-space, both fields
+    // present), never `Decimal32(S)`/`Decimal64(S)`/etc., so only this spelling
+    // is parsed (mirroring the decision to accept only `Enum8(`/`Enum16(`). The
+    // byte width is derived from P, not carried in the per-row data. Any
+    // out-of-range P/S or non-numeric field surfaces as None (UnsupportedType);
+    // the type string is untrusted, so this never panics.
+    if let Some(inner) = type_name.strip_prefix("Decimal(") {
+        if let Some(inner) = inner.strip_suffix(')') {
+            if let Some((p_str, s_str)) = inner.split_once(',') {
+                let precision = p_str.trim().parse::<u8>().ok()?;
+                let scale = s_str.trim().parse::<u8>().ok()?;
+                // Constraint (server `DataTypeDecimal`): 1 <= P <= 76 and
+                // 0 <= S <= P. The byte width follows from P.
+                let bits = decimal_bits_from_precision(precision)?;
+                if scale > precision {
+                    return None;
+                }
+                return Some(ChType::Decimal {
+                    precision,
+                    scale,
+                    bits,
+                });
+            }
+            // Missing comma: not the canonical `Decimal(P, S)` the server emits.
+            return None;
+        }
+    }
+
     // DateTime('<tz>'). The bare DateTime is handled by the exact-match block
     // below. Only the parameterized, timezone-carrying form reaches here.
     if let Some(inner) = type_name.strip_prefix("DateTime(") {
@@ -223,6 +253,29 @@ fn parse_ch_type(type_name: &str) -> Option<ChType> {
         "UUID" => Some(ChType::Uuid),
         "IPv4" => Some(ChType::Ipv4),
         "IPv6" => Some(ChType::Ipv6),
+        _ => None,
+    }
+}
+
+/// Derive a `Decimal`'s on-wire byte width (as a bit count) from its precision.
+///
+/// ClickHouse backs a `Decimal(P, S)` with a fixed-width signed integer chosen
+/// by P (server `DataTypesDecimal` / `createDecimal`, confirmed at
+/// v26.6.1.1193-stable):
+///
+/// - P in  1..=9  -> Int32  (32 bits, 4 bytes/row)
+/// - P in 10..=18 -> Int64  (64 bits, 8 bytes/row)
+/// - P in 19..=38 -> Int128 (128 bits, 16 bytes/row)
+/// - P in 39..=76 -> Int256 (256 bits, 32 bytes/row)
+///
+/// P must be in 1..=76; a precision of 0 or above 76 has no backing integer and
+/// returns `None` (the caller maps it to `UnsupportedType`).
+fn decimal_bits_from_precision(precision: u8) -> Option<u16> {
+    match precision {
+        1..=9 => Some(32),
+        10..=18 => Some(64),
+        19..=38 => Some(128),
+        39..=76 => Some(256),
         _ => None,
     }
 }
@@ -1009,6 +1062,30 @@ fn decode_column_body(
             let values = decode_primitive!(reader, num_rows, i16);
             Column::Enum16(PrimitiveColumn { values, validity })
         }
+        // Decimal(P, S) is a raw little-endian two's-complement fixed-width
+        // integer per row (4/8/16/32 bytes by precision), no per-row framing and
+        // no in-band precision/scale (`SerializationDecimalBase`'s final bulk
+        // methods do a single contiguous read of sizeof(FieldType) * num_rows;
+        // confirmed at v26.6.1.1193-stable). The physical buffer is identical to
+        // a FixedSizeBinary of width bits/8, so it reuses the fixed-binary
+        // single contiguous read. Decode is a host-agnostic passthrough: the
+        // bytes are stored verbatim (correct on big-endian hosts too) and the
+        // host value policy lives in the bindings, so the core needs no native
+        // i128/i256.
+        ChType::Decimal {
+            precision,
+            scale,
+            bits,
+        } => {
+            let width = (*bits / 8) as usize;
+            let data = decode_fixed_binary_data(reader, num_rows, width)?;
+            match validity {
+                Some(bm) => Column::Decimal(DecimalColumn::new_nullable(
+                    data, width, *precision, *scale, bm,
+                )),
+                None => Column::Decimal(DecimalColumn::new(data, width, *precision, *scale)),
+            }
+        }
         ChType::Nullable(_) => unreachable!("Nullable already unwrapped"),
         ChType::LowCardinality(_) => unreachable!("LowCardinality handled above"),
     };
@@ -1122,6 +1199,19 @@ fn empty_column(ch_type: &ChType) -> Column {
             values: vec![],
             validity: empty_validity,
         }),
+        // Decimal empty column: an empty fixed-width buffer keeping precision,
+        // scale, and width, like FixedString. width = bits / 8.
+        ChType::Decimal {
+            precision,
+            scale,
+            bits,
+        } => {
+            let width = (*bits / 8) as usize;
+            Column::Decimal(match empty_validity {
+                Some(bm) => DecimalColumn::new_nullable(vec![], width, *precision, *scale, bm),
+                None => DecimalColumn::new(vec![], width, *precision, *scale),
+            })
+        }
         // A zero-row block reads no LowCardinality prefix or data (the server
         // gates `readData` on having rows), so the empty dictionary column has
         // no indices and an empty values dictionary. The values column is an
@@ -1434,6 +1524,11 @@ fn skip_column_body(
         // UUID and IPv6 are 16 raw bytes per row, the same body shape as
         // FixedString(16).
         ChType::Uuid | ChType::Ipv6 => reader.skip(num_rows.saturating_mul(16))?,
+        // Decimal(P, S) is bits/8 raw bytes per row (4/8/16/32 by precision),
+        // the same contiguous-buffer shape as FixedString(bits/8).
+        ChType::Decimal { bits, .. } => {
+            reader.skip(num_rows.saturating_mul((*bits / 8) as usize))?
+        }
         ChType::String => {
             for _ in 0..num_rows {
                 let len = reader.read_varint()? as usize;
@@ -1706,6 +1801,17 @@ mod tests {
         fn fixed16_data(mut self, values: &[[u8; 16]]) -> Self {
             for v in values {
                 self.buf.extend_from_slice(v);
+            }
+            self
+        }
+
+        /// Decimal column body: raw fixed-width little-endian two's-complement
+        /// integers, `width` bytes per row, no per-row framing. Each entry must
+        /// already be exactly `width` bytes wide.
+        fn decimal_data(mut self, rows: &[&[u8]], width: usize) -> Self {
+            for r in rows {
+                assert_eq!(r.len(), width, "decimal row must be {width} bytes");
+                self.buf.extend_from_slice(r);
             }
             self
         }
@@ -2122,10 +2228,10 @@ mod tests {
     fn test_block_end_rejects_unsupported_type() {
         // An unsupported type inside an otherwise-complete block must surface as
         // a DecodeError from the scan, not be silently skipped or reported as
-        // incomplete. Decimal is not decoded yet, so it serves as the example.
+        // incomplete. Int128 is not decoded yet, so it serves as the example.
         let data = BlockBuilder::new()
             .header(1, 1)
-            .column_header("id", "Decimal(10, 2)")
+            .column_header("id", "Int128")
             .build();
         assert!(matches!(
             block_end(&data, &DecodeOptions::default()),
@@ -2141,11 +2247,11 @@ mod tests {
 
     #[test]
     fn test_unsupported_type() {
-        // Decimal is not decoded yet, so it serves as the unsupported example
-        // now that UUID/IPv4/IPv6 are decoded.
+        // Int128 is not decoded yet, so it serves as the unsupported example now
+        // that Decimal and UUID/IPv4/IPv6 are decoded.
         let data = BlockBuilder::new()
             .header(1, 1)
-            .column_header("id", "Decimal(10, 2)")
+            .column_header("id", "Int128")
             .build();
         assert!(matches!(
             decode_all_bytes(&data, &DecodeOptions::default()),
@@ -4131,6 +4237,474 @@ mod tests {
         assert!(matches!(
             err,
             DecodeError::Io(ref e) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Decimal
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decimal_bits_from_precision_boundaries() {
+        // Width is derived from P alone (server `createDecimal`): the byte width
+        // jumps at every boundary. Pin each edge so a derivation regression is
+        // caught.
+        assert_eq!(decimal_bits_from_precision(1), Some(32));
+        assert_eq!(decimal_bits_from_precision(9), Some(32));
+        assert_eq!(decimal_bits_from_precision(10), Some(64));
+        assert_eq!(decimal_bits_from_precision(18), Some(64));
+        assert_eq!(decimal_bits_from_precision(19), Some(128));
+        assert_eq!(decimal_bits_from_precision(38), Some(128));
+        assert_eq!(decimal_bits_from_precision(39), Some(256));
+        assert_eq!(decimal_bits_from_precision(76), Some(256));
+        // Out of range: P = 0 and P > 76 have no backing integer.
+        assert_eq!(decimal_bits_from_precision(0), None);
+        assert_eq!(decimal_bits_from_precision(77), None);
+    }
+
+    #[test]
+    fn test_parse_ch_type_decimal() {
+        // The server emits the canonical `Decimal(P, S)`; the parser derives the
+        // bit width from P and validates 0 <= S <= P, 1 <= P <= 76.
+        assert_eq!(
+            parse_ch_type("Decimal(9, 4)"),
+            Some(ChType::Decimal {
+                precision: 9,
+                scale: 4,
+                bits: 32,
+            })
+        );
+        assert_eq!(
+            parse_ch_type("Decimal(18, 0)"),
+            Some(ChType::Decimal {
+                precision: 18,
+                scale: 0,
+                bits: 64,
+            })
+        );
+        assert_eq!(
+            parse_ch_type("Decimal(38, 38)"),
+            Some(ChType::Decimal {
+                precision: 38,
+                scale: 38,
+                bits: 128,
+            })
+        );
+        assert_eq!(
+            parse_ch_type("Decimal(76, 50)"),
+            Some(ChType::Decimal {
+                precision: 76,
+                scale: 50,
+                bits: 256,
+            })
+        );
+        // Width derivation at every boundary, parsed end to end.
+        for (p, bits) in [
+            (1u8, 32u16),
+            (9, 32),
+            (10, 64),
+            (18, 64),
+            (19, 128),
+            (38, 128),
+            (39, 256),
+            (76, 256),
+        ] {
+            assert_eq!(
+                parse_ch_type(&format!("Decimal({p}, 0)")),
+                Some(ChType::Decimal {
+                    precision: p,
+                    scale: 0,
+                    bits,
+                }),
+                "precision {p} should derive {bits} bits"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_ch_type_decimal_invalid_rejected() {
+        // Each is rejected as None (UnsupportedType), never a panic, on the
+        // untrusted type string.
+        for bad in [
+            "Decimal(0, 0)",     // P below 1: no backing integer
+            "Decimal(77, 0)",    // P above 76
+            "Decimal(9, 10)",    // S > P
+            "Decimal(5)",        // missing scale (server always emits both)
+            "Decimal(a, 2)",     // non-numeric precision
+            "Decimal(9, b)",     // non-numeric scale
+            "Decimal(9, )",      // missing scale value
+            "Decimal(, 2)",      // missing precision value
+            "Decimal(9, 4, 32)", // extra field is not the canonical form
+        ] {
+            assert_eq!(parse_ch_type(bad), None, "expected None for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_decimal_type_string_round_trips() {
+        // Display emits the canonical `Decimal(P, S)` the server writes, so
+        // parse(display(t)) == t at every width, including S = 0 and S = P.
+        for t in [
+            ChType::Decimal {
+                precision: 9,
+                scale: 4,
+                bits: 32,
+            },
+            ChType::Decimal {
+                precision: 10,
+                scale: 0,
+                bits: 64,
+            },
+            ChType::Decimal {
+                precision: 38,
+                scale: 38,
+                bits: 128,
+            },
+            ChType::Decimal {
+                precision: 50,
+                scale: 10,
+                bits: 256,
+            },
+        ] {
+            let rendered = t.to_string();
+            assert_eq!(
+                parse_ch_type(&rendered),
+                Some(t.clone()),
+                "Display {rendered:?} did not parse back to {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_decimal32_plain() {
+        // Decimal32 is a raw 4-byte LE Int32 per row. Include a negative unscaled
+        // value (-1) to exercise two's-complement: it must decode to all-0xFF
+        // bytes of the width. Precision/scale live in the ChType, not the data.
+        let rows: Vec<[u8; 4]> = vec![
+            13i32.to_le_bytes(),
+            (-1i32).to_le_bytes(),
+            0i32.to_le_bytes(),
+            i32::MIN.to_le_bytes(),
+        ];
+        let row_refs: Vec<&[u8]> = rows.iter().map(|r| r.as_slice()).collect();
+        let data = BlockBuilder::new()
+            .header(1, 4)
+            .column_header("d", "Decimal(9, 4)")
+            .decimal_data(&row_refs, 4)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Decimal(c) => {
+                assert_eq!(c.width, 4);
+                assert_eq!(c.precision, 9);
+                assert_eq!(c.scale, 4);
+                assert_eq!(c.len(), 4);
+                // The raw unscaled integers, read back as i32 LE.
+                assert_eq!(i32::from_le_bytes(c.value(0).try_into().unwrap()), 13);
+                assert_eq!(i32::from_le_bytes(c.value(1).try_into().unwrap()), -1);
+                // -1 is all-0xFF bytes of the width (two's-complement).
+                assert_eq!(c.value(1), &[0xFF, 0xFF, 0xFF, 0xFF]);
+                assert_eq!(i32::from_le_bytes(c.value(2).try_into().unwrap()), 0);
+                assert_eq!(i32::from_le_bytes(c.value(3).try_into().unwrap()), i32::MIN);
+                assert!(c.validity.is_none());
+            }
+            other => panic!("expected Decimal, got {other:?}"),
+        }
+        assert_eq!(
+            batch.schema.fields[0].ch_type,
+            ChType::Decimal {
+                precision: 9,
+                scale: 4,
+                bits: 32,
+            }
+        );
+    }
+
+    #[test]
+    fn test_decode_decimal64_plain() {
+        // Decimal64 is a raw 8-byte LE Int64 per row, including a negative.
+        let rows: Vec<[u8; 8]> = vec![
+            79i64.to_le_bytes(),
+            (-1i64).to_le_bytes(),
+            i64::MAX.to_le_bytes(),
+        ];
+        let row_refs: Vec<&[u8]> = rows.iter().map(|r| r.as_slice()).collect();
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("d", "Decimal(18, 9)")
+            .decimal_data(&row_refs, 8)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Decimal(c) => {
+                assert_eq!(c.width, 8);
+                assert_eq!(c.precision, 18);
+                assert_eq!(c.scale, 9);
+                assert_eq!(i64::from_le_bytes(c.value(0).try_into().unwrap()), 79);
+                assert_eq!(i64::from_le_bytes(c.value(1).try_into().unwrap()), -1);
+                assert_eq!(c.value(1), &[0xFF; 8]);
+                assert_eq!(i64::from_le_bytes(c.value(2).try_into().unwrap()), i64::MAX);
+            }
+            other => panic!("expected Decimal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_decimal128_plain() {
+        // Decimal128 is a raw 16-byte LE Int128 per row. The core has no native
+        // i128, so assert the raw little-endian byte pattern directly. An
+        // unscaled 1 is byte 0 = 0x01, the rest zero; an unscaled -1 is all
+        // 0xFF (two's-complement of the full 16-byte width).
+        let one: [u8; 16] = {
+            let mut b = [0u8; 16];
+            b[0] = 0x01;
+            b
+        };
+        let neg_one: [u8; 16] = [0xFF; 16];
+        let zero: [u8; 16] = [0u8; 16];
+        let row_refs: Vec<&[u8]> = vec![one.as_slice(), neg_one.as_slice(), zero.as_slice()];
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("d", "Decimal(20, 2)")
+            .decimal_data(&row_refs, 16)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Decimal(c) => {
+                assert_eq!(c.width, 16);
+                assert_eq!(c.precision, 20);
+                assert_eq!(c.scale, 2);
+                assert_eq!(c.value(0), one);
+                assert_eq!(c.value(1), neg_one);
+                assert_eq!(c.value(2), zero);
+            }
+            other => panic!("expected Decimal, got {other:?}"),
+        }
+        assert_eq!(
+            batch.schema.fields[0].ch_type,
+            ChType::Decimal {
+                precision: 20,
+                scale: 2,
+                bits: 128,
+            }
+        );
+    }
+
+    #[test]
+    fn test_decode_decimal256_plain() {
+        // Decimal256 is a raw 32-byte LE Int256 per row. Assert the raw
+        // little-endian byte pattern: an unscaled 1, an unscaled -1 (all 0xFF),
+        // and a larger value 258 (0x0102 little-endian -> bytes 0x02, 0x01).
+        let one: [u8; 32] = {
+            let mut b = [0u8; 32];
+            b[0] = 0x01;
+            b
+        };
+        let neg_one: [u8; 32] = [0xFF; 32];
+        let two_fifty_eight: [u8; 32] = {
+            let mut b = [0u8; 32];
+            b[0] = 0x02;
+            b[1] = 0x01;
+            b
+        };
+        let row_refs: Vec<&[u8]> = vec![
+            one.as_slice(),
+            neg_one.as_slice(),
+            two_fifty_eight.as_slice(),
+        ];
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("d", "Decimal(50, 10)")
+            .decimal_data(&row_refs, 32)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Decimal(c) => {
+                assert_eq!(c.width, 32);
+                assert_eq!(c.precision, 50);
+                assert_eq!(c.scale, 10);
+                assert_eq!(c.value(0), one);
+                assert_eq!(c.value(1), neg_one);
+                assert_eq!(c.value(2), two_fifty_eight);
+            }
+            other => panic!("expected Decimal, got {other:?}"),
+        }
+        assert_eq!(
+            batch.schema.fields[0].ch_type,
+            ChType::Decimal {
+                precision: 50,
+                scale: 10,
+                bits: 256,
+            }
+        );
+    }
+
+    #[test]
+    fn test_decode_nullable_decimal64() {
+        // Nullable(Decimal64): the null map first, then the Int64 buffer, exactly
+        // like Nullable(Int64). Null rows still carry a placeholder on the wire.
+        let rows: Vec<[u8; 8]> = vec![
+            13i64.to_le_bytes(),
+            0i64.to_le_bytes(),
+            (-1i64).to_le_bytes(),
+            0i64.to_le_bytes(),
+        ];
+        let row_refs: Vec<&[u8]> = rows.iter().map(|r| r.as_slice()).collect();
+        let data = BlockBuilder::new()
+            .header(1, 4)
+            .column_header("d", "Nullable(Decimal(18, 9))")
+            .null_map(&[false, true, false, true])
+            .decimal_data(&row_refs, 8)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Decimal(c) => {
+                assert_eq!(c.null_count(), 2);
+                assert_eq!(i64::from_le_bytes(c.value(0).try_into().unwrap()), 13);
+                assert_eq!(i64::from_le_bytes(c.value(2).try_into().unwrap()), -1);
+            }
+            other => panic!("expected Decimal, got {other:?}"),
+        }
+        assert!(batch.column(0).validity().unwrap().is_valid(0));
+        assert!(!batch.column(0).validity().unwrap().is_valid(1));
+        assert_eq!(
+            batch.schema.fields[0].ch_type,
+            ChType::Nullable(Box::new(ChType::Decimal {
+                precision: 18,
+                scale: 9,
+                bits: 64,
+            }))
+        );
+    }
+
+    #[test]
+    fn test_decode_decimal_zero_rows() {
+        // A zero-row block carrying decimals of every width contributes the
+        // schema but no chunks; the empty columns have length 0 and keep their
+        // width/precision/scale.
+        let data = BlockBuilder::new()
+            .header(4, 0)
+            .column_header("d32", "Decimal(9, 2)")
+            .column_header("d64", "Decimal(18, 4)")
+            .column_header("d128", "Decimal(38, 10)")
+            .column_header("d256", "Decimal(76, 20)")
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_rows(), 0);
+        assert_eq!(cb.num_chunks(), 0);
+        assert_eq!(cb.num_columns(), 4);
+        for (i, (p, s, bits)) in [(9u8, 2u8, 32u16), (18, 4, 64), (38, 10, 128), (76, 20, 256)]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                cb.schema.fields[i].ch_type,
+                ChType::Decimal {
+                    precision: p,
+                    scale: s,
+                    bits,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn test_multi_block_decimal_kept_as_chunks() {
+        // Decimal blocks stay separate chunks, never concatenated.
+        let block_a: Vec<[u8; 4]> = vec![13i32.to_le_bytes(), (-1i32).to_le_bytes()];
+        let block_b: Vec<[u8; 4]> = vec![79i32.to_le_bytes()];
+        let refs_a: Vec<&[u8]> = block_a.iter().map(|r| r.as_slice()).collect();
+        let refs_b: Vec<&[u8]> = block_b.iter().map(|r| r.as_slice()).collect();
+        let mut data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("d", "Decimal(9, 4)")
+            .decimal_data(&refs_a, 4)
+            .build();
+        data.extend(
+            BlockBuilder::new()
+                .header(1, 1)
+                .column_header("d", "Decimal(9, 4)")
+                .decimal_data(&refs_b, 4)
+                .build(),
+        );
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_chunks(), 2);
+        assert_eq!(cb.num_rows(), 3);
+        match cb.chunks[0].column(0) {
+            Column::Decimal(c) => {
+                assert_eq!(c.len(), 2);
+                assert_eq!(i32::from_le_bytes(c.value(1).try_into().unwrap()), -1);
+            }
+            other => panic!("expected Decimal, got {other:?}"),
+        }
+        match cb.chunks[1].column(0) {
+            Column::Decimal(c) => {
+                assert_eq!(c.len(), 1);
+                assert_eq!(i32::from_le_bytes(c.value(0).try_into().unwrap()), 79);
+            }
+            other => panic!("expected Decimal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_block_end_scans_decimal_columns() {
+        // The completeness scan must walk every Decimal width (4/8/16/32 bytes
+        // per row) to the exact block end, and report a one-byte-short buffer as
+        // "need more bytes".
+        let d32: Vec<[u8; 4]> = vec![13i32.to_le_bytes(), (-1i32).to_le_bytes()];
+        let d256: Vec<[u8; 32]> = vec![[0x01u8; 32], [0xFFu8; 32]];
+        let refs32: Vec<&[u8]> = d32.iter().map(|r| r.as_slice()).collect();
+        let refs256: Vec<&[u8]> = d256.iter().map(|r| r.as_slice()).collect();
+        let data = BlockBuilder::new()
+            .header(2, 2)
+            .column_header("d32", "Decimal(9, 4)")
+            .decimal_data(&refs32, 4)
+            .column_header("d256", "Decimal(50, 10)")
+            .decimal_data(&refs256, 32)
+            .build();
+
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len())
+        );
+        let truncated = &data[..data.len() - 1];
+        let err = block_end(truncated, &DecodeOptions::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::Io(ref e) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[test]
+    fn test_decimal_rejected_as_low_cardinality_inner() {
+        // The server forbids Decimal as a LowCardinality inner
+        // (`canBeInsideLowCardinality()` is false on DataTypeDecimalBase), so it
+        // never appears on the wire and the decoder rejects it as
+        // UnsupportedType rather than mis-decoding.
+        let data = BlockBuilder::new()
+            .header(1, 1)
+            .column_header("lc", "LowCardinality(Decimal(9, 4))")
+            // key-version prefix then an index word; decode rejects before
+            // reaching the body, so the exact trailing bytes do not matter.
+            .raw_bytes(&1u64.to_le_bytes())
+            .raw_bytes(&(LC_HAS_ADDITIONAL_KEYS_BIT).to_le_bytes())
+            .raw_bytes(&0u64.to_le_bytes())
+            .build();
+        assert!(matches!(
+            decode_all_bytes(&data, &DecodeOptions::default()),
+            Err(DecodeError::UnsupportedType { .. })
         ));
     }
 

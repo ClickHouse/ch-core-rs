@@ -219,6 +219,78 @@ impl FixedBinaryColumn {
     }
 }
 
+/// Decimal column: a contiguous little-endian two's-complement fixed-width
+/// integer buffer, the same physical shape as a `FixedSizeBinary` of width
+/// `bits / 8`.
+///
+/// ClickHouse serializes `Decimal(P, S)` as a raw fixed-width signed integer per
+/// row (4/8/16/32 bytes by precision), little-endian, with no per-row framing
+/// and no in-band precision or scale. Decode is a raw passthrough: the wire
+/// bytes go into `data` unchanged, host-agnostic, so the buffer stays correct on
+/// big-endian hosts and the core needs no native `i128`/`i256`. The host
+/// representation (a Python `Decimal`, a JS `BigInt`, and so on) is a binding
+/// concern; the unscaled value is `data` read as a little-endian signed integer
+/// of `width` bytes, divided by `10^scale`.
+///
+/// `precision` and `scale` are the type metadata; `width` is the byte width
+/// derived from the precision (`bits / 8`).
+#[derive(Debug, Clone)]
+pub struct DecimalColumn {
+    pub data: Vec<u8>,
+    pub width: usize,
+    pub precision: u8,
+    pub scale: u8,
+    pub validity: Option<Bitmap>,
+}
+
+impl DecimalColumn {
+    pub fn new(data: Vec<u8>, width: usize, precision: u8, scale: u8) -> Self {
+        Self {
+            data,
+            width,
+            precision,
+            scale,
+            validity: None,
+        }
+    }
+
+    pub fn new_nullable(
+        data: Vec<u8>,
+        width: usize,
+        precision: u8,
+        scale: u8,
+        validity: Bitmap,
+    ) -> Self {
+        Self {
+            data,
+            width,
+            precision,
+            scale,
+            validity: Some(validity),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len().checked_div(self.width).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The raw little-endian two's-complement bytes for row `index`, `width`
+    /// bytes wide. The caller interprets them as a signed integer scaled by
+    /// `10^scale`.
+    pub fn value(&self, index: usize) -> &[u8] {
+        let start = index * self.width;
+        &self.data[start..start + self.width]
+    }
+
+    pub fn null_count(&self) -> usize {
+        self.validity.as_ref().map_or(0, |b| b.null_count())
+    }
+}
+
 /// Dictionary-encoded column (Arrow dictionary layout).
 ///
 /// Used for `LowCardinality(T)`. The column is a pair of an index array and a
@@ -309,6 +381,11 @@ pub enum Column {
     // little-endian fast path, identical on the wire to Int8/Int16.
     Enum8(PrimitiveColumn<i8>),
     Enum16(PrimitiveColumn<i16>),
+    // Decimal(P, S) is a contiguous little-endian two's-complement fixed-width
+    // integer buffer (4/8/16/32 bytes per row by precision), the same physical
+    // shape as a FixedSizeBinary. precision/scale are metadata on the column;
+    // host materialization is a binding concern.
+    Decimal(DecimalColumn),
     Dictionary(DictionaryColumn),
 }
 
@@ -337,6 +414,7 @@ impl Column {
             Column::Uuid(c) => c.len(),
             Column::Enum8(c) => c.len(),
             Column::Enum16(c) => c.len(),
+            Column::Decimal(c) => c.len(),
             Column::Dictionary(c) => c.len(),
         }
     }
@@ -369,6 +447,7 @@ impl Column {
             Column::Uuid(c) => c.null_count(),
             Column::Enum8(c) => c.null_count(),
             Column::Enum16(c) => c.null_count(),
+            Column::Decimal(c) => c.null_count(),
             Column::Dictionary(c) => c.null_count(),
         }
     }
@@ -397,6 +476,7 @@ impl Column {
             Column::Uuid(c) => c.validity.as_ref(),
             Column::Enum8(c) => c.validity.as_ref(),
             Column::Enum16(c) => c.validity.as_ref(),
+            Column::Decimal(c) => c.validity.as_ref(),
             Column::Dictionary(c) => c.validity.as_ref(),
         }
     }

@@ -505,9 +505,10 @@ mod tests {
     #[test]
     fn test_unsupported_type_in_complete_stream_errors() {
         // An unsupported type inside an otherwise-complete block surfaces as a
-        // DecodeError from the scan, not as "need more bytes". Decimal is not
-        // decoded yet, so it serves as the unsupported example (UUID/IPv4/IPv6
-        // are decoded now).
+        // DecodeError from the scan, not as "need more bytes". `Decimal64(4)` is
+        // a creation-time-only spelling the server never emits on the wire (it
+        // always writes the canonical `Decimal(P, S)`), so the parser rejects it
+        // and it serves as the unsupported example here.
         let mut dec = StreamDecoder::new(DecodeOptions::default());
         let mut data = Vec::new();
         write_varint(&mut data, 1).unwrap(); // num_cols

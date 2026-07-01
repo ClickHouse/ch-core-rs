@@ -107,7 +107,26 @@ SELECT
     CAST(multiIf(n = 0, 'north', n = 1, 'south', n = 2, 'west', 'north'), 'Enum8(\'north\' = 1, \'south\' = 2, \'west\' = -1)') AS e8,
     -- Enum16: raw Int16 on the wire (2 bytes/row), same name->value-in-type-string
     -- shape, wider value range. Rows resolve to 1, 2, -1, 1.
-    CAST(multiIf(n = 0, 'north', n = 1, 'south', n = 2, 'west', 'north'), 'Enum16(\'north\' = 1, \'south\' = 2, \'west\' = -1)') AS e16
+    CAST(multiIf(n = 0, 'north', n = 1, 'south', n = 2, 'west', 'north'), 'Enum16(\'north\' = 1, \'south\' = 2, \'west\' = -1)') AS e16,
+    -- Decimal(P, S): a raw little-endian two's-complement fixed-width integer per
+    -- row, byte width derived from P (4/8/16/32 bytes). The server always emits
+    -- the canonical Decimal(P, S) type string, so Decimal32(4) becomes
+    -- Decimal(9, 4), Decimal64(9) becomes Decimal(18, 9), Decimal128(20) becomes
+    -- Decimal(38, 20), and Decimal256(50) becomes Decimal(76, 50). Each column
+    -- includes a negative value to exercise the signed two's-complement decode.
+    -- The CAST string is the unscaled value; the stored integer is value*10^S.
+    -- Decimal32(4) -> Decimal(9, 4): unscaled bytes are value*10^4. Rows:
+    -- 0.0013 -> 13, -0.0001 -> -1, 0 -> 0, 1.2345 -> 12345.
+    CAST(multiIf(n = 0, '0.0013', n = 1, '-0.0001', n = 2, '0', '1.2345'), 'Decimal32(4)') AS dec32,
+    -- Decimal64(9) -> Decimal(18, 9): unscaled is value*10^9. Rows:
+    -- 0.000000079 -> 79, -0.000000001 -> -1, 0 -> 0, 1.5 -> 1500000000.
+    CAST(multiIf(n = 0, '0.000000079', n = 1, '-0.000000001', n = 2, '0', '1.5'), 'Decimal64(9)') AS dec64,
+    -- Decimal128(20) -> Decimal(38, 20): unscaled is value*10^20. Rows:
+    -- 1e-20 -> 1, -1e-20 -> -1, 0 -> 0, 7.9e-19 -> 79.
+    CAST(multiIf(n = 0, '0.00000000000000000001', n = 1, '-0.00000000000000000001', n = 2, '0', '0.00000000000000000079'), 'Decimal128(20)') AS dec128,
+    -- Decimal256(50) -> Decimal(76, 50): unscaled is value*10^50. Rows:
+    -- 1e-50 -> 1, -1e-50 -> -1, 0 -> 0, 2.58e-48 -> 258.
+    CAST(multiIf(n = 0, '0.00000000000000000000000000000000000000000000000001', n = 1, '-0.00000000000000000000000000000000000000000000000001', n = 2, '0', '0.00000000000000000000000000000000000000000000000258'), 'Decimal256(50)') AS dec256
 FROM numbers(4)
 SETTINGS allow_suspicious_low_cardinality_types = 1
 FORMAT Native
