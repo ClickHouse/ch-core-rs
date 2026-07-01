@@ -27,17 +27,41 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use ch_core_rs::batch::ColBatch;
-use ch_core_rs::column::{Column, PrimitiveColumn};
+use ch_core_rs::column::{Column, FixedBinaryColumn, PrimitiveColumn, Utf8Column};
 use ch_core_rs::native::decode::{decode_all_bytes, DecodeOptions};
 use ch_core_rs::native::encode::{encode_block, EncodeOptions};
 use ch_core_rs::schema::{ChType, Field, Schema};
 
 const TABLE: &str = "ch_core_rs_encode_test";
 
-/// The batch to insert: all ten fixed-width numeric types over four rows. The
-/// `i32` column is strictly ascending so `ORDER BY i32` on read-back is
-/// deterministic and matches insertion order.
-fn numeric_batch() -> ColBatch {
+/// Build a `Utf8Column` from raw byte values, computing Arrow offsets the same
+/// way the decoder does.
+fn utf8_column(values: &[&[u8]]) -> Utf8Column {
+    let mut offsets = Vec::with_capacity(values.len() + 1);
+    let mut data = Vec::new();
+    offsets.push(0i32);
+    for v in values {
+        data.extend_from_slice(v);
+        offsets.push(data.len() as i32);
+    }
+    Utf8Column::new(offsets, data)
+}
+
+/// Build a `FixedBinaryColumn` of the given width from equal-width byte values.
+fn fixed_binary_column(width: usize, values: &[&[u8]]) -> FixedBinaryColumn {
+    let mut data = Vec::with_capacity(width * values.len());
+    for v in values {
+        assert_eq!(v.len(), width, "fixed-string value must be {width} bytes");
+        data.extend_from_slice(v);
+    }
+    FixedBinaryColumn::new(data, width)
+}
+
+/// The batch to insert: every encodable type over four rows (the ten fixed-width
+/// numerics plus `String` and `FixedString(4)`). The `i32` column is strictly
+/// ascending so `ORDER BY i32` on read-back is deterministic and matches
+/// insertion order, which lets the string columns line up row-for-row too.
+fn sample_batch() -> ColBatch {
     let fields = vec![
         ("i8", ChType::Int8),
         ("i16", ChType::Int16),
@@ -49,6 +73,8 @@ fn numeric_batch() -> ColBatch {
         ("u64", ChType::UInt64),
         ("f32", ChType::Float32),
         ("f64", ChType::Float64),
+        ("s", ChType::String),
+        ("fs", ChType::FixedString(4)),
     ]
     .into_iter()
     .map(|(name, ch_type)| Field {
@@ -68,6 +94,11 @@ fn numeric_batch() -> ColBatch {
         Column::UInt64(PrimitiveColumn::new(vec![0, 13, 79, u64::MAX])),
         Column::Float32(PrimitiveColumn::new(vec![-1.25, 0.0, 3.5, 79.125])),
         Column::Float64(PrimitiveColumn::new(vec![-1.25, 0.0, 3.5, 79.125])),
+        Column::Utf8(utf8_column(&[b"user_1", b"", b"n", b"user_2_longer"])),
+        Column::FixedBinary(fixed_binary_column(
+            4,
+            &[b"road", b"1234", b"\x00\x00\x00\x00", b"n\x00\x00\x00"],
+        )),
     ];
 
     ColBatch::new(Schema::new(fields), columns, 4)
@@ -182,8 +213,8 @@ impl Server {
     }
 }
 
-/// Gather every value of numeric column `col` across all chunks, in chunk order,
-/// as a debug string, so the ten types can be compared uniformly.
+/// Gather every value of column `col` across all chunks, in chunk order, as a
+/// debug string, so the supported types can be compared uniformly.
 fn column_repr(batch: &ch_core_rs::batch::ChunkedBatch, col: usize) -> Vec<String> {
     let mut out = Vec::new();
     for chunk in &batch.chunks {
@@ -198,6 +229,8 @@ fn column_repr(batch: &ch_core_rs::batch::ChunkedBatch, col: usize) -> Vec<Strin
             Column::UInt64(c) => out.extend(c.values.iter().map(|v| v.to_string())),
             Column::Float32(c) => out.extend(c.values.iter().map(|v| v.to_bits().to_string())),
             Column::Float64(c) => out.extend(c.values.iter().map(|v| v.to_bits().to_string())),
+            Column::Utf8(c) => out.extend((0..c.len()).map(|i| format!("{:?}", c.value(i)))),
+            Column::FixedBinary(c) => out.extend((0..c.len()).map(|i| format!("{:?}", c.value(i)))),
             other => panic!("unexpected column {col} variant: {other:?}"),
         }
     }
@@ -206,9 +239,9 @@ fn column_repr(batch: &ch_core_rs::batch::ChunkedBatch, col: usize) -> Vec<Strin
 
 #[test]
 #[ignore = "requires a live ClickHouse server matching .server-ref; run with --ignored"]
-fn insert_numerics_roundtrips_through_server() {
+fn insert_roundtrips_through_server() {
     let server = Server::from_env();
-    let batch = numeric_batch();
+    let batch = sample_batch();
 
     // Clean slate, then a Memory table matching the batch's columns and order.
     server.ddl(&format!("DROP TABLE IF EXISTS {TABLE}"));
@@ -216,7 +249,8 @@ fn insert_numerics_roundtrips_through_server() {
         "CREATE TABLE {TABLE} (\
          i8 Int8, i16 Int16, i32 Int32, i64 Int64, \
          u8 UInt8, u16 UInt16, u32 UInt32, u64 UInt64, \
-         f32 Float32, f64 Float64) ENGINE = Memory"
+         f32 Float32, f64 Float64, \
+         s String, fs FixedString(4)) ENGINE = Memory"
     ));
 
     // Encode at revision 0: HTTP INSERT parses the body with server_revision 0,
@@ -234,7 +268,7 @@ fn insert_numerics_roundtrips_through_server() {
     // crate. ORDER BY i32 is deterministic (i32 is strictly ascending), so the
     // decoded rows line up with the inserted rows.
     let native = server.select(&format!(
-        "SELECT i8, i16, i32, i64, u8, u16, u32, u64, f32, f64 \
+        "SELECT i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, s, fs \
          FROM {TABLE} ORDER BY i32 FORMAT Native"
     ));
     let decoded = decode_all_bytes(

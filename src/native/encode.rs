@@ -9,13 +9,14 @@
 //! `src/Core/BlockInfo.cpp`, and `src/Processors/Formats/Impl/NativeFormat.cpp`
 //! at v26.6.1.1193-stable).
 //!
-//! Scope: this first slice encodes the fixed-width numeric types (`Int8`..`Int64`,
-//! `UInt8`..`UInt64`, `Float32`, `Float64`). Every other column, and any
-//! `Nullable` wrapper, returns [`EncodeError::UnsupportedType`] until its encoder
-//! lands, the same one-type-at-a-time growth the decode path follows.
+//! Scope: this encodes the fixed-width numeric types (`Int8`..`Int64`,
+//! `UInt8`..`UInt64`, `Float32`, `Float64`), plus `String` and `FixedString(N)`.
+//! Every other column, and any `Nullable` wrapper, returns
+//! [`EncodeError::UnsupportedType`] until its encoder lands, the same
+//! one-type-at-a-time growth the decode path follows.
 
 use crate::batch::{ChunkedBatch, ColBatch};
-use crate::column::Column;
+use crate::column::{Column, FixedBinaryColumn, Utf8Column};
 use crate::schema::{ChType, Field};
 
 use super::decode::DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION;
@@ -249,8 +250,56 @@ fn encode_column_data(
         (ChType::UInt64, Column::UInt64(c)) => encode_primitive!(buf, &c.values, u64),
         (ChType::Float32, Column::Float32(c)) => encode_primitive!(buf, &c.values, f32),
         (ChType::Float64, Column::Float64(c)) => encode_primitive!(buf, &c.values, f64),
+        (ChType::String, Column::Utf8(c)) => encode_string_data(buf, c),
+        (ChType::FixedString(n), Column::FixedBinary(c)) => {
+            encode_fixed_string_data(buf, field, c, *n)?
+        }
         _ => return Err(column_error(field)),
     }
+    Ok(())
+}
+
+/// Encode a `String` column body: one varint length prefix then the raw value
+/// bytes, per row, the inverse of [`super::decode::decode_string_data`].
+///
+/// The values are walked straight out of the Arrow offsets+data buffer, one
+/// sub-slice of `data` per row, so there is no per-row allocation and the value
+/// bytes are copied exactly once. A zero-row column has `offsets == [0]`, so
+/// `windows(2)` yields nothing and no body is written.
+fn encode_string_data(buf: &mut Vec<u8>, col: &Utf8Column) {
+    for pair in col.offsets.windows(2) {
+        // Offsets are monotonic and bounded by `data.len()` for any column this
+        // crate produces (the decoder builds them that way and they are not wire
+        // input), so the slice is always in range.
+        let value = &col.data[pair[0] as usize..pair[1] as usize];
+        write_varint(buf, value.len() as u64);
+        buf.extend_from_slice(value);
+    }
+}
+
+/// Encode a `FixedString(N)` column body: the contiguous `N * num_rows` data
+/// buffer written verbatim, the inverse of
+/// [`super::decode::decode_fixed_binary_data`]. There is no per-row framing; the
+/// width lives only in the type string.
+///
+/// The column's stored `width` must equal the declared `N`. A mismatch would put
+/// a body with the wrong bytes-per-row under a truthful type string, so it is an
+/// [`EncodeError::InconsistentBatch`] rather than a corrupt wire column.
+fn encode_fixed_string_data(
+    buf: &mut Vec<u8>,
+    field: &Field,
+    col: &FixedBinaryColumn,
+    declared_width: usize,
+) -> Result<(), EncodeError> {
+    if col.width != declared_width {
+        return Err(EncodeError::InconsistentBatch {
+            detail: format!(
+                "column {:?} is declared FixedString({declared_width}) but its buffer stores {}-byte rows",
+                field.name, col.width
+            ),
+        });
+    }
+    buf.extend_from_slice(&col.data);
     Ok(())
 }
 
@@ -262,7 +311,7 @@ fn encode_column_data(
 /// supported (a `Nullable` wrapper, or a type whose encoder has not landed), which
 /// is an [`EncodeError::UnsupportedType`].
 fn column_error(field: &Field) -> EncodeError {
-    if is_supported_numeric(&field.ch_type) {
+    if is_encodable(&field.ch_type) {
         EncodeError::InconsistentBatch {
             detail: format!(
                 "column {:?} is declared {} but its buffer is a mismatched column variant",
@@ -277,8 +326,12 @@ fn column_error(field: &Field) -> EncodeError {
     }
 }
 
-/// The fixed-width numeric types this slice can encode.
-fn is_supported_numeric(ch_type: &ChType) -> bool {
+/// The types this encoder can write. Encode coverage is kept a subset of decode
+/// coverage, and this predicate is the single place that lists it, so
+/// [`column_error`] can tell a wrong-buffer mismatch (`InconsistentBatch`) apart
+/// from a genuinely unsupported type (`UnsupportedType`). Extend it as each new
+/// type's arm lands in [`encode_column_data`].
+fn is_encodable(ch_type: &ChType) -> bool {
     matches!(
         ch_type,
         ChType::Int8
@@ -291,6 +344,8 @@ fn is_supported_numeric(ch_type: &ChType) -> bool {
             | ChType::UInt64
             | ChType::Float32
             | ChType::Float64
+            | ChType::String
+            | ChType::FixedString(_)
     )
 }
 
@@ -300,6 +355,59 @@ mod tests {
     use crate::column::PrimitiveColumn;
     use crate::native::decode::{decode_all_bytes, DecodeOptions, DBMS_TCP_PROTOCOL_VERSION};
     use crate::schema::Schema;
+
+    /// Build a `Utf8Column` from raw byte values, computing the Arrow offsets the
+    /// same way the decoder does (starting at 0, one entry past each value).
+    fn utf8_column(values: &[&[u8]]) -> Utf8Column {
+        let mut offsets = Vec::with_capacity(values.len() + 1);
+        let mut data = Vec::new();
+        offsets.push(0i32);
+        for v in values {
+            data.extend_from_slice(v);
+            offsets.push(data.len() as i32);
+        }
+        Utf8Column::new(offsets, data)
+    }
+
+    /// Build a `FixedBinaryColumn` of the given width from equal-width byte
+    /// values, concatenated into the contiguous data buffer.
+    fn fixed_binary_column(width: usize, values: &[&[u8]]) -> FixedBinaryColumn {
+        let mut data = Vec::with_capacity(width * values.len());
+        for v in values {
+            assert_eq!(
+                v.len(),
+                width,
+                "fixed-string test value must be {width} bytes"
+            );
+            data.extend_from_slice(v);
+        }
+        FixedBinaryColumn::new(data, width)
+    }
+
+    /// A `String` column and a `FixedString(4)` column over four rows. The string
+    /// values include an empty string and a value longer than the fixed width to
+    /// exercise the varint length framing; the fixed-string values include an
+    /// all-zero row and a zero-padded row.
+    fn string_batch() -> ColBatch {
+        let fields = vec![
+            Field {
+                name: "s".into(),
+                ch_type: ChType::String,
+            },
+            Field {
+                name: "fs".into(),
+                ch_type: ChType::FixedString(4),
+            },
+        ];
+        let columns = vec![
+            Column::Utf8(utf8_column(&[b"user_1", b"", b"n", b"user_2_longer"])),
+            Column::FixedBinary(fixed_binary_column(
+                4,
+                &[b"road", b"1234", b"\x00\x00\x00\x00", b"n\x00\x00\x00"],
+            )),
+        ];
+        ColBatch::new(Schema::new(fields), columns, 4)
+    }
 
     /// All ten fixed-width numeric columns over four rows, one batch. Values pick
     /// each type's extremes plus a couple of neutral in-range values.
@@ -361,8 +469,9 @@ mod tests {
         ColBatch::new(Schema::new(fields), columns, 4)
     }
 
-    /// Compare two batches column by column for the numeric types this slice
-    /// encodes. Panics on any other variant so a wrong decode is loud.
+    /// Compare two batches column by column for the types this encoder covers
+    /// (the numerics, `String`, `FixedString`). Panics on any other variant so a
+    /// wrong decode is loud.
     fn assert_batches_eq(left: &ColBatch, right: &ColBatch) {
         assert_eq!(left.schema, right.schema, "schema mismatch");
         assert_eq!(left.num_rows, right.num_rows, "row count mismatch");
@@ -388,15 +497,24 @@ mod tests {
                 (Column::UInt64(x), Column::UInt64(y)) => eq!(x, y),
                 (Column::Float32(x), Column::Float32(y)) => eq!(x, y),
                 (Column::Float64(x), Column::Float64(y)) => eq!(x, y),
+                (Column::Utf8(x), Column::Utf8(y)) => {
+                    assert_eq!(x.offsets, y.offsets, "column {i} offsets differ");
+                    assert_eq!(x.data, y.data, "column {i} data differ");
+                }
+                (Column::FixedBinary(x), Column::FixedBinary(y)) => {
+                    assert_eq!(x.width, y.width, "column {i} width differ");
+                    assert_eq!(x.data, y.data, "column {i} data differ");
+                }
                 (other_a, other_b) => panic!("column {i}: unexpected {other_a:?} vs {other_b:?}"),
             }
         }
     }
 
-    fn roundtrip_at(revision: u64) {
-        let batch = numeric_batch();
+    /// Encode `batch` as one block at `revision`, decode it back, and assert the
+    /// buffers survived unchanged.
+    fn roundtrip(batch: &ColBatch, revision: u64) {
         let bytes = encode_block(
-            &batch,
+            batch,
             &EncodeOptions {
                 protocol_revision: revision,
             },
@@ -410,17 +528,27 @@ mod tests {
         )
         .unwrap_or_else(|e| panic!("decode at rev {revision} failed: {e}"));
         assert_eq!(decoded.num_chunks(), 1);
-        assert_batches_eq(&batch, &decoded.chunks[0]);
+        assert_batches_eq(batch, &decoded.chunks[0]);
     }
 
     #[test]
     fn roundtrip_numerics_rev0() {
-        roundtrip_at(0);
+        roundtrip(&numeric_batch(), 0);
     }
 
     #[test]
     fn roundtrip_numerics_tcp_revision() {
-        roundtrip_at(DBMS_TCP_PROTOCOL_VERSION);
+        roundtrip(&numeric_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_strings_rev0() {
+        roundtrip(&string_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_strings_tcp_revision() {
+        roundtrip(&string_batch(), DBMS_TCP_PROTOCOL_VERSION);
     }
 
     #[test]
@@ -572,23 +700,87 @@ mod tests {
 
     #[test]
     fn unsupported_type_reports_column_and_type() {
+        // `Bool` is decoded but not yet encodable, so it still reports
+        // UnsupportedType with the column name and type.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "b".into(),
+                ch_type: ChType::Bool,
+            }]),
+            vec![Column::Bool(crate::column::BoolColumn::empty())],
+            0,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::UnsupportedType { column, ch_type } => {
+                assert_eq!(column, "b");
+                assert_eq!(ch_type, ChType::Bool);
+            }
+            other => panic!("expected UnsupportedType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rev0_frames_string_bytes() {
+        // Pin the String body framing: one varint length prefix then the raw
+        // bytes, per row. One String column "s" with a single row "hi".
         let batch = ColBatch::new(
             Schema::new(vec![Field {
                 name: "s".into(),
                 ch_type: ChType::String,
             }]),
-            vec![Column::Utf8(crate::column::Utf8Column::new(
-                vec![0],
-                vec![],
-            ))],
-            0,
+            vec![Column::Utf8(utf8_column(&[b"hi"]))],
+            1,
         );
+        let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+        let expected = [
+            0x01, // num_cols = 1
+            0x01, // num_rows = 1
+            0x01, b's', // name "s"
+            0x06, b'S', b't', b'r', b'i', b'n', b'g', // type "String"
+            0x02, b'h', b'i', // value: varint len 2 then "hi"
+        ];
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn rev0_frames_fixed_string_bytes() {
+        // Pin the FixedString body framing: contiguous width*num_rows bytes, no
+        // per-row length prefix. One FixedString(4) column "fs", single row.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "fs".into(),
+                ch_type: ChType::FixedString(4),
+            }]),
+            vec![Column::FixedBinary(fixed_binary_column(4, &[b"road"]))],
+            1,
+        );
+        let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+        let expected = [
+            0x01, // num_cols = 1
+            0x01, // num_rows = 1
+            0x02, b'f', b's', // name "fs"
+            0x0E, b'F', b'i', b'x', b'e', b'd', b'S', b't', b'r', b'i', b'n', b'g', b'(', b'4',
+            b')', // type "FixedString(4)"
+            b'r', b'o', b'a', b'd', // 4 raw bytes, no length prefix
+        ];
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn fixed_string_width_mismatch_is_rejected() {
+        // A FixedString(4) type string paired with a width-3 buffer would emit a
+        // body with the wrong bytes-per-row; reject it rather than corrupt.
+        let batch = ColBatch {
+            schema: Schema::new(vec![Field {
+                name: "fs".into(),
+                ch_type: ChType::FixedString(4),
+            }]),
+            columns: vec![Column::FixedBinary(fixed_binary_column(3, &[b"abc"]))],
+            num_rows: 1,
+        };
         match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
-            EncodeError::UnsupportedType { column, ch_type } => {
-                assert_eq!(column, "s");
-                assert_eq!(ch_type, ChType::String);
-            }
-            other => panic!("expected UnsupportedType, got {other:?}"),
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
         }
     }
 
