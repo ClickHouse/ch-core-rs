@@ -133,10 +133,13 @@ Implemented:
   in Arrow-compatible layouts.
 - Export decoded chunks as an Arrow C Data stream.
 - Malformed-input hardening: untrusted wire bytes return errors, never panic.
+- Encode fixed-width numeric columns back to Native block bytes for `INSERT`
+  (`native::encode`); accepted by a live server over HTTP.
 
 Not implemented yet:
 
-- Native encoding for inserts.
+- Native encoding for the non-numeric types on the insert path (strings,
+  nullable, temporal, and the rest); they follow the numerics one at a time.
 - TCP/native protocol packet framing.
 - Compression framing.
 - Binary-encoded Native type headers.
@@ -194,7 +197,9 @@ Use a local `[patch]` in `.cargo/config.toml` to override a pinned git
 dependency with a local checkout during development.
 
 Decode a complete buffer with `native::decode::decode_all_bytes`, or stream
-with `native::stream_decoder::StreamDecoder`.
+with `native::stream_decoder::StreamDecoder`. Encode a batch back to Native
+block bytes for `INSERT` with `native::encode::encode_block` (numeric columns
+so far; see `COMPLETENESS.md` for the insert-path progress).
 
 ## Repo layout
 

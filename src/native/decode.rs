@@ -1665,8 +1665,8 @@ mod tests {
             if self.revision > 0 {
                 Self::push_block_info(&mut self.buf, self.revision);
             }
-            write_varint(&mut self.buf, num_cols as u64).unwrap();
-            write_varint(&mut self.buf, num_rows as u64).unwrap();
+            write_varint(&mut self.buf, num_cols as u64);
+            write_varint(&mut self.buf, num_rows as u64);
             self
         }
 
@@ -1696,22 +1696,22 @@ mod tests {
         }
 
         fn push_string(buf: &mut Vec<u8>, s: &str) {
-            write_varint(buf, s.len() as u64).unwrap();
+            write_varint(buf, s.len() as u64);
             buf.extend_from_slice(s.as_bytes());
         }
 
         /// Standard BlockInfo: is_overflows=false, bucket_num=-1, and an empty
         /// out_of_order_buckets vector at revision >= 54480.
         fn push_block_info(buf: &mut Vec<u8>, revision: u64) {
-            write_varint(buf, 1).unwrap();
+            write_varint(buf, 1);
             buf.push(0x00); // is_overflows = false
-            write_varint(buf, 2).unwrap();
+            write_varint(buf, 2);
             buf.extend_from_slice(&(-1i32).to_le_bytes()); // bucket_num = -1
             if revision >= 54480 {
-                write_varint(buf, 3).unwrap();
-                write_varint(buf, 0).unwrap(); // empty out_of_order_buckets
+                write_varint(buf, 3);
+                write_varint(buf, 0); // empty out_of_order_buckets
             }
-            write_varint(buf, 0).unwrap(); // terminator
+            write_varint(buf, 0); // terminator
         }
 
         fn raw_bytes(mut self, bytes: &[u8]) -> Self {
@@ -1784,7 +1784,7 @@ mod tests {
 
         fn string_data(mut self, values: &[&str]) -> Self {
             for &s in values {
-                write_varint(&mut self.buf, s.len() as u64).unwrap();
+                write_varint(&mut self.buf, s.len() as u64);
                 self.buf.extend_from_slice(s.as_bytes());
             }
             self
@@ -1880,7 +1880,7 @@ mod tests {
         ) -> Self {
             let mut dict_bytes = Vec::new();
             for &s in dictionary {
-                write_varint(&mut dict_bytes, s.len() as u64).unwrap();
+                write_varint(&mut dict_bytes, s.len() as u64);
                 dict_bytes.extend_from_slice(s.as_bytes());
             }
             self.low_cardinality_block(dictionary.len(), &dict_bytes, indices, index_width)
@@ -2523,7 +2523,7 @@ mod tests {
     fn test_unknown_block_info_field_rejected() {
         // An unknown BlockInfo field number is rejected, matching the server.
         let mut data = Vec::new();
-        write_varint(&mut data, 7).unwrap(); // unknown field number
+        write_varint(&mut data, 7); // unknown field number
 
         let options = DecodeOptions {
             protocol_revision: DBMS_TCP_PROTOCOL_VERSION,
@@ -2815,21 +2815,21 @@ mod tests {
         // assemble a nonzero one by hand and confirm the decoder skips the whole
         // vector and lands exactly on the block body.
         let mut data = Vec::new();
-        write_varint(&mut data, 1).unwrap(); // field 1: is_overflows
+        write_varint(&mut data, 1); // field 1: is_overflows
         data.push(0x00);
-        write_varint(&mut data, 2).unwrap(); // field 2: bucket_num
+        write_varint(&mut data, 2); // field 2: bucket_num
         data.extend_from_slice(&(-1i32).to_le_bytes());
-        write_varint(&mut data, 3).unwrap(); // field 3: out_of_order_buckets
-        write_varint(&mut data, 2).unwrap(); // count = 2
+        write_varint(&mut data, 3); // field 3: out_of_order_buckets
+        write_varint(&mut data, 2); // count = 2
         data.extend_from_slice(&7i32.to_le_bytes());
         data.extend_from_slice(&9i32.to_le_bytes());
-        write_varint(&mut data, 0).unwrap(); // terminator
-                                             // Block body: one Int32 column, one row.
-        write_varint(&mut data, 1).unwrap(); // num_cols
-        write_varint(&mut data, 1).unwrap(); // num_rows
-        write_varint(&mut data, 1).unwrap(); // name length
+        write_varint(&mut data, 0); // terminator
+                                    // Block body: one Int32 column, one row.
+        write_varint(&mut data, 1); // num_cols
+        write_varint(&mut data, 1); // num_rows
+        write_varint(&mut data, 1); // name length
         data.extend_from_slice(b"n");
-        write_varint(&mut data, 5).unwrap(); // type length
+        write_varint(&mut data, 5); // type length
         data.extend_from_slice(b"Int32");
         data.push(0x00); // default serialization (revision >= 54454)
         data.extend_from_slice(&13i32.to_le_bytes());

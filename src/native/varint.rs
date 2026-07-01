@@ -125,22 +125,24 @@ impl<'a> ByteReader<'a> {
     }
 }
 
-/// Write a LEB128-encoded unsigned integer to a writer.
+/// Append a LEB128-encoded unsigned integer to an in-memory buffer.
 ///
-/// The crate is decode-only today, so this exists only for the in-crate test
-/// builders that synthesize wire bytes, hence `#[cfg(test)]`. When the
-/// insert/encode path lands it can be promoted to real API deliberately.
-#[cfg(test)]
-pub(crate) fn write_varint<W: io::Write>(writer: &mut W, mut value: u64) -> io::Result<()> {
+/// This is the varint writer for the encode/insert path: `native::encode` builds
+/// Native block bytes into a `Vec<u8>`, and every length, count, and framing word
+/// on the wire is a LEB128 varint (server `writeVarUInt`, `src/IO/VarInt.h`). It
+/// is the exact inverse of [`ByteReader::read_varint`]. The in-crate test builders
+/// that synthesize wire bytes use it too. Appending to a `Vec` is infallible, so
+/// this returns nothing and cannot error.
+pub(crate) fn write_varint(buf: &mut Vec<u8>, mut value: u64) {
     loop {
         let mut byte = (value & 0x7F) as u8;
         value >>= 7;
         if value != 0 {
             byte |= 0x80;
         }
-        writer.write_all(&[byte])?;
+        buf.push(byte);
         if value == 0 {
-            return Ok(());
+            return;
         }
     }
 }
@@ -151,7 +153,7 @@ mod tests {
 
     fn roundtrip(value: u64) {
         let mut buf = Vec::new();
-        write_varint(&mut buf, value).unwrap();
+        write_varint(&mut buf, value);
         let decoded = ByteReader::new(&buf).read_varint().unwrap();
         assert_eq!(decoded, value, "roundtrip failed for {value}");
     }
@@ -199,7 +201,7 @@ mod tests {
         // Encode: length=5 then "hello"
         let data = {
             let mut buf = Vec::new();
-            write_varint(&mut buf, 5).unwrap();
+            write_varint(&mut buf, 5);
             buf.extend_from_slice(b"hello");
             buf
         };

@@ -203,15 +203,15 @@ mod tests {
     fn make_int64_block(name: &str, values: &[i64]) -> Vec<u8> {
         let mut buf = Vec::new();
         // num_cols = 1
-        write_varint(&mut buf, 1).unwrap();
+        write_varint(&mut buf, 1);
         // num_rows
-        write_varint(&mut buf, values.len() as u64).unwrap();
+        write_varint(&mut buf, values.len() as u64);
         // column header
         let name_bytes = name.as_bytes();
-        write_varint(&mut buf, name_bytes.len() as u64).unwrap();
+        write_varint(&mut buf, name_bytes.len() as u64);
         buf.extend_from_slice(name_bytes);
         let type_name = b"Int64";
-        write_varint(&mut buf, type_name.len() as u64).unwrap();
+        write_varint(&mut buf, type_name.len() as u64);
         buf.extend_from_slice(type_name);
         // column data
         for &v in values {
@@ -223,15 +223,15 @@ mod tests {
     /// Helper: build a Native format block with one String column (no framing).
     fn make_string_block(name: &str, values: &[&str]) -> Vec<u8> {
         let mut buf = Vec::new();
-        write_varint(&mut buf, 1).unwrap(); // num_cols
-        write_varint(&mut buf, values.len() as u64).unwrap(); // num_rows
-        write_varint(&mut buf, name.len() as u64).unwrap();
+        write_varint(&mut buf, 1); // num_cols
+        write_varint(&mut buf, values.len() as u64); // num_rows
+        write_varint(&mut buf, name.len() as u64);
         buf.extend_from_slice(name.as_bytes());
         let type_name = b"String";
-        write_varint(&mut buf, type_name.len() as u64).unwrap();
+        write_varint(&mut buf, type_name.len() as u64);
         buf.extend_from_slice(type_name);
         for &s in values {
-            write_varint(&mut buf, s.len() as u64).unwrap();
+            write_varint(&mut buf, s.len() as u64);
             buf.extend_from_slice(s.as_bytes());
         }
         buf
@@ -511,12 +511,12 @@ mod tests {
         // and it serves as the unsupported example here.
         let mut dec = StreamDecoder::new(DecodeOptions::default());
         let mut data = Vec::new();
-        write_varint(&mut data, 1).unwrap(); // num_cols
-        write_varint(&mut data, 1).unwrap(); // num_rows
-        write_varint(&mut data, 2).unwrap();
+        write_varint(&mut data, 1); // num_cols
+        write_varint(&mut data, 1); // num_rows
+        write_varint(&mut data, 2);
         data.extend_from_slice(b"id");
         let type_name = b"Decimal64(4)";
-        write_varint(&mut data, type_name.len() as u64).unwrap();
+        write_varint(&mut data, type_name.len() as u64);
         data.extend_from_slice(type_name);
         data.extend_from_slice(&0u64.to_le_bytes()); // any 8 bytes of data
 
