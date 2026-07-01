@@ -59,7 +59,8 @@ fn fixed_binary_column(width: usize, values: &[&[u8]]) -> FixedBinaryColumn {
 }
 
 /// The batch to insert: every encodable type over four rows (the ten fixed-width
-/// numerics, `String`, `FixedString(4)`, `Bool`, and three `Nullable` columns).
+/// numerics, `String`, `FixedString(4)`, `Bool`, the four temporal types, and
+/// three `Nullable` columns).
 /// The `i32` column is strictly ascending so `ORDER BY i32` on read-back is
 /// deterministic and matches insertion order, which lets the other columns line up
 /// row-for-row too. The `Nullable` columns use the null pattern valid, null, valid,
@@ -79,6 +80,21 @@ fn sample_batch() -> ColBatch {
         ("s", ChType::String),
         ("fs", ChType::FixedString(4)),
         ("b", ChType::Bool),
+        ("d", ChType::Date),
+        ("d32", ChType::Date32),
+        (
+            "dt",
+            ChType::DateTime {
+                timezone: Some("UTC".into()),
+            },
+        ),
+        (
+            "dt64",
+            ChType::DateTime64 {
+                precision: 3,
+                timezone: Some("UTC".into()),
+            },
+        ),
         ("ni32", ChType::Nullable(Box::new(ChType::Int32))),
         ("ns", ChType::Nullable(Box::new(ChType::String))),
         ("nb", ChType::Nullable(Box::new(ChType::Bool))),
@@ -112,6 +128,24 @@ fn sample_batch() -> ColBatch {
             &[b"road", b"1234", b"\x00\x00\x00\x00", b"n\x00\x00\x00"],
         )),
         Column::Bool(BoolColumn::from_wire_bytes(&[1, 0, 1, 0])),
+        // Neutral in-range temporal values. Date is days since 1970-01-01, Date32
+        // days signed (one row pre-epoch), DateTime seconds since the epoch,
+        // DateTime64(3) milliseconds. All well within each type's server range so
+        // the Memory table round-trips them verbatim.
+        Column::Date(PrimitiveColumn::new(vec![0, 19000, 19001, 19710])),
+        Column::Date32(PrimitiveColumn::new(vec![-25567, 0, 19000, 19710])),
+        Column::DateTime(PrimitiveColumn::new(vec![
+            0,
+            1_600_000_000,
+            1_700_000_000,
+            1_710_000_000,
+        ])),
+        Column::DateTime64(PrimitiveColumn::new(vec![
+            0,
+            1_600_000_000_000,
+            1_700_000_000_000,
+            1_710_000_000_000,
+        ])),
         Column::Int32(PrimitiveColumn::new_nullable(
             vec![13, 0, 79, 0],
             validity(),
@@ -255,6 +289,13 @@ fn column_repr(batch: &ch_core_rs::batch::ChunkedBatch, col: usize) -> Vec<Strin
             Column::Float32(c) => c.values.iter().map(|v| v.to_bits().to_string()).collect(),
             Column::Float64(c) => c.values.iter().map(|v| v.to_bits().to_string()).collect(),
             Column::Bool(c) => (0..c.len()).map(|i| c.get(i).to_string()).collect(),
+            // Temporal columns are physically primitives; render the raw numeric
+            // value (days / seconds / ticks) so the sent-vs-decoded comparison is a
+            // straight physical check, the same as the numerics above.
+            Column::Date(c) => c.values.iter().map(|v| v.to_string()).collect(),
+            Column::Date32(c) => c.values.iter().map(|v| v.to_string()).collect(),
+            Column::DateTime(c) => c.values.iter().map(|v| v.to_string()).collect(),
+            Column::DateTime64(c) => c.values.iter().map(|v| v.to_string()).collect(),
             Column::Utf8(c) => (0..c.len()).map(|i| format!("{:?}", c.value(i))).collect(),
             Column::FixedBinary(c) => (0..c.len()).map(|i| format!("{:?}", c.value(i))).collect(),
             other => panic!("unexpected column {col} variant: {other:?}"),
@@ -286,6 +327,7 @@ fn insert_roundtrips_through_server() {
          f32 Float32, f64 Float64, \
          s String, fs FixedString(4), \
          b Bool, \
+         d Date, d32 Date32, dt DateTime('UTC'), dt64 DateTime64(3, 'UTC'), \
          ni32 Nullable(Int32), ns Nullable(String), nb Nullable(Bool)) ENGINE = Memory"
     ));
 
@@ -304,7 +346,8 @@ fn insert_roundtrips_through_server() {
     // crate. ORDER BY i32 is deterministic (i32 is strictly ascending), so the
     // decoded rows line up with the inserted rows.
     let native = server.select(&format!(
-        "SELECT i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, s, fs, b, ni32, ns, nb \
+        "SELECT i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, s, fs, b, \
+         d, d32, dt, dt64, ni32, ns, nb \
          FROM {TABLE} ORDER BY i32 FORMAT Native"
     ));
     let decoded = decode_all_bytes(

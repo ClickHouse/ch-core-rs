@@ -10,10 +10,11 @@
 //! at v26.6.1.1193-stable).
 //!
 //! Scope: this encodes `Bool`, the fixed-width numeric types (`Int8`..`Int64`,
-//! `UInt8`..`UInt64`, `Float32`, `Float64`), `String`, and `FixedString(N)`, each
-//! also inside a `Nullable(T)` wrapper (a per-row null map precedes the inner
-//! values). Every other column type returns [`EncodeError::UnsupportedType`] until
-//! its encoder lands, the same one-type-at-a-time growth the decode path follows.
+//! `UInt8`..`UInt64`, `Float32`, `Float64`), the temporal types (`Date`,
+//! `Date32`, `DateTime`, `DateTime64`), `String`, and `FixedString(N)`, each also
+//! inside a `Nullable(T)` wrapper (a per-row null map precedes the inner values).
+//! Every other column type returns [`EncodeError::UnsupportedType`] until its
+//! encoder lands, the same one-type-at-a-time growth the decode path follows.
 
 use crate::batch::{ChunkedBatch, ColBatch};
 use crate::column::{BoolColumn, Column, FixedBinaryColumn, Utf8Column};
@@ -330,6 +331,16 @@ fn encode_column_body(
         (ChType::UInt64, Column::UInt64(c)) => encode_primitive!(buf, &c.values, u64),
         (ChType::Float32, Column::Float32(c)) => encode_primitive!(buf, &c.values, f32),
         (ChType::Float64, Column::Float64(c)) => encode_primitive!(buf, &c.values, f64),
+        // Temporal types are plain little-endian primitives at their native width;
+        // timezone and precision live only in the type string (rendered by
+        // `ChType::Display`), never in the per-row data, so each is just the
+        // matching `encode_primitive!` run, the inverse of `decode_primitive!`.
+        (ChType::Date, Column::Date(c)) => encode_primitive!(buf, &c.values, u16),
+        (ChType::Date32, Column::Date32(c)) => encode_primitive!(buf, &c.values, i32),
+        (ChType::DateTime { .. }, Column::DateTime(c)) => encode_primitive!(buf, &c.values, u32),
+        (ChType::DateTime64 { .. }, Column::DateTime64(c)) => {
+            encode_primitive!(buf, &c.values, i64)
+        }
         (ChType::String, Column::Utf8(c)) => encode_string_data(buf, c),
         (ChType::FixedString(n), Column::FixedBinary(c)) => {
             encode_fixed_string_data(buf, field, c, *n)?
@@ -456,6 +467,10 @@ fn is_encodable(ch_type: &ChType) -> bool {
             | ChType::UInt64
             | ChType::Float32
             | ChType::Float64
+            | ChType::Date
+            | ChType::Date32
+            | ChType::DateTime { .. }
+            | ChType::DateTime64 { .. }
             | ChType::String
             | ChType::FixedString(_)
     )
@@ -629,9 +644,78 @@ mod tests {
         ColBatch::new(Schema::new(fields), columns, 4)
     }
 
+    /// The four temporal columns over four rows. `DateTime` carries a timezone and
+    /// `DateTime64` carries precision plus a timezone so the type-string rendering
+    /// (which is where tz and precision live, never the per-row data) is exercised
+    /// on the wire. Values pick each width's boundaries plus neutral in-range days,
+    /// and `Date32`/`DateTime64` include a negative pre-epoch value to prove the
+    /// signed little-endian round-trip.
+    fn temporal_batch() -> ColBatch {
+        let fields = vec![
+            Field {
+                name: "d".into(),
+                ch_type: ChType::Date,
+            },
+            Field {
+                name: "d32".into(),
+                ch_type: ChType::Date32,
+            },
+            Field {
+                name: "dt".into(),
+                ch_type: ChType::DateTime {
+                    timezone: Some("UTC".into()),
+                },
+            },
+            Field {
+                name: "dt64".into(),
+                ch_type: ChType::DateTime64 {
+                    precision: 3,
+                    timezone: Some("UTC".into()),
+                },
+            },
+        ];
+        let columns = vec![
+            Column::Date(PrimitiveColumn::new(vec![0, 19000, 19001, u16::MAX])),
+            Column::Date32(PrimitiveColumn::new(vec![i32::MIN, -25567, 0, i32::MAX])),
+            Column::DateTime(PrimitiveColumn::new(vec![
+                0,
+                1_600_000_000,
+                1_700_000_000,
+                u32::MAX,
+            ])),
+            Column::DateTime64(PrimitiveColumn::new(vec![
+                i64::MIN,
+                -1_000,
+                1_700_000_000_000,
+                i64::MAX,
+            ])),
+        ];
+        ColBatch::new(Schema::new(fields), columns, 4)
+    }
+
+    /// A `Nullable(DateTime64(3, 'UTC'))` column over four rows with the valid,
+    /// null, valid, null pattern, proving the `Nullable` wrapper composes with a
+    /// temporal inner: the null map precedes the inner i64 values.
+    fn nullable_temporal_batch() -> ColBatch {
+        // 0x00 = valid, 0x01 = null (ClickHouse null-map polarity).
+        let validity = Bitmap::from_ch_null_map(&[0, 1, 0, 1]);
+        let fields = vec![Field {
+            name: "ndt64".into(),
+            ch_type: ChType::Nullable(Box::new(ChType::DateTime64 {
+                precision: 3,
+                timezone: Some("UTC".into()),
+            })),
+        }];
+        let columns = vec![Column::DateTime64(PrimitiveColumn::new_nullable(
+            vec![1_700_000_000_000, 0, -1_000, 0],
+            validity,
+        ))];
+        ColBatch::new(Schema::new(fields), columns, 4)
+    }
+
     /// Compare two batches column by column for the types this encoder covers
-    /// (the numerics, `String`, `FixedString`). Panics on any other variant so a
-    /// wrong decode is loud.
+    /// (the numerics, the temporal types, `String`, `FixedString`). Panics on any
+    /// other variant so a wrong decode is loud.
     fn assert_batches_eq(left: &ColBatch, right: &ColBatch) {
         assert_eq!(left.schema, right.schema, "schema mismatch");
         assert_eq!(left.num_rows, right.num_rows, "row count mismatch");
@@ -663,6 +747,10 @@ mod tests {
                 (Column::UInt64(x), Column::UInt64(y)) => eq!(x, y),
                 (Column::Float32(x), Column::Float32(y)) => eq!(x, y),
                 (Column::Float64(x), Column::Float64(y)) => eq!(x, y),
+                (Column::Date(x), Column::Date(y)) => eq!(x, y),
+                (Column::Date32(x), Column::Date32(y)) => eq!(x, y),
+                (Column::DateTime(x), Column::DateTime(y)) => eq!(x, y),
+                (Column::DateTime64(x), Column::DateTime64(y)) => eq!(x, y),
                 (Column::Utf8(x), Column::Utf8(y)) => {
                     assert_eq!(x.offsets, y.offsets, "column {i} offsets differ");
                     assert_eq!(x.data, y.data, "column {i} data differ");
@@ -755,6 +843,26 @@ mod tests {
     #[test]
     fn roundtrip_nullable_tcp_revision() {
         roundtrip(&nullable_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_temporal_rev0() {
+        roundtrip(&temporal_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_temporal_tcp_revision() {
+        roundtrip(&temporal_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_nullable_temporal_rev0() {
+        roundtrip(&nullable_temporal_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_nullable_temporal_tcp_revision() {
+        roundtrip(&nullable_temporal_batch(), DBMS_TCP_PROTOCOL_VERSION);
     }
 
     #[test]
@@ -890,23 +998,24 @@ mod tests {
     #[test]
     fn nullable_unsupported_inner_is_unsupported() {
         // `Nullable` is a supported wrapper now, but its inner type must also be
-        // encodable. `Date` is decoded yet not encodable, so `Nullable(Date)` is
-        // still rejected, and the reported type is the full `Nullable(Date)`.
+        // encodable. `UUID` is decoded yet not encodable, so `Nullable(UUID)` is
+        // still rejected, and the reported type is the full `Nullable(UUID)`.
         let batch = ColBatch::new(
             Schema::new(vec![Field {
-                name: "nd".into(),
-                ch_type: ChType::Nullable(Box::new(ChType::Date)),
+                name: "nu".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::Uuid)),
             }]),
-            vec![Column::Date(PrimitiveColumn::new_nullable(
-                vec![19000u16],
+            vec![Column::Uuid(FixedBinaryColumn::new_nullable(
+                vec![0u8; 16],
+                16,
                 Bitmap::from_ch_null_map(&[0]),
             ))],
             1,
         );
         match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
             EncodeError::UnsupportedType { column, ch_type } => {
-                assert_eq!(column, "nd");
-                assert_eq!(ch_type, ChType::Nullable(Box::new(ChType::Date)));
+                assert_eq!(column, "nu");
+                assert_eq!(ch_type, ChType::Nullable(Box::new(ChType::Uuid)));
             }
             other => panic!("expected UnsupportedType, got {other:?}"),
         }
@@ -914,20 +1023,20 @@ mod tests {
 
     #[test]
     fn unsupported_type_reports_column_and_type() {
-        // `Date` is decoded but not yet encodable, so it reports UnsupportedType
+        // `UUID` is decoded but not yet encodable, so it reports UnsupportedType
         // with the column name and type.
         let batch = ColBatch::new(
             Schema::new(vec![Field {
-                name: "d".into(),
-                ch_type: ChType::Date,
+                name: "u".into(),
+                ch_type: ChType::Uuid,
             }]),
-            vec![Column::Date(PrimitiveColumn::new(vec![]))],
+            vec![Column::Uuid(FixedBinaryColumn::new(vec![], 16))],
             0,
         );
         match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
             EncodeError::UnsupportedType { column, ch_type } => {
-                assert_eq!(column, "d");
-                assert_eq!(ch_type, ChType::Date);
+                assert_eq!(column, "u");
+                assert_eq!(ch_type, ChType::Uuid);
             }
             other => panic!("expected UnsupportedType, got {other:?}"),
         }
