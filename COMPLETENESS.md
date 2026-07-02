@@ -47,11 +47,13 @@ point-in-time snapshot for the next agent, not a changelog. Keep it short. Alway
 include a "Recommended next" with a one-line reason, so the next agent has a
 default; the user may override it.
 
-- **Last updated:** 2026-07-02 (encode/insert path: **`UUID`/`IPv4`/`IPv6`
-  encode** landed on top of the temporal, `Bool` + `Nullable(T)` null map,
-  `String`/`FixedString(N)`, and fixed-width numeric encode slices; unit
-  round-trips green at rev 0 and rev 54485, plain and nullable; the live INSERT
-  test was extended with `u`/`ip4`/`ip6`/`nu` columns but not run this session)
+- **Last updated:** 2026-07-02 (encode/insert path: **`Enum8`/`Enum16` encode**
+  landed on top of the `UUID`/`IPv4`/`IPv6`, temporal, `Bool` + `Nullable(T)`
+  null map, `String`/`FixedString(N)`, and fixed-width numeric encode slices;
+  unit round-trips green at rev 0 and rev 54485, plain and nullable; the live
+  INSERT test was extended with `e8`/`e16` columns and **run green** this session
+  against a 26.6.1.1193 server, so every encode arm through `Enum8`/`Enum16` is
+  now live-server confirmed)
 - **Active track:** the **encode/insert path** is now the priority (shifted
   2026-07-01, at the user's direction). Decode type coverage is paused with
   `Array(T)` as its next item. See the "Encode / insert path" section for the
@@ -65,63 +67,68 @@ default; the user may override it.
   HTTP `FORMAT Native` does not enable native block-frame compression by default.
   The LZ4/NONE + CityHash128 compressed-block framing in `src/compression/` is
   built and tested but intentionally **unwired** (no caller). See "Out of scope".
-- **Last completed:** **`UUID`/`IPv4`/`IPv6` encode** (`src/native/encode.rs`).
-  `UUID` and `IPv6` are raw 16-byte-per-row passthrough arms in
-  `encode_column_body` over the shared `encode_fixed_binary_data` (the renamed,
-  generalized `encode_fixed_string_data`: one `extend_from_slice` of the whole
-  `FixedBinaryColumn` data buffer, NO reordering; the RFC-4122 / host-address
-  mapping is a binding concern, matching the decode passthrough). `IPv4` is one
-  `encode_primitive!` arm over `Column::Ipv4` at u32 LE, exactly like `UInt32`.
-  Each is the exact inverse of the already-confirmed decode arms, so no server
-  read and no new fixtures were needed. `validate_column` applies the shared
-  `validate_fixed_binary` guard (also used by `FixedString`, so the three cannot
-  drift when `Decimal`/wide ints land): stored width must be 16, data must be
-  exactly `16 * num_rows` bytes, else `InconsistentBatch` before any bytes are
-  written. `column_variant_matches` and `is_encodable` gained all three, keeping
-  the `(ch_type, column)` pair-match intact. `Nullable` composes for free via
-  `encode_null_map`. Verified by round-trip unit tests (rev 0 and rev 54485,
-  plain and nullable), exact-byte pins for all three
-  (`rev0_frames_uuid_bytes`/`rev0_frames_ipv6_bytes` with 16 distinct bytes so
-  any shuffle fails, `rev0_frames_ipv4_bytes` proving the LE u32 byte order),
-  zero-row and two-block `encode_chunked` coverage, width/ragged rejection
-  tests, and the
-  live-server INSERT test extended to a 24-column batch (`u UUID`, `ip4 IPv4`,
-  `ip6 IPv6`, `nu Nullable(UUID)`) -- extended but not run this session, so run
-  `cargo test --test live_insert -- --ignored` against a 26.6.1.1193 server to
-  confirm. The two "unsupported type" unit tests that used `UUID` as the
-  decoded-but-not-encodable example were swapped to `Enum8` (still not
-  encodable). Prior slices (still in place): temporal
-  (`Date`/`Date32`/`DateTime`/`DateTime64`), `Bool` + the `Nullable(T)` null map,
-  `String`/`FixedString(N)` encode, the framing (`encode_block`/`encode_chunked`,
-  `EncodeOptions`, `EncodeError`, the `BlockInfo` preamble, counts, per-column
-  header + marker byte), and the fixed-width numeric `encode_primitive!` path, all
-  confirmed against `NativeWriter::write`/`BlockInfo::write`/`NativeInputFormat` at
-  v26.6.1.1193-stable. HTTP `INSERT ... FORMAT Native` parses at server_revision 0,
-  so encode at `protocol_revision = 0` for HTTP; the stream ends at EOF (no trailing
-  empty block; that terminator is TCP-only).
-- **Build/test status:** Tree builds clean; `cargo test` green (214 unit + 3
+- **Last completed:** **`Enum8`/`Enum16` encode** (`src/native/encode.rs`). Each
+  is one `encode_primitive!` arm in `encode_column_body` over
+  `Column::Enum8`/`Column::Enum16` at i8/i16 LE, byte-identical to the `Int8`/
+  `Int16` arms and the exact inverse of the decode arms, because
+  `SerializationEnum` inherits `SerializationNumber` and the name->value map
+  lives only in the type string (rendered by `ChType::Display`, validated by the
+  header round-trip check in `validate_column`). `column_variant_matches` and
+  `is_encodable` gained both variants, so `Nullable(Enum8/16)` composes for free
+  via `encode_null_map`. No server read and no new fixtures were needed. The enum
+  map is intentionally NOT semantically validated on encode: a degenerate map
+  (empty variant list, duplicate names/values) or a per-row value outside the
+  declared set is the server's call on INSERT, the same trusted-input boundary as
+  a `DateTime64` precision above 9 (the decode parser is deliberately lenient on
+  enum maps, so the header round-trip check does not catch it); this is
+  documented at the arms. Both reviewers (`rust-reviewer`, `codex-reviewer`)
+  raised exactly this one point and both judged it consistent with the crate's
+  philosophy. Verified by round-trip unit tests
+  (`roundtrip_enum_rev0`/`roundtrip_enum_tcp_revision` and the two
+  `roundtrip_nullable_enum_*`; rev 0 and rev 54485, plain and nullable, i8/i16
+  MIN/MAX and a negative), the two "unsupported type" tests swapped from `Enum8`
+  to `Decimal(9, 4)` (still decoded-but-not-encodable, structurally valid so the
+  only rejection reason is unsupported-encode), and the live-server INSERT test
+  extended with `e8 Enum8('off' = -1, 'idle' = 0, 'busy' = 13)` /
+  `e16 Enum16(...)` columns and **run green** against a 26.6.1.1193 server. Prior
+  slices (still in place, all live-confirmed this session): `UUID`/`IPv4`/`IPv6`,
+  temporal (`Date`/`Date32`/`DateTime`/`DateTime64`), `Bool` + the `Nullable(T)`
+  null map, `String`/`FixedString(N)`, the framing
+  (`encode_block`/`encode_chunked`, `EncodeOptions`, `EncodeError`, the
+  `BlockInfo` preamble, counts, per-column header + marker byte), and the
+  fixed-width numeric `encode_primitive!` path, all confirmed against
+  `NativeWriter::write`/`BlockInfo::write`/`NativeInputFormat` at
+  v26.6.1.1193-stable. HTTP `INSERT ... FORMAT Native` parses at server_revision
+  0, so encode at `protocol_revision = 0` for HTTP; the stream ends at EOF (no
+  trailing empty block; that terminator is TCP-only).
+- **Build/test status:** Tree builds clean; `cargo test` green (218 unit + 3
   integration; the live INSERT test in `tests/live_insert.rs` is `#[ignore]` and
   server-gated, run it with `cargo test --test live_insert -- --ignored` against a
-  server matching `.server-ref` -> was extended with the `UUID`/`IPv4`/`IPv6`
-  columns but not run this session); clippy clean
+  server matching `.server-ref` -> extended with the `e8`/`e16` columns and run
+  green this session against a 26.6.1.1193 server); clippy clean
   (`--all-targets -- -D warnings`); fmt clean. Verify with `cargo test && cargo
   clippy --all-targets -- -D warnings && cargo fmt --check` before starting, so you
   know any breakage is yours.
-- **Recommended next (encode track):** **`Enum8`/`Enum16` encode**, the next
-  unchecked item in the "Encode / insert path" checklist. On the wire they are
-  the raw underlying `Int8`/`Int16` (byte-identical to the numeric arms), so each
-  is one `encode_primitive!` arm over `Column::Enum8`/`Column::Enum16`; the
-  name->value map lives only in the type string, which `ChType::Display` already
-  renders and which the round-trip type-string check in `validate_column` already
-  validates. Add the two arms, extend `column_variant_matches` and
-  `is_encodable`, add round-trip unit tests (rev 0 and rev 54485, plain and
-  nullable), swap the "unsupported type" unit tests' example from `Enum8` to a
-  still-unsupported type (e.g. `Decimal`), and add columns to
-  `tests/live_insert.rs`. No `clickhouse-server-reader` read or new fixtures are
-  needed: encode is the exact inverse of the already-confirmed decode layout.
-  After these the remaining order is `Decimal(P, S)` (contiguous LE bytes
-  straight from the `DecimalColumn` buffer, like `FixedString`), then
-  `LowCardinality(T)` (hardest, do last: needs the write-side state prefix and
+- **Recommended next (encode track):** **`Decimal(P, S)` encode**, the next
+  unchecked item in the "Encode / insert path" checklist. On the wire a `Decimal`
+  is a raw little-endian two's-complement fixed-width integer per row (4/8/16/32
+  bytes by precision), the same contiguous-buffer shape as `FixedString`, so it
+  is one arm in `encode_column_body` over `Column::Decimal`/`DecimalColumn` that
+  writes the whole data buffer verbatim (mirror `encode_fixed_binary_data`, or
+  add a `encode_decimal_data` if the buffer field names differ). Precision and
+  scale live only in the type string (`ChType::Display` renders `Decimal(P, S)`,
+  which the round-trip check in `validate_column` already validates); the byte
+  width is derived from P. Extend `column_variant_matches` and `is_encodable`,
+  add a `validate_column` guard that the `DecimalColumn` buffer is exactly
+  `(bits/8) * num_rows` bytes and its width matches the precision-derived width
+  (reuse/generalize `validate_fixed_binary` if it fits), add round-trip unit
+  tests (rev 0 and rev 54485, plain and nullable, one column per width
+  32/64/128/256), and swap the two "unsupported type" tests off `Decimal` to
+  another still-unsupported type. `Decimal` is forbidden as a `LowCardinality`
+  inner, so no LC interaction. No `clickhouse-server-reader` read or new fixtures
+  are needed: encode is the exact inverse of the already-confirmed decode layout.
+  After `Decimal` the only remaining encode item is `LowCardinality(T)` (hardest,
+  do last: needs the write-side 8-byte key-version state prefix and the
   dictionary/index framing). Keep encode coverage a subset of decode coverage and
   the `(ch_type, column)` pair-match intact. If the decode track resumes instead,
   its next item is **`Array(T)`** (see "Type coverage"). **Compression framing
@@ -552,8 +559,22 @@ bring encode to parity with what the decoder already supports.
       `cargo test --test live_insert -- --ignored` against a 26.6.1.1193 server).
       The two "unsupported type" unit tests that used `UUID` as the
       decoded-but-not-encodable example were swapped to `Enum8`.
-- [ ] `Enum8`/`Enum16` (raw underlying `Int8`/`Int16`; the name->value map lives
-      in the type string, which `ChType::Display` already renders).
+- [x] `Enum8`/`Enum16` (raw underlying `Int8`/`Int16`; the name->value map lives
+      in the type string, which `ChType::Display` already renders). Two
+      `encode_primitive!` arms in `encode_column_body` over
+      `Column::Enum8`/`Column::Enum16` at i8/i16 LE, the exact inverse of the
+      decode arms; `column_variant_matches` and `is_encodable` gained both, so
+      `Nullable(Enum8/16)` composes for free via `encode_null_map`. No server
+      read or new fixtures needed (byte-identical to the confirmed `Int8`/`Int16`
+      layout). The enum map is not semantically validated on encode (an empty or
+      duplicate variant list, or a per-row value outside the declared set, is the
+      server's call on INSERT, the same trusted-input boundary as a `DateTime64`
+      precision above 9); documented at the arms. Verified by round-trip unit
+      tests (rev 0 and rev 54485, plain and nullable, sign and width boundaries),
+      the swapped unsupported-type tests (now `Decimal`, still decoded-not-
+      encodable), and a passing live-server INSERT of `e8 Enum8(...)` /
+      `e16 Enum16(...)` columns against 26.6.1.1193. Reviewed clean by
+      `rust-reviewer` and `codex-reviewer`.
 - [ ] `Decimal(P, S)` (contiguous fixed-width LE two's-complement bytes straight
       from the `DecimalColumn` data buffer, the same shape as `FixedString`).
 - [ ] `LowCardinality(T)` (hardest, do last). Needs the write-side per-column

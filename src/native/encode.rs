@@ -11,9 +11,9 @@
 //!
 //! Scope: this encodes `Bool`, the fixed-width numeric types (`Int8`..`Int64`,
 //! `UInt8`..`UInt64`, `Float32`, `Float64`), the temporal types (`Date`,
-//! `Date32`, `DateTime`, `DateTime64`), `UUID`, `IPv4`, `IPv6`, `String`, and
-//! `FixedString(N)`, each also inside a `Nullable(T)` wrapper (a per-row null map
-//! precedes the inner values).
+//! `Date32`, `DateTime`, `DateTime64`), `UUID`, `IPv4`, `IPv6`, `String`,
+//! `FixedString(N)`, and `Enum8`/`Enum16`, each also inside a `Nullable(T)`
+//! wrapper (a per-row null map precedes the inner values).
 //! Every other column type returns [`EncodeError::UnsupportedType`] until its
 //! encoder lands, the same one-type-at-a-time growth the decode path follows.
 
@@ -395,6 +395,8 @@ fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
             | (ChType::Ipv6, Column::Ipv6(_))
             | (ChType::String, Column::Utf8(_))
             | (ChType::FixedString(_), Column::FixedBinary(_))
+            | (ChType::Enum8 { .. }, Column::Enum8(_))
+            | (ChType::Enum16 { .. }, Column::Enum16(_))
     )
 }
 
@@ -590,6 +592,24 @@ fn encode_column_body(
         (ChType::DateTime64 { .. }, Column::DateTime64(c)) => {
             encode_primitive!(buf, &c.values, i64)
         }
+        // Enum8/Enum16 are byte-identical to Int8/Int16 on the wire
+        // (`SerializationEnum` inherits `SerializationNumber` and overrides no
+        // bulk method); the name->value map lives only in the type string
+        // (rendered by `ChType::Display`), never in the per-row data, so each is
+        // the matching `encode_primitive!` run over the underlying signed-int
+        // buffer, the exact inverse of the decoder's `Enum8`/`Enum16` arms.
+        //
+        // The enum map itself is not semantically validated here: a degenerate
+        // `ChType::Enum8` (empty variant list, or duplicate names/values) renders
+        // a type string the decode parser accepts by design (it round-trips
+        // whatever the server emitted), so the header round-trip check in
+        // `validate_column` does not reject it, and a per-row value outside the
+        // declared set still encodes as a plain Int8/Int16. Both are semantic
+        // legality the server owns, not wire framing: the same trusted-input
+        // boundary as a `DateTime64` precision above 9, so the server rejects a
+        // malformed map on INSERT rather than the encoder rejecting it locally.
+        (ChType::Enum8 { .. }, Column::Enum8(c)) => encode_primitive!(buf, &c.values, i8),
+        (ChType::Enum16 { .. }, Column::Enum16(c)) => encode_primitive!(buf, &c.values, i16),
         // UUID and IPv6 bodies are 16 raw bytes per row written verbatim from the
         // width-16 fixed-binary buffer, with NO reordering, the inverse of the
         // decoder's passthrough `Uuid`/`Ipv6` arms over
@@ -811,6 +831,8 @@ fn is_encodable(ch_type: &ChType) -> bool {
             | ChType::Ipv6
             | ChType::String
             | ChType::FixedString(_)
+            | ChType::Enum8 { .. }
+            | ChType::Enum16 { .. }
     )
 }
 
@@ -818,7 +840,7 @@ fn is_encodable(ch_type: &ChType) -> bool {
 mod tests {
     use super::*;
     use crate::bitmap::Bitmap;
-    use crate::column::PrimitiveColumn;
+    use crate::column::{DecimalColumn, PrimitiveColumn};
     use crate::native::decode::{decode_all_bytes, DecodeOptions, DBMS_TCP_PROTOCOL_VERSION};
     use crate::schema::Schema;
 
@@ -1145,6 +1167,81 @@ mod tests {
         ColBatch::new(Schema::new(fields), columns, 4)
     }
 
+    /// An `Enum8` and an `Enum16` column over four rows. The variant lists carry
+    /// distinct signed values in the server's ascending-by-value order, including
+    /// a negative variant and each width's boundary (`i8::MIN`/`i8::MAX`,
+    /// `i16::MIN`/`i16::MAX`), and the physical buffers pick those boundary and
+    /// negative values so the little-endian byte order and sign of the underlying
+    /// int are exercised. The name->value map lives only in the type string
+    /// (`ChType::Display`), so this proves that string round-trips too.
+    fn enum_batch() -> ColBatch {
+        let fields = vec![
+            Field {
+                name: "e8".into(),
+                ch_type: ChType::Enum8 {
+                    variants: vec![
+                        ("floor".into(), i8::MIN),
+                        ("neg".into(), -13),
+                        ("idle".into(), 0),
+                        ("busy".into(), 13),
+                        ("ceil".into(), i8::MAX),
+                    ],
+                },
+            },
+            Field {
+                name: "e16".into(),
+                ch_type: ChType::Enum16 {
+                    variants: vec![
+                        ("floor".into(), i16::MIN),
+                        ("neg".into(), -79),
+                        ("idle".into(), 0),
+                        ("busy".into(), 79),
+                        ("ceil".into(), i16::MAX),
+                    ],
+                },
+            },
+        ];
+        let columns = vec![
+            Column::Enum8(PrimitiveColumn::new(vec![i8::MIN, -13, 0, i8::MAX])),
+            Column::Enum16(PrimitiveColumn::new(vec![i16::MIN, -79, 0, i16::MAX])),
+        ];
+        ColBatch::new(Schema::new(fields), columns, 4)
+    }
+
+    /// A `Nullable(Enum8(...))` and a `Nullable(Enum16(...))` column over four
+    /// rows with the valid, null, valid, null pattern, proving the `Nullable`
+    /// wrapper composes with an enum inner: the null map precedes the inner
+    /// signed-int values.
+    fn nullable_enum_batch() -> ColBatch {
+        // 0x00 = valid, 0x01 = null (ClickHouse null-map polarity).
+        let validity = || Bitmap::from_ch_null_map(&[0, 1, 0, 1]);
+        let fields = vec![
+            Field {
+                name: "ne8".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::Enum8 {
+                    variants: vec![("neg".into(), -13), ("idle".into(), 0), ("busy".into(), 13)],
+                })),
+            },
+            Field {
+                name: "ne16".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::Enum16 {
+                    variants: vec![("neg".into(), -79), ("idle".into(), 0), ("busy".into(), 79)],
+                })),
+            },
+        ];
+        let columns = vec![
+            Column::Enum8(PrimitiveColumn::new_nullable(
+                vec![-13, 0, 13, 0],
+                validity(),
+            )),
+            Column::Enum16(PrimitiveColumn::new_nullable(
+                vec![-79, 0, 79, 0],
+                validity(),
+            )),
+        ];
+        ColBatch::new(Schema::new(fields), columns, 4)
+    }
+
     /// Compare two batches column by column for the types this encoder covers
     /// (the numerics, the temporal types, `UUID`/`IPv4`/`IPv6`, `String`,
     /// `FixedString`). Panics on any other variant so a wrong decode is loud.
@@ -1183,6 +1280,8 @@ mod tests {
                 (Column::Date32(x), Column::Date32(y)) => eq!(x, y),
                 (Column::DateTime(x), Column::DateTime(y)) => eq!(x, y),
                 (Column::DateTime64(x), Column::DateTime64(y)) => eq!(x, y),
+                (Column::Enum8(x), Column::Enum8(y)) => eq!(x, y),
+                (Column::Enum16(x), Column::Enum16(y)) => eq!(x, y),
                 (Column::Ipv4(x), Column::Ipv4(y)) => eq!(x, y),
                 (Column::Uuid(x), Column::Uuid(y)) | (Column::Ipv6(x), Column::Ipv6(y)) => {
                     assert_eq!(x.width, y.width, "column {i} width differ");
@@ -1320,6 +1419,26 @@ mod tests {
     #[test]
     fn roundtrip_nullable_uuid_ip_tcp_revision() {
         roundtrip(&nullable_uuid_ip_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_enum_rev0() {
+        roundtrip(&enum_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_enum_tcp_revision() {
+        roundtrip(&enum_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_nullable_enum_rev0() {
+        roundtrip(&nullable_enum_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_nullable_enum_tcp_revision() {
+        roundtrip(&nullable_enum_batch(), DBMS_TCP_PROTOCOL_VERSION);
     }
 
     #[test]
@@ -1513,34 +1632,43 @@ mod tests {
         assert_eq!(bytes, expected);
     }
 
-    /// A small `Enum8` type for the unsupported-type tests: decoded by this crate
-    /// but not yet encodable.
-    fn enum8_type() -> ChType {
-        ChType::Enum8 {
-            variants: vec![("off".into(), 0), ("on".into(), 1)],
+    /// A small `Decimal(9, 4)` type for the unsupported-type tests: decoded by
+    /// this crate but not yet encodable. (`Enum8`/`Enum16` are now encodable, so
+    /// they no longer serve as the "decoded but not encodable" example.) A
+    /// precision of 9 gives the 32-bit backing integer (4 bytes per row).
+    fn decimal_type() -> ChType {
+        ChType::Decimal {
+            precision: 9,
+            scale: 4,
+            bits: 32,
         }
     }
 
     #[test]
     fn nullable_unsupported_inner_is_unsupported() {
         // `Nullable` is a supported wrapper now, but its inner type must also be
-        // encodable. `Enum8` is decoded yet not encodable, so `Nullable(Enum8(...))`
-        // is still rejected, and the reported type is the full declared wrapper.
+        // encodable. `Decimal` is decoded yet not encodable, so
+        // `Nullable(Decimal(9, 4))` is still rejected, and the reported type is the
+        // full declared wrapper. The column is structurally valid (one 4-byte row),
+        // so the only reason for rejection is the unsupported inner type.
         let batch = ColBatch::new(
             Schema::new(vec![Field {
-                name: "ne".into(),
-                ch_type: ChType::Nullable(Box::new(enum8_type())),
+                name: "ndec".into(),
+                ch_type: ChType::Nullable(Box::new(decimal_type())),
             }]),
-            vec![Column::Enum8(PrimitiveColumn::new_nullable(
-                vec![0i8],
+            vec![Column::Decimal(DecimalColumn::new_nullable(
+                vec![0u8; 4],
+                4,
+                9,
+                4,
                 Bitmap::from_ch_null_map(&[0]),
             ))],
             1,
         );
         match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
             EncodeError::UnsupportedType { column, ch_type } => {
-                assert_eq!(column, "ne");
-                assert_eq!(ch_type, ChType::Nullable(Box::new(enum8_type())));
+                assert_eq!(column, "ndec");
+                assert_eq!(ch_type, ChType::Nullable(Box::new(decimal_type())));
             }
             other => panic!("expected UnsupportedType, got {other:?}"),
         }
@@ -1548,20 +1676,22 @@ mod tests {
 
     #[test]
     fn unsupported_type_reports_column_and_type() {
-        // `Enum8` is decoded but not yet encodable, so it reports UnsupportedType
-        // with the column name and type.
+        // `Decimal` is decoded but not yet encodable, so it reports UnsupportedType
+        // with the column name and type. The column is a structurally valid single
+        // 4-byte row, so the only reason for rejection is that the encoder cannot
+        // write `Decimal` yet.
         let batch = ColBatch::new(
             Schema::new(vec![Field {
-                name: "e".into(),
-                ch_type: enum8_type(),
+                name: "dec".into(),
+                ch_type: decimal_type(),
             }]),
-            vec![Column::Enum8(PrimitiveColumn::new(Vec::new()))],
-            0,
+            vec![Column::Decimal(DecimalColumn::new(vec![0u8; 4], 4, 9, 4))],
+            1,
         );
         match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
             EncodeError::UnsupportedType { column, ch_type } => {
-                assert_eq!(column, "e");
-                assert_eq!(ch_type, enum8_type());
+                assert_eq!(column, "dec");
+                assert_eq!(ch_type, decimal_type());
             }
             other => panic!("expected UnsupportedType, got {other:?}"),
         }

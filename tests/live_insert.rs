@@ -98,6 +98,18 @@ fn sample_batch() -> ColBatch {
         ("u", ChType::Uuid),
         ("ip4", ChType::Ipv4),
         ("ip6", ChType::Ipv6),
+        (
+            "e8",
+            ChType::Enum8 {
+                variants: vec![("off".into(), -1), ("idle".into(), 0), ("busy".into(), 13)],
+            },
+        ),
+        (
+            "e16",
+            ChType::Enum16 {
+                variants: vec![("off".into(), -1), ("idle".into(), 0), ("busy".into(), 79)],
+            },
+        ),
         ("ni32", ChType::Nullable(Box::new(ChType::Int32))),
         ("ns", ChType::Nullable(Box::new(ChType::String))),
         ("nb", ChType::Nullable(Box::new(ChType::Bool))),
@@ -182,6 +194,12 @@ fn sample_batch() -> ColBatch {
                 &[0xFF; 16],
             ],
         )),
+        // Enum8/Enum16 physical values must be legal members of the declared
+        // variant sets (the server validates each value on INSERT); they are the
+        // underlying signed int on the wire. The values line up with the
+        // `ORDER BY i32` row order: off, idle, busy, idle.
+        Column::Enum8(PrimitiveColumn::new(vec![-1, 0, 13, 0])),
+        Column::Enum16(PrimitiveColumn::new(vec![-1, 0, 79, 0])),
         Column::Int32(PrimitiveColumn::new_nullable(
             vec![13, 0, 79, 0],
             validity(),
@@ -333,6 +351,11 @@ fn column_repr(batch: &ch_core_rs::batch::ChunkedBatch, col: usize) -> Vec<Strin
             Column::Date32(c) => c.values.iter().map(|v| v.to_string()).collect(),
             Column::DateTime(c) => c.values.iter().map(|v| v.to_string()).collect(),
             Column::DateTime64(c) => c.values.iter().map(|v| v.to_string()).collect(),
+            // Enum8/Enum16 are physically the underlying signed int; render the
+            // raw value (the name->value map is type metadata, not per-row data),
+            // so the sent-vs-decoded comparison is a straight physical check.
+            Column::Enum8(c) => c.values.iter().map(|v| v.to_string()).collect(),
+            Column::Enum16(c) => c.values.iter().map(|v| v.to_string()).collect(),
             Column::Utf8(c) => (0..c.len()).map(|i| format!("{:?}", c.value(i))).collect(),
             // IPv4 is physically a u32; UUID and IPv6 are raw 16-byte rows, so
             // render the wire bytes verbatim (any reordering would show up here).
@@ -371,6 +394,8 @@ fn insert_roundtrips_through_server() {
          b Bool, \
          d Date, d32 Date32, dt DateTime('UTC'), dt64 DateTime64(3, 'UTC'), \
          u UUID, ip4 IPv4, ip6 IPv6, \
+         e8 Enum8('off' = -1, 'idle' = 0, 'busy' = 13), \
+         e16 Enum16('off' = -1, 'idle' = 0, 'busy' = 79), \
          ni32 Nullable(Int32), ns Nullable(String), nb Nullable(Bool), \
          nu Nullable(UUID)) ENGINE = Memory"
     ));
@@ -391,7 +416,7 @@ fn insert_roundtrips_through_server() {
     // decoded rows line up with the inserted rows.
     let native = server.select(&format!(
         "SELECT i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, s, fs, b, \
-         d, d32, dt, dt64, u, ip4, ip6, ni32, ns, nb, nu \
+         d, d32, dt, dt64, u, ip4, ip6, e8, e16, ni32, ns, nb, nu \
          FROM {TABLE} ORDER BY i32 FORMAT Native"
     ));
     let decoded = decode_all_bytes(
