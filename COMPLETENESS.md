@@ -47,12 +47,14 @@ point-in-time snapshot for the next agent, not a changelog. Keep it short. Alway
 include a "Recommended next" with a one-line reason, so the next agent has a
 default; the user may override it.
 
-- **Last updated:** 2026-07-02 (encode/insert path: **`Decimal(P, S)` encode**
-  landed on top of `Enum8`/`Enum16`, `UUID`/`IPv4`/`IPv6`, temporal, `Bool` +
-  `Nullable(T)` null map, `String`/`FixedString(N)`, and fixed-width numeric
-  encode slices; unit round-trips are green at rev 0 and rev 54485, plain and
-  nullable; the live INSERT test was extended with Decimal columns and **run
-  green** against a 26.6.1.1193 server)
+- **Last updated:** 2026-07-02 (encode/insert path: **`LowCardinality(T)` encode**
+  landed on top of `Decimal(P, S)`, `Enum8`/`Enum16`, `UUID`/`IPv4`/`IPv6`,
+  temporal, `Bool` + `Nullable(T)` null map, `String`/`FixedString(N)`, and
+  fixed-width numeric encode slices; unit round-trips are green at rev 0 and rev
+  54485, plain and nullable; the live INSERT tests cover
+  `LowCardinality(String)`, `LowCardinality(Nullable(String))`, and a 260-entry
+  `LowCardinality(FixedString(4))` dictionary that exercises the UInt16 index
+  path, and **run green** against a 26.6.1.1193 server)
 - **Active track:** the **encode/insert path** is now the priority (shifted
   2026-07-01, at the user's direction). Decode type coverage is paused with
   `Array(T)` as its next item. See the "Encode / insert path" section for the
@@ -66,33 +68,31 @@ default; the user may override it.
   HTTP `FORMAT Native` does not enable native block-frame compression by default.
   The LZ4/NONE + CityHash128 compressed-block framing in `src/compression/` is
   built and tested but intentionally **unwired** (no caller). See "Out of scope".
-- **Last completed:** **`Decimal(P, S)` encode** (`src/native/encode.rs`). Decimal
-  is now an encodable `(ChType::Decimal, Column::Decimal)` pair, including through
-  `Nullable(T)`. `validate_column` checks `DecimalColumn` precision and scale
-  against `ChType::Decimal`, checks `width == bits / 8`, and requires
-  `data.len() == width * num_rows` before any write. The body encoder writes
-  `DecimalColumn::data` in one verbatim `extend_from_slice`, matching the
-  confirmed server contract at v26.6.1.1193-stable: contiguous fixed-width
-  little-endian scaled integers, no per-row length, no varint, no precision, and
-  no scale in the body. The negative-value two's-complement point remains marked
-  as inferred from signed backing/raw storage. `Decimal` was not added to any
-  LowCardinality allowlist; `LowCardinality(Decimal(...))` remains illegal.
-  Unit coverage includes all four widths, nullable Decimal, exact rev-0 bytes
-  with a negative value, zero-row schema round-trip, multi-block chunked
-  round-trip, and width/ragged/metadata nullable-ragged rejection tests. The two
-  unsupported-type tests now use `LowCardinality(String)` via `Column::Dictionary`.
-- **Build/test status:** Tree builds clean; `cargo test -q` green (228 unit + 3
+- **Last completed:** **`LowCardinality(T)` encode** (`src/native/encode.rs`).
+  The encoder now accepts `Column::Dictionary` for every decoded
+  `LowCardinality` inner the server permits (`String`, `FixedString`, numeric,
+  `Bool`, `Date`, `Date32`, `DateTime`, `UUID`, `IPv4`, `IPv6`, with optional
+  inner `Nullable`). For nonzero rows it writes the server-confirmed key-version
+  prefix `1`, then index words `0x600..0x603` (`HasAdditionalKeysBit` +
+  `NeedUpdateDictionary` + width tag), dictionary size, removeNullable inner body,
+  row count, and raw fixed-width indexes. The width tag is self-described and
+  server-accepted as long as indexes are in range; this encoder uses UInt8
+  through 255 dictionary entries, UInt16 through 65535, then UInt32/UInt64.
+  Zero-row LC writes only the column header, no LC prefix or body.
+  `LowCardinality(Nullable(T))` preserves the decoded contract:
+  dictionary/index 0 is the NULL sentinel, valid rows may not use index 0, and
+  NULL rows must use index 0.
+- **Build/test status:** Tree builds clean; `cargo test` green (242 unit + 3
   integration, ignored tests skipped); clippy clean
   (`cargo clippy --all-targets -- -D warnings`); fmt clean
-  (`cargo fmt --check`). The live INSERT test in `tests/live_insert.rs` is
-  `#[ignore]` and server-gated; it was extended with `dec32`/`dec64`/`dec128`/
-  `dec256` plus `ndec Nullable(Decimal(18, 9))` and **run green** outside the
-  sandbox against a 26.6.1.1193 ClickHouse container.
-- **Recommended next (encode track):** **`LowCardinality(T)` encode**, the last
-  remaining encode checklist item and the only one with a real write-side
-  bulk-state prefix. Re-read `SerializationLowCardinality` via the
-  `clickhouse-server-reader` sub-agent before implementing the 8-byte key-version
-  prefix, dictionary body, and per-row index framing. If the decode track resumes
+  (`cargo fmt --check`). The live INSERT tests in `tests/live_insert.rs` are
+  `#[ignore]` and server-gated; they cover `lc LowCardinality(String)`,
+  `lcn LowCardinality(Nullable(String))`, and a 260-entry
+  `LowCardinality(FixedString(4))` dictionary that exercises UInt16 indexes, and
+  **run green** against the localhost 26.6.1.1193 ClickHouse server.
+- **Recommended next (encode track):** **Sink-based encode**, exposing the
+  existing private `encode_block_into` shape so bindings can write directly into
+  a transport buffer and skip an owned `Vec` handoff. If the decode track resumes
   instead, its next item is **`Array(T)`** (see "Type coverage"). Compression
   framing stays implemented but unwired and out of the current HTTP scope.
 - **Active gotchas / context:**
@@ -547,14 +547,18 @@ bring encode to parity with what the decoder already supports.
       multi-block `encode_chunked` round-trips, rejection tests for all Decimal
       guards, and the live INSERT test extended with all four widths plus
       `Nullable(Decimal(18, 9))` and run green against a 26.6.1.1193 server.
-- [ ] `LowCardinality(T)` (hardest, do last). Needs the write-side per-column
-      bulk-state prefix (the 8-byte key version, the inverse of
-      `read_state_prefix`; every other type writes a zero-length prefix) plus the
-      dictionary + index framing: index-type word, dictionary size, the dictionary
-      body (defer to the inner type's encoder), and the per-row indexes. Inverse
-      of `decode_low_cardinality_dictionary`; re-read `SerializationLowCardinality`
-      via the `clickhouse-server-reader` sub-agent if the additional-keys framing
-      is unclear.
+- [x] `LowCardinality(T)` (write-side bulk-state prefix + dictionary/index
+      framing). Writes key version 1, server-native index words
+      `0x600..0x603`, dictionary size, removeNullable inner body through the
+      existing inner encoder, row count, and raw UInt8/16/32/64 indexes. Zero-row
+      LC writes no prefix/body. Validation rejects forbidden inners
+      (`Decimal`, `DateTime64`, `Enum`), wrong dictionary value variants, negative
+      or out-of-range indexes, non-empty dictionaries on zero-row blocks, and
+      nullable-LC rows that violate the index-0 NULL sentinel rule. Covered by
+      rev 0 / rev 54485 round-trips, exact-byte pins, zero-row and multi-block
+      tests, rejection tests, and live INSERT tests against localhost, including
+      String, nullable String, and a 260-entry FixedString dictionary that
+      exercises UInt16 indexes.
 - [x] Round-trip tests (encode then decode equals the original buffers) for the
       numerics, plus a live-server `INSERT` acceptance test
       (`tests/live_insert.rs`, `#[ignore]`, curl over HTTP). Extend both as each

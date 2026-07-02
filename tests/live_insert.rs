@@ -29,13 +29,15 @@ use std::process::{Command, Stdio};
 use ch_core_rs::batch::ColBatch;
 use ch_core_rs::bitmap::Bitmap;
 use ch_core_rs::column::{
-    BoolColumn, Column, DecimalColumn, FixedBinaryColumn, PrimitiveColumn, Utf8Column,
+    BoolColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn, PrimitiveColumn,
+    Utf8Column,
 };
 use ch_core_rs::native::decode::{decode_all_bytes, DecodeOptions};
 use ch_core_rs::native::encode::{encode_block, EncodeOptions};
 use ch_core_rs::schema::{ChType, Field, Schema};
 
 const TABLE: &str = "ch_core_rs_encode_test";
+const LC_U16_TABLE: &str = "ch_core_rs_encode_lc_u16_test";
 
 /// Build a `Utf8Column` from raw byte values, computing Arrow offsets the same
 /// way the decoder does.
@@ -91,6 +93,11 @@ fn sample_batch() -> ColBatch {
         ("f32", ChType::Float32),
         ("f64", ChType::Float64),
         ("s", ChType::String),
+        ("lc", ChType::LowCardinality(Box::new(ChType::String))),
+        (
+            "lcn",
+            ChType::LowCardinality(Box::new(ChType::Nullable(Box::new(ChType::String)))),
+        ),
         ("fs", ChType::FixedString(4)),
         ("b", ChType::Bool),
         ("d", ChType::Date),
@@ -219,6 +226,15 @@ fn sample_batch() -> ColBatch {
         Column::Float32(PrimitiveColumn::new(vec![-1.25, 0.0, 3.5, 79.125])),
         Column::Float64(PrimitiveColumn::new(vec![-1.25, 0.0, 3.5, 79.125])),
         Column::Utf8(utf8_column(&[b"user_1", b"", b"n", b"user_2_longer"])),
+        Column::Dictionary(DictionaryColumn::new(
+            vec![1, 2, 1, 3],
+            Column::Utf8(utf8_column(&[b"", b"user_1", b"user_2", b"user_3"])),
+        )),
+        Column::Dictionary(DictionaryColumn::new_nullable(
+            vec![1, 0, 2, 0],
+            Column::Utf8(utf8_column(&[b"", b"user_1", b"user_2"])),
+            validity(),
+        )),
         Column::FixedBinary(fixed_binary_column(
             4,
             &[b"road", b"1234", b"\x00\x00\x00\x00", b"n\x00\x00\x00"],
@@ -320,6 +336,38 @@ fn sample_batch() -> ColBatch {
     ColBatch::new(Schema::new(fields), columns, 4)
 }
 
+/// A focused LowCardinality batch whose dictionary has more than 255 entries,
+/// forcing the encoder's UInt16 index-width path. FixedString also covers a
+/// non-String dictionary value body in the live server round-trip.
+fn lc_fixed_string_u16_batch() -> ColBatch {
+    let fields = vec![
+        Field {
+            name: "k".into(),
+            ch_type: ChType::UInt16,
+        },
+        Field {
+            name: "lc".into(),
+            ch_type: ChType::LowCardinality(Box::new(ChType::FixedString(4))),
+        },
+    ];
+
+    let mut values = Vec::with_capacity(260 * 4);
+    for i in 0..260u16 {
+        values.extend_from_slice(&i.to_le_bytes());
+        values.extend_from_slice(&[0x13, 0x79]);
+    }
+
+    let columns = vec![
+        Column::UInt16(PrimitiveColumn::new((0..260u16).collect())),
+        Column::Dictionary(DictionaryColumn::new(
+            (0..260i32).collect(),
+            Column::FixedBinary(FixedBinaryColumn::new(values, 4)),
+        )),
+    ];
+
+    ColBatch::new(Schema::new(fields), columns, 260)
+}
+
 struct Server {
     base_url: String,
     user: String,
@@ -403,8 +451,13 @@ impl Server {
     /// the request body is exactly the Native stream) and the bytes are piped as
     /// a `--data-binary @-` body.
     fn insert_native(&self, bytes: &[u8]) {
+        self.insert_native_into(TABLE, bytes);
+    }
+
+    /// INSERT the given Native bytes into `table`.
+    fn insert_native_into(&self, table: &str, bytes: &[u8]) {
         let url = format!(
-            "{}?query=INSERT%20INTO%20{TABLE}%20FORMAT%20Native",
+            "{}?query=INSERT%20INTO%20{table}%20FORMAT%20Native",
             self.base_url
         );
         self.exec_empty(&url, &["--data-binary", "@-"], Some(bytes), "INSERT");
@@ -429,6 +482,51 @@ impl Server {
     }
 }
 
+/// Render one column's physical values without applying that column's validity.
+/// `LowCardinality` resolves each row through its block-local dictionary so
+/// server-side dictionary reordering does not affect the live INSERT comparison.
+fn raw_column_repr(column: &Column) -> Vec<String> {
+    match column {
+        Column::Int8(c) => c.values.iter().map(|v| v.to_string()).collect(),
+        Column::Int16(c) => c.values.iter().map(|v| v.to_string()).collect(),
+        Column::Int32(c) => c.values.iter().map(|v| v.to_string()).collect(),
+        Column::Int64(c) => c.values.iter().map(|v| v.to_string()).collect(),
+        Column::UInt8(c) => c.values.iter().map(|v| v.to_string()).collect(),
+        Column::UInt16(c) => c.values.iter().map(|v| v.to_string()).collect(),
+        Column::UInt32(c) => c.values.iter().map(|v| v.to_string()).collect(),
+        Column::UInt64(c) => c.values.iter().map(|v| v.to_string()).collect(),
+        Column::Float32(c) => c.values.iter().map(|v| v.to_bits().to_string()).collect(),
+        Column::Float64(c) => c.values.iter().map(|v| v.to_bits().to_string()).collect(),
+        Column::Bool(c) => (0..c.len()).map(|i| c.get(i).to_string()).collect(),
+        // Temporal columns are physically primitives; render the raw numeric
+        // value (days / seconds / ticks) so the sent-vs-decoded comparison is a
+        // straight physical check, the same as the numerics above.
+        Column::Date(c) => c.values.iter().map(|v| v.to_string()).collect(),
+        Column::Date32(c) => c.values.iter().map(|v| v.to_string()).collect(),
+        Column::DateTime(c) => c.values.iter().map(|v| v.to_string()).collect(),
+        Column::DateTime64(c) => c.values.iter().map(|v| v.to_string()).collect(),
+        // Enum8/Enum16 are physically the underlying signed int; render the raw
+        // value (the name->value map is type metadata, not per-row data).
+        Column::Enum8(c) => c.values.iter().map(|v| v.to_string()).collect(),
+        Column::Enum16(c) => c.values.iter().map(|v| v.to_string()).collect(),
+        Column::Utf8(c) => (0..c.len()).map(|i| format!("{:?}", c.value(i))).collect(),
+        // IPv4 is physically a u32; UUID and IPv6 are raw 16-byte rows, so
+        // render the wire bytes verbatim (any reordering would show up here).
+        Column::Ipv4(c) => c.values.iter().map(|v| v.to_string()).collect(),
+        Column::Uuid(c) | Column::Ipv6(c) | Column::FixedBinary(c) => {
+            (0..c.len()).map(|i| format!("{:?}", c.value(i))).collect()
+        }
+        Column::Decimal(c) => (0..c.len()).map(|i| format!("{:?}", c.value(i))).collect(),
+        Column::Dictionary(c) => {
+            let values = raw_column_repr(c.values.as_ref());
+            c.indices
+                .iter()
+                .map(|&idx| values[idx as usize].clone())
+                .collect()
+        }
+    }
+}
+
 /// Gather every value of column `col` across all chunks, in chunk order, as a
 /// debug string, so the supported types can be compared uniformly. A null row
 /// renders as `"NULL"` regardless of the placeholder value in the buffer, so an
@@ -437,40 +535,7 @@ fn column_repr(batch: &ch_core_rs::batch::ChunkedBatch, col: usize) -> Vec<Strin
     let mut out = Vec::new();
     for chunk in &batch.chunks {
         let column = chunk.column(col);
-        let mut vals: Vec<String> = match column {
-            Column::Int8(c) => c.values.iter().map(|v| v.to_string()).collect(),
-            Column::Int16(c) => c.values.iter().map(|v| v.to_string()).collect(),
-            Column::Int32(c) => c.values.iter().map(|v| v.to_string()).collect(),
-            Column::Int64(c) => c.values.iter().map(|v| v.to_string()).collect(),
-            Column::UInt8(c) => c.values.iter().map(|v| v.to_string()).collect(),
-            Column::UInt16(c) => c.values.iter().map(|v| v.to_string()).collect(),
-            Column::UInt32(c) => c.values.iter().map(|v| v.to_string()).collect(),
-            Column::UInt64(c) => c.values.iter().map(|v| v.to_string()).collect(),
-            Column::Float32(c) => c.values.iter().map(|v| v.to_bits().to_string()).collect(),
-            Column::Float64(c) => c.values.iter().map(|v| v.to_bits().to_string()).collect(),
-            Column::Bool(c) => (0..c.len()).map(|i| c.get(i).to_string()).collect(),
-            // Temporal columns are physically primitives; render the raw numeric
-            // value (days / seconds / ticks) so the sent-vs-decoded comparison is a
-            // straight physical check, the same as the numerics above.
-            Column::Date(c) => c.values.iter().map(|v| v.to_string()).collect(),
-            Column::Date32(c) => c.values.iter().map(|v| v.to_string()).collect(),
-            Column::DateTime(c) => c.values.iter().map(|v| v.to_string()).collect(),
-            Column::DateTime64(c) => c.values.iter().map(|v| v.to_string()).collect(),
-            // Enum8/Enum16 are physically the underlying signed int; render the
-            // raw value (the name->value map is type metadata, not per-row data),
-            // so the sent-vs-decoded comparison is a straight physical check.
-            Column::Enum8(c) => c.values.iter().map(|v| v.to_string()).collect(),
-            Column::Enum16(c) => c.values.iter().map(|v| v.to_string()).collect(),
-            Column::Utf8(c) => (0..c.len()).map(|i| format!("{:?}", c.value(i))).collect(),
-            // IPv4 is physically a u32; UUID and IPv6 are raw 16-byte rows, so
-            // render the wire bytes verbatim (any reordering would show up here).
-            Column::Ipv4(c) => c.values.iter().map(|v| v.to_string()).collect(),
-            Column::Uuid(c) | Column::Ipv6(c) | Column::FixedBinary(c) => {
-                (0..c.len()).map(|i| format!("{:?}", c.value(i))).collect()
-            }
-            Column::Decimal(c) => (0..c.len()).map(|i| format!("{:?}", c.value(i))).collect(),
-            other => panic!("unexpected column {col} variant: {other:?}"),
-        };
+        let mut vals = raw_column_repr(column);
         if let Some(validity) = column.validity() {
             for (i, s) in vals.iter_mut().enumerate() {
                 if !validity.is_valid(i) {
@@ -496,7 +561,8 @@ fn insert_roundtrips_through_server() {
          i8 Int8, i16 Int16, i32 Int32, i64 Int64, \
          u8 UInt8, u16 UInt16, u32 UInt32, u64 UInt64, \
          f32 Float32, f64 Float64, \
-         s String, fs FixedString(4), \
+         s String, lc LowCardinality(String), \
+         lcn LowCardinality(Nullable(String)), fs FixedString(4), \
          b Bool, \
          d Date, d32 Date32, dt DateTime('UTC'), dt64 DateTime64(3, 'UTC'), \
          u UUID, ip4 IPv4, ip6 IPv6, \
@@ -523,7 +589,7 @@ fn insert_roundtrips_through_server() {
     // crate. ORDER BY i32 is deterministic (i32 is strictly ascending), so the
     // decoded rows line up with the inserted rows.
     let native = server.select(&format!(
-        "SELECT i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, s, fs, b, \
+        "SELECT i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, s, lc, lcn, fs, b, \
          d, d32, dt, dt64, u, ip4, ip6, e8, e16, \
          dec32, dec64, dec128, dec256, ni32, ns, nb, nu, ndec \
          FROM {TABLE} ORDER BY i32 FORMAT Native"
@@ -548,6 +614,58 @@ fn insert_roundtrips_through_server() {
     // The server round-tripped every value: compare each column against the
     // batch we sent, re-decoded through the same crate for an apples-to-apples
     // physical comparison.
+    let sent = single_block(&batch);
+    for col in 0..batch.num_columns() {
+        assert_eq!(
+            column_repr(&decoded, col),
+            column_repr(&sent, col),
+            "column {col} ({}) differs after server round-trip",
+            batch.schema.fields[col].name
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a live ClickHouse server matching .server-ref; run with --ignored"]
+fn low_cardinality_fixed_string_u16_dictionary_roundtrips_through_server() {
+    let server = Server::from_env();
+    let batch = lc_fixed_string_u16_batch();
+
+    server.ddl(&format!("DROP TABLE IF EXISTS {LC_U16_TABLE}"));
+    server.ddl(&format!(
+        "CREATE TABLE {LC_U16_TABLE} (\
+         k UInt16, lc LowCardinality(FixedString(4))) ENGINE = Memory"
+    ));
+
+    let bytes = encode_block(
+        &batch,
+        &EncodeOptions {
+            protocol_revision: 0,
+        },
+    )
+    .expect("encode LowCardinality FixedString batch");
+    server.insert_native_into(LC_U16_TABLE, &bytes);
+
+    let native = server.select(&format!(
+        "SELECT k, lc FROM {LC_U16_TABLE} ORDER BY k FORMAT Native"
+    ));
+    let decoded = decode_all_bytes(
+        &native,
+        &DecodeOptions {
+            protocol_revision: 0,
+        },
+    )
+    .expect("decode server Native response");
+
+    server.ddl(&format!("DROP TABLE IF EXISTS {LC_U16_TABLE}"));
+
+    assert_eq!(decoded.num_rows(), batch.num_rows, "row count from server");
+    assert_eq!(
+        decoded.num_columns(),
+        batch.num_columns(),
+        "column count from server"
+    );
+
     let sent = single_block(&batch);
     for col in 0..batch.num_columns() {
         assert_eq!(

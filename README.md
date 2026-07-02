@@ -133,18 +133,15 @@ Implemented:
   in Arrow-compatible layouts.
 - Export decoded chunks as an Arrow C Data stream.
 - Malformed-input hardening: untrusted wire bytes return errors, never panic.
-- Encode fixed-width numeric columns back to Native block bytes for `INSERT`
-  (`native::encode`); accepted by a live server over HTTP.
+- Encode supported scalar and `LowCardinality` columns back to Native block bytes
+  for `INSERT` (`native::encode`); accepted by a live server over HTTP.
 
 Not implemented yet:
 
-- Native encoding for the non-numeric types on the insert path (strings,
-  nullable, temporal, and the rest); they follow the numerics one at a time.
 - TCP/native protocol packet framing.
 - Compression framing.
 - Binary-encoded Native type headers.
-- Decimal, LowCardinality, Enum, UUID/IP, Array, Tuple, Map, or wide integer
-  types.
+- Array, Tuple, Map, or wide integer types.
 - Language-specific materialization policy (bindings own this, by design).
 
 ## Supported types
@@ -157,6 +154,11 @@ Not implemented yet:
 - `FixedString(N)`
 - `Date`, `Date32`, `DateTime`, `DateTime64(P[, tz])`
 - `Nullable(T)` where `T` is one of the supported inner types
+- `Decimal(P, S)`
+- `UUID`, `IPv4`, `IPv6`
+- `Enum8(...)`, `Enum16(...)`
+- `LowCardinality(T)` for the allowed inner types above, excluding server-forbidden
+  combinations such as `Decimal`, `DateTime64`, and `Enum`
 
 Unsupported types raise a decode error rather than guessing.
 
@@ -164,8 +166,7 @@ Unsupported types raise a decode error rather than guessing.
 
 In rough priority order:
 
-1. Type coverage: `LowCardinality`, `Decimal`, `UUID`, `IPv4`/`IPv6`,
-   `Enum8`/`Enum16`, `Array`, `Tuple`, `Map`, `Int128`/`Int256` and unsigned
+1. Type coverage: `Array`, `Tuple`, `Map`, `Int128`/`Int256` and unsigned
    variants.
 2. Compression framing: LZ4, then ZSTD.
 3. Per-runtime zero-copy adapters: JS `TypedArray` over an external

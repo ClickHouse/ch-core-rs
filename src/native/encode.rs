@@ -12,18 +12,23 @@
 //! Scope: this encodes `Bool`, the fixed-width numeric types (`Int8`..`Int64`,
 //! `UInt8`..`UInt64`, `Float32`, `Float64`), the temporal types (`Date`,
 //! `Date32`, `DateTime`, `DateTime64`), `UUID`, `IPv4`, `IPv6`, `String`,
-//! `FixedString(N)`, `Enum8`/`Enum16`, and `Decimal(P, S)`, each also inside a
-//! `Nullable(T)` wrapper (a per-row null map precedes the inner values).
-//! Every other column type returns [`EncodeError::UnsupportedType`] until its
-//! encoder lands, the same one-type-at-a-time growth the decode path follows.
+//! `FixedString(N)`, `Enum8`/`Enum16`, `Decimal(P, S)`, and
+//! `LowCardinality(T)` for the allowed inner types this crate decodes. The
+//! plain types also compose inside a `Nullable(T)` wrapper (a per-row null map
+//! precedes the inner values). Every other column type returns
+//! [`EncodeError::UnsupportedType`] until its encoder lands, the same
+//! one-type-at-a-time growth the decode path follows.
 
 use crate::batch::{ChunkedBatch, ColBatch};
-use crate::column::{BoolColumn, Column, DecimalColumn, FixedBinaryColumn, Utf8Column};
+use crate::column::{
+    BoolColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn, Utf8Column,
+};
 use crate::schema::{ChType, Field};
 
 use super::decode::{
-    decimal_bits_from_precision, parse_ch_type, DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION,
-    DBMS_MIN_REVISION_WITH_OUT_OF_ORDER_BUCKETS,
+    decimal_bits_from_precision, is_low_cardinality_inner, parse_ch_type,
+    DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION, DBMS_MIN_REVISION_WITH_OUT_OF_ORDER_BUCKETS,
+    LC_HAS_ADDITIONAL_KEYS_BIT, LC_NEED_UPDATE_DICTIONARY_BIT, LOW_CARDINALITY_KEY_VERSION,
 };
 use super::varint::write_varint;
 
@@ -256,11 +261,14 @@ fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<()
     }
 
     // Nullability. A `Nullable` field writes a per-row null map from the validity
-    // bitmap, so the bitmap (when present) must cover exactly `num_rows`; this also
-    // keeps `encode_null_map`'s reads in range. A non-`Nullable` field writes no
-    // null map, so a null in its validity bitmap would be silently dropped and the
-    // row's placeholder value encoded as real data; reject that.
-    if matches!(field.ch_type, ChType::Nullable(_)) {
+    // bitmap. A `LowCardinality(Nullable(T))` field instead writes NULL as
+    // dictionary index 0, with validity on the index array. In either nullable
+    // shape, a present bitmap must cover exactly `num_rows`. A non-nullable field
+    // writes no nulls, so a null in its validity bitmap would be silently dropped
+    // and the row's placeholder value encoded as real data; reject that.
+    let nullable_at_this_level = matches!(field.ch_type, ChType::Nullable(_))
+        || matches!(&field.ch_type, ChType::LowCardinality(inner) if matches!(inner.as_ref(), ChType::Nullable(_)));
+    if nullable_at_this_level {
         if let Some(validity) = column.validity() {
             if validity.len() != num_rows {
                 return Err(EncodeError::InconsistentBatch {
@@ -280,6 +288,10 @@ fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<()
                 column.null_count()
             ),
         });
+    }
+
+    if let (ChType::LowCardinality(inner), Column::Dictionary(c)) = (&field.ch_type, column) {
+        validate_low_cardinality(field, inner, c, num_rows)?;
     }
 
     // A `Bool` column is unpacked from its packed bitmap positionally, so the
@@ -442,11 +454,109 @@ fn validate_decimal(
     Ok(())
 }
 
+/// Validate a `LowCardinality(T)` dictionary column before any bytes are written.
+///
+/// The Native payload carries a per-block dictionary plus row indexes. For
+/// `LowCardinality(Nullable(T))`, ClickHouse reserves dictionary index 0 as the
+/// NULL sentinel; the dictionary body itself is serialized as the non-nullable
+/// removeNullable inner type with no null map. This encoder preserves the decoded
+/// representation: nullable rows must have index 0, and valid rows must not.
+fn validate_low_cardinality(
+    field: &Field,
+    inner: &ChType,
+    col: &DictionaryColumn,
+    num_rows: usize,
+) -> Result<(), EncodeError> {
+    let (nullable, dict_value_type) = match inner {
+        ChType::Nullable(t) => (true, t.as_ref()),
+        other => (false, other),
+    };
+
+    if !is_low_cardinality_inner(dict_value_type) || !is_encodable(dict_value_type) {
+        return Err(EncodeError::UnsupportedType {
+            column: field.name.clone(),
+            ch_type: field.ch_type.clone(),
+        });
+    }
+
+    let num_keys = col.values.len();
+    // Since this crate stores indexes as i32, a larger dictionary could not be
+    // fully addressed by the public buffer shape.
+    if num_keys > i32::MAX as usize {
+        return Err(EncodeError::InconsistentBatch {
+            detail: format!(
+                "column {:?} LowCardinality dictionary has {num_keys} entries, exceeding the i32 index buffer contract",
+                field.name
+            ),
+        });
+    }
+
+    if num_rows == 0 && num_keys > 0 {
+        return Err(EncodeError::InconsistentBatch {
+            detail: format!(
+                "column {:?} declares 0 LowCardinality rows but carries a non-empty {}-entry dictionary",
+                field.name, num_keys
+            ),
+        });
+    }
+
+    let dict_field = Field {
+        name: format!("{} dictionary", field.name),
+        ch_type: dict_value_type.clone(),
+    };
+    validate_column(&dict_field, col.values.as_ref(), num_keys)?;
+
+    for (row, &idx) in col.indices.iter().enumerate() {
+        if idx < 0 {
+            return Err(EncodeError::InconsistentBatch {
+                detail: format!(
+                    "column {:?} LowCardinality row {row} has negative dictionary index {idx}",
+                    field.name
+                ),
+            });
+        }
+        let index = idx as usize;
+        if index >= num_keys {
+            return Err(EncodeError::InconsistentBatch {
+                detail: format!(
+                    "column {:?} LowCardinality row {row} index {idx} points outside its {num_keys}-entry dictionary",
+                    field.name
+                ),
+            });
+        }
+        if nullable {
+            let is_valid = match &col.validity {
+                Some(bitmap) => bitmap.is_valid(row),
+                None => true,
+            };
+            if is_valid && index == 0 {
+                return Err(EncodeError::InconsistentBatch {
+                    detail: format!(
+                        "column {:?} LowCardinality(Nullable) row {row} is valid but uses dictionary index 0, which ClickHouse reserves for NULL",
+                        field.name
+                    ),
+                });
+            }
+            if !is_valid && index != 0 {
+                return Err(EncodeError::InconsistentBatch {
+                    detail: format!(
+                        "column {:?} LowCardinality(Nullable) row {row} is NULL but uses dictionary index {idx}; NULL rows must use index 0",
+                        field.name
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Whether `value_type` (the unwrapped inner value type) and `column` form a
 /// supported, matching pair this encoder can write.
 ///
-/// This must list exactly the matching arms of [`encode_column_body`]; keep the two
-/// in sync the same way [`is_encodable`] is. [`validate_column`] uses it to reject a
+/// This must list exactly the matching arms of [`encode_column_body`], plus
+/// `LowCardinality`'s [`encode_low_cardinality_data`] path; keep it in sync the
+/// same way [`is_encodable`] is. [`validate_column`] uses it to reject a
 /// wrong-buffer or not-yet-encodable column before any bytes are written, which is
 /// what lets [`write_block_into`] treat the body match as structurally infallible.
 fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
@@ -475,6 +585,7 @@ fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
             | (ChType::Enum8 { .. }, Column::Enum8(_))
             | (ChType::Enum16 { .. }, Column::Enum16(_))
             | (ChType::Decimal { .. }, Column::Decimal(_))
+            | (ChType::LowCardinality(_), Column::Dictionary(_))
     )
 }
 
@@ -585,11 +696,96 @@ fn encode_column_data(
     field: &Field,
     column: &Column,
 ) -> Result<(), EncodeError> {
+    if let ChType::LowCardinality(inner) = &field.ch_type {
+        if let Column::Dictionary(c) = column {
+            if c.is_empty() {
+                return Ok(());
+            }
+            return encode_low_cardinality_data(buf, field, inner, c);
+        }
+        return Err(column_error(field, &field.ch_type));
+    }
     if let ChType::Nullable(inner) = &field.ch_type {
         encode_null_map(buf, column);
         return encode_column_body(buf, field, inner, column);
     }
     encode_column_body(buf, field, &field.ch_type, column)
+}
+
+/// Encode one `LowCardinality(T)` column body.
+///
+/// Confirmed at `v26.6.1.1193-stable`: Native writes the per-column key-version
+/// prefix (`SharedDictionariesWithAdditionalKeys` = 1), then an index word with
+/// `HasAdditionalKeysBit` and `NeedUpdateDictionary` set, then the per-block
+/// dictionary as the removeNullable inner type's plain body, then the row count
+/// and fixed-width raw indexes. Zero-row blocks skip this function entirely,
+/// matching `NativeWriter::write`'s `rows > 0` gate.
+fn encode_low_cardinality_data(
+    buf: &mut Vec<u8>,
+    field: &Field,
+    inner: &ChType,
+    col: &DictionaryColumn,
+) -> Result<(), EncodeError> {
+    let dict_value_type = match inner {
+        ChType::Nullable(t) => t.as_ref(),
+        other => other,
+    };
+    let (index_width, width_tag) = low_cardinality_index_width(col.values.len());
+
+    buf.extend_from_slice(&LOW_CARDINALITY_KEY_VERSION.to_le_bytes());
+    let index_word = width_tag | LC_HAS_ADDITIONAL_KEYS_BIT | LC_NEED_UPDATE_DICTIONARY_BIT;
+    buf.extend_from_slice(&index_word.to_le_bytes());
+    buf.extend_from_slice(&(col.values.len() as u64).to_le_bytes());
+    encode_column_body(buf, field, dict_value_type, col.values.as_ref())?;
+    buf.extend_from_slice(&(col.indices.len() as u64).to_le_bytes());
+
+    match index_width {
+        1 => {
+            buf.reserve(col.indices.len());
+            for &idx in &col.indices {
+                buf.push(idx as u8);
+            }
+        }
+        2 => {
+            buf.reserve(col.indices.len() * 2);
+            for &idx in &col.indices {
+                buf.extend_from_slice(&(idx as u16).to_le_bytes());
+            }
+        }
+        4 => {
+            buf.reserve(col.indices.len() * 4);
+            for &idx in &col.indices {
+                buf.extend_from_slice(&(idx as u32).to_le_bytes());
+            }
+        }
+        8 => {
+            buf.reserve(col.indices.len() * 8);
+            for &idx in &col.indices {
+                buf.extend_from_slice(&(idx as u64).to_le_bytes());
+            }
+        }
+        _ => unreachable!("LowCardinality index width is selected from 1/2/4/8"),
+    }
+    Ok(())
+}
+
+/// Pick the Native index width and low-bit type tag from the dictionary size.
+///
+/// The width tag is self-describing and ClickHouse accepts any width whose index
+/// values are in range for the emitted dictionary. This encoder uses UInt8
+/// through 255 dictionary entries, UInt16 through 65535, UInt32 through
+/// `u32::MAX`, and UInt64 above that. The validation layer rejects dictionary
+/// sizes beyond the i32 public index-buffer contract before this is called.
+fn low_cardinality_index_width(num_keys: usize) -> (usize, u64) {
+    if num_keys <= u8::MAX as usize {
+        (1, 0)
+    } else if num_keys <= u16::MAX as usize {
+        (2, 1)
+    } else if num_keys <= u32::MAX as usize {
+        (4, 2)
+    } else {
+        (8, 3)
+    }
 }
 
 /// Encode a `Nullable(T)` null map: one byte per row, 0x00 = valid, 0x01 = NULL,
@@ -896,36 +1092,44 @@ fn column_error(field: &Field, ch_type: &ChType) -> EncodeError {
 /// subset of decode coverage, and this predicate is the single place that lists
 /// it, so [`column_error`] can tell a wrong-buffer mismatch (`InconsistentBatch`)
 /// apart from a genuinely unsupported type (`UnsupportedType`). It lists the
-/// unwrapped value types only; the `Nullable` wrapper composes with any type here
-/// via [`encode_null_map`]. Extend it as each new type's arm lands in
-/// [`encode_column_body`].
+/// unwrapped value types plus `LowCardinality`, whose wrapper framing is handled
+/// by [`encode_low_cardinality_data`]. The `Nullable` wrapper composes with any
+/// non-wrapper type here via [`encode_null_map`]. Extend it as each new type's arm
+/// lands in [`encode_column_body`] or [`encode_column_data`].
 fn is_encodable(ch_type: &ChType) -> bool {
-    matches!(
-        ch_type,
+    match ch_type {
+        ChType::LowCardinality(inner) => {
+            let dict_value_type = match inner.as_ref() {
+                ChType::Nullable(t) => t.as_ref(),
+                other => other,
+            };
+            is_low_cardinality_inner(dict_value_type) && is_encodable(dict_value_type)
+        }
         ChType::Bool
-            | ChType::Int8
-            | ChType::Int16
-            | ChType::Int32
-            | ChType::Int64
-            | ChType::UInt8
-            | ChType::UInt16
-            | ChType::UInt32
-            | ChType::UInt64
-            | ChType::Float32
-            | ChType::Float64
-            | ChType::Date
-            | ChType::Date32
-            | ChType::DateTime { .. }
-            | ChType::DateTime64 { .. }
-            | ChType::Uuid
-            | ChType::Ipv4
-            | ChType::Ipv6
-            | ChType::String
-            | ChType::FixedString(_)
-            | ChType::Enum8 { .. }
-            | ChType::Enum16 { .. }
-            | ChType::Decimal { .. }
-    )
+        | ChType::Int8
+        | ChType::Int16
+        | ChType::Int32
+        | ChType::Int64
+        | ChType::UInt8
+        | ChType::UInt16
+        | ChType::UInt32
+        | ChType::UInt64
+        | ChType::Float32
+        | ChType::Float64
+        | ChType::Date
+        | ChType::Date32
+        | ChType::DateTime { .. }
+        | ChType::DateTime64 { .. }
+        | ChType::Uuid
+        | ChType::Ipv4
+        | ChType::Ipv6
+        | ChType::String
+        | ChType::FixedString(_)
+        | ChType::Enum8 { .. }
+        | ChType::Enum16 { .. }
+        | ChType::Decimal { .. } => true,
+        ChType::Nullable(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -1452,9 +1656,152 @@ mod tests {
         )
     }
 
-    /// Compare two batches column by column for the types this encoder covers
-    /// (the numerics, the temporal types, `UUID`/`IPv4`/`IPv6`, `String`,
-    /// `FixedString`). Panics on any other variant so a wrong decode is loud.
+    /// A plain `LowCardinality(String)` and `LowCardinality(UInt32)` over four
+    /// rows. The dictionary includes the server's reserved default slot 0 and
+    /// rows reference real values in slots 1.., matching server-produced Native
+    /// blocks while still exercising the dictionary/index writer.
+    fn low_cardinality_batch() -> ColBatch {
+        let fields = vec![
+            Field {
+                name: "lc".into(),
+                ch_type: ChType::LowCardinality(Box::new(ChType::String)),
+            },
+            Field {
+                name: "lc_u32".into(),
+                ch_type: ChType::LowCardinality(Box::new(ChType::UInt32)),
+            },
+        ];
+        let columns = vec![
+            Column::Dictionary(DictionaryColumn::new(
+                vec![1, 2, 1, 2],
+                Column::Utf8(utf8_column(&[b"", b"user_1", b"user_2"])),
+            )),
+            Column::Dictionary(DictionaryColumn::new(
+                vec![1, 2, 1, 2],
+                Column::UInt32(PrimitiveColumn::new(vec![0, 13, 79])),
+            )),
+        ];
+        ColBatch::new(Schema::new(fields), columns, 4)
+    }
+
+    /// `LowCardinality(Nullable(String))` and
+    /// `LowCardinality(Nullable(UInt32))` over four rows with the valid, null,
+    /// valid, null pattern. Index 0 is the ClickHouse NULL sentinel and the
+    /// dictionary body is the bare non-nullable inner type.
+    fn low_cardinality_nullable_batch() -> ColBatch {
+        let validity = || Bitmap::from_ch_null_map(&[0, 1, 0, 1]);
+        let fields = vec![
+            Field {
+                name: "lcn".into(),
+                ch_type: ChType::LowCardinality(Box::new(ChType::Nullable(Box::new(
+                    ChType::String,
+                )))),
+            },
+            Field {
+                name: "lcn_u32".into(),
+                ch_type: ChType::LowCardinality(Box::new(ChType::Nullable(Box::new(
+                    ChType::UInt32,
+                )))),
+            },
+        ];
+        let columns = vec![
+            Column::Dictionary(DictionaryColumn::new_nullable(
+                vec![1, 0, 2, 0],
+                Column::Utf8(utf8_column(&[b"", b"user_1", b"user_2"])),
+                validity(),
+            )),
+            Column::Dictionary(DictionaryColumn::new_nullable(
+                vec![1, 0, 2, 0],
+                Column::UInt32(PrimitiveColumn::new(vec![0, 13, 79])),
+                validity(),
+            )),
+        ];
+        ColBatch::new(Schema::new(fields), columns, 4)
+    }
+
+    /// Compare two columns for the types this encoder covers. Used recursively
+    /// for `LowCardinality` dictionary values.
+    fn assert_columns_eq(left: &Column, right: &Column, label: &str) {
+        macro_rules! eq {
+            ($va:expr, $vb:expr) => {
+                assert_eq!($va.values, $vb.values, "{label} values differ")
+            };
+        }
+        match (left, right) {
+            (Column::Bool(x), Column::Bool(y)) => {
+                assert_eq!(x.len, y.len, "{label} bool len differs");
+                for row in 0..x.len {
+                    assert_eq!(x.get(row), y.get(row), "{label} bool row {row} differs");
+                }
+            }
+            (Column::Int8(x), Column::Int8(y)) => eq!(x, y),
+            (Column::Int16(x), Column::Int16(y)) => eq!(x, y),
+            (Column::Int32(x), Column::Int32(y)) => eq!(x, y),
+            (Column::Int64(x), Column::Int64(y)) => eq!(x, y),
+            (Column::UInt8(x), Column::UInt8(y)) => eq!(x, y),
+            (Column::UInt16(x), Column::UInt16(y)) => eq!(x, y),
+            (Column::UInt32(x), Column::UInt32(y)) => eq!(x, y),
+            (Column::UInt64(x), Column::UInt64(y)) => eq!(x, y),
+            (Column::Float32(x), Column::Float32(y)) => eq!(x, y),
+            (Column::Float64(x), Column::Float64(y)) => eq!(x, y),
+            (Column::Date(x), Column::Date(y)) => eq!(x, y),
+            (Column::Date32(x), Column::Date32(y)) => eq!(x, y),
+            (Column::DateTime(x), Column::DateTime(y)) => eq!(x, y),
+            (Column::DateTime64(x), Column::DateTime64(y)) => eq!(x, y),
+            (Column::Enum8(x), Column::Enum8(y)) => eq!(x, y),
+            (Column::Enum16(x), Column::Enum16(y)) => eq!(x, y),
+            (Column::Ipv4(x), Column::Ipv4(y)) => eq!(x, y),
+            (Column::Uuid(x), Column::Uuid(y)) | (Column::Ipv6(x), Column::Ipv6(y)) => {
+                assert_eq!(x.width, y.width, "{label} width differ");
+                assert_eq!(x.data, y.data, "{label} data differ");
+            }
+            (Column::Utf8(x), Column::Utf8(y)) => {
+                assert_eq!(x.offsets, y.offsets, "{label} offsets differ");
+                assert_eq!(x.data, y.data, "{label} data differ");
+            }
+            (Column::FixedBinary(x), Column::FixedBinary(y)) => {
+                assert_eq!(x.width, y.width, "{label} width differ");
+                assert_eq!(x.data, y.data, "{label} data differ");
+            }
+            (Column::Decimal(x), Column::Decimal(y)) => {
+                assert_eq!(x.width, y.width, "{label} width differ");
+                assert_eq!(x.precision, y.precision, "{label} precision differs");
+                assert_eq!(x.scale, y.scale, "{label} scale differs");
+                assert_eq!(x.data, y.data, "{label} data differ");
+            }
+            (Column::Dictionary(x), Column::Dictionary(y)) => {
+                assert_eq!(x.indices, y.indices, "{label} dictionary indices differ");
+                let dict_label = format!("{label} dictionary");
+                assert_columns_eq(x.values.as_ref(), y.values.as_ref(), &dict_label);
+            }
+            (other_a, other_b) => panic!("{label}: unexpected {other_a:?} vs {other_b:?}"),
+        }
+
+        // Validity (the null map or dictionary-index validity) must survive the
+        // round-trip too. Both sides must agree on presence and on every row's
+        // valid/null bit.
+        match (left.validity(), right.validity()) {
+            (None, None) => {}
+            (Some(x), Some(y)) => {
+                assert_eq!(x.len(), y.len(), "{label} validity len differs");
+                for row in 0..x.len() {
+                    assert_eq!(
+                        x.is_valid(row),
+                        y.is_valid(row),
+                        "{label} validity row {row} differs"
+                    );
+                }
+            }
+            (x, y) => panic!(
+                "{label} validity presence differs: {} vs {}",
+                x.is_some(),
+                y.is_some()
+            ),
+        }
+    }
+
+    /// Compare two batches column by column. Panics on any unexpected variant so
+    /// a wrong decode is loud.
     fn assert_batches_eq(left: &ColBatch, right: &ColBatch) {
         assert_eq!(left.schema, right.schema, "schema mismatch");
         assert_eq!(left.num_rows, right.num_rows, "row count mismatch");
@@ -1464,75 +1811,7 @@ mod tests {
             "column count mismatch"
         );
         for (i, (a, b)) in left.columns.iter().zip(&right.columns).enumerate() {
-            macro_rules! eq {
-                ($va:expr, $vb:expr) => {
-                    assert_eq!($va.values, $vb.values, "column {i} values differ")
-                };
-            }
-            match (a, b) {
-                (Column::Bool(x), Column::Bool(y)) => {
-                    assert_eq!(x.len, y.len, "column {i} bool len differs");
-                    for row in 0..x.len {
-                        assert_eq!(x.get(row), y.get(row), "column {i} bool row {row} differs");
-                    }
-                }
-                (Column::Int8(x), Column::Int8(y)) => eq!(x, y),
-                (Column::Int16(x), Column::Int16(y)) => eq!(x, y),
-                (Column::Int32(x), Column::Int32(y)) => eq!(x, y),
-                (Column::Int64(x), Column::Int64(y)) => eq!(x, y),
-                (Column::UInt8(x), Column::UInt8(y)) => eq!(x, y),
-                (Column::UInt16(x), Column::UInt16(y)) => eq!(x, y),
-                (Column::UInt32(x), Column::UInt32(y)) => eq!(x, y),
-                (Column::UInt64(x), Column::UInt64(y)) => eq!(x, y),
-                (Column::Float32(x), Column::Float32(y)) => eq!(x, y),
-                (Column::Float64(x), Column::Float64(y)) => eq!(x, y),
-                (Column::Date(x), Column::Date(y)) => eq!(x, y),
-                (Column::Date32(x), Column::Date32(y)) => eq!(x, y),
-                (Column::DateTime(x), Column::DateTime(y)) => eq!(x, y),
-                (Column::DateTime64(x), Column::DateTime64(y)) => eq!(x, y),
-                (Column::Enum8(x), Column::Enum8(y)) => eq!(x, y),
-                (Column::Enum16(x), Column::Enum16(y)) => eq!(x, y),
-                (Column::Ipv4(x), Column::Ipv4(y)) => eq!(x, y),
-                (Column::Uuid(x), Column::Uuid(y)) | (Column::Ipv6(x), Column::Ipv6(y)) => {
-                    assert_eq!(x.width, y.width, "column {i} width differ");
-                    assert_eq!(x.data, y.data, "column {i} data differ");
-                }
-                (Column::Utf8(x), Column::Utf8(y)) => {
-                    assert_eq!(x.offsets, y.offsets, "column {i} offsets differ");
-                    assert_eq!(x.data, y.data, "column {i} data differ");
-                }
-                (Column::FixedBinary(x), Column::FixedBinary(y)) => {
-                    assert_eq!(x.width, y.width, "column {i} width differ");
-                    assert_eq!(x.data, y.data, "column {i} data differ");
-                }
-                (Column::Decimal(x), Column::Decimal(y)) => {
-                    assert_eq!(x.width, y.width, "column {i} width differ");
-                    assert_eq!(x.precision, y.precision, "column {i} precision differs");
-                    assert_eq!(x.scale, y.scale, "column {i} scale differs");
-                    assert_eq!(x.data, y.data, "column {i} data differ");
-                }
-                (other_a, other_b) => panic!("column {i}: unexpected {other_a:?} vs {other_b:?}"),
-            }
-            // Validity (the null map) must survive the round-trip too. Both sides
-            // must agree on presence and on every row's valid/null bit.
-            match (a.validity(), b.validity()) {
-                (None, None) => {}
-                (Some(x), Some(y)) => {
-                    assert_eq!(x.len(), y.len(), "column {i} validity len differs");
-                    for row in 0..x.len() {
-                        assert_eq!(
-                            x.is_valid(row),
-                            y.is_valid(row),
-                            "column {i} validity row {row} differs"
-                        );
-                    }
-                }
-                (x, y) => panic!(
-                    "column {i} validity presence differs: {} vs {}",
-                    x.is_some(),
-                    y.is_some()
-                ),
-            }
+            assert_columns_eq(a, b, &format!("column {i}"));
         }
     }
 
@@ -1678,6 +1957,26 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_low_cardinality_rev0() {
+        roundtrip(&low_cardinality_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_low_cardinality_tcp_revision() {
+        roundtrip(&low_cardinality_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_nullable_low_cardinality_rev0() {
+        roundtrip(&low_cardinality_nullable_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_nullable_low_cardinality_tcp_revision() {
+        roundtrip(&low_cardinality_nullable_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
     fn zero_row_block_roundtrips_schema() {
         // A zero-row block still carries full column headers. The decoder keeps
         // the schema but drops the empty block from `chunks`.
@@ -1710,6 +2009,16 @@ mod tests {
                     bits: 32,
                 },
             },
+            Field {
+                name: "lc".into(),
+                ch_type: ChType::LowCardinality(Box::new(ChType::String)),
+            },
+            Field {
+                name: "lcn".into(),
+                ch_type: ChType::LowCardinality(Box::new(ChType::Nullable(Box::new(
+                    ChType::String,
+                )))),
+            },
         ];
         let columns = vec![
             Column::Int32(PrimitiveColumn::new(vec![])),
@@ -1718,6 +2027,15 @@ mod tests {
             Column::Ipv4(PrimitiveColumn::new(Vec::new())),
             Column::Ipv6(FixedBinaryColumn::new(Vec::new(), 16)),
             Column::Decimal(DecimalColumn::new(Vec::new(), 4, 9, 4)),
+            Column::Dictionary(DictionaryColumn::new(
+                vec![],
+                Column::Utf8(utf8_column(&[])),
+            )),
+            Column::Dictionary(DictionaryColumn::new_nullable(
+                vec![],
+                Column::Utf8(utf8_column(&[])),
+                Bitmap::from_ch_null_map(&[]),
+            )),
         ];
         let batch = ColBatch::new(Schema::new(fields), columns, 0);
         for revision in [0, DBMS_TCP_PROTOCOL_VERSION] {
@@ -1855,6 +2173,40 @@ mod tests {
     }
 
     #[test]
+    fn encode_chunked_roundtrips_low_cardinality_blocks() {
+        // LowCardinality dictionaries are block-local. These two chunks use
+        // different dictionaries and must stay separate after decode.
+        let field = Field {
+            name: "lc".into(),
+            ch_type: ChType::LowCardinality(Box::new(ChType::String)),
+        };
+        let chunk = |values: &[&[u8]], indices: Vec<i32>| {
+            let n = indices.len();
+            std::sync::Arc::new(ColBatch::new(
+                Schema::new(vec![field.clone()]),
+                vec![Column::Dictionary(DictionaryColumn::new(
+                    indices,
+                    Column::Utf8(utf8_column(values)),
+                ))],
+                n,
+            ))
+        };
+        let batch = ChunkedBatch {
+            schema: Schema::new(vec![field.clone()]),
+            chunks: vec![
+                chunk(&[b"", b"user_1", b"user_2"], vec![1, 2, 1]),
+                chunk(&[b"", b"user_3"], vec![1, 1]),
+            ],
+        };
+        let bytes = encode_chunked(&batch, &EncodeOptions::default()).unwrap();
+        let decoded = decode_all_bytes(&bytes, &DecodeOptions::default()).unwrap();
+        assert_eq!(decoded.num_chunks(), 2);
+        for (sent, got) in batch.chunks.iter().zip(&decoded.chunks) {
+            assert_batches_eq(sent, got);
+        }
+    }
+
+    #[test]
     fn rev0_frames_exact_bytes() {
         // Pin the rev-0 framing byte-for-byte: no BlockInfo, no marker. One Int32
         // column "n" with a single row = 1.
@@ -1911,51 +2263,16 @@ mod tests {
         assert_eq!(bytes, expected);
     }
 
-    /// A small `LowCardinality(String)` type for unsupported-type tests: decoded
-    /// by this crate but not yet encodable.
-    fn low_cardinality_string_type() -> ChType {
-        ChType::LowCardinality(Box::new(ChType::String))
-    }
-
     #[test]
-    fn nullable_unsupported_inner_is_unsupported() {
-        // `Nullable` is a supported wrapper now, but its inner type must also be
-        // encodable. `LowCardinality(String)` is decoded yet not encodable, so the
-        // wrapper is still rejected, and the reported type is the full declared
-        // wrapper. The dictionary column is structurally valid, so the only reason
-        // for rejection is the unsupported inner type.
+    fn nullable_low_cardinality_nesting_is_rejected() {
+        // `Nullable(LowCardinality(T))` is the illegal nesting direction. The
+        // supported shape is `LowCardinality(Nullable(T))`, so this must fail at
+        // the type-header round-trip check before any bytes are written.
+        let lc_string = ChType::LowCardinality(Box::new(ChType::String));
         let batch = ColBatch::new(
             Schema::new(vec![Field {
                 name: "nlc".into(),
-                ch_type: ChType::Nullable(Box::new(low_cardinality_string_type())),
-            }]),
-            vec![Column::Dictionary(DictionaryColumn::new_nullable(
-                vec![0],
-                Column::Utf8(utf8_column(&[b"user_1"])),
-                Bitmap::from_ch_null_map(&[0]),
-            ))],
-            1,
-        );
-        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
-            EncodeError::UnsupportedType { column, ch_type } => {
-                assert_eq!(column, "nlc");
-                assert_eq!(
-                    ch_type,
-                    ChType::Nullable(Box::new(low_cardinality_string_type()))
-                );
-            }
-            other => panic!("expected UnsupportedType, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn unsupported_type_reports_column_and_type() {
-        // `LowCardinality(String)` is decoded but not yet encodable, so it reports
-        // UnsupportedType with the column name and type.
-        let batch = ColBatch::new(
-            Schema::new(vec![Field {
-                name: "lc".into(),
-                ch_type: low_cardinality_string_type(),
+                ch_type: ChType::Nullable(Box::new(lc_string)),
             }]),
             vec![Column::Dictionary(DictionaryColumn::new(
                 vec![0],
@@ -1964,9 +2281,36 @@ mod tests {
             1,
         );
         match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn low_cardinality_unsupported_inner_reports_column_and_type() {
+        // Decimal is encodable as a plain column, but the server forbids it as a
+        // LowCardinality inner (`canBeInsideLowCardinality()` is false), so the
+        // wrapper remains unsupported and reports the full declared type.
+        let lc_decimal = ChType::LowCardinality(Box::new(ChType::Decimal {
+            precision: 9,
+            scale: 4,
+            bits: 32,
+        }));
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "lc".into(),
+                ch_type: lc_decimal.clone(),
+            }]),
+            vec![Column::Dictionary(DictionaryColumn::new(
+                vec![0],
+                Column::Decimal(DecimalColumn::new(vec![0u8; 4], 4, 9, 4)),
+            ))],
+            1,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
             EncodeError::UnsupportedType { column, ch_type } => {
                 assert_eq!(column, "lc");
-                assert_eq!(ch_type, low_cardinality_string_type());
+                assert_eq!(ch_type, lc_decimal);
             }
             other => panic!("expected UnsupportedType, got {other:?}"),
         }
@@ -2134,6 +2478,198 @@ mod tests {
             0xF3, 0xFF, 0xFF, 0xFF, // i32 -13, little-endian two's-complement
         ];
         assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn rev0_frames_low_cardinality_string_bytes() {
+        // Pin the LowCardinality body framing at rev 0. The server-confirmed
+        // Native index word sets both HasAdditionalKeysBit and
+        // NeedUpdateDictionary, so a UInt8-index block writes 0x600.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "lc".into(),
+                ch_type: ChType::LowCardinality(Box::new(ChType::String)),
+            }]),
+            vec![Column::Dictionary(DictionaryColumn::new(
+                vec![1],
+                Column::Utf8(utf8_column(&[b"", b"user_1"])),
+            ))],
+            1,
+        );
+        let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+        let expected = [
+            0x01, // num_cols = 1
+            0x01, // num_rows = 1
+            0x02, b'l', b'c', // name "lc"
+            0x16, b'L', b'o', b'w', b'C', b'a', b'r', b'd', b'i', b'n', b'a', b'l', b'i', b't',
+            b'y', b'(', b'S', b't', b'r', b'i', b'n', b'g', b')',
+            // LowCardinality key version = 1.
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // index_word = 0x600: UInt8 tag, HasAdditionalKeysBit,
+            // NeedUpdateDictionary.
+            0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, // num_keys = 2
+            0x00, // dictionary[0] = ""
+            0x06, b'u', b's', b'e', b'r', b'_', b'1', // dictionary[1]
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // row count = 1
+            0x01, // row index = 1
+        ];
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn rev0_frames_low_cardinality_zero_rows_without_payload() {
+        // Zero-row Native blocks write only the column header. The server skips
+        // writeData entirely, so there is no LowCardinality key-version prefix.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "lc".into(),
+                ch_type: ChType::LowCardinality(Box::new(ChType::String)),
+            }]),
+            vec![Column::Dictionary(DictionaryColumn::new(
+                vec![],
+                Column::Utf8(utf8_column(&[])),
+            ))],
+            0,
+        );
+        let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+        let expected = [
+            0x01, // num_cols = 1
+            0x00, // num_rows = 0
+            0x02, b'l', b'c', // name "lc"
+            0x16, b'L', b'o', b'w', b'C', b'a', b'r', b'd', b'i', b'n', b'a', b'l', b'i', b't',
+            b'y', b'(', b'S', b't', b'r', b'i', b'n', b'g', b')',
+        ];
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn low_cardinality_index_width_selects_self_describing_widths() {
+        assert_eq!(low_cardinality_index_width(0), (1, 0));
+        assert_eq!(low_cardinality_index_width(255), (1, 0));
+        assert_eq!(low_cardinality_index_width(256), (2, 1));
+        assert_eq!(low_cardinality_index_width(65_535), (2, 1));
+        assert_eq!(low_cardinality_index_width(65_536), (4, 2));
+    }
+
+    #[test]
+    fn low_cardinality_negative_index_is_rejected() {
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "lc".into(),
+                ch_type: ChType::LowCardinality(Box::new(ChType::String)),
+            }]),
+            vec![Column::Dictionary(DictionaryColumn::new(
+                vec![-1],
+                Column::Utf8(utf8_column(&[b"", b"user_1"])),
+            ))],
+            1,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn low_cardinality_out_of_range_index_is_rejected() {
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "lc".into(),
+                ch_type: ChType::LowCardinality(Box::new(ChType::UInt32)),
+            }]),
+            vec![Column::Dictionary(DictionaryColumn::new(
+                vec![2],
+                Column::UInt32(PrimitiveColumn::new(vec![0, 13])),
+            ))],
+            1,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn low_cardinality_nullable_valid_index_zero_is_rejected() {
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "lcn".into(),
+                ch_type: ChType::LowCardinality(Box::new(ChType::Nullable(Box::new(
+                    ChType::String,
+                )))),
+            }]),
+            vec![Column::Dictionary(DictionaryColumn::new_nullable(
+                vec![0],
+                Column::Utf8(utf8_column(&[b"", b"user_1"])),
+                Bitmap::from_ch_null_map(&[0]),
+            ))],
+            1,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn low_cardinality_nullable_null_nonzero_index_is_rejected() {
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "lcn".into(),
+                ch_type: ChType::LowCardinality(Box::new(ChType::Nullable(Box::new(
+                    ChType::UInt32,
+                )))),
+            }]),
+            vec![Column::Dictionary(DictionaryColumn::new_nullable(
+                vec![1],
+                Column::UInt32(PrimitiveColumn::new(vec![0, 13])),
+                Bitmap::from_ch_null_map(&[1]),
+            ))],
+            1,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn low_cardinality_dictionary_type_mismatch_is_rejected() {
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "lc".into(),
+                ch_type: ChType::LowCardinality(Box::new(ChType::String)),
+            }]),
+            vec![Column::Dictionary(DictionaryColumn::new(
+                vec![1],
+                Column::UInt32(PrimitiveColumn::new(vec![0, 13])),
+            ))],
+            1,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn low_cardinality_zero_rows_nonempty_dictionary_is_rejected() {
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "lc".into(),
+                ch_type: ChType::LowCardinality(Box::new(ChType::String)),
+            }]),
+            vec![Column::Dictionary(DictionaryColumn::new(
+                vec![],
+                Column::Utf8(utf8_column(&[b"", b"user_1"])),
+            ))],
+            0,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
     }
 
     #[test]

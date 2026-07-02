@@ -856,10 +856,10 @@ field when the inner type is `Nullable`. The array carries 2 index buffers in
 order: validity then the i32 index data, and its `dictionary` child array holds
 the dictionary values exported as a column of the inner type.
 
-Index-width decision: ClickHouse picks the index width (u8..u64) per block from
-that block's dictionary size, but the decoder normalizes every index to a single
-signed `i32`, widening the native width during decode. This matches the index
-type pyarrow accepts for a dictionary array and keeps the `Column` model and the
+Index-width decision: the Native payload self-describes the index width
+(u8..u64) per block, and the decoder normalizes every index to a single signed
+`i32`, widening the native width during decode. This matches the index type
+pyarrow accepts for a dictionary array and keeps the `Column` model and the
 Arrow export single-shaped rather than branching the index format per chunk. A
 per-block dictionary large enough to overflow `i32` is not a real Native payload
 and is rejected.

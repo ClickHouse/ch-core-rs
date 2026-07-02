@@ -630,14 +630,19 @@ fn read_state_prefix(
 /// Key serialization version this decoder accepts. The Native format always
 /// uses `SharedDictionariesWithAdditionalKeys` (server
 /// `KeysSerializationVersion`).
-const LOW_CARDINALITY_KEY_VERSION: u64 = 1;
+pub(crate) const LOW_CARDINALITY_KEY_VERSION: u64 = 1;
 
 /// `NeedGlobalDictionaryBit` of the per-block index type word. Native never sets
 /// it (the server rejects it for `native_format`), so the decoder rejects it too.
 const LC_NEED_GLOBAL_DICTIONARY_BIT: u64 = 1 << 8;
 /// `HasAdditionalKeysBit` of the per-block index type word. Always set in Native:
 /// each block carries its own dictionary as "additional keys".
-const LC_HAS_ADDITIONAL_KEYS_BIT: u64 = 1 << 9;
+pub(crate) const LC_HAS_ADDITIONAL_KEYS_BIT: u64 = 1 << 9;
+/// `NeedUpdateDictionary` of the per-block index type word. Native writes it
+/// alongside `HasAdditionalKeysBit` for the per-block dictionary. The decoder
+/// does not require it so older or synthetic payloads with only
+/// `HasAdditionalKeysBit` still decode.
+pub(crate) const LC_NEED_UPDATE_DICTIONARY_BIT: u64 = 1 << 10;
 
 /// Decode one `LowCardinality(T)` column block into a dictionary `Column`.
 ///
@@ -774,7 +779,7 @@ fn decode_low_cardinality(
 /// decoding a column the server already produced. `UUID` (like `String` and
 /// `FixedString`) is allowed unconditionally; `IPv4`/`IPv6` need the suspicious
 /// setting at creation, again with no wire effect.
-fn is_low_cardinality_inner(dict_value_type: &ChType) -> bool {
+pub(crate) fn is_low_cardinality_inner(dict_value_type: &ChType) -> bool {
     matches!(
         dict_value_type,
         ChType::Bool
