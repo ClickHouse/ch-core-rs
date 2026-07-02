@@ -12,17 +12,17 @@
 //! Scope: this encodes `Bool`, the fixed-width numeric types (`Int8`..`Int64`,
 //! `UInt8`..`UInt64`, `Float32`, `Float64`), the temporal types (`Date`,
 //! `Date32`, `DateTime`, `DateTime64`), `UUID`, `IPv4`, `IPv6`, `String`,
-//! `FixedString(N)`, and `Enum8`/`Enum16`, each also inside a `Nullable(T)`
-//! wrapper (a per-row null map precedes the inner values).
+//! `FixedString(N)`, `Enum8`/`Enum16`, and `Decimal(P, S)`, each also inside a
+//! `Nullable(T)` wrapper (a per-row null map precedes the inner values).
 //! Every other column type returns [`EncodeError::UnsupportedType`] until its
 //! encoder lands, the same one-type-at-a-time growth the decode path follows.
 
 use crate::batch::{ChunkedBatch, ColBatch};
-use crate::column::{BoolColumn, Column, FixedBinaryColumn, Utf8Column};
+use crate::column::{BoolColumn, Column, DecimalColumn, FixedBinaryColumn, Utf8Column};
 use crate::schema::{ChType, Field};
 
 use super::decode::{
-    parse_ch_type, DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION,
+    decimal_bits_from_precision, parse_ch_type, DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION,
     DBMS_MIN_REVISION_WITH_OUT_OF_ORDER_BUCKETS,
 };
 use super::varint::write_varint;
@@ -311,6 +311,14 @@ fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<()
         (ChType::Uuid, Column::Uuid(c)) | (ChType::Ipv6, Column::Ipv6(c)) => {
             validate_fixed_binary(field, value_type, c, 16, num_rows)?;
         }
+        (
+            ChType::Decimal {
+                precision,
+                scale,
+                bits,
+            },
+            Column::Decimal(c),
+        ) => validate_decimal(field, c, *precision, *scale, *bits, num_rows)?,
         _ => {}
     }
 
@@ -324,8 +332,8 @@ fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<()
     Ok(())
 }
 
-/// Shared misframe guard for the fixed-width binary bodies (`FixedString(N)`,
-/// `UUID`, `IPv6`, and later fixed-width passthroughs such as `Decimal`).
+/// Shared misframe guard for fixed-width binary bodies (`FixedString(N)`,
+/// `UUID`, and `IPv6`).
 ///
 /// The body is the contiguous `width * num_rows` data buffer written verbatim
 /// with no per-row framing, so the reader consumes exactly `width` bytes per
@@ -356,6 +364,75 @@ fn validate_fixed_binary(
         return Err(EncodeError::InconsistentBatch {
             detail: format!(
                 "column {:?} is {value_type} over {num_rows} rows so its body must be {} bytes, but the buffer holds {}",
+                field.name,
+                declared_width.saturating_mul(num_rows),
+                col.data.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Guard the raw Decimal body before writing.
+///
+/// `Decimal(P, S)` carries precision and scale in the type string only, while
+/// `DecimalColumn` carries them for direct buffer consumers. They must agree, and
+/// the byte buffer must be exactly one precision-derived fixed-width integer per
+/// row. This derives width from precision directly instead of trusting the
+/// `ChType::Decimal::bits` field, so a truthful type string cannot sit over a
+/// wrong-shaped body.
+fn validate_decimal(
+    field: &Field,
+    col: &DecimalColumn,
+    precision: u8,
+    scale: u8,
+    bits: u16,
+    num_rows: usize,
+) -> Result<(), EncodeError> {
+    if scale > precision {
+        return Err(EncodeError::InconsistentBatch {
+            detail: format!(
+                "column {:?} is declared Decimal({precision}, {scale}) but Decimal scale must not exceed precision",
+                field.name
+            ),
+        });
+    }
+    let expected_bits =
+        decimal_bits_from_precision(precision).ok_or_else(|| EncodeError::InconsistentBatch {
+            detail: format!(
+                "column {:?} is declared Decimal({precision}, {scale}) but Decimal precision must be in 1..=76",
+                field.name
+            ),
+        })?;
+    if bits != expected_bits {
+        return Err(EncodeError::InconsistentBatch {
+            detail: format!(
+                "column {:?} is declared Decimal({precision}, {scale}) with {bits} bits, but precision {precision} requires {expected_bits} bits",
+                field.name
+            ),
+        });
+    }
+    let declared_width = (expected_bits / 8) as usize;
+    if col.precision != precision || col.scale != scale {
+        return Err(EncodeError::InconsistentBatch {
+            detail: format!(
+                "column {:?} is declared Decimal({precision}, {scale}) but its buffer metadata is Decimal({}, {})",
+                field.name, col.precision, col.scale
+            ),
+        });
+    }
+    if col.width != declared_width {
+        return Err(EncodeError::InconsistentBatch {
+            detail: format!(
+                "column {:?} is declared Decimal({precision}, {scale}) ({declared_width} bytes per row) but its buffer stores {}-byte rows",
+                field.name, col.width
+            ),
+        });
+    }
+    if declared_width.checked_mul(num_rows) != Some(col.data.len()) {
+        return Err(EncodeError::InconsistentBatch {
+            detail: format!(
+                "column {:?} is Decimal({precision}, {scale}) over {num_rows} rows so its body must be {} bytes, but the buffer holds {}",
                 field.name,
                 declared_width.saturating_mul(num_rows),
                 col.data.len()
@@ -397,6 +474,7 @@ fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
             | (ChType::FixedString(_), Column::FixedBinary(_))
             | (ChType::Enum8 { .. }, Column::Enum8(_))
             | (ChType::Enum16 { .. }, Column::Enum16(_))
+            | (ChType::Decimal { .. }, Column::Decimal(_))
     )
 }
 
@@ -625,6 +703,7 @@ fn encode_column_body(
         (ChType::Ipv4, Column::Ipv4(c)) => encode_primitive!(buf, &c.values, u32),
         (ChType::String, Column::Utf8(c)) => encode_string_data(buf, c),
         (ChType::FixedString(_), Column::FixedBinary(c)) => encode_fixed_binary_data(buf, c),
+        (ChType::Decimal { .. }, Column::Decimal(c)) => encode_decimal_data(buf, c),
         // Defensive: `validate_column` rejects every unsupported type and every
         // mismatched `(type, buffer)` pair before the write phase, so this arm
         // cannot occur for a validated batch. It returns the same error validation
@@ -776,6 +855,18 @@ fn encode_fixed_binary_data(buf: &mut Vec<u8>, col: &FixedBinaryColumn) {
     buf.extend_from_slice(&col.data);
 }
 
+/// Encode a `Decimal(P, S)` column body: one contiguous fixed-width scaled
+/// integer per row, written verbatim from `DecimalColumn::data`.
+///
+/// Confirmed at v26.6.1.1193-stable in `SerializationDecimalBase`: the body is
+/// raw little-endian fixed-width integer bytes with no per-row framing and no
+/// precision/scale in-band. `DecimalColumn::data` is already wire-order bytes, so
+/// this is one copy. Negative values are inferred to be little-endian
+/// two's-complement from signed backing types and raw integer storage.
+fn encode_decimal_data(buf: &mut Vec<u8>, col: &DecimalColumn) {
+    buf.extend_from_slice(&col.data);
+}
+
 /// Classify a column that did not match any supported `(ch_type, column)` pair.
 ///
 /// `ch_type` is the concrete value type the body match failed on (the unwrapped
@@ -833,6 +924,7 @@ fn is_encodable(ch_type: &ChType) -> bool {
             | ChType::FixedString(_)
             | ChType::Enum8 { .. }
             | ChType::Enum16 { .. }
+            | ChType::Decimal { .. }
     )
 }
 
@@ -840,7 +932,7 @@ fn is_encodable(ch_type: &ChType) -> bool {
 mod tests {
     use super::*;
     use crate::bitmap::Bitmap;
-    use crate::column::{DecimalColumn, PrimitiveColumn};
+    use crate::column::{DecimalColumn, DictionaryColumn, PrimitiveColumn};
     use crate::native::decode::{decode_all_bytes, DecodeOptions, DBMS_TCP_PROTOCOL_VERSION};
     use crate::schema::Schema;
 
@@ -1242,6 +1334,124 @@ mod tests {
         ColBatch::new(Schema::new(fields), columns, 4)
     }
 
+    /// Build a DecimalColumn of the given width from equal-width raw wire-order
+    /// byte values.
+    fn decimal_column(width: usize, precision: u8, scale: u8, values: &[&[u8]]) -> DecimalColumn {
+        let mut data = Vec::with_capacity(width * values.len());
+        for v in values {
+            assert_eq!(v.len(), width, "decimal test value must be {width} bytes");
+            data.extend_from_slice(v);
+        }
+        DecimalColumn::new(data, width, precision, scale)
+    }
+
+    /// Decimal columns covering all four precision-derived widths. The raw bytes
+    /// include positive, zero, and negative two's-complement values, but the core
+    /// treats them as already-wire-order bytes and does not materialize integers.
+    fn decimal_batch() -> ColBatch {
+        let fields = vec![
+            Field {
+                name: "d32".into(),
+                ch_type: ChType::Decimal {
+                    precision: 9,
+                    scale: 4,
+                    bits: 32,
+                },
+            },
+            Field {
+                name: "d64".into(),
+                ch_type: ChType::Decimal {
+                    precision: 18,
+                    scale: 9,
+                    bits: 64,
+                },
+            },
+            Field {
+                name: "d128".into(),
+                ch_type: ChType::Decimal {
+                    precision: 38,
+                    scale: 10,
+                    bits: 128,
+                },
+            },
+            Field {
+                name: "d256".into(),
+                ch_type: ChType::Decimal {
+                    precision: 76,
+                    scale: 20,
+                    bits: 256,
+                },
+            },
+        ];
+        let d32_neg = (-13i32).to_le_bytes();
+        let d32_pos = 79i32.to_le_bytes();
+        let d64_neg = (-13i64).to_le_bytes();
+        let d64_pos = 79i64.to_le_bytes();
+        let d64_zero = [0u8; 8];
+        let d128_neg = [0xFFu8; 16];
+        let d128_zero = [0u8; 16];
+        let d256_neg = [0xFFu8; 32];
+        let d256_zero = [0u8; 32];
+        let columns = vec![
+            Column::Decimal(decimal_column(
+                4,
+                9,
+                4,
+                &[&d32_neg, &[0, 0, 0, 0], &d32_pos],
+            )),
+            Column::Decimal(decimal_column(
+                8,
+                18,
+                9,
+                &[&d64_neg, &d64_zero, &d64_pos],
+            )),
+            Column::Decimal(decimal_column(
+                16,
+                38,
+                10,
+                &[
+                    &d128_neg,
+                    &d128_zero,
+                    b"\x4F\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+                ],
+            )),
+            Column::Decimal(decimal_column(
+                32,
+                76,
+                20,
+                &[
+                    &d256_neg,
+                    &d256_zero,
+                    b"\x13\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+                ],
+            )),
+        ];
+        ColBatch::new(Schema::new(fields), columns, 3)
+    }
+
+    /// A `Nullable(Decimal(18, 9))` column with valid, null, valid, null rows.
+    fn nullable_decimal_batch() -> ColBatch {
+        let validity = Bitmap::from_ch_null_map(&[0, 1, 0, 1]);
+        let neg = (-13i64).to_le_bytes();
+        let zero = [0u8; 8];
+        let pos = 79i64.to_le_bytes();
+        let values = [&neg[..], &zero[..], &pos[..], &zero[..]];
+        let mut col = decimal_column(8, 18, 9, &values);
+        col.validity = Some(validity);
+        ColBatch::new(
+            Schema::new(vec![Field {
+                name: "nd".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::Decimal {
+                    precision: 18,
+                    scale: 9,
+                    bits: 64,
+                })),
+            }]),
+            vec![Column::Decimal(col)],
+            4,
+        )
+    }
+
     /// Compare two batches column by column for the types this encoder covers
     /// (the numerics, the temporal types, `UUID`/`IPv4`/`IPv6`, `String`,
     /// `FixedString`). Panics on any other variant so a wrong decode is loud.
@@ -1293,6 +1503,12 @@ mod tests {
                 }
                 (Column::FixedBinary(x), Column::FixedBinary(y)) => {
                     assert_eq!(x.width, y.width, "column {i} width differ");
+                    assert_eq!(x.data, y.data, "column {i} data differ");
+                }
+                (Column::Decimal(x), Column::Decimal(y)) => {
+                    assert_eq!(x.width, y.width, "column {i} width differ");
+                    assert_eq!(x.precision, y.precision, "column {i} precision differs");
+                    assert_eq!(x.scale, y.scale, "column {i} scale differs");
                     assert_eq!(x.data, y.data, "column {i} data differ");
                 }
                 (other_a, other_b) => panic!("column {i}: unexpected {other_a:?} vs {other_b:?}"),
@@ -1442,6 +1658,26 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_decimal_rev0() {
+        roundtrip(&decimal_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_decimal_tcp_revision() {
+        roundtrip(&decimal_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_nullable_decimal_rev0() {
+        roundtrip(&nullable_decimal_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_nullable_decimal_tcp_revision() {
+        roundtrip(&nullable_decimal_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
     fn zero_row_block_roundtrips_schema() {
         // A zero-row block still carries full column headers. The decoder keeps
         // the schema but drops the empty block from `chunks`.
@@ -1466,6 +1702,14 @@ mod tests {
                 name: "ip6".into(),
                 ch_type: ChType::Ipv6,
             },
+            Field {
+                name: "dec".into(),
+                ch_type: ChType::Decimal {
+                    precision: 9,
+                    scale: 4,
+                    bits: 32,
+                },
+            },
         ];
         let columns = vec![
             Column::Int32(PrimitiveColumn::new(vec![])),
@@ -1473,6 +1717,7 @@ mod tests {
             Column::Uuid(FixedBinaryColumn::new(Vec::new(), 16)),
             Column::Ipv4(PrimitiveColumn::new(Vec::new())),
             Column::Ipv6(FixedBinaryColumn::new(Vec::new(), 16)),
+            Column::Decimal(DecimalColumn::new(Vec::new(), 4, 9, 4)),
         ];
         let batch = ColBatch::new(Schema::new(fields), columns, 0);
         for revision in [0, DBMS_TCP_PROTOCOL_VERSION] {
@@ -1576,6 +1821,40 @@ mod tests {
     }
 
     #[test]
+    fn encode_chunked_roundtrips_decimal_blocks() {
+        // Decimal blocks stay separate chunks, never concatenated.
+        let field = Field {
+            name: "dec".into(),
+            ch_type: ChType::Decimal {
+                precision: 9,
+                scale: 4,
+                bits: 32,
+            },
+        };
+        let chunk = |vals: Vec<i32>| {
+            let mut data = Vec::with_capacity(vals.len() * 4);
+            for v in &vals {
+                data.extend_from_slice(&v.to_le_bytes());
+            }
+            std::sync::Arc::new(ColBatch::new(
+                Schema::new(vec![field.clone()]),
+                vec![Column::Decimal(DecimalColumn::new(data, 4, 9, 4))],
+                vals.len(),
+            ))
+        };
+        let batch = ChunkedBatch {
+            schema: Schema::new(vec![field.clone()]),
+            chunks: vec![chunk(vec![-13, 0]), chunk(vec![79])],
+        };
+        let bytes = encode_chunked(&batch, &EncodeOptions::default()).unwrap();
+        let decoded = decode_all_bytes(&bytes, &DecodeOptions::default()).unwrap();
+        assert_eq!(decoded.num_chunks(), 2);
+        for (sent, got) in batch.chunks.iter().zip(&decoded.chunks) {
+            assert_batches_eq(sent, got);
+        }
+    }
+
+    #[test]
     fn rev0_frames_exact_bytes() {
         // Pin the rev-0 framing byte-for-byte: no BlockInfo, no marker. One Int32
         // column "n" with a single row = 1.
@@ -1632,43 +1911,38 @@ mod tests {
         assert_eq!(bytes, expected);
     }
 
-    /// A small `Decimal(9, 4)` type for the unsupported-type tests: decoded by
-    /// this crate but not yet encodable. (`Enum8`/`Enum16` are now encodable, so
-    /// they no longer serve as the "decoded but not encodable" example.) A
-    /// precision of 9 gives the 32-bit backing integer (4 bytes per row).
-    fn decimal_type() -> ChType {
-        ChType::Decimal {
-            precision: 9,
-            scale: 4,
-            bits: 32,
-        }
+    /// A small `LowCardinality(String)` type for unsupported-type tests: decoded
+    /// by this crate but not yet encodable.
+    fn low_cardinality_string_type() -> ChType {
+        ChType::LowCardinality(Box::new(ChType::String))
     }
 
     #[test]
     fn nullable_unsupported_inner_is_unsupported() {
         // `Nullable` is a supported wrapper now, but its inner type must also be
-        // encodable. `Decimal` is decoded yet not encodable, so
-        // `Nullable(Decimal(9, 4))` is still rejected, and the reported type is the
-        // full declared wrapper. The column is structurally valid (one 4-byte row),
-        // so the only reason for rejection is the unsupported inner type.
+        // encodable. `LowCardinality(String)` is decoded yet not encodable, so the
+        // wrapper is still rejected, and the reported type is the full declared
+        // wrapper. The dictionary column is structurally valid, so the only reason
+        // for rejection is the unsupported inner type.
         let batch = ColBatch::new(
             Schema::new(vec![Field {
-                name: "ndec".into(),
-                ch_type: ChType::Nullable(Box::new(decimal_type())),
+                name: "nlc".into(),
+                ch_type: ChType::Nullable(Box::new(low_cardinality_string_type())),
             }]),
-            vec![Column::Decimal(DecimalColumn::new_nullable(
-                vec![0u8; 4],
-                4,
-                9,
-                4,
+            vec![Column::Dictionary(DictionaryColumn::new_nullable(
+                vec![0],
+                Column::Utf8(utf8_column(&[b"user_1"])),
                 Bitmap::from_ch_null_map(&[0]),
             ))],
             1,
         );
         match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
             EncodeError::UnsupportedType { column, ch_type } => {
-                assert_eq!(column, "ndec");
-                assert_eq!(ch_type, ChType::Nullable(Box::new(decimal_type())));
+                assert_eq!(column, "nlc");
+                assert_eq!(
+                    ch_type,
+                    ChType::Nullable(Box::new(low_cardinality_string_type()))
+                );
             }
             other => panic!("expected UnsupportedType, got {other:?}"),
         }
@@ -1676,22 +1950,23 @@ mod tests {
 
     #[test]
     fn unsupported_type_reports_column_and_type() {
-        // `Decimal` is decoded but not yet encodable, so it reports UnsupportedType
-        // with the column name and type. The column is a structurally valid single
-        // 4-byte row, so the only reason for rejection is that the encoder cannot
-        // write `Decimal` yet.
+        // `LowCardinality(String)` is decoded but not yet encodable, so it reports
+        // UnsupportedType with the column name and type.
         let batch = ColBatch::new(
             Schema::new(vec![Field {
-                name: "dec".into(),
-                ch_type: decimal_type(),
+                name: "lc".into(),
+                ch_type: low_cardinality_string_type(),
             }]),
-            vec![Column::Decimal(DecimalColumn::new(vec![0u8; 4], 4, 9, 4))],
+            vec![Column::Dictionary(DictionaryColumn::new(
+                vec![0],
+                Column::Utf8(utf8_column(&[b"user_1"])),
+            ))],
             1,
         );
         match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
             EncodeError::UnsupportedType { column, ch_type } => {
-                assert_eq!(column, "dec");
-                assert_eq!(ch_type, decimal_type());
+                assert_eq!(column, "lc");
+                assert_eq!(ch_type, low_cardinality_string_type());
             }
             other => panic!("expected UnsupportedType, got {other:?}"),
         }
@@ -1828,6 +2103,40 @@ mod tests {
     }
 
     #[test]
+    fn rev0_frames_decimal_bytes() {
+        // Pin the Decimal body framing: contiguous width*num_rows bytes, no
+        // per-row length prefix, precision, or scale. The single Decimal(9, 4)
+        // value is unscaled -13, little-endian two's-complement i32.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "d".into(),
+                ch_type: ChType::Decimal {
+                    precision: 9,
+                    scale: 4,
+                    bits: 32,
+                },
+            }]),
+            vec![Column::Decimal(DecimalColumn::new(
+                (-13i32).to_le_bytes().to_vec(),
+                4,
+                9,
+                4,
+            ))],
+            1,
+        );
+        let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+        let expected = [
+            0x01, // num_cols = 1
+            0x01, // num_rows = 1
+            0x01, b'd', // name "d"
+            0x0D, b'D', b'e', b'c', b'i', b'm', b'a', b'l', b'(', b'9', b',', b' ', b'4',
+            b')', // type "Decimal(9, 4)"
+            0xF3, 0xFF, 0xFF, 0xFF, // i32 -13, little-endian two's-complement
+        ];
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
     fn uuid_width_mismatch_is_rejected() {
         // A UUID buffer whose stored width is not 16 would put the wrong number of
         // bytes per row on the wire under a truthful type string; reject it before
@@ -1857,6 +2166,101 @@ mod tests {
                 ch_type: ChType::Ipv6,
             }]),
             columns: vec![Column::Ipv6(FixedBinaryColumn::new(vec![0u8; 17], 16))],
+            num_rows: 1,
+        };
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decimal_width_mismatch_is_rejected() {
+        // Decimal(9, 4) is 4 bytes per row by precision, so a width-8 buffer
+        // would misframe the body under the truthful type string.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "dec".into(),
+                ch_type: ChType::Decimal {
+                    precision: 9,
+                    scale: 4,
+                    bits: 32,
+                },
+            }]),
+            vec![Column::Decimal(DecimalColumn::new(vec![0u8; 8], 8, 9, 4))],
+            1,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decimal_ragged_data_is_rejected() {
+        // A Decimal buffer whose byte count is not exactly width * num_rows
+        // reports the right row count via truncating division but would put too
+        // many bytes on the wire.
+        let batch = ColBatch {
+            schema: Schema::new(vec![Field {
+                name: "dec".into(),
+                ch_type: ChType::Decimal {
+                    precision: 9,
+                    scale: 4,
+                    bits: 32,
+                },
+            }]),
+            columns: vec![Column::Decimal(DecimalColumn::new(vec![0u8; 7], 4, 9, 4))],
+            num_rows: 1,
+        };
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decimal_metadata_mismatch_is_rejected() {
+        // The schema and DecimalColumn metadata must agree so downstream buffer
+        // consumers see the same precision and scale as the type header.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "dec".into(),
+                ch_type: ChType::Decimal {
+                    precision: 9,
+                    scale: 4,
+                    bits: 32,
+                },
+            }]),
+            vec![Column::Decimal(DecimalColumn::new(vec![0u8; 4], 4, 9, 2))],
+            1,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nullable_decimal_ragged_data_is_rejected() {
+        // The Decimal body guard must apply inside `Nullable` too, after the
+        // value type is unwrapped.
+        let batch = ColBatch {
+            schema: Schema::new(vec![Field {
+                name: "dec".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::Decimal {
+                    precision: 9,
+                    scale: 4,
+                    bits: 32,
+                })),
+            }]),
+            columns: vec![Column::Decimal(DecimalColumn::new_nullable(
+                vec![0u8; 7],
+                4,
+                9,
+                4,
+                Bitmap::from_ch_null_map(&[0]),
+            ))],
             num_rows: 1,
         };
         match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
@@ -2153,10 +2557,12 @@ mod tests {
 
     #[test]
     fn unrepresentable_type_string_is_rejected() {
-        // A `DateTime64` precision above 9 and a `FixedString(0)` are constructible
-        // `ChType`s whose rendered type string this crate's parser and the server
-        // both reject. Encoding must fail at the source (InconsistentBatch) rather
-        // than emit a header that fails to decode downstream.
+        // A `DateTime64` precision above 9, invalid Decimal metadata, and a
+        // `FixedString(0)` are constructible `ChType`s whose rendered type string
+        // this crate's parser and the server reject or normalize differently.
+        // Encoding must fail at the source (InconsistentBatch) rather than emit a
+        // header that fails to decode downstream, or worse, a Decimal header whose
+        // server-derived width disagrees with the body width.
         let dt64 = ColBatch {
             schema: Schema::new(vec![Field {
                 name: "t".into(),
@@ -2171,6 +2577,50 @@ mod tests {
         match encode_block(&dt64, &EncodeOptions::default()).unwrap_err() {
             EncodeError::InconsistentBatch { .. } => {}
             other => panic!("expected InconsistentBatch for DateTime64(200), got {other:?}"),
+        }
+
+        let decimal_cases = [
+            (
+                "Decimal(9, 4) with 64 bits",
+                ChType::Decimal {
+                    precision: 9,
+                    scale: 4,
+                    bits: 64,
+                },
+                DecimalColumn::new(vec![0u8; 8], 8, 9, 4),
+            ),
+            (
+                "Decimal(100, 4)",
+                ChType::Decimal {
+                    precision: 100,
+                    scale: 4,
+                    bits: 128,
+                },
+                DecimalColumn::new(vec![0u8; 16], 16, 100, 4),
+            ),
+            (
+                "Decimal(9, 20)",
+                ChType::Decimal {
+                    precision: 9,
+                    scale: 20,
+                    bits: 32,
+                },
+                DecimalColumn::new(vec![0u8; 4], 4, 9, 20),
+            ),
+        ];
+        for (label, ch_type, column) in decimal_cases {
+            let batch = ColBatch {
+                schema: Schema::new(vec![Field {
+                    name: "dec".into(),
+                    ch_type,
+                }]),
+                columns: vec![Column::Decimal(column)],
+                num_rows: 1,
+            };
+            match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+                EncodeError::InconsistentBatch { .. } => {}
+                other => panic!("expected InconsistentBatch for {label}, got {other:?}"),
+            }
         }
 
         let fs0 = ColBatch {

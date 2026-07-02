@@ -293,7 +293,7 @@ pub(crate) fn parse_ch_type(type_name: &str) -> Option<ChType> {
 ///
 /// P must be in 1..=76; a precision of 0 or above 76 has no backing integer and
 /// returns `None` (the caller maps it to `UnsupportedType`).
-fn decimal_bits_from_precision(precision: u8) -> Option<u16> {
+pub(crate) fn decimal_bits_from_precision(precision: u8) -> Option<u16> {
     match precision {
         1..=9 => Some(32),
         10..=18 => Some(64),

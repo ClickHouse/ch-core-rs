@@ -28,7 +28,9 @@ use std::process::{Command, Stdio};
 
 use ch_core_rs::batch::ColBatch;
 use ch_core_rs::bitmap::Bitmap;
-use ch_core_rs::column::{BoolColumn, Column, FixedBinaryColumn, PrimitiveColumn, Utf8Column};
+use ch_core_rs::column::{
+    BoolColumn, Column, DecimalColumn, FixedBinaryColumn, PrimitiveColumn, Utf8Column,
+};
 use ch_core_rs::native::decode::{decode_all_bytes, DecodeOptions};
 use ch_core_rs::native::encode::{encode_block, EncodeOptions};
 use ch_core_rs::schema::{ChType, Field, Schema};
@@ -58,9 +60,20 @@ fn fixed_binary_column(width: usize, values: &[&[u8]]) -> FixedBinaryColumn {
     FixedBinaryColumn::new(data, width)
 }
 
+/// Build a DecimalColumn from raw wire-order fixed-width byte values.
+fn decimal_column(width: usize, precision: u8, scale: u8, values: &[&[u8]]) -> DecimalColumn {
+    let mut data = Vec::with_capacity(width * values.len());
+    for v in values {
+        assert_eq!(v.len(), width, "decimal value must be {width} bytes");
+        data.extend_from_slice(v);
+    }
+    DecimalColumn::new(data, width, precision, scale)
+}
+
 /// The batch to insert: every encodable type over four rows (the ten fixed-width
 /// numerics, `String`, `FixedString(4)`, `Bool`, the four temporal types,
-/// `UUID`, `IPv4`, `IPv6`, and four `Nullable` columns).
+/// `UUID`, `IPv4`, `IPv6`, `Enum8`/`Enum16`, four Decimal widths, and five
+/// `Nullable` columns).
 /// The `i32` column is strictly ascending so `ORDER BY i32` on read-back is
 /// deterministic and matches insertion order, which lets the other columns line up
 /// row-for-row too. The `Nullable` columns use the null pattern valid, null, valid,
@@ -110,10 +123,50 @@ fn sample_batch() -> ColBatch {
                 variants: vec![("off".into(), -1), ("idle".into(), 0), ("busy".into(), 79)],
             },
         ),
+        (
+            "dec32",
+            ChType::Decimal {
+                precision: 9,
+                scale: 4,
+                bits: 32,
+            },
+        ),
+        (
+            "dec64",
+            ChType::Decimal {
+                precision: 18,
+                scale: 9,
+                bits: 64,
+            },
+        ),
+        (
+            "dec128",
+            ChType::Decimal {
+                precision: 38,
+                scale: 10,
+                bits: 128,
+            },
+        ),
+        (
+            "dec256",
+            ChType::Decimal {
+                precision: 76,
+                scale: 20,
+                bits: 256,
+            },
+        ),
         ("ni32", ChType::Nullable(Box::new(ChType::Int32))),
         ("ns", ChType::Nullable(Box::new(ChType::String))),
         ("nb", ChType::Nullable(Box::new(ChType::Bool))),
         ("nu", ChType::Nullable(Box::new(ChType::Uuid))),
+        (
+            "ndec",
+            ChType::Nullable(Box::new(ChType::Decimal {
+                precision: 18,
+                scale: 9,
+                bits: 64,
+            })),
+        ),
     ]
     .into_iter()
     .map(|(name, ch_type)| Field {
@@ -128,6 +181,31 @@ fn sample_batch() -> ColBatch {
     ns.validity = Some(validity());
     let mut nu = fixed_binary_column(16, &[&[0x13; 16], &[0u8; 16], &[0x79; 16], &[0u8; 16]]);
     nu.validity = Some(validity());
+    let dec32_neg = (-13i32).to_le_bytes();
+    let dec32_zero = 0i32.to_le_bytes();
+    let dec32_pos = 79i32.to_le_bytes();
+    let dec32_one = 1i32.to_le_bytes();
+    let dec64_neg = (-13i64).to_le_bytes();
+    let dec64_zero = 0i64.to_le_bytes();
+    let dec64_pos = 79i64.to_le_bytes();
+    let dec64_one = 1i64.to_le_bytes();
+    let dec128_neg = [0xFFu8; 16];
+    let dec128_zero = [0u8; 16];
+    let dec128_pos = *b"\x4F\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    let dec128_one = *b"\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    let dec256_neg = [0xFFu8; 32];
+    let dec256_zero = [0u8; 32];
+    let dec256_pos =
+        *b"\x13\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    let dec256_one =
+        *b"\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    let mut ndec = decimal_column(
+        8,
+        18,
+        9,
+        &[&dec64_neg, &dec64_zero, &dec64_pos, &dec64_zero],
+    );
+    ndec.validity = Some(validity());
 
     let columns = vec![
         Column::Int8(PrimitiveColumn::new(vec![i8::MIN, -13, 0, i8::MAX])),
@@ -200,6 +278,32 @@ fn sample_batch() -> ColBatch {
         // `ORDER BY i32` row order: off, idle, busy, idle.
         Column::Enum8(PrimitiveColumn::new(vec![-1, 0, 13, 0])),
         Column::Enum16(PrimitiveColumn::new(vec![-1, 0, 79, 0])),
+        // Decimal stores scaled signed integers as raw little-endian bytes. These
+        // values fit each declared precision and include a negative row.
+        Column::Decimal(decimal_column(
+            4,
+            9,
+            4,
+            &[&dec32_neg, &dec32_zero, &dec32_pos, &dec32_one],
+        )),
+        Column::Decimal(decimal_column(
+            8,
+            18,
+            9,
+            &[&dec64_neg, &dec64_zero, &dec64_pos, &dec64_one],
+        )),
+        Column::Decimal(decimal_column(
+            16,
+            38,
+            10,
+            &[&dec128_neg, &dec128_zero, &dec128_pos, &dec128_one],
+        )),
+        Column::Decimal(decimal_column(
+            32,
+            76,
+            20,
+            &[&dec256_neg, &dec256_zero, &dec256_pos, &dec256_one],
+        )),
         Column::Int32(PrimitiveColumn::new_nullable(
             vec![13, 0, 79, 0],
             validity(),
@@ -210,6 +314,7 @@ fn sample_batch() -> ColBatch {
             validity(),
         )),
         Column::Uuid(nu),
+        Column::Decimal(ndec),
     ];
 
     ColBatch::new(Schema::new(fields), columns, 4)
@@ -363,6 +468,7 @@ fn column_repr(batch: &ch_core_rs::batch::ChunkedBatch, col: usize) -> Vec<Strin
             Column::Uuid(c) | Column::Ipv6(c) | Column::FixedBinary(c) => {
                 (0..c.len()).map(|i| format!("{:?}", c.value(i))).collect()
             }
+            Column::Decimal(c) => (0..c.len()).map(|i| format!("{:?}", c.value(i))).collect(),
             other => panic!("unexpected column {col} variant: {other:?}"),
         };
         if let Some(validity) = column.validity() {
@@ -396,8 +502,10 @@ fn insert_roundtrips_through_server() {
          u UUID, ip4 IPv4, ip6 IPv6, \
          e8 Enum8('off' = -1, 'idle' = 0, 'busy' = 13), \
          e16 Enum16('off' = -1, 'idle' = 0, 'busy' = 79), \
+         dec32 Decimal(9, 4), dec64 Decimal(18, 9), \
+         dec128 Decimal(38, 10), dec256 Decimal(76, 20), \
          ni32 Nullable(Int32), ns Nullable(String), nb Nullable(Bool), \
-         nu Nullable(UUID)) ENGINE = Memory"
+         nu Nullable(UUID), ndec Nullable(Decimal(18, 9))) ENGINE = Memory"
     ));
 
     // Encode at revision 0: HTTP INSERT parses the body with server_revision 0,
@@ -416,7 +524,8 @@ fn insert_roundtrips_through_server() {
     // decoded rows line up with the inserted rows.
     let native = server.select(&format!(
         "SELECT i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, s, fs, b, \
-         d, d32, dt, dt64, u, ip4, ip6, e8, e16, ni32, ns, nb, nu \
+         d, d32, dt, dt64, u, ip4, ip6, e8, e16, \
+         dec32, dec64, dec128, dec256, ni32, ns, nb, nu, ndec \
          FROM {TABLE} ORDER BY i32 FORMAT Native"
     ));
     let decoded = decode_all_bytes(
