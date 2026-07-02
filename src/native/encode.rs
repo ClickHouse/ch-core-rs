@@ -11,8 +11,9 @@
 //!
 //! Scope: this encodes `Bool`, the fixed-width numeric types (`Int8`..`Int64`,
 //! `UInt8`..`UInt64`, `Float32`, `Float64`), the temporal types (`Date`,
-//! `Date32`, `DateTime`, `DateTime64`), `String`, and `FixedString(N)`, each also
-//! inside a `Nullable(T)` wrapper (a per-row null map precedes the inner values).
+//! `Date32`, `DateTime`, `DateTime64`), `UUID`, `IPv4`, `IPv6`, `String`, and
+//! `FixedString(N)`, each also inside a `Nullable(T)` wrapper (a per-row null map
+//! precedes the inner values).
 //! Every other column type returns [`EncodeError::UnsupportedType`] until its
 //! encoder lands, the same one-type-at-a-time growth the decode path follows.
 
@@ -300,33 +301,17 @@ fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<()
         }
     }
 
-    // A `FixedString(N)` body is the contiguous `N * num_rows` data buffer written
-    // verbatim, with no per-row framing, so the reader consumes exactly `N` bytes
-    // per row. `FixedBinaryColumn::len()` is `data.len() / width` (truncating), so a
-    // buffer whose length is not exactly `N * num_rows` still reports `num_rows`
-    // rows and passes the row-count check above, yet would put a different number of
-    // bytes on the wire: a silently misframed stream. The stored `width` must also
-    // equal the declared `N`, or a truthful type string would sit over a
-    // wrong-bytes-per-row body.
-    if let (ChType::FixedString(width), Column::FixedBinary(c)) = (value_type, column) {
-        if c.width != *width {
-            return Err(EncodeError::InconsistentBatch {
-                detail: format!(
-                    "column {:?} is declared FixedString({width}) but its buffer stores {}-byte rows",
-                    field.name, c.width
-                ),
-            });
+    // The fixed-width binary bodies are written verbatim with no per-row framing,
+    // so guard each against a misframed buffer: `FixedString(N)` against its
+    // declared N, `UUID` and `IPv6` against their implied width 16.
+    match (value_type, column) {
+        (ChType::FixedString(width), Column::FixedBinary(c)) => {
+            validate_fixed_binary(field, value_type, c, *width, num_rows)?;
         }
-        if width.checked_mul(num_rows) != Some(c.data.len()) {
-            return Err(EncodeError::InconsistentBatch {
-                detail: format!(
-                    "column {:?} is FixedString({width}) over {num_rows} rows so its body must be {} bytes, but the buffer holds {}",
-                    field.name,
-                    width.saturating_mul(num_rows),
-                    c.data.len()
-                ),
-            });
+        (ChType::Uuid, Column::Uuid(c)) | (ChType::Ipv6, Column::Ipv6(c)) => {
+            validate_fixed_binary(field, value_type, c, 16, num_rows)?;
         }
+        _ => {}
     }
 
     // A `String` body is written by slicing `data[offsets[i]..offsets[i+1]]` per
@@ -336,6 +321,47 @@ fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<()
         validate_utf8_column(field, c, num_rows)?;
     }
 
+    Ok(())
+}
+
+/// Shared misframe guard for the fixed-width binary bodies (`FixedString(N)`,
+/// `UUID`, `IPv6`, and later fixed-width passthroughs such as `Decimal`).
+///
+/// The body is the contiguous `width * num_rows` data buffer written verbatim
+/// with no per-row framing, so the reader consumes exactly `width` bytes per
+/// row. `FixedBinaryColumn::len()` is `data.len() / width` (truncating), so a
+/// buffer whose length is not exactly `width * num_rows` still reports
+/// `num_rows` rows and passes the row-count check in [`validate_column`], yet
+/// would put a different number of bytes on the wire: a silently misframed
+/// stream. The stored buffer width must also equal the width the type declares
+/// (`FixedString(N)`) or implies (16 for `UUID`/`IPv6`), or a truthful type
+/// string would sit over a wrong-bytes-per-row body. `value_type` is used only
+/// to render the type name in the error.
+fn validate_fixed_binary(
+    field: &Field,
+    value_type: &ChType,
+    col: &FixedBinaryColumn,
+    declared_width: usize,
+    num_rows: usize,
+) -> Result<(), EncodeError> {
+    if col.width != declared_width {
+        return Err(EncodeError::InconsistentBatch {
+            detail: format!(
+                "column {:?} is declared {value_type} ({declared_width} bytes per row) but its buffer stores {}-byte rows",
+                field.name, col.width
+            ),
+        });
+    }
+    if declared_width.checked_mul(num_rows) != Some(col.data.len()) {
+        return Err(EncodeError::InconsistentBatch {
+            detail: format!(
+                "column {:?} is {value_type} over {num_rows} rows so its body must be {} bytes, but the buffer holds {}",
+                field.name,
+                declared_width.saturating_mul(num_rows),
+                col.data.len()
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -364,6 +390,9 @@ fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
             | (ChType::Date32, Column::Date32(_))
             | (ChType::DateTime { .. }, Column::DateTime(_))
             | (ChType::DateTime64 { .. }, Column::DateTime64(_))
+            | (ChType::Uuid, Column::Uuid(_))
+            | (ChType::Ipv4, Column::Ipv4(_))
+            | (ChType::Ipv6, Column::Ipv6(_))
             | (ChType::String, Column::Utf8(_))
             | (ChType::FixedString(_), Column::FixedBinary(_))
     )
@@ -561,8 +590,21 @@ fn encode_column_body(
         (ChType::DateTime64 { .. }, Column::DateTime64(c)) => {
             encode_primitive!(buf, &c.values, i64)
         }
+        // UUID and IPv6 bodies are 16 raw bytes per row written verbatim from the
+        // width-16 fixed-binary buffer, with NO reordering, the inverse of the
+        // decoder's passthrough `Uuid`/`Ipv6` arms over
+        // `decode_fixed_binary_data`. The bytes stay in wire order (UUID: the
+        // UInt128 POD dump, not RFC-4122; IPv6: network byte order); any host
+        // byte-order mapping is a binding concern on both directions.
+        (ChType::Uuid, Column::Uuid(c)) => encode_fixed_binary_data(buf, c),
+        (ChType::Ipv6, Column::Ipv6(c)) => encode_fixed_binary_data(buf, c),
+        // IPv4 is a UInt32 in bulk (`SerializationIP<IPv4>` serializes identically
+        // to `SerializationNumber<UInt32>`), so it is the same contiguous
+        // little-endian run as `UInt32`, the inverse of the decoder's `Ipv4`
+        // `decode_primitive!` arm.
+        (ChType::Ipv4, Column::Ipv4(c)) => encode_primitive!(buf, &c.values, u32),
         (ChType::String, Column::Utf8(c)) => encode_string_data(buf, c),
-        (ChType::FixedString(_), Column::FixedBinary(c)) => encode_fixed_string_data(buf, c),
+        (ChType::FixedString(_), Column::FixedBinary(c)) => encode_fixed_binary_data(buf, c),
         // Defensive: `validate_column` rejects every unsupported type and every
         // mismatched `(type, buffer)` pair before the write phase, so this arm
         // cannot occur for a validated batch. It returns the same error validation
@@ -699,15 +741,18 @@ fn encode_string_data(buf: &mut Vec<u8>, col: &Utf8Column) {
     }
 }
 
-/// Encode a `FixedString(N)` column body: the contiguous `N * num_rows` data
-/// buffer written verbatim, the inverse of
-/// [`super::decode::decode_fixed_binary_data`]. There is no per-row framing; the
-/// width lives only in the type string.
+/// Encode a fixed-width binary column body (`FixedString(N)`, `UUID`, `IPv6`):
+/// the contiguous `width * num_rows` data buffer written verbatim, the inverse
+/// of [`super::decode::decode_fixed_binary_data`]. There is no per-row framing;
+/// the width lives in the type string for `FixedString(N)` and is implied (16)
+/// for `UUID` and `IPv6`. The bytes are not reordered: `UUID` stays in its wire
+/// UInt128 POD order and `IPv6` in network byte order, matching the decode
+/// passthrough (the RFC-4122 / host-address mapping is a binding concern).
 ///
-/// [`validate_column`] already confirmed `col.width == N` and
-/// `col.data.len() == N * num_rows`, so the buffer is exactly the wire body and
-/// this is a single verbatim copy.
-fn encode_fixed_string_data(buf: &mut Vec<u8>, col: &FixedBinaryColumn) {
+/// [`validate_column`] already confirmed the stored width matches the declared
+/// or implied width and `col.data.len() == width * num_rows`, so the buffer is
+/// exactly the wire body and this is a single verbatim copy.
+fn encode_fixed_binary_data(buf: &mut Vec<u8>, col: &FixedBinaryColumn) {
     buf.extend_from_slice(&col.data);
 }
 
@@ -761,6 +806,9 @@ fn is_encodable(ch_type: &ChType) -> bool {
             | ChType::Date32
             | ChType::DateTime { .. }
             | ChType::DateTime64 { .. }
+            | ChType::Uuid
+            | ChType::Ipv4
+            | ChType::Ipv6
             | ChType::String
             | ChType::FixedString(_)
     )
@@ -1003,9 +1051,103 @@ mod tests {
         ColBatch::new(Schema::new(fields), columns, 4)
     }
 
+    /// A `UUID`, `IPv4`, and `IPv6` column over four rows. The UUID and IPv6
+    /// values are distinct 16-byte patterns (all-zero, an ascending run, a
+    /// constant, all-0xFF) that must survive verbatim with no reordering; the
+    /// IPv4 values hit the u32 boundaries plus two real addresses.
+    fn uuid_ip_batch() -> ColBatch {
+        let fields = vec![
+            Field {
+                name: "u".into(),
+                ch_type: ChType::Uuid,
+            },
+            Field {
+                name: "ip4".into(),
+                ch_type: ChType::Ipv4,
+            },
+            Field {
+                name: "ip6".into(),
+                ch_type: ChType::Ipv6,
+            },
+        ];
+        let columns = vec![
+            Column::Uuid(fixed_binary_column(
+                16,
+                &[
+                    &[0u8; 16],
+                    b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10",
+                    &[0x79; 16],
+                    &[0xFF; 16],
+                ],
+            )),
+            // 0.0.0.0, 127.0.0.1, 192.168.0.1, 255.255.255.255 as the standard
+            // numeric value (a<<24 | b<<16 | c<<8 | d).
+            Column::Ipv4(PrimitiveColumn::new(vec![
+                0,
+                2_130_706_433,
+                3_232_235_521,
+                u32::MAX,
+            ])),
+            // ::, ::1, 2001:db8::13, all-0xFF, in network byte order.
+            Column::Ipv6(fixed_binary_column(
+                16,
+                &[
+                    &[0u8; 16],
+                    b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01",
+                    b"\x20\x01\x0D\xB8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x13",
+                    &[0xFF; 16],
+                ],
+            )),
+        ];
+        ColBatch::new(Schema::new(fields), columns, 4)
+    }
+
+    /// `Nullable(UUID)`, `Nullable(IPv4)`, and `Nullable(IPv6)` over four rows
+    /// with the valid, null, valid, null pattern, proving the `Nullable` wrapper
+    /// composes with all three: the null map precedes the inner body.
+    fn nullable_uuid_ip_batch() -> ColBatch {
+        // 0x00 = valid, 0x01 = null (ClickHouse null-map polarity).
+        let validity = || Bitmap::from_ch_null_map(&[0, 1, 0, 1]);
+        let fields = vec![
+            Field {
+                name: "nu".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::Uuid)),
+            },
+            Field {
+                name: "nip4".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::Ipv4)),
+            },
+            Field {
+                name: "nip6".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::Ipv6)),
+            },
+        ];
+        let mut nu = fixed_binary_column(16, &[&[0x13; 16], &[0u8; 16], &[0x79; 16], &[0u8; 16]]);
+        nu.validity = Some(validity());
+        let mut nip6 = fixed_binary_column(
+            16,
+            &[
+                b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01",
+                &[0u8; 16],
+                b"\x20\x01\x0D\xB8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x13",
+                &[0u8; 16],
+            ],
+        );
+        nip6.validity = Some(validity());
+        let columns = vec![
+            Column::Uuid(nu),
+            Column::Ipv4(PrimitiveColumn::new_nullable(
+                vec![2_130_706_433, 0, 3_232_235_521, 0],
+                validity(),
+            )),
+            Column::Ipv6(nip6),
+        ];
+        ColBatch::new(Schema::new(fields), columns, 4)
+    }
+
     /// Compare two batches column by column for the types this encoder covers
-    /// (the numerics, the temporal types, `String`, `FixedString`). Panics on any
-    /// other variant so a wrong decode is loud.
+    /// (the numerics, the temporal types, `UUID`/`IPv4`/`IPv6`, `String`,
+    /// `FixedString`). Panics on any other variant so a wrong decode is loud.
     fn assert_batches_eq(left: &ColBatch, right: &ColBatch) {
         assert_eq!(left.schema, right.schema, "schema mismatch");
         assert_eq!(left.num_rows, right.num_rows, "row count mismatch");
@@ -1041,6 +1183,11 @@ mod tests {
                 (Column::Date32(x), Column::Date32(y)) => eq!(x, y),
                 (Column::DateTime(x), Column::DateTime(y)) => eq!(x, y),
                 (Column::DateTime64(x), Column::DateTime64(y)) => eq!(x, y),
+                (Column::Ipv4(x), Column::Ipv4(y)) => eq!(x, y),
+                (Column::Uuid(x), Column::Uuid(y)) | (Column::Ipv6(x), Column::Ipv6(y)) => {
+                    assert_eq!(x.width, y.width, "column {i} width differ");
+                    assert_eq!(x.data, y.data, "column {i} data differ");
+                }
                 (Column::Utf8(x), Column::Utf8(y)) => {
                     assert_eq!(x.offsets, y.offsets, "column {i} offsets differ");
                     assert_eq!(x.data, y.data, "column {i} data differ");
@@ -1156,6 +1303,26 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_uuid_ip_rev0() {
+        roundtrip(&uuid_ip_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_uuid_ip_tcp_revision() {
+        roundtrip(&uuid_ip_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_nullable_uuid_ip_rev0() {
+        roundtrip(&nullable_uuid_ip_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_nullable_uuid_ip_tcp_revision() {
+        roundtrip(&nullable_uuid_ip_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
     fn zero_row_block_roundtrips_schema() {
         // A zero-row block still carries full column headers. The decoder keeps
         // the schema but drops the empty block from `chunks`.
@@ -1168,10 +1335,25 @@ mod tests {
                 name: "x".into(),
                 ch_type: ChType::Float64,
             },
+            Field {
+                name: "u".into(),
+                ch_type: ChType::Uuid,
+            },
+            Field {
+                name: "ip4".into(),
+                ch_type: ChType::Ipv4,
+            },
+            Field {
+                name: "ip6".into(),
+                ch_type: ChType::Ipv6,
+            },
         ];
         let columns = vec![
             Column::Int32(PrimitiveColumn::new(vec![])),
             Column::Float64(PrimitiveColumn::new(vec![])),
+            Column::Uuid(FixedBinaryColumn::new(Vec::new(), 16)),
+            Column::Ipv4(PrimitiveColumn::new(Vec::new())),
+            Column::Ipv6(FixedBinaryColumn::new(Vec::new(), 16)),
         ];
         let batch = ColBatch::new(Schema::new(fields), columns, 0);
         for revision in [0, DBMS_TCP_PROTOCOL_VERSION] {
@@ -1226,6 +1408,52 @@ mod tests {
             })
             .collect();
         assert_eq!(got, vec![vec![13, 14], vec![15, 16], vec![17]]);
+    }
+
+    #[test]
+    fn encode_chunked_roundtrips_uuid_ip_blocks() {
+        // Two blocks of the UUID/IPv4/IPv6 schema round-trip through
+        // `encode_chunked`, staying separate chunks with the buffers intact
+        // (blocks are never merged; see AGENTS.md).
+        let schema = uuid_ip_batch().schema.clone();
+        let chunk = |uuid_byte: u8, ip4: u32, ip6_byte: u8| {
+            std::sync::Arc::new(ColBatch::new(
+                schema.clone(),
+                vec![
+                    Column::Uuid(FixedBinaryColumn::new(vec![uuid_byte; 32], 16)),
+                    Column::Ipv4(PrimitiveColumn::new(vec![ip4, ip4 + 1])),
+                    Column::Ipv6(FixedBinaryColumn::new(vec![ip6_byte; 32], 16)),
+                ],
+                2,
+            ))
+        };
+        let batch = ChunkedBatch {
+            schema: schema.clone(),
+            chunks: vec![
+                chunk(0x13, 2_130_706_433, 0x20),
+                chunk(0x79, 3_232_235_521, 0x0D),
+            ],
+        };
+        for revision in [0, DBMS_TCP_PROTOCOL_VERSION] {
+            let bytes = encode_chunked(
+                &batch,
+                &EncodeOptions {
+                    protocol_revision: revision,
+                },
+            )
+            .unwrap();
+            let decoded = decode_all_bytes(
+                &bytes,
+                &DecodeOptions {
+                    protocol_revision: revision,
+                },
+            )
+            .unwrap_or_else(|e| panic!("decode at rev {revision} failed: {e}"));
+            assert_eq!(decoded.num_chunks(), 2);
+            for (sent, got) in batch.chunks.iter().zip(&decoded.chunks) {
+                assert_batches_eq(sent, got);
+            }
+        }
     }
 
     #[test]
@@ -1285,27 +1513,34 @@ mod tests {
         assert_eq!(bytes, expected);
     }
 
+    /// A small `Enum8` type for the unsupported-type tests: decoded by this crate
+    /// but not yet encodable.
+    fn enum8_type() -> ChType {
+        ChType::Enum8 {
+            variants: vec![("off".into(), 0), ("on".into(), 1)],
+        }
+    }
+
     #[test]
     fn nullable_unsupported_inner_is_unsupported() {
         // `Nullable` is a supported wrapper now, but its inner type must also be
-        // encodable. `UUID` is decoded yet not encodable, so `Nullable(UUID)` is
-        // still rejected, and the reported type is the full `Nullable(UUID)`.
+        // encodable. `Enum8` is decoded yet not encodable, so `Nullable(Enum8(...))`
+        // is still rejected, and the reported type is the full declared wrapper.
         let batch = ColBatch::new(
             Schema::new(vec![Field {
-                name: "nu".into(),
-                ch_type: ChType::Nullable(Box::new(ChType::Uuid)),
+                name: "ne".into(),
+                ch_type: ChType::Nullable(Box::new(enum8_type())),
             }]),
-            vec![Column::Uuid(FixedBinaryColumn::new_nullable(
-                vec![0u8; 16],
-                16,
+            vec![Column::Enum8(PrimitiveColumn::new_nullable(
+                vec![0i8],
                 Bitmap::from_ch_null_map(&[0]),
             ))],
             1,
         );
         match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
             EncodeError::UnsupportedType { column, ch_type } => {
-                assert_eq!(column, "nu");
-                assert_eq!(ch_type, ChType::Nullable(Box::new(ChType::Uuid)));
+                assert_eq!(column, "ne");
+                assert_eq!(ch_type, ChType::Nullable(Box::new(enum8_type())));
             }
             other => panic!("expected UnsupportedType, got {other:?}"),
         }
@@ -1313,20 +1548,20 @@ mod tests {
 
     #[test]
     fn unsupported_type_reports_column_and_type() {
-        // `UUID` is decoded but not yet encodable, so it reports UnsupportedType
+        // `Enum8` is decoded but not yet encodable, so it reports UnsupportedType
         // with the column name and type.
         let batch = ColBatch::new(
             Schema::new(vec![Field {
-                name: "u".into(),
-                ch_type: ChType::Uuid,
+                name: "e".into(),
+                ch_type: enum8_type(),
             }]),
-            vec![Column::Uuid(FixedBinaryColumn::new(vec![], 16))],
+            vec![Column::Enum8(PrimitiveColumn::new(Vec::new()))],
             0,
         );
         match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
             EncodeError::UnsupportedType { column, ch_type } => {
-                assert_eq!(column, "u");
-                assert_eq!(ch_type, ChType::Uuid);
+                assert_eq!(column, "e");
+                assert_eq!(ch_type, enum8_type());
             }
             other => panic!("expected UnsupportedType, got {other:?}"),
         }
@@ -1377,6 +1612,127 @@ mod tests {
             b'r', b'o', b'a', b'd', // 4 raw bytes, no length prefix
         ];
         assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn rev0_frames_uuid_bytes() {
+        // Pin the UUID body framing: 16 raw bytes per row, passthrough in wire
+        // (UInt128 POD) order, no reordering and no per-row framing. One UUID
+        // column "u", single row with 16 distinct bytes, so any byte shuffle on
+        // encode would break the exact comparison.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "u".into(),
+                ch_type: ChType::Uuid,
+            }]),
+            vec![Column::Uuid(fixed_binary_column(
+                16,
+                &[b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10"],
+            ))],
+            1,
+        );
+        let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+        let expected = [
+            0x01, // num_cols = 1
+            0x01, // num_rows = 1
+            0x01, b'u', // name "u"
+            0x04, b'U', b'U', b'I', b'D', // type "UUID"
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // 16 raw bytes,
+            0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, // buffer order
+        ];
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn rev0_frames_ipv4_bytes() {
+        // Pin the IPv4 body framing: the standard numeric value written as a
+        // little-endian u32, exactly like UInt32. One IPv4 column "ip4", single
+        // row 192.168.0.1 = 0xC0A80001, so the wire bytes must be the reversed
+        // 01 00 A8 C0 and any big-endian write would fail.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "ip4".into(),
+                ch_type: ChType::Ipv4,
+            }]),
+            vec![Column::Ipv4(PrimitiveColumn::new(vec![3_232_235_521]))],
+            1,
+        );
+        let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+        let expected = [
+            0x01, // num_cols = 1
+            0x01, // num_rows = 1
+            0x03, b'i', b'p', b'4', // name "ip4"
+            0x04, b'I', b'P', b'v', b'4', // type "IPv4"
+            0x01, 0x00, 0xA8, 0xC0, // u32 0xC0A80001 (192.168.0.1), little-endian
+        ];
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn rev0_frames_ipv6_bytes() {
+        // Pin the IPv6 body framing: 16 raw bytes per row, verbatim in network
+        // byte order, no per-row framing. One IPv6 column "ip6", single row with
+        // 16 distinct bytes, so any byte shuffle on encode would break the exact
+        // comparison.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "ip6".into(),
+                ch_type: ChType::Ipv6,
+            }]),
+            vec![Column::Ipv6(fixed_binary_column(
+                16,
+                &[b"\x20\x01\x0D\xB8\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x13"],
+            ))],
+            1,
+        );
+        let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+        let expected = [
+            0x01, // num_cols = 1
+            0x01, // num_rows = 1
+            0x03, b'i', b'p', b'6', // name "ip6"
+            0x04, b'I', b'P', b'v', b'6', // type "IPv6"
+            0x20, 0x01, 0x0D, 0xB8, 0x01, 0x02, 0x03, 0x04, // 16 raw bytes,
+            0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x13, // network order
+        ];
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn uuid_width_mismatch_is_rejected() {
+        // A UUID buffer whose stored width is not 16 would put the wrong number of
+        // bytes per row on the wire under a truthful type string; reject it before
+        // any bytes are written, mirroring the FixedString width guard.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "u".into(),
+                ch_type: ChType::Uuid,
+            }]),
+            vec![Column::Uuid(FixedBinaryColumn::new(vec![0u8; 8], 8))],
+            1,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ipv6_ragged_data_is_rejected() {
+        // An IPv6 buffer whose byte count is not exactly 16 * num_rows reports the
+        // right row count via truncating division but would misframe the stream;
+        // reject it, mirroring the FixedString ragged-data guard.
+        let batch = ColBatch {
+            schema: Schema::new(vec![Field {
+                name: "ip6".into(),
+                ch_type: ChType::Ipv6,
+            }]),
+            columns: vec![Column::Ipv6(FixedBinaryColumn::new(vec![0u8; 17], 16))],
+            num_rows: 1,
+        };
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
     }
 
     #[test]

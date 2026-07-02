@@ -59,8 +59,8 @@ fn fixed_binary_column(width: usize, values: &[&[u8]]) -> FixedBinaryColumn {
 }
 
 /// The batch to insert: every encodable type over four rows (the ten fixed-width
-/// numerics, `String`, `FixedString(4)`, `Bool`, the four temporal types, and
-/// three `Nullable` columns).
+/// numerics, `String`, `FixedString(4)`, `Bool`, the four temporal types,
+/// `UUID`, `IPv4`, `IPv6`, and four `Nullable` columns).
 /// The `i32` column is strictly ascending so `ORDER BY i32` on read-back is
 /// deterministic and matches insertion order, which lets the other columns line up
 /// row-for-row too. The `Nullable` columns use the null pattern valid, null, valid,
@@ -95,9 +95,13 @@ fn sample_batch() -> ColBatch {
                 timezone: Some("UTC".into()),
             },
         ),
+        ("u", ChType::Uuid),
+        ("ip4", ChType::Ipv4),
+        ("ip6", ChType::Ipv6),
         ("ni32", ChType::Nullable(Box::new(ChType::Int32))),
         ("ns", ChType::Nullable(Box::new(ChType::String))),
         ("nb", ChType::Nullable(Box::new(ChType::Bool))),
+        ("nu", ChType::Nullable(Box::new(ChType::Uuid))),
     ]
     .into_iter()
     .map(|(name, ch_type)| Field {
@@ -110,6 +114,8 @@ fn sample_batch() -> ColBatch {
     let validity = || Bitmap::from_ch_null_map(&[0, 1, 0, 1]);
     let mut ns = utf8_column(&[b"user_1", b"", b"user_2", b""]);
     ns.validity = Some(validity());
+    let mut nu = fixed_binary_column(16, &[&[0x13; 16], &[0u8; 16], &[0x79; 16], &[0u8; 16]]);
+    nu.validity = Some(validity());
 
     let columns = vec![
         Column::Int8(PrimitiveColumn::new(vec![i8::MIN, -13, 0, i8::MAX])),
@@ -146,6 +152,36 @@ fn sample_batch() -> ColBatch {
             1_700_000_000_000,
             1_710_000_000_000,
         ])),
+        // UUID and IPv6 are raw 16-byte passthrough (UUID in its wire UInt128 POD
+        // order, IPv6 in network byte order); IPv4 is the standard u32 numeric
+        // value. Distinct byte patterns per row so any reordering or misframing
+        // shows up in the comparison.
+        Column::Uuid(fixed_binary_column(
+            16,
+            &[
+                &[0u8; 16],
+                b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10",
+                &[0x79; 16],
+                &[0xFF; 16],
+            ],
+        )),
+        // 0.0.0.0, 127.0.0.1, 192.168.0.1, 255.255.255.255.
+        Column::Ipv4(PrimitiveColumn::new(vec![
+            0,
+            2_130_706_433,
+            3_232_235_521,
+            u32::MAX,
+        ])),
+        // ::, ::1, 2001:db8::13, all-0xFF.
+        Column::Ipv6(fixed_binary_column(
+            16,
+            &[
+                &[0u8; 16],
+                b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01",
+                b"\x20\x01\x0D\xB8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x13",
+                &[0xFF; 16],
+            ],
+        )),
         Column::Int32(PrimitiveColumn::new_nullable(
             vec![13, 0, 79, 0],
             validity(),
@@ -155,6 +191,7 @@ fn sample_batch() -> ColBatch {
             &[1, 0, 1, 0],
             validity(),
         )),
+        Column::Uuid(nu),
     ];
 
     ColBatch::new(Schema::new(fields), columns, 4)
@@ -297,7 +334,12 @@ fn column_repr(batch: &ch_core_rs::batch::ChunkedBatch, col: usize) -> Vec<Strin
             Column::DateTime(c) => c.values.iter().map(|v| v.to_string()).collect(),
             Column::DateTime64(c) => c.values.iter().map(|v| v.to_string()).collect(),
             Column::Utf8(c) => (0..c.len()).map(|i| format!("{:?}", c.value(i))).collect(),
-            Column::FixedBinary(c) => (0..c.len()).map(|i| format!("{:?}", c.value(i))).collect(),
+            // IPv4 is physically a u32; UUID and IPv6 are raw 16-byte rows, so
+            // render the wire bytes verbatim (any reordering would show up here).
+            Column::Ipv4(c) => c.values.iter().map(|v| v.to_string()).collect(),
+            Column::Uuid(c) | Column::Ipv6(c) | Column::FixedBinary(c) => {
+                (0..c.len()).map(|i| format!("{:?}", c.value(i))).collect()
+            }
             other => panic!("unexpected column {col} variant: {other:?}"),
         };
         if let Some(validity) = column.validity() {
@@ -328,7 +370,9 @@ fn insert_roundtrips_through_server() {
          s String, fs FixedString(4), \
          b Bool, \
          d Date, d32 Date32, dt DateTime('UTC'), dt64 DateTime64(3, 'UTC'), \
-         ni32 Nullable(Int32), ns Nullable(String), nb Nullable(Bool)) ENGINE = Memory"
+         u UUID, ip4 IPv4, ip6 IPv6, \
+         ni32 Nullable(Int32), ns Nullable(String), nb Nullable(Bool), \
+         nu Nullable(UUID)) ENGINE = Memory"
     ));
 
     // Encode at revision 0: HTTP INSERT parses the body with server_revision 0,
@@ -347,7 +391,7 @@ fn insert_roundtrips_through_server() {
     // decoded rows line up with the inserted rows.
     let native = server.select(&format!(
         "SELECT i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, s, fs, b, \
-         d, d32, dt, dt64, ni32, ns, nb \
+         d, d32, dt, dt64, u, ip4, ip6, ni32, ns, nb, nu \
          FROM {TABLE} ORDER BY i32 FORMAT Native"
     ));
     let decoded = decode_all_bytes(
