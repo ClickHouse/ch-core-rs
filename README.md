@@ -11,8 +11,8 @@ Native block decoding, null maps, and the long tail of types. Each client
 redoes that work on every server release. This crate does it once. A
 wire-format bug produces silently corrupt columns, so one audited decoder
 beats one per client. The result is a single implementation that is correct,
-maintained in one place, and faster end to end than the existing client query
-paths.
+maintained in one place, and built for zero-copy, streaming delivery into
+native containers.
 
 ```
 ClickHouse server
@@ -59,37 +59,12 @@ interfaces in-process.
    semantics that host or Arrow types can blur, such as `DateTime64` precision
    and timezone, `FixedString` width, and exact signed/unsigned integer width.
    Presentation policy stays in the bindings.
-3. Speed. The Rust decode path plus zero-copy delivery into native containers
-   outperforms the existing client paths end to end. Numbers below.
+3. Speed. Decoding once in Rust, with zero-copy delivery into native containers
+   and no per-cell work, is built to be fast. End-to-end speed also depends on
+   the binding and transport, so the measured numbers stay a binding concern.
 4. Streaming. The decoder accepts transport byte chunks as they arrive and emits
    decoded column chunks as each block completes. Decode overlaps the network
    instead of waiting for the full response.
-
-## Performance
-
-End-to-end POCs in the Node and Python clients route real queries through
-each client's full transport stack and decode with this core. Localhost
-medians against each client's existing query paths:
-
-| Client                  | Destination          | Speedup                      |
-|-------------------------|----------------------|------------------------------|
-| Node (1M rows x 6 cols) | columns              | 8.7x vs JSON (21.1M rows/s)  |
-| Node                    | row arrays / objects | 2.3x / 2.5x vs JSON          |
-| Python                  | rows                 | 1.3-2.7x vs `client.query()` |
-| Python                  | columns              | 1.7-3.1x                     |
-| Python                  | NumPy                | 3.6-5.8x                     |
-| Python                  | pandas               | 1.4-7.2x                     |
-| Python                  | Arrow                | 2.7-7.7x vs `query_arrow`    |
-
-The Python Arrow path also used 25-42% less peak memory than `query_arrow`.
-
-Scope on these numbers: they are localhost measurements against the clients'
-current paths. Part of the Arrow gain comes from streaming with overlapped
-decode, where the existing clients buffer the full response before decoding.
-Under heavy server-side compression on localhost the Arrow lead can invert,
-bounded by server compression throughput. Native's compact columnar wire shape
-can favor it further over a real network. The full analysis is in
-`ARCHITECTURE.md`.
 
 ## How it works
 
