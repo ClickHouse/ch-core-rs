@@ -1,9 +1,10 @@
 # ch-core-rs
 
-A shared Rust core that decodes the ClickHouse `FORMAT Native` wire format
-into typed, Arrow-compatible columnar buffers. Pure Rust, zero runtime
-dependencies. The decoder is implemented once here. Each language client wraps
-it with a thin binding.
+A shared Rust core for the ClickHouse `FORMAT Native` wire format: it decodes
+Native bytes into typed, Arrow-compatible columnar buffers, and encodes those
+buffers back to Native bytes for `INSERT`. Pure Rust, zero runtime dependencies.
+The codec is implemented once here. Each language client wraps it with a thin
+binding.
 
 Every ClickHouse client reimplements the same work today: type string parsing,
 Native block decoding, null maps, and the long tail of types. Each client
@@ -32,10 +33,13 @@ ClickHouse server
   NumPy / Arrow capsule (Python), TypedArray (JS), ...
 ```
 
+The diagram shows the decode (read) path. The same columnar buffers also encode
+back to `FORMAT Native` bytes for the `INSERT` path.
+
 ## Division of labor
 
-The core owns binary decoding, the ClickHouse logical type model, and the
-shared Arrow-compatible buffer layout.
+The core owns binary decoding and encoding, the ClickHouse logical type model,
+and the shared Arrow-compatible buffer layout.
 
 Bindings live in the client repos and own everything runtime-specific: Python
 `int` versus JavaScript `BigInt`, null handling, stream and backpressure
@@ -118,9 +122,10 @@ emits complete `ColBatch` values as soon as enough data has arrived.
 Transport-level backpressure stays a binding or client responsibility.
 
 `ARCHITECTURE.md` covers the decode path, streaming machinery, and the Arrow
-C Data export in detail. `DECODER_CONTRACT.md` is the definitive per-type
-contract: wire payload, decoded buffers, and Arrow export for every supported
-type.
+C Data export in detail. `CODEC_CONTRACT.md` is the definitive per-type
+contract for both directions: wire payload, decoded buffers, and Arrow export
+for every supported type, plus the encode-side contract (preconditions, choices,
+and round-trip guarantees) for turning those buffers back into Native bytes.
 
 ## Current scope
 
@@ -171,7 +176,8 @@ In rough priority order:
 2. Compression framing: LZ4, then ZSTD.
 3. Per-runtime zero-copy adapters: JS `TypedArray` over an external
    `ArrayBuffer`, NumPy export that does not route through Arrow.
-4. Insert path: columnar input encoded to Native block bytes.
+4. Insert-path completion: a streaming/sink encode API and remaining type
+   parity (scalar and `LowCardinality` encode already land over HTTP).
 5. Native TCP protocol engine: handshake, query/data/progress/exception
    packets, revision negotiation.
 
@@ -199,8 +205,9 @@ dependency with a local checkout during development.
 
 Decode a complete buffer with `native::decode::decode_all_bytes`, or stream
 with `native::stream_decoder::StreamDecoder`. Encode a batch back to Native
-block bytes for `INSERT` with `native::encode::encode_block` (numeric columns
-so far; see `COMPLETENESS.md` for the insert-path progress).
+block bytes for `INSERT` with `native::encode::encode_block` or
+`native::encode::encode_chunked` (the full scalar and `LowCardinality` set; see
+`COMPLETENESS.md` for the insert-path progress).
 
 ## Repo layout
 
@@ -208,7 +215,7 @@ so far; see `COMPLETENESS.md` for the insert-path progress).
 - `src/column.rs` - Arrow-compatible physical column buffers.
 - `src/batch.rs` - `ColBatch` and `ChunkedBatch` result model.
 - `src/bitmap.rs` - validity bitmap conversion and storage.
-- `src/native/` - Native-format varints, block decode, and stream decode.
+- `src/native/` - Native-format varints, block decode, stream decode, and block encode.
 - `src/ffi.rs` - Arrow C Data Interface export.
 
 ## Testing

@@ -60,7 +60,7 @@ default; the user may override it.
   `Array(T)` as its next item. See the "Encode / insert path" section for the
   encode checklist and "Type coverage" for the decode backlog.
 - **Pinned server tag (`.server-ref`):** v26.6.1.1193-stable, protocol revision
-  **54485**. The crate, the committed fixtures, and the `DECODER_CONTRACT.md`
+  **54485**. The crate, the committed fixtures, and the `CODEC_CONTRACT.md`
   citations are all aligned to this pin. The local `.server-src` checkout and the
   running capture server are both 26.6.1.1193.
 - **Scope (current completeness bar):** "complete" means decoding `FORMAT Native`
@@ -141,7 +141,7 @@ default; the user may override it.
     there. Note the prefix is emitted per column per block in Native and only
     when the block has rows, not once per column overall.
 - **Key references:** per-type workflow is in `AGENTS.md` ("Adding A New
-  ClickHouse Type"). Output contract is `DECODER_CONTRACT.md`. Deferred
+  ClickHouse Type"). Output contract is `CODEC_CONTRACT.md`. Deferred
   decisions are in `FINDINGS.md`. Type enum and planned placeholders are in
   `src/schema.rs`.
 
@@ -162,7 +162,7 @@ versions. This has concrete consequences for how work is done here:
 - **Record each type's introduction version.** As a type is implemented, record
   the ClickHouse version it first appeared in, confirmed against the server
   source or changelog, not asserted from memory. This goes in the type's
-  `DECODER_CONTRACT.md` section and lets bindings reason about what a given server
+  `CODEC_CONTRACT.md` section and lets bindings reason about what a given server
   can emit.
 - **Some layouts are version dependent.** A few types changed wire serialization
   across releases, and the newest self-describing types are still evolving. Where
@@ -199,7 +199,7 @@ is not done, and must not be checked off, until all of these hold:
    `scripts/gen_fixtures.sh`, recapture committed `.native` bytes against a
    server matching `.server-ref`, and assert decoded values in
    `tests/integration.rs`.
-9. `DECODER_CONTRACT.md` updated: move the type from "Unsupported types" into the
+9. `CODEC_CONTRACT.md` updated: move the type from "Unsupported types" into the
    support matrix and add its type section (wire payload, Arrow export, Rust
    buffer, server reference, introduction version).
 10. `cargo test` and `cargo clippy --all-targets` clean.
@@ -440,7 +440,10 @@ of the decoder, confirmed against `NativeWriter::write`, `BlockInfo::write`, and
 `NativeInputFormat` at v26.6.1.1193-stable via the `clickhouse-server-reader`
 sub-agent. Encode coverage is kept a subset of decode coverage: any type or
 `Nullable` wrapper the encoder does not handle yet returns
-`EncodeError::UnsupportedType` rather than emitting wrong bytes.
+`EncodeError::UnsupportedType` rather than emitting wrong bytes. The encode-side
+contract (API, trust and error model, input preconditions, encoder choices,
+round-trip guarantees) is documented in the "Encoding" section of
+`CODEC_CONTRACT.md`; keep it current as encode coverage grows.
 
 - [x] Native block framing for writes: optional `BlockInfo` preamble (rev > 0),
       column/row counts, per-column name + type string (`ChType::Display`) +
@@ -649,7 +652,7 @@ Potential future work, in value order. None of it is required for the overlap:
 ## Policy decisions to resolve
 
 These are decisions, not implementations. Resolve with the user, then record the
-outcome in `DECODER_CONTRACT.md`.
+outcome in `CODEC_CONTRACT.md`.
 
 - [ ] `String` export as Arrow `u` (Utf8) vs `z` (Binary), or a binding-selected
       option. ClickHouse `String` is arbitrary bytes; current export is `u`. See

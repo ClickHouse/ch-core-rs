@@ -1,30 +1,48 @@
-# Decoder Contract: Supported Types and Decoded Output
+# Codec Contract: Supported Types, Decoded Output, and Encode Input
 
-This is the definitive reference for what `ch-core-rs` decodes and the exact
-shape of the decoded output. For every supported ClickHouse type it records two
-views:
+This is the definitive reference for what `ch-core-rs` decodes and encodes, and
+for the exact shapes on both sides of each path. The crate runs two inverse
+paths over one shared columnar model and one shared wire format:
 
-1. The Arrow C Data export produced by `src/ffi.rs`: the format string, the
-   buffer count, and the buffer order. This is the primary contract surface.
-2. The raw Rust `Column` buffers produced by `src/native/decode.rs` and defined
-   in `src/column.rs`, for readers that consume the decoded buffers directly
-   rather than through the Arrow C Data Interface.
+- **Decode** (`src/native/decode.rs`): ClickHouse `FORMAT Native` bytes ->
+  `Column` buffers -> Arrow C Data export (`src/ffi.rs`).
+- **Encode** (`src/native/encode.rs`): `Column` buffers -> ClickHouse
+  `FORMAT Native` bytes the server accepts for `INSERT`.
 
-This document describes the core's output only. It says nothing about how any
-particular consumer should map that output to a host language. Host value policy
-is out of scope by design.
+For every supported ClickHouse type this doc records three views, all shared by
+both paths:
+
+1. The **wire payload**: the Native bytes decode reads and encode writes. This
+   is one description of one format; the two paths are exact inverses over it.
+2. The raw Rust `Column` buffers defined in `src/column.rs`: decode's output and
+   encode's input.
+3. The Arrow C Data export produced by `src/ffi.rs`: the format string, the
+   buffer count, and the buffer order. This is the primary decode contract
+   surface. Encode has no Arrow export; it consumes the `Column` buffers directly.
+
+The per-type sections below describe these shared shapes. Everything specific to
+the encode direction (its API, trust and error model, input preconditions, the
+choices it makes where the wire format allows more than one valid encoding, and
+the round-trip guarantees) lives in the "Encoding" section, which does not
+repeat the per-type wire layouts.
+
+This document describes the core's own input and output only. It says nothing
+about how any particular consumer should map decoded output to a host language,
+or build the `Column` buffers it hands to encode. Host value policy is out of
+scope by design.
 
 ## Source of truth and how to keep this current
 
 The code is authoritative. If this file and the source disagree, the source
 wins and this file is stale. When a new type is added to the decoder, update the
-support matrix and add a type section here in the same change. See the "Adding A
+support matrix and add a type section here in the same change; when its encoder
+lands, update the "Encoding" coverage list in the same change. See the "Adding A
 New ClickHouse Type" workflow in `AGENTS.md`.
 
 Wire-layout claims below were confirmed against the ClickHouse server source at
 tag `v26.6.1.1193-stable` (the tag pinned in `.server-ref`, protocol revision
 54485) via the `clickhouse-server-reader` sub-agent, and the per-type payloads
-are verified by the crate's round-trip decode tests. Each type section cites the
+are verified by the crate's round-trip decode and encode tests. Each type section cites the
 server serialization class and method it was confirmed against. When you change
 the pinned tag, reconfirm the layouts and update the citations, as `AGENTS.md`
 describes.
@@ -36,13 +54,14 @@ Every type section uses the same fields, in the same order:
 - **Type string(s)**: the exact ClickHouse type name(s) that `parse_ch_type`
   in `src/native/decode.rs` accepts for this type.
 - **Logical type**: the `ChType` variant in `src/schema.rs`.
-- **Wire payload**: the bytes the decoder reads for this column, for a block of
-  `num_rows` rows. This is the per-column payload only. Block framing and the
-  nullable null map are described once below, not repeated per type.
+- **Wire payload**: the bytes decode reads and encode writes for this column, for
+  a block of `num_rows` rows. The two paths are exact inverses over these bytes.
+  This is the per-column payload only. Block framing and the nullable null map are
+  described once below, not repeated per type.
 - **Arrow export**: the Arrow format string and the buffers emitted by
-  `export_column_array` in `src/ffi.rs`, in order.
+  `export_column_array` in `src/ffi.rs`, in order. Decode only.
 - **Rust buffer**: the `Column` variant and the fields of its backing struct in
-  `src/column.rs`.
+  `src/column.rs`. This is decode's output and encode's input.
 - **Notes**: edge cases, range limits, and anything a consumer can get wrong.
 - **Server reference**: the server serialization class and method that defines
   the layout, confirmed at `v26.6.1.1193-stable`.
@@ -899,6 +918,195 @@ per-column-per-block state and the `if (rows)` gate in
 and the index-0 NULL sentinel are in `IndexesSerializationType` and
 `read_additional_keys` in the same serialization file. Confirmed at
 `v26.6.1.1193-stable`.
+
+---
+
+## Encoding
+
+`src/native/encode.rs` is the inverse of the decode path: it turns a `ColBatch`
+(or each chunk of a `ChunkedBatch`) back into the Native block bytes the server
+accepts for `INSERT`. The wire it produces is exactly the wire the per-type
+sections above describe and exactly what `decode_next_block` reads at the same
+protocol revision, so the per-type "Wire payload" is not repeated here. This
+section is the encode-only contract: the API, what encode trusts, what it
+rejects, the choices it makes where the format allows more than one valid
+encoding, and what a round trip guarantees.
+
+Confirmed against the server source at `v26.6.1.1193-stable`: `NativeWriter::write`
+in `src/Formats/`, `BlockInfo::write` in `src/Core/BlockInfo.cpp`, and the
+revision-0 read path in `NativeFormat.cpp` in `src/Processors/Formats/Impl/`.
+
+### API
+
+- `encode_block(&ColBatch, &EncodeOptions) -> Result<Vec<u8>, EncodeError>`
+  produces one standalone Native block.
+- `encode_chunked(&ChunkedBatch, &EncodeOptions) -> Result<Vec<u8>, EncodeError>`
+  produces one block per chunk, in chunk order, concatenated. It validates every
+  chunk (including that each chunk's schema equals the batch schema) before
+  writing any bytes, so a rejected `ChunkedBatch` leaves no partial stream.
+- `EncodeOptions { protocol_revision: u64 }` is the only knob, the mirror of
+  `DecodeOptions.protocol_revision`. See "Encode framing" below.
+
+### Trust and error model
+
+Encode's input is trusted in one sense and untrusted in another. The bytes are
+in-memory `Column` buffers, not wire bytes from the network, so the failure
+modes are structural, not adversarial. But `Column`, `ColBatch`, and `Bitmap`
+have public fields and only debug-assert their invariants (`ColBatch::new`,
+`Bitmap::from_raw`), so a binding that builds buffers by hand for the insert path
+can hand encode a release-mode-inconsistent batch. Encode therefore validates
+fully in release, and it does so before writing any bytes.
+
+`EncodeError` has two variants:
+
+- `UnsupportedType { column, ch_type }`: a column whose type encode cannot yet
+  write (see coverage below), or a `LowCardinality` inner outside the allowlist.
+- `InconsistentBatch { detail }`: a structurally invalid batch. Every
+  precondition below maps to this variant.
+
+Because `validate_block` runs to completion before any byte is emitted, a
+rejected batch never produces a partial or truncated block. The write step is
+structurally infallible once validation passes; its `Result` exists only for a
+defensive fall-through that validation already rules out.
+
+### Coverage
+
+Encode coverage is a subset of decode coverage and grows the same
+one-type-at-a-time way. Encodable today: `Bool`, the fixed-width numerics
+(`Int8`..`Int64`, `UInt8`..`UInt64`, `Float32`, `Float64`), the temporals
+(`Date`, `Date32`, `DateTime`, `DateTime64`), `UUID`, `IPv4`, `IPv6`, `String`,
+`FixedString(N)`, `Enum8`/`Enum16`, `Decimal(P, S)`, and `LowCardinality(T)` for
+the same allowed inner types decode accepts, each optionally wrapped in
+`Nullable`. Any other type is `UnsupportedType`, at every row count including
+zero. This is deliberately stricter than decode, whose `empty_column` builds an
+empty column for any decodable type in a zero-row block: encode fails fast rather
+than write a header for a type it cannot write rows of.
+
+### Encode framing
+
+`EncodeOptions.protocol_revision` gates the same framing
+`DecodeOptions.protocol_revision` gates on the read side, and must match the
+revision the consumer reads with.
+
+- **Revision 0**: no `BlockInfo` preamble and no per-column custom-serialization
+  marker. This is the HTTP `INSERT ... FORMAT Native` shape: the server builds
+  its `NativeReader` with revision 0, expects neither, and stops at EOF.
+- **Revision > 0**: each block is preceded by the standard client `BlockInfo`
+  preamble (`is_overflows` = false, `bucket_num` = -1, and at revision >= 54480
+  an empty `out_of_order_buckets` vector, then the field-0 terminator: the same
+  10-byte preamble the "Native block framing" section above documents).
+- **Revision >= 54454** (`DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION`): a
+  per-column custom-serialization marker byte, always `0x00` (default
+  serialization), is written for every column including in a zero-row block.
+
+Within a block, encode writes `num_columns` and `num_rows` as varints, then per
+column the varint-length-prefixed name, the varint-length-prefixed type string,
+the marker byte (when the revision calls for it), and the column body.
+
+`encode_chunked` writes one Native block per chunk and no terminating empty
+block: for HTTP the concatenated blocks are the whole request body and the
+server stops at EOF. The native TCP protocol needs an explicit empty-block
+terminator; that path is outside the current encode scope.
+
+### Input preconditions
+
+All of these are checked before any bytes are written and reported as
+`InconsistentBatch` unless noted. They exist because the `Column` buffers are
+public and a hand-built insert column can violate an invariant the decode path
+would never produce.
+
+- **Batch shape.** The column count equals the schema field count, and every
+  column's `len()` equals the block's `num_rows`. For `encode_chunked`, every
+  chunk's schema equals the batch schema.
+- **Type/buffer match.** The `Column` variant matches the field's `ChType` (for
+  a `Nullable(T)`, the inner `T`). A supported type paired with the wrong buffer
+  variant (say `Int64` over a `Column::Int32`) is rejected here rather than
+  written as wrong-width bytes. A not-yet-encodable type is reported as
+  `UnsupportedType`.
+- **Type string round-trips.** `field.ch_type.to_string()` must parse back to the
+  same `ChType` through `parse_ch_type`, so encode never writes a header the
+  server or this crate's own decoder would reject: `FixedString(0)`, a
+  `DateTime64` precision above 9, an out-of-range `Decimal` precision, and so on.
+  A `DateTime`/`DateTime64` timezone containing a single quote is rejected
+  separately, since it renders a header that closes its quote early even though
+  the crate's own lenient parser would recover it.
+- **Validity bitmap backing.** Any present validity bitmap must have a backing
+  buffer of at least `len.div_ceil(8)` bytes, and for a nullable field its bit
+  length must equal `num_rows`.
+- **Nullability match.** A non-`Nullable` field (and a `LowCardinality` over a
+  non-`Nullable` inner) must have `null_count() == 0`. Encode writes no null map
+  for a non-nullable column, so a null bit there would silently encode that row's
+  placeholder value as a real value.
+- **Fixed-width bodies.** For `FixedString(N)`, `UUID`, and `IPv6`, the stored
+  buffer width must equal the declared or implied width and the data length must
+  be exactly `width * num_rows`. `FixedBinaryColumn::len()` truncates, so a
+  misframed buffer would otherwise pass the row-count check and put a different
+  number of bytes on the wire.
+- **Decimal.** `scale <= precision`, `precision` in `1..=76`, the column's
+  `precision`/`scale`/`width` agree with the type, and the width is derived from
+  precision (not trusted from `ChType`'s `bits`), with data length exactly
+  `width * num_rows`.
+- **String offsets.** The Arrow offset invariants are checked (monotonic
+  non-decreasing, in range, covering `data` exactly) so the per-row
+  `data[offsets[i]..offsets[i+1]]` slice cannot panic or silently drop bytes.
+- **LowCardinality.** The inner is in the allowlist and encodable; the dictionary
+  has at most `i32::MAX` entries (the public index buffer is `i32`); a zero-row
+  block carries an empty dictionary; every index is in `0..num_keys`; and for a
+  `LowCardinality(Nullable(T))`, NULL rows use dictionary index 0 and valid rows
+  do not. The dictionary column is validated recursively as its own inner-typed
+  column.
+
+### Encoder choices
+
+Decoding one wire input yields exactly one output; encoding often has more than
+one valid wire form, and encode commits to these:
+
+- **Canonical type string.** Encode writes the canonical `ChType` `Display` form
+  (`Decimal(P, S)`, `Enum8('a' = 1, ...)`, `DateTime64(3, 'UTC')`, and so on),
+  which is the same string the server emits and the decoder parses.
+- **Bool.** Encode writes `0x00`/`0x01` per row. The decoder accepts any nonzero
+  byte as true, but the server emits 0/1, so encode does too.
+- **Nullable placeholder.** For a `Nullable(T)`, encode writes the null map, then
+  the full inner body straight from the buffer, including whatever value sits in
+  each null row's slot. It does not zero or otherwise rewrite null-row values, so
+  the placeholder bytes a decode captured are written back verbatim.
+- **LowCardinality.** Encode writes `key_version` = 1
+  (`SharedDictionariesWithAdditionalKeys`) once per block per column, and an index
+  word with `HasAdditionalKeysBit` and `NeedUpdateDictionary` set and
+  `NeedGlobalDictionaryBit` clear (Native never uses a global dictionary). It
+  picks the narrowest self-describing index width that addresses the dictionary
+  (u8 through 255 entries, then u16, u32, u64). The dictionary is written exactly
+  as the `DictionaryColumn` carries it, in slot order; encode does not re-dedup or
+  reorder it. Indexes are written as a raw little-endian array at the chosen width.
+
+### Round-trip guarantees
+
+- **`decode(encode(x))` reproduces `x`.** Encoding a `ColBatch` and decoding the
+  result at the same protocol revision yields the same columns and buffers. This
+  is the fidelity the encode tests assert.
+- **`encode(decode(server_bytes))` reproduces canonical server bytes.** At the
+  pinned revision the server emits canonical output (0/1 for `Bool`, the canonical
+  type string, a minimal `LowCardinality` index width), and encode emits the same
+  canonical form, so for real server blocks of the supported types the round trip
+  is byte-for-byte.
+- **Byte-identity is not guaranteed in general.** The decoder is deliberately
+  lenient where the encoder is canonical: it accepts any nonzero byte as `Bool`
+  true (encode writes `0x01`), accepts non-canonical type strings the server would
+  not emit (encode re-renders the canonical string), and ignores unused bits in
+  the `LowCardinality` index word (encode writes a fixed set). A non-canonical
+  input that decodes correctly can therefore re-encode to different but
+  semantically equal bytes. Null-row placeholder values under a `Nullable` are
+  passed through verbatim, so they survive any round trip.
+
+### Zero-row encoding
+
+A zero-row block still writes its `BlockInfo` preamble (at revision > 0), the
+column and row counts, and, for every column, the name, type string, and
+custom-serialization marker (at revision >= 54454). It writes no column body: a
+fixed-width body is empty, and a `LowCardinality` column writes not even the
+key-version prefix, matching `NativeWriter::write`'s `rows > 0` gate. A
+not-yet-encodable type is still rejected at zero rows (see coverage). This is the
+write-side mirror of the "Zero-row output" section below.
 
 ---
 

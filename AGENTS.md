@@ -261,7 +261,7 @@ and check the item off as part of the same change. The per-type workflow:
 1. Make sure the server source checkout exists at the tag in `.server-ref`,
    shallow cloning it per "Local server source checkout" if missing. This
    checkout is for reading the C++ to confirm layout. It is a different role from
-   the running server used to capture fixtures in step 8, and both must be the
+   the running server used to capture fixtures in step 9, and both must be the
    same version so the bytes you commit match the source you cite.
 2. Confirm the exact wire layout against that source first, via the
    `clickhouse-server-reader` sub-agent. Do not start from a guess.
@@ -273,10 +273,15 @@ and check the item off as part of the same change. The per-type workflow:
 5. Decode the wire bytes into a `Column` variant in `src/column.rs`, keeping the
    buffer layout Arrow-compatible.
 6. Add Arrow format and buffer export in `src/ffi.rs`.
-7. Add unit tests in the relevant module using the `BlockBuilder` pattern: cover
+7. Encode the type back to Native bytes in `src/native/encode.rs`: add its
+   validation preconditions and its body writer so encode coverage keeps pace
+   with decode. Prefer landing encode in the same change. If you defer it, the
+   type stays `EncodeError::UnsupportedType` on the write side until it lands.
+8. Add unit tests in the relevant module using the `BlockBuilder` pattern: cover
    the plain case, the `Nullable` wrapper, the zero-row block, and at least one
-   multi-block case. These synthesize wire bytes in process.
-8. Add real-server coverage in `tests/integration.rs`. Extend the `all_types`
+   multi-block case, plus an encode round-trip when step 7 landed. These
+   synthesize wire bytes in process.
+9. Add real-server coverage in `tests/integration.rs`. Extend the `all_types`
    query in `scripts/gen_fixtures.sh` with the new column rather than adding a new
    fixture file, run the script against a live server of the same version as
    `.server-ref` to recapture the committed `.native` bytes, then assert the
@@ -289,10 +294,12 @@ and check the item off as part of the same change. The per-type workflow:
    that version's `DBMS_TCP_PROTOCOL_VERSION`. The server caps the negotiated
    revision at its own maximum, so name the fixture by the negotiated revision,
    not a higher value you requested.
-9. Update `DECODER_CONTRACT.md`: move the type from "Unsupported types" into the
-   support matrix and add its type section (wire payload, Arrow export, Rust
-   buffer, server reference). That doc is the definitive description of decoder
-   output and must not drift from the code.
+10. Update `CODEC_CONTRACT.md`: move the type from "Unsupported types" into the
+    support matrix and add its type section (wire payload, Arrow export, Rust
+    buffer, server reference). If you landed encode in step 7, add the type to
+    the "Encoding" coverage list and note any encode-specific choices. That doc
+    is the definitive description of decoder output and encode input and must not
+    drift from the code.
 
 The decode rules and physical buffers live here, in one place. Language-specific
 host value policy (Python `int` vs JS `BigInt`, `uuid.UUID` vs fixed binary,

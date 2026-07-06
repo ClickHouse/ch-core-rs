@@ -1073,7 +1073,7 @@ fn decode_column_body(
         // is raw passthrough: the 16 wire bytes go into a width-16
         // FixedBinaryColumn unchanged, no reordering. The wire->RFC mapping
         // (rfc[i] = wire[7-i] for i in 0..7, rfc[i] = wire[23-i] for i in 8..15)
-        // is documented in DECODER_CONTRACT.md for bindings only.
+        // is documented in CODEC_CONTRACT.md for bindings only.
         ChType::Uuid => {
             let data = decode_fixed_binary_data(reader, num_rows, 16)?;
             match validity {

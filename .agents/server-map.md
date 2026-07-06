@@ -2,7 +2,7 @@
 
 Source tree lives at `.server-src/` (gitignored). The version actually being investigated is recorded in `.server-ref`.
 
-This map serves `ch-core-rs`, a Rust decoder for ClickHouse `FORMAT Native` bytes. The decoder mirrors the server's serialization, so the most valuable reading is usually the `Serialization*` deserialize paths and the Native block framing. The map also covers settings, errors, and compression for the cases where decode behavior depends on them.
+This map serves `ch-core-rs`, a Rust codec for ClickHouse `FORMAT Native` bytes: it decodes result bytes into columnar buffers and encodes those buffers back to Native bytes for `INSERT`. The codec mirrors the server's serialization, so the most valuable reading is usually the `Serialization*` bulk paths (`deserializeBinaryBulk*` for decode, `serializeBinaryBulk*` and `NativeWriter` for encode) and the Native block framing. The map also covers settings, errors, and compression for the cases where codec behavior depends on them.
 
 ## How to use this map
 
@@ -22,7 +22,7 @@ Cite file and class or function names in your answers. Do not cite line numbers,
 ## Type system and binary serialization
 
 - **Core type interface**: `src/DataTypes/IDataType.h`. Every SQL type derives from `IDataType` and exposes metadata plus a serialization object.
-- **Serialization interface**: `src/DataTypes/Serializations/ISerialization.h`. One type can have multiple serializations (default, sparse, subcolumn). Binary read/write lives on methods like `serializeBinaryBulk*` / `deserializeBinaryBulk*`. For the decoder, the `deserializeBinaryBulk*` methods are the wire contract to mirror.
+- **Serialization interface**: `src/DataTypes/Serializations/ISerialization.h`. One type can have multiple serializations (default, sparse, subcolumn). Binary read/write lives on methods like `serializeBinaryBulk*` / `deserializeBinaryBulk*`. The `deserializeBinaryBulk*` methods are the wire contract the decoder mirrors; the matching `serializeBinaryBulk*` methods (with `NativeWriter::write`) are the reference for the encode/insert side.
 - **Per-type implementations**: `src/DataTypes/DataTypeXXX.{cpp,h}` for each type.
 - **Per-type serializations**: `src/DataTypes/Serializations/SerializationXXX.{cpp,h}`.
 - **Type factory and text parsing of type strings**: `src/DataTypes/DataTypeFactory.cpp`. Relevant when teaching `parse_ch_type` to recognize a type string.

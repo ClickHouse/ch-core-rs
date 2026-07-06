@@ -8,10 +8,10 @@ handling block framing, null maps, and the long tail of types, and redoing all
 of it on every server release. `ch-core-rs` exists so that work is done once,
 correctly, in one place.
 
-The idea in one sentence: **read ClickHouse `FORMAT Native` wire bytes and
-place the decoded columns into typed, Arrow-shaped buffers, as fast and as
-safely as possible, with zero dependencies, and let each language binding
-decide how to expose those buffers to its own runtime.**
+The idea in one sentence: **turn ClickHouse `FORMAT Native` wire bytes into
+typed, Arrow-shaped columnar buffers and back again, as fast and as safely as
+possible, with zero dependencies, and let each language binding decide how to
+expose those buffers to its own runtime.**
 
 ```
 ClickHouse server
@@ -37,10 +37,14 @@ ClickHouse server
    Arrow capsule  ArrayBuffer    stream
 ```
 
+The diagram is the decode (read) path. The same buffers run the inverse
+direction too: `native/encode.rs` encodes them back into Native block bytes for
+`INSERT ... FORMAT Native`.
+
 The division of labor is strict:
 
-- **The core owns** binary decoding, the ClickHouse type model, and the shared
-  columnar buffer layout. This is the hot path, and it is written once.
+- **The core owns** binary decoding and encoding, the ClickHouse type model, and
+  the shared columnar buffer layout. This is the hot path, and it is written once.
 - **The bindings own** everything runtime-specific: whether a `UInt64` becomes
   a Python `int` or a JS `BigInt`, how nulls surface, stream backpressure, and
   the public client API. Bindings are thin adapters over buffers the core has
@@ -114,6 +118,7 @@ src/batch.rs             ColBatch (one block) and ChunkedBatch (one result)
 src/bitmap.rs            bit-packed validity bitmaps, CH null map conversion
 src/native/varint.rs     ByteReader slice cursor + LEB128 varints
 src/native/decode.rs     block framing, type-string parsing, per-type decode
+src/native/encode.rs     block framing + per-type Native encode (insert path)
 src/native/stream_decoder.rs  push-based incremental decoding
 src/ffi.rs               Arrow C Data Interface export (schema/array/stream)
 ```
@@ -319,6 +324,35 @@ temporal type only when the physical width matches exactly (`Date32` ->
 raw integer type is exposed and interpretation is left to the binding. Buffers
 are never widened or rescaled at the FFI layer.
 
+### Encoding the Native format (`native/encode.rs`)
+
+The inverse of the decode path: `encode_block` and `encode_chunked` turn a
+`ColBatch` (or each chunk of a `ChunkedBatch`) back into Native block bytes the
+server accepts for `INSERT ... FORMAT Native`. Framing is the exact inverse of
+the decoder (optional `BlockInfo` preamble at revision > 0, column and row
+counts, per-column name/type-string/marker, then the body), gated by
+`EncodeOptions.protocol_revision` the same way decode is, so bytes written at a
+revision decode back at that revision. It is confirmed against
+`NativeWriter::write` at the pinned tag.
+
+Two things differ from decode by nature:
+
+- **Input is validated, not trusted blindly.** The `Column` buffers are public,
+  so a binding can build an insert column by hand. Encode validates the whole
+  batch before writing a byte (column and row counts, type-string round-trip,
+  string offset and fixed-width invariants, `LowCardinality` index bounds,
+  nullability) and returns `EncodeError` rather than emit corrupt bytes or
+  panic. A rejected batch leaves no partial stream.
+- **Encode is canonical where decode is lenient.** It writes `0`/`1` for `Bool`,
+  the canonical type string, and a minimal `LowCardinality` index width, so
+  `decode(encode(x))` reproduces `x` and re-encoding canonical server bytes is
+  byte-for-byte, though byte-identity is not guaranteed for non-canonical input.
+
+Encode coverage is a subset of decode coverage (the full scalar and
+`LowCardinality` set today) and targets the HTTP `INSERT` path at
+`protocol_revision = 0`; there is no TCP engine or compression framing yet. The
+per-type encode contract is the "Encoding" section of `CODEC_CONTRACT.md`.
+
 ### Error handling
 
 `DecodeError` is the single decode error type: `Io` (with `UnexpectedEof`
@@ -326,7 +360,11 @@ reserved for "need more bytes"), `UnsupportedType`,
 `UnsupportedSerialization`, `InvalidBlockInfo`, and `BlockSchemaMismatch`.
 Anything the decoder does not understand fails loudly and precisely; the worst
 failure mode for a wire decoder is a silently corrupt column, and the design
-consistently chooses an explicit error over a guess.
+consistently chooses an explicit error over a guess. Encode has its own
+`EncodeError` with two variants: `UnsupportedType` (a column type encode cannot
+yet write) and `InconsistentBatch` (a structurally invalid batch, caught during
+pre-write validation), so a bad batch fails cleanly instead of emitting partial
+or corrupt bytes.
 
 ### Testing strategy
 
@@ -340,17 +378,20 @@ Two complementary layers:
   shared wrong assumption about the format would let an encode/decode
   round-trip pass while a real server fixture fails.
 
-`DECODER_CONTRACT.md` is the definitive per-type reference (wire payload,
-decoded buffers, Arrow export) and is kept in lockstep with the code.
+`CODEC_CONTRACT.md` is the definitive per-type reference (wire payload,
+decoded buffers, Arrow export) and covers the encode direction too (input
+preconditions, encoder choices, round-trip guarantees). It is kept in lockstep
+with the code.
 
 ### Current scope and direction
 
 Supported today: `Bool`, `Int8..64`, `UInt8..64`, `Float32/64`, `String`,
-`FixedString(N)`, `Date`, `Date32`, `DateTime`, `DateTime64`, and
-`Nullable(T)` over any of them; whole-buffer and streaming decode; Arrow C
-Data export. Not yet: compression framing, the native TCP protocol, the
-insert/encode path, and the type long tail (`LowCardinality`, `Decimal`,
-`UUID`/IP, enums, `Array`/`Tuple`/`Map`, wide ints). The growth model is
-fixed: implement a type once here, following the documented
-confirm-against-server-source workflow in `AGENTS.md`, and every binding gets
-it for free. The roadmap lives in `README.md`.
+`FixedString(N)`, `Date`, `Date32`, `DateTime`, `DateTime64`, `Decimal(P, S)`,
+`UUID`, `IPv4`, `IPv6`, `Enum8`/`Enum16`, and `LowCardinality(T)` for the
+allowed inner types, plus `Nullable(T)` over any of them; whole-buffer and
+streaming decode; Arrow C Data export; and encode back to Native block bytes for
+that same scalar and `LowCardinality` set (the HTTP `INSERT` path). Not yet:
+compression framing, the native TCP protocol, `Array`/`Tuple`/`Map`, and wide
+ints. The growth model is fixed: implement a type once here, following the
+documented confirm-against-server-source workflow in `AGENTS.md`, and every
+binding gets it for free. The roadmap lives in `README.md`.

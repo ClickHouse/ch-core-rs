@@ -13,8 +13,8 @@ cross-checked against the matching `.server-ref` tag `v26.6.1.1193-stable`.
 
 | File | Capture path | `protocol_revision` | First bytes |
 |------|--------------|---------------------|-------------|
-| `all_types_rev0.native` | HTTP `FORMAT Native` | `0` | `1e 04 02 69 38 04 49 6e 74 38 80 ff 00 7f 03 69` |
-| `all_types_rev54485.native` | HTTP `FORMAT Native` with `client_protocol_version=54485` | `54485` | `01 00 02 ff ff ff ff 03 00 00 1e 04 02 69 38 04` |
+| `all_types_rev0.native` | HTTP `FORMAT Native` | `0` | `26 04 02 69 38 04 49 6e 74 38 80 ff 00 7f 03 69` |
+| `all_types_rev54485.native` | HTTP `FORMAT Native` with `client_protocol_version=54485` | `54485` | `01 00 02 ff ff ff ff 03 00 00 26 04 02 69 38 04` |
 | `multi_block_rev0.native` | HTTP `FORMAT Native`, `max_block_size=2` | `0` | `01 02 01 6e 05 49 6e 74 33 32 0d 00 00 00 0e 00` |
 
 The framed fixture starts with the standard 10-byte `BlockInfo` preamble:
