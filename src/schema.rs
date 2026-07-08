@@ -75,8 +75,24 @@ pub enum ChType {
     // `Nullable` (the server's `DataTypeArray::canBeInsideNullable()` is false),
     // so element-level nulls live in the element type, not in the array.
     Array(Box<ChType>),
-    // Tuple(Vec<(Option<String>, ChType)>),
-    // Map(Box<ChType>, Box<ChType>),
+    // `Tuple(T1, ...)` / `Tuple(name1 T1, ...)`: a fixed set of element types,
+    // each with an optional explicit name. The server renders names
+    // all-or-nothing (`DataTypeTuple::doGetName` emits either every name or
+    // none), but the parser stores them per element so a header is preserved
+    // exactly as received. `Tuple()` (zero elements) is constructible and
+    // emittable. The tuple itself may be wrapped in `Nullable`
+    // (`DataTypeTuple::canBeInsideNullable()` is true; the DDL gate
+    // `enable_nullable_tuple_type` is a creation-time concern only), but never
+    // in `LowCardinality`.
+    Tuple(Vec<(Option<String>, ChType)>),
+    // `Map(K, V)`: on the Native wire this is exactly the
+    // `Array(Tuple(keys, values))` layout (offsets, then the flattened key run,
+    // then the flattened value run); the nested "keys"/"values" names never
+    // appear in the type string or as wire bytes. The key type must not be
+    // `Nullable` or `LowCardinality(Nullable(...))`
+    // (`DataTypeMap::isValidKeyType`); the value type is unrestricted. The map
+    // itself is never inside `Nullable` or `LowCardinality`.
+    Map(Box<ChType>, Box<ChType>),
 }
 
 /// A named, typed column descriptor.
@@ -150,8 +166,108 @@ impl std::fmt::Display for ChType {
             ChType::Nullable(inner) => write!(f, "Nullable({inner})"),
             ChType::LowCardinality(inner) => write!(f, "LowCardinality({inner})"),
             ChType::Array(inner) => write!(f, "Array({inner})"),
+            ChType::Tuple(elements) => write_tuple(f, elements),
+            // The canonical server form (`DataTypeMap::doGetName`): the two
+            // type arguments only, comma-space separated, no element names.
+            ChType::Map(key, value) => write!(f, "Map({key}, {value})"),
         }
     }
+}
+
+/// Render a `Tuple(...)` type string: the elements joined by `, ` inside one
+/// pair of parentheses, each element as `name type` when it carries a name and
+/// as the bare type otherwise. `Tuple()` renders with empty parentheses.
+///
+/// Name rendering matches the server byte for byte:
+/// `DataTypeTuple::doGetName` runs each name through `backQuoteIfNeed`
+/// ([`back_quote_if_need`]), confirmed at v26.6.1.1193-stable
+/// (`src/DataTypes/DataTypeTuple.cpp`, `src/Common/quoteString.cpp`).
+fn write_tuple(
+    f: &mut std::fmt::Formatter<'_>,
+    elements: &[(Option<String>, ChType)],
+) -> std::fmt::Result {
+    write!(f, "Tuple(")?;
+    for (i, (name, ch_type)) in elements.iter().enumerate() {
+        if i > 0 {
+            write!(f, ", ")?;
+        }
+        if let Some(name) = name {
+            back_quote_if_need(f, name)?;
+            write!(f, " ")?;
+        }
+        write!(f, "{ch_type}")?;
+    }
+    write!(f, ")")
+}
+
+/// Whether `name` renders unquoted in a type string, matching the server's
+/// `backQuoteIfNeed` (`src/Common/quoteString.cpp` ->
+/// `writeProbablyBackQuotedString` -> `isValidIdentifier`, confirmed at
+/// v26.6.1.1193-stable in `src/Common/StringUtils.h` and
+/// `src/Common/quoteString.cpp`): a name stays bare only if it is a valid
+/// ASCII identifier (`[A-Za-z_][A-Za-z0-9_]*`), not any-case `null` (which
+/// `isValidIdentifier` excludes before the keyword list, since a bare NULL
+/// would read back as the NULL keyword), and not one of the case-insensitive
+/// keywords the server always quotes. Shared with the tuple-element parser in
+/// `native::decode` so parse and render agree on which names need backticks.
+pub(crate) fn is_bare_identifier(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let valid_shape = match bytes.first() {
+        Some(b) if b.is_ascii_alphabetic() || *b == b'_' => bytes[1..]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_'),
+        _ => false,
+    };
+    if !valid_shape {
+        return false;
+    }
+    // Any-case "null" is excluded by isValidIdentifier itself; the keyword set
+    // below is what writeProbablyBackQuotedString additionally quotes even
+    // though the shape is a valid identifier (case-insensitive).
+    !name.eq_ignore_ascii_case("null")
+        && !name.eq_ignore_ascii_case("distinct")
+        && !name.eq_ignore_ascii_case("all")
+        && !name.eq_ignore_ascii_case("table")
+        && !name.eq_ignore_ascii_case("select")
+        && !name.eq_ignore_ascii_case("from")
+        && !name.eq_ignore_ascii_case("values")
+}
+
+/// Write a tuple element name, backtick-quoting it when [`is_bare_identifier`]
+/// says the server would.
+fn back_quote_if_need(f: &mut std::fmt::Formatter<'_>, name: &str) -> std::fmt::Result {
+    if is_bare_identifier(name) {
+        write!(f, "{name}")
+    } else {
+        write!(f, "`{}`", escape_back_quoted(name))
+    }
+}
+
+/// Escape a name for emission inside backticks, matching the server's
+/// `writeBackQuotedString` -> `writeAnyEscapedString<'`'>` (confirmed at
+/// v26.6.1.1193-stable, `src/IO/WriteHelpers.h`): a backtick becomes `` \` ``
+/// (the backslash form, never the doubled `` `` `` MySQL form), a backslash
+/// becomes `\\`, the C0 control bytes the server names get their two-char
+/// letter escapes, and every other byte (including `'`, `,`, and spaces)
+/// passes through raw at the byte level. The parser accepts a superset (see
+/// `parse_back_quoted_name` in `native::decode`), so `parse(display(x)) == x`
+/// holds for any name.
+fn escape_back_quoted(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '`' => out.push_str("\\`"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0C}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\0' => out.push_str("\\0"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Render an `Enum8`/`Enum16` type string: the keyword, then the `'name' = N`
@@ -235,6 +351,66 @@ mod tests {
         assert_eq!(schema.fields[0].name, "id");
         assert!(!schema.fields[0].ch_type.is_nullable());
         assert!(schema.fields[1].ch_type.is_nullable());
+    }
+
+    #[test]
+    fn test_tuple_display_matches_server_rendering() {
+        // Unnamed elements render as the bare types.
+        assert_eq!(
+            ChType::Tuple(vec![(None, ChType::Int32), (None, ChType::String)]).to_string(),
+            "Tuple(Int32, String)"
+        );
+        // Zero elements render with empty parentheses.
+        assert_eq!(ChType::Tuple(vec![]).to_string(), "Tuple()");
+        // Bare-identifier names stay unquoted.
+        assert_eq!(
+            ChType::Tuple(vec![
+                (Some("a".to_string()), ChType::Int32),
+                (Some("user_2".to_string()), ChType::String),
+            ])
+            .to_string(),
+            "Tuple(a Int32, user_2 String)"
+        );
+        // A name with a space, a comma, a backtick, or a backslash is
+        // backtick-quoted; the backtick escapes as \` (writeBackQuotedString,
+        // never the doubled `` form) and the backslash as \\.
+        assert_eq!(
+            ChType::Tuple(vec![
+                (Some("a b".to_string()), ChType::Int8),
+                (Some("c,d".to_string()), ChType::Int8),
+                (Some("e`f".to_string()), ChType::Int8),
+                (Some("g\\h".to_string()), ChType::Int8),
+            ])
+            .to_string(),
+            "Tuple(`a b` Int8, `c,d` Int8, `e\\`f` Int8, `g\\\\h` Int8)"
+        );
+        // The case-insensitive keywords backQuoteIfNeed always quotes.
+        assert_eq!(
+            ChType::Tuple(vec![
+                (Some("select".to_string()), ChType::Int8),
+                (Some("From".to_string()), ChType::Int8),
+                (Some("selected".to_string()), ChType::Int8),
+            ])
+            .to_string(),
+            "Tuple(`select` Int8, `From` Int8, selected Int8)"
+        );
+        // Any-case "null" is excluded by isValidIdentifier itself (a bare NULL
+        // would read back as the NULL keyword), so it is always quoted; a name
+        // merely containing it is not.
+        assert_eq!(
+            ChType::Tuple(vec![
+                (Some("NULL".to_string()), ChType::Int8),
+                (Some("Null".to_string()), ChType::Int8),
+                (Some("nullable".to_string()), ChType::Int8),
+            ])
+            .to_string(),
+            "Tuple(`NULL` Int8, `Null` Int8, nullable Int8)"
+        );
+        // Control bytes get their two-char letter escapes.
+        assert_eq!(
+            ChType::Tuple(vec![(Some("a\tb\n".to_string()), ChType::Int8)]).to_string(),
+            "Tuple(`a\\tb\\n` Int8)"
+        );
     }
 
     #[test]

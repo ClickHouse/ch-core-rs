@@ -170,9 +170,60 @@ SELECT
     -- (SerializationLowCardinality::serializeBinaryBulkWithMultipleStreams
     -- early-returns at limit == 0). Decodes to offsets [0, 0, 0, 0, 0] over an
     -- empty dictionary element column.
-    CAST([], 'Array(LowCardinality(String))') AS arr_lc_empty
+    CAST([], 'Array(LowCardinality(String))') AS arr_lc_empty,
+    -- Tuple(T1, ...): SerializationTuple writes each element's FULL run one
+    -- after another in declaration order (column-of-columns), no interleaving
+    -- and no tuple-level framing. Rows: (-13, 'user_0'), (-6, 'user_1'),
+    -- (1, 'user_2'), (8, 'user_3').
+    CAST(tuple(toInt32(n) * 7 - 13, concat('user_', toString(n))), 'Tuple(Int32, String)') AS tup,
+    -- Named tuple with a Nullable element: the names live only in the type
+    -- string (Tuple(a Int32, b Nullable(String))); element b's body is its own
+    -- null map then the strings. Rows: (0, 'user_0'), (1, NULL), (2, 'user_2'),
+    -- (3, NULL).
+    CAST(tuple(toInt32(n), multiIf(n = 1, NULL, n = 3, NULL, concat('user_', toString(n)))), 'Tuple(a Int32, b Nullable(String))') AS tup_named,
+    -- Array(Tuple(Int32, Int32)): offsets first (the tuple elements write no
+    -- state prefix), then the flattened tuple body (element 0's full run, then
+    -- element 1's). [] / [(13, 79)] / [(1, 2), (3, 4)] / [(-1, -2)] -> offsets
+    -- [0, 0, 1, 3, 4], element 0 values 13, 1, 3, -1, element 1 values
+    -- 79, 2, 4, -2.
+    CAST(multiIf(n = 0, [], n = 1, [(13, 79)], n = 2, [(1, 2), (3, 4)], [(-1, -2)]), 'Array(Tuple(Int32, Int32))') AS arr_tup,
+    -- Nullable(Tuple(Int32, String)): legal on the wire
+    -- (DataTypeTuple::canBeInsideNullable() is true; the DDL gate
+    -- enable_nullable_tuple_type is set in SETTINGS below and has no wire
+    -- effect). Ordinary Nullable framing: the per-row null map first, then the
+    -- tuple body; null rows carry element defaults (0, ''). Rows:
+    -- (0, 'user_0'), NULL, (2, 'user_2'), NULL.
+    CAST(multiIf(n = 1, NULL, n = 3, NULL, tuple(toInt32(n), concat('user_', toString(n)))), 'Nullable(Tuple(Int32, String))') AS ntup,
+    -- Map(K, V): on the Native wire always the plain Array(Tuple(keys, values))
+    -- layout, cumulative UInt64 end-offsets then the flattened key run then the
+    -- flattened value run. Rows: {} / {a: 13} / {a: 1, b: 2} / {k: -7} ->
+    -- offsets [0, 0, 1, 3, 4], keys a, a, b, k, values 13, 1, 2, -7.
+    CAST(multiIf(n = 0, map(), n = 1, map('a', 13), n = 2, map('a', 1, 'b', 2), map('k', -7)), 'Map(String, Int32)') AS m,
+    -- Map(LowCardinality(String), UInt8): a plain LC key is legal
+    -- (DataTypeMap::isValidKeyType forbids only Nullable and
+    -- LowCardinality(Nullable)); the LC 8-byte key version is hoisted to the
+    -- very front of the column, before the offsets. Rows: {red: 1} / {} /
+    -- {red: 2, blue: 3} / {green: 4} -> offsets [0, 1, 1, 3, 4].
+    CAST(multiIf(n = 0, map('red', 1), n = 1, map(), n = 2, map('red', 2, 'blue', 3), map('green', 4)), 'Map(LowCardinality(String), UInt8)') AS m_lc,
+    -- Map(String, Nullable(String)): the flattened value run carries its own
+    -- per-entry null map. Rows: {a: user_1} / {b: NULL} / {} /
+    -- {c: user_2, d: NULL} -> offsets [0, 1, 2, 2, 4], value validity T,F,T,F.
+    CAST(multiIf(n = 0, map('a', 'user_1'), n = 1, map('b', NULL), n = 2, map(), map('c', 'user_2', 'd', NULL)), 'Map(String, Nullable(String))') AS m_nv,
+    -- Map(String, Array(Int32)): the flattened value run is itself an Array
+    -- column over the entries. Rows: {a: [13]} / {} / {b: [], c: [1, 2]} /
+    -- {d: [79]} -> map offsets [0, 1, 1, 3, 4], value-array offsets
+    -- [0, 1, 1, 3, 4], leaf 13, 1, 2, 79.
+    CAST(multiIf(n = 0, map('a', [13]), n = 1, map(), n = 2, map('b', [], 'c', [1, 2]), map('d', [79])), 'Map(String, Array(Int32))') AS m_arr,
+    -- Array(Map(String, Int32)): maps compose inside Array. Rows: [] /
+    -- [{a: 1}] / [{b: 2}, {}] / [{c: 3}] -> outer offsets [0, 0, 1, 3, 4],
+    -- inner map offsets [0, 1, 2, 2, 3], keys a, b, c, values 1, 2, 3.
+    CAST(multiIf(n = 0, [], n = 1, [map('a', 1)], n = 2, [map('b', 2), map()], [map('c', 3)]), 'Array(Map(String, Int32))') AS arr_m,
+    -- Map(String, Int32) with EVERY row empty: the offsets are still written
+    -- (all zeros), and the key/value runs are entirely absent (limit == 0
+    -- passes to the nested tuple).
+    CAST(map(), 'Map(String, Int32)') AS m_empty
 FROM numbers(4)
-SETTINGS allow_suspicious_low_cardinality_types = 1
+SETTINGS allow_suspicious_low_cardinality_types = 1, enable_nullable_tuple_type = 1
 FORMAT Native
 SQL
 )

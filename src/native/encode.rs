@@ -13,21 +13,24 @@
 //! `UInt8`..`UInt64`, `Float32`, `Float64`), the temporal types (`Date`,
 //! `Date32`, `DateTime`, `DateTime64`), `UUID`, `IPv4`, `IPv6`, `String`,
 //! `FixedString(N)`, `Enum8`/`Enum16`, `Decimal(P, S)`, `LowCardinality(T)`
-//! for the allowed inner types this crate decodes, and `Array(T)` over any
-//! encodable element type (including nested arrays). The plain types also
-//! compose inside a `Nullable(T)` wrapper (a per-row null map precedes the
-//! inner values). Every other column type returns
-//! [`EncodeError::UnsupportedType`] until its encoder lands, the same
-//! one-type-at-a-time growth the decode path follows.
+//! for the allowed inner types this crate decodes, `Array(T)` over any
+//! encodable element type (including nested arrays), `Tuple(T1, ...)`
+//! (named or unnamed, including the zero-element `Tuple()`) over encodable
+//! element types, and `Map(K, V)` for a legal key type and any encodable
+//! key/value types. The plain types and `Tuple` also compose inside a
+//! `Nullable(T)` wrapper (a per-row null map precedes the inner values). Every
+//! other column type returns [`EncodeError::UnsupportedType`] until its
+//! encoder lands, the same one-type-at-a-time growth the decode path follows.
 
 use crate::batch::{ChunkedBatch, ColBatch};
 use crate::column::{
-    ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn, Utf8Column,
+    ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn, MapColumn,
+    TupleColumn, Utf8Column,
 };
 use crate::schema::{ChType, Field};
 
 use super::decode::{
-    decimal_bits_from_precision, is_low_cardinality_inner, parse_ch_type,
+    decimal_bits_from_precision, is_low_cardinality_inner, is_valid_map_key_type, parse_ch_type,
     DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION, DBMS_MIN_REVISION_WITH_OUT_OF_ORDER_BUCKETS,
     LC_HAS_ADDITIONAL_KEYS_BIT, LC_NEED_UPDATE_DICTIONARY_BIT, LOW_CARDINALITY_KEY_VERSION,
     MAX_TYPE_DEPTH,
@@ -62,9 +65,11 @@ pub struct EncodeOptions {
 /// or a column type the encoder does not yet support.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EncodeError {
-    /// A column this encoder cannot yet write: an unsupported physical type, or a
-    /// `Nullable(T)` whose inner type is not yet encodable. Grows narrower as
-    /// encode coverage catches up to decode coverage.
+    /// A column this encoder cannot write: an unsupported physical type, a
+    /// `Nullable(T)` whose inner type is not yet encodable, or a type the
+    /// server itself cannot construct (an illegal `Map` key type; tuple
+    /// element names that are mixed named/unnamed, empty, the reserved
+    /// lowercase `null`, or duplicated).
     UnsupportedType { column: String, ch_type: ChType },
     /// The batch is internally inconsistent: the column count does not match the
     /// schema field count, or a column's length does not match `num_rows`.
@@ -321,6 +326,14 @@ fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<()
         validate_array(field, inner, c, num_rows)?;
     }
 
+    if let (ChType::Tuple(elements), Column::Tuple(c)) = (value_type, column) {
+        validate_tuple(field, elements, c, num_rows)?;
+    }
+
+    if let (ChType::Map(key, value), Column::Map(c)) = (value_type, column) {
+        validate_map(field, key, value, c, num_rows)?;
+    }
+
     // A `Bool` column is unpacked from its packed bitmap positionally, so the
     // bitmap must hold at least `len.div_ceil(8)` bytes. `BoolColumn`'s fields are
     // public and `ColBatch::new` only debug-asserts, so a release-mode caller could
@@ -371,26 +384,36 @@ fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<()
     Ok(())
 }
 
-/// Count the wrapper/container nesting levels of `ch_type`, iteratively.
+/// Count the deepest wrapper/container nesting of `ch_type`, iteratively.
 ///
 /// Used by [`validate_column`] to reject a pathologically deep
 /// caller-constructed type before any of the encoder's recursive walks touch
-/// it, so this must not recurse itself. Every current wrapper (`Nullable`,
-/// `LowCardinality`, `Array`) has exactly one child, so a loop suffices; a
-/// future multi-child container (`Tuple`, `Map`) must switch this to an
-/// explicit worklist, still without recursion.
+/// it, so this must not recurse itself. `Tuple` is a multi-child container, so
+/// the walk is an explicit worklist over `(type, depth)` pairs taking the
+/// maximum leaf depth; memory is bounded by the fan-out (one pending entry per
+/// unvisited sibling) and time is linear in the number of type nodes.
 fn type_depth(ch_type: &ChType) -> usize {
-    let mut depth = 0;
-    let mut current = ch_type;
-    loop {
-        current = match current {
+    let mut max_depth = 0usize;
+    let mut work: Vec<(&ChType, usize)> = vec![(ch_type, 0)];
+    while let Some((current, depth)) = work.pop() {
+        max_depth = max_depth.max(depth);
+        match current {
             ChType::Nullable(inner) | ChType::LowCardinality(inner) | ChType::Array(inner) => {
-                depth += 1;
-                inner
+                work.push((inner, depth + 1));
             }
-            _ => return depth,
-        };
+            ChType::Tuple(elements) => {
+                for (_, element_type) in elements {
+                    work.push((element_type, depth + 1));
+                }
+            }
+            ChType::Map(key, value) => {
+                work.push((key, depth + 1));
+                work.push((value, depth + 1));
+            }
+            _ => {}
+        }
     }
+    max_depth
 }
 
 /// Shared misframe guard for fixed-width binary bodies (`FixedString(N)`,
@@ -670,6 +693,184 @@ fn validate_array(
     validate_column(&element_field, col.values.as_ref(), element_rows)
 }
 
+/// Validate a `Tuple(T1, ...)` column before any bytes are written.
+///
+/// [`encode_tuple_data`] writes each element column's full run sequentially
+/// through the shared [`encode_column_values`] path, so every element column
+/// must be a valid column of exactly `num_rows` rows: each is validated
+/// recursively as its own column (the row-count check inside the recursive
+/// [`validate_column`] is what enforces the server's equal-element-lengths
+/// invariant; a ragged element would put a misframed stream on the wire, which
+/// the server rejects with `INCORRECT_DATA`). A field-count mismatch between
+/// the declared type and the buffer is caught here explicitly; the earlier
+/// [`column_variant_matches`] gate also requires equal counts, but the check is
+/// restated so the zip below provably covers every declared element even if
+/// check ordering changes. The zero-element `Tuple()` needs no per-element
+/// validation; its row count is `TupleColumn::len`, already checked against
+/// `num_rows` by the caller.
+///
+/// Element names must also be a set the server can construct: the decode
+/// parser deliberately round-trips any received name shape (a server-authored
+/// header is preserved as written), so the type-string round-trip check in
+/// [`validate_column`] cannot catch a caller-constructed illegal name; it is
+/// rejected here instead (see the name checks below).
+fn validate_tuple(
+    field: &Field,
+    elements: &[(Option<String>, ChType)],
+    col: &TupleColumn,
+    num_rows: usize,
+) -> Result<(), EncodeError> {
+    // Mirror the server's tuple-name legality exactly (confirmed at
+    // v26.6.1.1193-stable, `src/DataTypes/DataTypeTuple.cpp`): the type factory
+    // rejects mixed named/unnamed elements ("Names are specified not for all
+    // elements of Tuple type"), and `checkTupleNames` rejects an empty name,
+    // the exact-lowercase reserved name "null" (it would collide with the
+    // Nullable null-map subcolumn name; "NULL"/"Null" are fine and render
+    // backtick-quoted), and duplicate names. A type violating any of these
+    // cannot exist on the server, so the rejection is `UnsupportedType`, the
+    // same classification as an illegal Map key.
+    let named = elements.iter().filter(|(name, _)| name.is_some()).count();
+    let mixed_names = named != 0 && named != elements.len();
+    let illegal_name = elements
+        .iter()
+        .any(|(name, _)| matches!(name.as_deref(), Some("") | Some("null")));
+    // O(n^2) over the element names; tuples are small and this runs once per
+    // column validation, never per row.
+    let duplicate_name = elements.iter().enumerate().any(|(i, (name, _))| {
+        name.is_some() && elements[..i].iter().any(|(other, _)| other == name)
+    });
+    if mixed_names || illegal_name || duplicate_name {
+        return Err(EncodeError::UnsupportedType {
+            column: field.name.clone(),
+            ch_type: field.ch_type.clone(),
+        });
+    }
+
+    if elements.len() != col.fields.len() {
+        return Err(EncodeError::InconsistentBatch {
+            detail: format!(
+                "column {:?} declares {} Tuple elements but the buffer carries {} field columns",
+                field.name,
+                elements.len(),
+                col.fields.len()
+            ),
+        });
+    }
+    for (i, ((name, element_type), element_col)) in elements.iter().zip(&col.fields).enumerate() {
+        let element_field = Field {
+            name: match name {
+                Some(n) => format!("{} element {n:?}", field.name),
+                None => format!("{} element {}", field.name, i + 1),
+            },
+            ch_type: element_type.clone(),
+        };
+        validate_column(&element_field, element_col, num_rows)?;
+    }
+    Ok(())
+}
+
+/// Validate a `Map(K, V)` column before any bytes are written.
+///
+/// [`encode_map_data`] writes `offsets[1..]` verbatim as raw `u64` and then the
+/// flattened key and value runs, so the same Arrow offset invariants as
+/// [`validate_array`] must hold: `num_rows + 1` offsets starting at 0,
+/// monotonically non-decreasing, final offset equal to the flattened entries
+/// length. The key type must satisfy the server's `DataTypeMap::isValidKeyType`
+/// constraint (no `Nullable` or `LowCardinality(Nullable(...))` key), reported
+/// as `UnsupportedType` since the type itself cannot exist on the server. The
+/// entries buffer must be a two-field `Tuple` column (keys then values) whose
+/// fields are validated recursively as their own columns of
+/// `offsets[num_rows]` rows, so every key/value-level guard applies to the
+/// flattened buffers.
+fn validate_map(
+    field: &Field,
+    key: &ChType,
+    value: &ChType,
+    col: &MapColumn,
+    num_rows: usize,
+) -> Result<(), EncodeError> {
+    let reject = |detail: String| Err(EncodeError::InconsistentBatch { detail });
+
+    if !is_valid_map_key_type(key) {
+        return Err(EncodeError::UnsupportedType {
+            column: field.name.clone(),
+            ch_type: field.ch_type.clone(),
+        });
+    }
+
+    // The same Arrow list offset invariants as `validate_array`; `MapColumn`'s
+    // offsets are physically the Array offsets of the wire's
+    // Array(Tuple(keys, values)).
+    if col.offsets.len() != num_rows + 1 {
+        return reject(format!(
+            "column {:?} declares {num_rows} rows so it needs {} Map offsets (a leading 0 plus one end-offset per row), but carries {}",
+            field.name,
+            num_rows + 1,
+            col.offsets.len()
+        ));
+    }
+    if col.offsets[0] != 0 {
+        return reject(format!(
+            "column {:?} has a nonzero first Map offset {}; Arrow list offsets start at 0",
+            field.name, col.offsets[0]
+        ));
+    }
+    for pair in col.offsets.windows(2) {
+        if pair[1] < pair[0] {
+            return reject(format!(
+                "column {:?} has non-monotonic Map offsets ({} then {})",
+                field.name, pair[0], pair[1]
+            ));
+        }
+    }
+    let total_entries = col.offsets[num_rows];
+    let entry_rows = col.entries.len();
+    if i64::try_from(entry_rows) != Ok(total_entries) {
+        return reject(format!(
+            "column {:?} Map offsets end at {total_entries} but the flattened entries column holds {entry_rows} rows",
+            field.name
+        ));
+    }
+
+    // The entries buffer must be the two-field keys/values tuple; each field is
+    // then validated recursively as its own column of `entry_rows` rows.
+    let entries = match col.entries.as_ref() {
+        Column::Tuple(t) if t.fields.len() == 2 => t,
+        Column::Tuple(t) => {
+            return reject(format!(
+                "column {:?} Map entries must carry exactly 2 field columns (keys, values), but carry {}",
+                field.name,
+                t.fields.len()
+            ));
+        }
+        // Defensive: `column_variant_matches` already required a two-field
+        // Tuple entries buffer, so a non-Tuple buffer cannot reach here.
+        _ => return Err(column_error(field, &field.ch_type)),
+    };
+    // The entries tuple never carries validity: the wire has no null map at
+    // the entries level (a map is never nullable there), so `encode_map_data`
+    // writes none, and a caller-attached bitmap would be silently dropped with
+    // its null entries encoded as real entries. Reject it before any bytes.
+    // (The recursive `validate_column` calls below cover the key and value
+    // columns but never the entries tuple itself, so this must be explicit.)
+    if entries.validity.is_some() {
+        return reject(format!(
+            "column {:?} Map entries tuple carries a validity bitmap; map entries are never nullable and the bitmap would be silently dropped",
+            field.name
+        ));
+    }
+    let key_field = Field {
+        name: format!("{} key", field.name),
+        ch_type: key.clone(),
+    };
+    validate_column(&key_field, &entries.fields[0], entry_rows)?;
+    let value_field = Field {
+        name: format!("{} value", field.name),
+        ch_type: value.clone(),
+    };
+    validate_column(&value_field, &entries.fields[1], entry_rows)
+}
+
 /// Whether `value_type` (the unwrapped inner value type) and `column` form a
 /// supported, matching pair this encoder can write.
 ///
@@ -687,6 +888,33 @@ fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
     // the top-level unwrap in `validate_column`.
     if let (ChType::Array(inner), Column::Array(c)) = (value_type, column) {
         return column_variant_matches(inner.inner(), c.values.as_ref());
+    }
+    // `Tuple(T1, ...)` matches only if the buffer carries exactly one field
+    // column per declared element and each matches its element value type in
+    // turn (a `Nullable` element unwraps to its inner, like the Array arm
+    // above; a `LowCardinality` or nested container element recurses through
+    // this function's own dispatch). The zero-element `Tuple()` matches a
+    // zero-field `TupleColumn`.
+    if let (ChType::Tuple(elements), Column::Tuple(c)) = (value_type, column) {
+        return elements.len() == c.fields.len()
+            && elements
+                .iter()
+                .zip(&c.fields)
+                .all(|((_, t), col)| column_variant_matches(t.inner(), col));
+    }
+    // `Map(K, V)` matches only if the entries buffer is a two-field Tuple
+    // column whose fields match the key and value types in turn (a `Nullable`
+    // value unwraps to its inner like everywhere else; a legal key is never
+    // `Nullable`, so its `inner()` is a no-op).
+    if let (ChType::Map(key, value), Column::Map(c)) = (value_type, column) {
+        return match c.entries.as_ref() {
+            Column::Tuple(t) => {
+                t.fields.len() == 2
+                    && column_variant_matches(key.inner(), &t.fields[0])
+                    && column_variant_matches(value.inner(), &t.fields[1])
+            }
+            _ => false,
+        };
     }
     matches!(
         (value_type, column),
@@ -849,6 +1077,29 @@ fn write_state_prefix(buf: &mut Vec<u8>, ch_type: &ChType) {
             buf.extend_from_slice(&LOW_CARDINALITY_KEY_VERSION.to_le_bytes());
         }
         ChType::Array(inner) => write_state_prefix(buf, inner),
+        // `SerializationTuple::serializeBinaryBulkStatePrefix` writes nothing of
+        // its own and delegates to every element in declaration order (confirmed
+        // at v26.6.1.1193-stable), so a LowCardinality element's key version is
+        // hoisted to the front of the whole Tuple column, before any element
+        // bodies, in element order.
+        ChType::Tuple(elements) => {
+            for (_, element_type) in elements {
+                write_state_prefix(buf, element_type);
+            }
+        }
+        // `SerializationMap` delegates through its nested Array(Tuple(...)),
+        // so the chain is Map -> Array (nothing) -> Tuple -> key's prefix then
+        // value's prefix (confirmed at v26.6.1.1193-stable). A
+        // Map(LowCardinality(String), V) therefore hoists the LC key version
+        // to the very front of the whole column, before the offsets.
+        ChType::Map(key, value) => {
+            write_state_prefix(buf, key);
+            write_state_prefix(buf, value);
+        }
+        // `SerializationNullable::serializeBinaryBulkStatePrefix` delegates to
+        // the nested type (confirmed at v26.6.1.1193-stable); only a
+        // `Nullable(Tuple(...))` can nest a prefix-bearing type today.
+        ChType::Nullable(inner) => write_state_prefix(buf, inner),
         _ => {}
     }
 }
@@ -891,11 +1142,104 @@ fn encode_column_values(
         }
         return Err(column_error(field, ch_type));
     }
-    if let ChType::Nullable(inner) = ch_type {
-        encode_null_map(buf, column);
-        return encode_column_body(buf, field, inner, column);
+    if let ChType::Map(key, value) = ch_type {
+        if let Column::Map(c) = column {
+            return encode_map_data(buf, field, ch_type, key, value, c);
+        }
+        return Err(column_error(field, ch_type));
     }
-    encode_column_body(buf, field, ch_type, column)
+    let value_type = if let ChType::Nullable(inner) = ch_type {
+        encode_null_map(buf, column);
+        inner.as_ref()
+    } else {
+        ch_type
+    };
+    // Tuple after the Nullable unwrap, mirroring the decode side: a
+    // `Nullable(Tuple(...))` writes its per-row null map above, then the tuple
+    // body (element bodies still carry a placeholder value for null rows).
+    if let ChType::Tuple(elements) = value_type {
+        if let Column::Tuple(c) = column {
+            return encode_tuple_data(buf, field, elements, c);
+        }
+        return Err(column_error(field, value_type));
+    }
+    encode_column_body(buf, field, value_type, column)
+}
+
+/// Encode one `Map(K, V)` column body: the Array offsets run, then the
+/// flattened key run and the flattened value run, the inverse of
+/// [`super::decode::decode_map`].
+///
+/// On the Native wire a Map is always the plain `Array(Tuple(keys, values))`
+/// layout (server `SerializationMap`, confirmed at v26.6.1.1193-stable; the
+/// bucketed `WITH_BUCKETS` on-disk mode never reaches the Native wire, see the
+/// decode-side doc). The offsets are `offsets[1..]` written as raw
+/// little-endian `u64` exactly like [`encode_array_data`] (validation proved
+/// them non-negative), and the two runs go through the shared
+/// [`encode_column_values`] path with no prefix re-emission
+/// ([`write_state_prefix`] hoisted the key and value prefixes to the front of
+/// the whole column). A zero-length entries run (rows > 0 but every map empty)
+/// writes nothing for the runs; in particular a `LowCardinality` key or value
+/// takes its `limit == 0` early-return gate.
+///
+/// `map_type` is the full declared `Map` type, used only for the defensive
+/// wrong-buffer error (validation already proved the entries shape).
+fn encode_map_data(
+    buf: &mut Vec<u8>,
+    field: &Field,
+    map_type: &ChType,
+    key: &ChType,
+    value: &ChType,
+    col: &MapColumn,
+) -> Result<(), EncodeError> {
+    // `get(1..)` rather than `[1..]`: validation guarantees the leading 0
+    // exists, but stay panic-free if a caller reaches this without validating.
+    if let Some(end_offsets) = col.offsets.get(1..) {
+        encode_primitive!(buf, end_offsets, i64);
+    }
+    match col.entries.as_ref() {
+        Column::Tuple(entries) if entries.fields.len() == 2 => {
+            encode_column_values(buf, field, key, &entries.fields[0])?;
+            encode_column_values(buf, field, value, &entries.fields[1])
+        }
+        // Defensive: `validate_map` rejected any other entries shape before
+        // the write phase.
+        _ => Err(column_error(field, map_type)),
+    }
+}
+
+/// Encode one `Tuple(T1, ...)` column body: each element column's FULL run, in
+/// declaration order, through the shared [`encode_column_values`] path (no
+/// state prefix re-emission; [`write_state_prefix`] already hoisted every
+/// element's prefix to the front of the whole column), the inverse of
+/// [`super::decode::decode_tuple`].
+///
+/// Wire layout per block (server `SerializationTuple`, confirmed at
+/// v26.6.1.1193-stable in `src/DataTypes/Serializations/SerializationTuple.cpp`):
+/// the element bodies one after another, column-of-columns, with no
+/// interleaving, no offsets, and no Tuple-level length framing. A `Nullable`,
+/// `LowCardinality`, `Array`, or nested `Tuple` element composes through the
+/// shared path, including the `limit == 0` early return for a zero-length
+/// `LowCardinality` element run.
+///
+/// The zero-element `Tuple()` writes exactly one literal ASCII '0' byte (0x30)
+/// per row and nothing else (confirmed at v26.6.1.1193-stable; the reader side
+/// ignores the byte values via `tryIgnore`); a zero-length run (`col.len == 0`,
+/// reachable nested inside an all-empty `Array` run) writes nothing.
+fn encode_tuple_data(
+    buf: &mut Vec<u8>,
+    field: &Field,
+    elements: &[(Option<String>, ChType)],
+    col: &TupleColumn,
+) -> Result<(), EncodeError> {
+    if elements.is_empty() {
+        buf.resize(buf.len() + col.len, b'0');
+        return Ok(());
+    }
+    for ((_, element_type), element_col) in elements.iter().zip(&col.fields) {
+        encode_column_values(buf, field, element_type, element_col)?;
+    }
+    Ok(())
 }
 
 /// Encode one `LowCardinality(T)` column body, after its 8-byte key-version
@@ -1367,6 +1711,21 @@ fn is_encodable(ch_type: &ChType) -> bool {
         // `parse_ch_type` never nests `Array` directly inside `Nullable`, so
         // `inner()` cannot hide a second `Array` wrapper.
         ChType::Array(inner) => is_encodable(inner.inner()),
+        // `Tuple(T1, ...)` writes its element bodies through the shared path
+        // (`encode_tuple_data`), so it is encodable exactly when every element
+        // value type is (a `Nullable` element unwraps like the Array arm). The
+        // zero-element `Tuple()` is encodable: its body is the one placeholder
+        // byte per row.
+        ChType::Tuple(elements) => elements.iter().all(|(_, t)| is_encodable(t.inner())),
+        // `Map(K, V)` only frames Array offsets around its flattened key and
+        // value runs (`encode_map_data`), so it is encodable exactly when the
+        // key type is legal (the server's `isValidKeyType`: never `Nullable`
+        // or `LowCardinality(Nullable(...))`) and both types are encodable. A
+        // legal key is never `Nullable`, so it is checked directly; the value
+        // unwraps a `Nullable` like everywhere else.
+        ChType::Map(key, value) => {
+            is_valid_map_key_type(key) && is_encodable(key) && is_encodable(value.inner())
+        }
         ChType::Nullable(_) => false,
     }
 }
@@ -2046,6 +2405,290 @@ mod tests {
         ColBatch::new(Schema::new(fields), columns, 3)
     }
 
+    /// Tuple(Int32, String) plus a named Tuple(a Int32, b Nullable(String)),
+    /// covering an unnamed tuple, element names, and a Nullable element.
+    fn tuple_batch() -> ColBatch {
+        let fields = vec![
+            Field {
+                name: "t".into(),
+                ch_type: ChType::Tuple(vec![(None, ChType::Int32), (None, ChType::String)]),
+            },
+            Field {
+                name: "tn".into(),
+                ch_type: ChType::Tuple(vec![
+                    (Some("a".to_string()), ChType::Int32),
+                    (
+                        Some("b".to_string()),
+                        ChType::Nullable(Box::new(ChType::String)),
+                    ),
+                ]),
+            },
+        ];
+        let mut b = utf8_column(&[b"user_1", b"", b"user_2"]);
+        b.validity = Some(Bitmap::from_ch_null_map(&[0x00, 0x01, 0x00]));
+        let columns = vec![
+            Column::Tuple(TupleColumn::new(
+                vec![
+                    Column::Int32(PrimitiveColumn::new(vec![13, 79, -7])),
+                    Column::Utf8(utf8_column(&[b"user_1", b"user_2", b""])),
+                ],
+                3,
+            )),
+            Column::Tuple(TupleColumn::new(
+                vec![
+                    Column::Int32(PrimitiveColumn::new(vec![1, 2, 3])),
+                    Column::Utf8(b),
+                ],
+                3,
+            )),
+        ];
+        ColBatch::new(Schema::new(fields), columns, 3)
+    }
+
+    /// Nullable(Tuple(Int32, String)) with the tuple-level null map, plus a
+    /// tuple with a LowCardinality element (whose key-version prefix is hoisted
+    /// ahead of element 0's body).
+    fn nullable_and_lc_tuple_batch() -> ColBatch {
+        let fields = vec![
+            Field {
+                name: "nt".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::Tuple(vec![
+                    (None, ChType::Int32),
+                    (None, ChType::String),
+                ]))),
+            },
+            Field {
+                name: "tlc".into(),
+                ch_type: ChType::Tuple(vec![
+                    (Some("k".to_string()), ChType::Int32),
+                    (
+                        Some("lc".to_string()),
+                        ChType::LowCardinality(Box::new(ChType::String)),
+                    ),
+                ]),
+            },
+        ];
+        let columns = vec![
+            Column::Tuple(TupleColumn::new_nullable(
+                vec![
+                    Column::Int32(PrimitiveColumn::new(vec![13, 0, 79])),
+                    Column::Utf8(utf8_column(&[b"user_1", b"", b"user_2"])),
+                ],
+                3,
+                Bitmap::from_ch_null_map(&[0x00, 0x01, 0x00]),
+            )),
+            Column::Tuple(TupleColumn::new(
+                vec![
+                    Column::Int32(PrimitiveColumn::new(vec![1, 2, 3])),
+                    Column::Dictionary(DictionaryColumn::new(
+                        vec![1, 2, 1],
+                        Column::Utf8(utf8_column(&[b"", b"red", b"green"])),
+                    )),
+                ],
+                3,
+            )),
+        ];
+        ColBatch::new(Schema::new(fields), columns, 3)
+    }
+
+    /// Array(Tuple(Int32, Int32)) and a nested Tuple(p Tuple(Int8, Int8), s
+    /// String), covering both container compositions.
+    fn array_and_nested_tuple_batch() -> ColBatch {
+        let fields = vec![
+            Field {
+                name: "at".into(),
+                ch_type: ChType::Array(Box::new(ChType::Tuple(vec![
+                    (None, ChType::Int32),
+                    (None, ChType::Int32),
+                ]))),
+            },
+            Field {
+                name: "tt".into(),
+                ch_type: ChType::Tuple(vec![
+                    (
+                        Some("p".to_string()),
+                        ChType::Tuple(vec![(None, ChType::Int8), (None, ChType::Int8)]),
+                    ),
+                    (Some("s".to_string()), ChType::String),
+                ]),
+            },
+        ];
+        let columns = vec![
+            // [], [(13, 79)], [(1, 2), (3, 4)] -> offsets [0, 0, 1, 3].
+            Column::Array(ArrayColumn::new(
+                vec![0, 0, 1, 3],
+                Column::Tuple(TupleColumn::new(
+                    vec![
+                        Column::Int32(PrimitiveColumn::new(vec![13, 1, 3])),
+                        Column::Int32(PrimitiveColumn::new(vec![79, 2, 4])),
+                    ],
+                    3,
+                )),
+            )),
+            Column::Tuple(TupleColumn::new(
+                vec![
+                    Column::Tuple(TupleColumn::new(
+                        vec![
+                            Column::Int8(PrimitiveColumn::new(vec![1, 3, 5])),
+                            Column::Int8(PrimitiveColumn::new(vec![2, 4, 6])),
+                        ],
+                        3,
+                    )),
+                    Column::Utf8(utf8_column(&[b"user_1", b"user_2", b"user_3"])),
+                ],
+                3,
+            )),
+        ];
+        ColBatch::new(Schema::new(fields), columns, 3)
+    }
+
+    /// The zero-element Tuple(): one placeholder byte per row on the wire.
+    fn empty_tuple_batch() -> ColBatch {
+        let fields = vec![
+            Field {
+                name: "k".into(),
+                ch_type: ChType::Int32,
+            },
+            Field {
+                name: "t0".into(),
+                ch_type: ChType::Tuple(vec![]),
+            },
+        ];
+        let columns = vec![
+            Column::Int32(PrimitiveColumn::new(vec![13, 79])),
+            Column::Tuple(TupleColumn::new(vec![], 2)),
+        ];
+        ColBatch::new(Schema::new(fields), columns, 2)
+    }
+
+    /// Build a `MapColumn` from Arrow-shaped offsets plus the keys and values
+    /// columns.
+    fn map_column(offsets: Vec<i64>, keys: Column, values: Column) -> MapColumn {
+        let total = keys.len();
+        MapColumn::new(
+            offsets,
+            Column::Tuple(TupleColumn::new(vec![keys, values], total)),
+        )
+    }
+
+    /// Map(String, Int32) plus Map(Int32, Nullable(String)), covering a plain
+    /// map with an empty row and a Nullable value run.
+    fn map_batch() -> ColBatch {
+        let fields = vec![
+            Field {
+                name: "m".into(),
+                ch_type: ChType::Map(Box::new(ChType::String), Box::new(ChType::Int32)),
+            },
+            Field {
+                name: "mnv".into(),
+                ch_type: ChType::Map(
+                    Box::new(ChType::Int32),
+                    Box::new(ChType::Nullable(Box::new(ChType::String))),
+                ),
+            },
+        ];
+        let mut nullable_values = utf8_column(&[b"user_1", b"", b"user_2"]);
+        nullable_values.validity = Some(Bitmap::from_ch_null_map(&[0x00, 0x01, 0x00]));
+        let columns = vec![
+            // {} / {a: 13} / {a: 1, b: 2}
+            Column::Map(map_column(
+                vec![0, 0, 1, 3],
+                Column::Utf8(utf8_column(&[b"a", b"a", b"b"])),
+                Column::Int32(PrimitiveColumn::new(vec![13, 1, 2])),
+            )),
+            // {1: user_1} / {2: NULL} / {3: user_2}
+            Column::Map(map_column(
+                vec![0, 1, 2, 3],
+                Column::Int32(PrimitiveColumn::new(vec![1, 2, 3])),
+                Column::Utf8(nullable_values),
+            )),
+        ];
+        ColBatch::new(Schema::new(fields), columns, 3)
+    }
+
+    /// Map(LowCardinality(String), UInt8) (the hoisted key prefix) plus
+    /// Map(String, Array(Int32)) and a nested Map value.
+    fn lc_and_nested_map_batch() -> ColBatch {
+        let fields = vec![
+            Field {
+                name: "mlc".into(),
+                ch_type: ChType::Map(
+                    Box::new(ChType::LowCardinality(Box::new(ChType::String))),
+                    Box::new(ChType::UInt8),
+                ),
+            },
+            Field {
+                name: "marr".into(),
+                ch_type: ChType::Map(
+                    Box::new(ChType::String),
+                    Box::new(ChType::Array(Box::new(ChType::Int32))),
+                ),
+            },
+            Field {
+                name: "mm".into(),
+                ch_type: ChType::Map(
+                    Box::new(ChType::String),
+                    Box::new(ChType::Map(
+                        Box::new(ChType::String),
+                        Box::new(ChType::Int32),
+                    )),
+                ),
+            },
+        ];
+        let columns = vec![
+            // {red: 1} / {} / {red: 2, blue: 3}
+            Column::Map(map_column(
+                vec![0, 1, 1, 3],
+                Column::Dictionary(DictionaryColumn::new(
+                    vec![1, 1, 2],
+                    Column::Utf8(utf8_column(&[b"", b"red", b"blue"])),
+                )),
+                Column::UInt8(PrimitiveColumn::new(vec![1, 2, 3])),
+            )),
+            // {a: [13]} / {b: [], c: [1, 2]} / {}
+            Column::Map(map_column(
+                vec![0, 1, 3, 3],
+                Column::Utf8(utf8_column(&[b"a", b"b", b"c"])),
+                Column::Array(ArrayColumn::new(
+                    vec![0, 1, 1, 3],
+                    Column::Int32(PrimitiveColumn::new(vec![13, 1, 2])),
+                )),
+            )),
+            // {a: {x: 1}} / {b: {y: 2, z: 3}} / {}
+            Column::Map(map_column(
+                vec![0, 1, 2, 2],
+                Column::Utf8(utf8_column(&[b"a", b"b"])),
+                Column::Map(map_column(
+                    vec![0, 1, 3],
+                    Column::Utf8(utf8_column(&[b"x", b"y", b"z"])),
+                    Column::Int32(PrimitiveColumn::new(vec![1, 2, 3])),
+                )),
+            )),
+        ];
+        ColBatch::new(Schema::new(fields), columns, 3)
+    }
+
+    /// Array(Map(String, Int32)): maps flattened under array offsets.
+    fn array_of_map_batch() -> ColBatch {
+        let fields = vec![Field {
+            name: "am".into(),
+            ch_type: ChType::Array(Box::new(ChType::Map(
+                Box::new(ChType::String),
+                Box::new(ChType::Int32),
+            ))),
+        }];
+        // [] / [{a: 1}] / [{b: 2}, {}]
+        let columns = vec![Column::Array(ArrayColumn::new(
+            vec![0, 0, 1, 3],
+            Column::Map(map_column(
+                vec![0, 1, 2, 2],
+                Column::Utf8(utf8_column(&[b"a", b"b"])),
+                Column::Int32(PrimitiveColumn::new(vec![1, 2])),
+            )),
+        ))];
+        ColBatch::new(Schema::new(fields), columns, 3)
+    }
+
     /// Compare two columns for the types this encoder covers. Used recursively
     /// for `LowCardinality` dictionary values.
     fn assert_columns_eq(left: &Column, right: &Column, label: &str) {
@@ -2105,6 +2748,22 @@ mod tests {
                 assert_eq!(x.offsets, y.offsets, "{label} array offsets differ");
                 let elem_label = format!("{label} array elements");
                 assert_columns_eq(x.values.as_ref(), y.values.as_ref(), &elem_label);
+            }
+            (Column::Tuple(x), Column::Tuple(y)) => {
+                assert_eq!(x.len, y.len, "{label} tuple len differs");
+                assert_eq!(
+                    x.fields.len(),
+                    y.fields.len(),
+                    "{label} tuple field count differs"
+                );
+                for (i, (a, b)) in x.fields.iter().zip(&y.fields).enumerate() {
+                    assert_columns_eq(a, b, &format!("{label} tuple element {i}"));
+                }
+            }
+            (Column::Map(x), Column::Map(y)) => {
+                assert_eq!(x.offsets, y.offsets, "{label} map offsets differ");
+                let entries_label = format!("{label} map entries");
+                assert_columns_eq(x.entries.as_ref(), y.entries.as_ref(), &entries_label);
             }
             (other_a, other_b) => panic!("{label}: unexpected {other_a:?} vs {other_b:?}"),
         }
@@ -2362,6 +3021,313 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_tuple_rev0() {
+        roundtrip(&tuple_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_tuple_tcp_revision() {
+        roundtrip(&tuple_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_nullable_and_lc_tuple_rev0() {
+        roundtrip(&nullable_and_lc_tuple_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_nullable_and_lc_tuple_tcp_revision() {
+        roundtrip(&nullable_and_lc_tuple_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_array_and_nested_tuple_rev0() {
+        roundtrip(&array_and_nested_tuple_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_array_and_nested_tuple_tcp_revision() {
+        roundtrip(&array_and_nested_tuple_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_map_rev0() {
+        roundtrip(&map_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_map_tcp_revision() {
+        roundtrip(&map_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_lc_and_nested_map_rev0() {
+        roundtrip(&lc_and_nested_map_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_lc_and_nested_map_tcp_revision() {
+        roundtrip(&lc_and_nested_map_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_array_of_map_rev0() {
+        roundtrip(&array_of_map_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_array_of_map_tcp_revision() {
+        roundtrip(&array_of_map_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_map_all_empty_lc_key() {
+        // Map(LowCardinality(String), Int32) with rows > 0 but every map empty:
+        // the wire must be the hoisted LC key version, the zero offsets, and
+        // NOTHING for the key/value runs (limit == 0 gates through the Map
+        // path).
+        let fields = vec![Field {
+            name: "m".into(),
+            ch_type: ChType::Map(
+                Box::new(ChType::LowCardinality(Box::new(ChType::String))),
+                Box::new(ChType::Int32),
+            ),
+        }];
+        let columns = vec![Column::Map(map_column(
+            vec![0, 0, 0, 0],
+            Column::Dictionary(DictionaryColumn::new(
+                vec![],
+                Column::Utf8(utf8_column(&[])),
+            )),
+            Column::Int32(PrimitiveColumn::new(vec![])),
+        ))];
+        let batch = ColBatch::new(Schema::new(fields), columns, 3);
+
+        // Pin the exact wire body: header, then key version + three zero
+        // offsets and nothing else.
+        let bytes = encode_block(
+            &batch,
+            &EncodeOptions {
+                protocol_revision: 0,
+            },
+        )
+        .unwrap();
+        let mut expected = Vec::new();
+        expected.push(0x01); // 1 column
+        expected.push(0x03); // 3 rows
+        expected.push(0x01); // name len
+        expected.extend_from_slice(b"m");
+        let type_name = "Map(LowCardinality(String), Int32)";
+        expected.push(type_name.len() as u8);
+        expected.extend_from_slice(type_name.as_bytes());
+        expected.extend_from_slice(&1u64.to_le_bytes()); // hoisted LC key version
+        expected.extend_from_slice(&[0u8; 24]); // three zero offsets
+        assert_eq!(bytes, expected);
+
+        roundtrip(&batch, 0);
+        roundtrip(&batch, DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn rev0_frames_map_bytes() {
+        // Pin the Map body framing: the Array offsets run (no leading zero),
+        // then the flattened key run, then the flattened value run. One
+        // Map(String, Int32) column "m" with two rows {hi: 13} and {}.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "m".into(),
+                ch_type: ChType::Map(Box::new(ChType::String), Box::new(ChType::Int32)),
+            }]),
+            vec![Column::Map(map_column(
+                vec![0, 1, 1],
+                Column::Utf8(utf8_column(&[b"hi"])),
+                Column::Int32(PrimitiveColumn::new(vec![13])),
+            ))],
+            2,
+        );
+        let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+        let expected = [
+            0x01, // num_cols = 1
+            0x02, // num_rows = 2
+            0x01, b'm', // name "m"
+            0x12, // type name length 18
+            b'M', b'a', b'p', b'(', b'S', b't', b'r', b'i', b'n', b'g', b',', b' ', b'I', b'n',
+            b't', b'3', b'2', b')', // type "Map(String, Int32)"
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // offset row 0: 1
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // offset row 1: 1
+            0x02, b'h', b'i', // key run: varint len 2 then "hi"
+            0x0D, 0x00, 0x00, 0x00, // value run: Int32 13
+        ];
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn map_illegal_key_type_is_rejected() {
+        // A Nullable key violates the server's DataTypeMap::isValidKeyType, so
+        // the type itself cannot exist: UnsupportedType, before any bytes.
+        let ch_type = ChType::Map(
+            Box::new(ChType::Nullable(Box::new(ChType::String))),
+            Box::new(ChType::Int32),
+        );
+        let mut keys = utf8_column(&[b"a"]);
+        keys.validity = Some(Bitmap::from_ch_null_map(&[0x00]));
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "m".into(),
+                ch_type: ch_type.clone(),
+            }]),
+            vec![Column::Map(map_column(
+                vec![0, 1],
+                Column::Utf8(keys),
+                Column::Int32(PrimitiveColumn::new(vec![13])),
+            ))],
+            1,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::UnsupportedType { column, ch_type: t } => {
+                assert_eq!(column, "m");
+                assert_eq!(t, ch_type);
+            }
+            other => panic!("expected UnsupportedType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_offsets_entries_mismatch_is_rejected() {
+        // Offsets end at 2 but the entries tuple holds 1 row: a misframed
+        // stream the server would reject, so InconsistentBatch before any
+        // bytes.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "m".into(),
+                ch_type: ChType::Map(Box::new(ChType::String), Box::new(ChType::Int32)),
+            }]),
+            vec![Column::Map(map_column(
+                vec![0, 2],
+                Column::Utf8(utf8_column(&[b"a"])),
+                Column::Int32(PrimitiveColumn::new(vec![13])),
+            ))],
+            1,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_ragged_entries_are_rejected() {
+        // Keys and values of different lengths cannot both be full runs of the
+        // entry count: InconsistentBatch, not a panic.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "m".into(),
+                ch_type: ChType::Map(Box::new(ChType::String), Box::new(ChType::Int32)),
+            }]),
+            vec![Column::Map(map_column(
+                vec![0, 2],
+                Column::Utf8(utf8_column(&[b"a", b"b"])),
+                Column::Int32(PrimitiveColumn::new(vec![13])),
+            ))],
+            1,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nullable_map_nesting_is_rejected() {
+        // Nullable(Map) is not constructible on the server
+        // (canBeInsideNullable false); the type-header round-trip check fails
+        // before any bytes are written, like Nullable(LowCardinality).
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "nm".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::Map(
+                    Box::new(ChType::String),
+                    Box::new(ChType::Int32),
+                ))),
+            }]),
+            vec![Column::Map(map_column(
+                vec![0, 1],
+                Column::Utf8(utf8_column(&[b"a"])),
+                Column::Int32(PrimitiveColumn::new(vec![13])),
+            ))],
+            1,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_empty_tuple_rev0() {
+        roundtrip(&empty_tuple_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_empty_tuple_tcp_revision() {
+        roundtrip(&empty_tuple_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_array_of_tuple_all_empty() {
+        // Array(Tuple(LowCardinality(String), Int32)) with rows > 0 but every
+        // array empty: the wire must be the hoisted LC key version, the zero
+        // offsets, and NOTHING for the element bodies (each element gets a
+        // limit == 0 run through the Tuple path; the LC early-return gate must
+        // fire).
+        let fields = vec![Field {
+            name: "a".into(),
+            ch_type: ChType::Array(Box::new(ChType::Tuple(vec![
+                (None, ChType::LowCardinality(Box::new(ChType::String))),
+                (None, ChType::Int32),
+            ]))),
+        }];
+        let columns = vec![Column::Array(ArrayColumn::new(
+            vec![0, 0, 0, 0],
+            Column::Tuple(TupleColumn::new(
+                vec![
+                    Column::Dictionary(DictionaryColumn::new(
+                        vec![],
+                        Column::Utf8(utf8_column(&[])),
+                    )),
+                    Column::Int32(PrimitiveColumn::new(vec![])),
+                ],
+                0,
+            )),
+        ))];
+        let batch = ColBatch::new(Schema::new(fields), columns, 3);
+
+        // Pin the exact wire body: header, then key version + three zero
+        // offsets and nothing else.
+        let bytes = encode_block(
+            &batch,
+            &EncodeOptions {
+                protocol_revision: 0,
+            },
+        )
+        .unwrap();
+        let mut expected = Vec::new();
+        expected.push(0x01); // 1 column
+        expected.push(0x03); // 3 rows
+        expected.push(0x01); // name len
+        expected.extend_from_slice(b"a");
+        let type_name = "Array(Tuple(LowCardinality(String), Int32))";
+        expected.push(type_name.len() as u8);
+        expected.extend_from_slice(type_name.as_bytes());
+        expected.extend_from_slice(&1u64.to_le_bytes()); // hoisted LC key version
+        expected.extend_from_slice(&[0u8; 24]); // three zero offsets
+        assert_eq!(bytes, expected);
+
+        roundtrip(&batch, 0);
+        roundtrip(&batch, DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
     fn zero_row_block_roundtrips_schema() {
         // A zero-row block still carries full column headers. The decoder keeps
         // the schema but drops the empty block from `chunks`.
@@ -2412,6 +3378,21 @@ mod tests {
                 name: "alc".into(),
                 ch_type: ChType::Array(Box::new(ChType::LowCardinality(Box::new(ChType::String)))),
             },
+            Field {
+                name: "t".into(),
+                ch_type: ChType::Tuple(vec![
+                    (Some("a".to_string()), ChType::Int32),
+                    (Some("b".to_string()), ChType::String),
+                ]),
+            },
+            Field {
+                name: "t0".into(),
+                ch_type: ChType::Tuple(vec![]),
+            },
+            Field {
+                name: "m".into(),
+                ch_type: ChType::Map(Box::new(ChType::String), Box::new(ChType::Int32)),
+            },
         ];
         let columns = vec![
             Column::Int32(PrimitiveColumn::new(vec![])),
@@ -2441,6 +3422,23 @@ mod tests {
                     vec![],
                     Column::Utf8(utf8_column(&[])),
                 )),
+            )),
+            // A zero-row Tuple carries only the header: no element bodies, and
+            // for Tuple() no placeholder bytes either.
+            Column::Tuple(TupleColumn::new(
+                vec![
+                    Column::Int32(PrimitiveColumn::new(vec![])),
+                    Column::Utf8(utf8_column(&[])),
+                ],
+                0,
+            )),
+            Column::Tuple(TupleColumn::new(vec![], 0)),
+            // A zero-row Map carries only the leading-0 offset and writes no
+            // data at all.
+            Column::Map(map_column(
+                vec![0],
+                Column::Utf8(utf8_column(&[])),
+                Column::Int32(PrimitiveColumn::new(vec![])),
             )),
         ];
         let batch = ColBatch::new(Schema::new(fields), columns, 0);
@@ -2768,6 +3766,337 @@ mod tests {
                 assert_eq!(ch_type, lc_decimal);
             }
             other => panic!("expected UnsupportedType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rev0_frames_tuple_bytes() {
+        // Pin the Tuple body framing: element 0's FULL run then element 1's,
+        // column-of-columns, no interleaving, no offsets, no tuple-level
+        // framing. One Tuple(Int32, String) column "t" with two rows
+        // (13, "hi") and (-1, "").
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "t".into(),
+                ch_type: ChType::Tuple(vec![(None, ChType::Int32), (None, ChType::String)]),
+            }]),
+            vec![Column::Tuple(TupleColumn::new(
+                vec![
+                    Column::Int32(PrimitiveColumn::new(vec![13, -1])),
+                    Column::Utf8(utf8_column(&[b"hi", b""])),
+                ],
+                2,
+            ))],
+            2,
+        );
+        let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+        let expected = [
+            0x01, // num_cols = 1
+            0x02, // num_rows = 2
+            0x01, b't', // name "t"
+            0x14, // type name length 20
+            b'T', b'u', b'p', b'l', b'e', b'(', b'I', b'n', b't', b'3', b'2', b',', b' ', b'S',
+            b't', b'r', b'i', b'n', b'g', b')', // type "Tuple(Int32, String)"
+            0x0D, 0x00, 0x00, 0x00, // element 0 row 0: Int32 13
+            0xFF, 0xFF, 0xFF, 0xFF, // element 0 row 1: Int32 -1
+            0x02, b'h', b'i', // element 1 row 0: varint len 2 then "hi"
+            0x00, // element 1 row 1: varint len 0
+        ];
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn rev0_frames_empty_tuple_bytes() {
+        // Pin the zero-element Tuple() body: exactly one literal ASCII '0'
+        // byte (0x30) per row, nothing else.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "t0".into(),
+                ch_type: ChType::Tuple(vec![]),
+            }]),
+            vec![Column::Tuple(TupleColumn::new(vec![], 3))],
+            3,
+        );
+        let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+        let expected = [
+            0x01, // num_cols = 1
+            0x03, // num_rows = 3
+            0x02, b't', b'0', // name "t0"
+            0x07, b'T', b'u', b'p', b'l', b'e', b'(', b')', // type "Tuple()"
+            0x30, 0x30, 0x30, // one ASCII '0' per row
+        ];
+        assert_eq!(bytes, expected);
+    }
+
+    /// A one-element named-tuple batch over a matching one-field Int8 column,
+    /// for the element-name legality tests.
+    fn named_tuple_batch(name: Option<&str>) -> ColBatch {
+        ColBatch::new(
+            Schema::new(vec![Field {
+                name: "t".into(),
+                ch_type: ChType::Tuple(vec![(name.map(str::to_string), ChType::Int8)]),
+            }]),
+            vec![Column::Tuple(TupleColumn::new(
+                vec![Column::Int8(PrimitiveColumn::new(vec![13]))],
+                1,
+            ))],
+            1,
+        )
+    }
+
+    #[test]
+    fn tuple_illegal_element_names_are_rejected() {
+        // Mirror the server's checkTupleNames: an empty name and the reserved
+        // exact-lowercase "null" cannot exist on the server, so they are
+        // UnsupportedType. The decode parser round-trips these shapes (a
+        // server-authored header is preserved), so the type-string round-trip
+        // check cannot catch them; the explicit name check must.
+        for bad in [Some(""), Some("null")] {
+            match encode_block(&named_tuple_batch(bad), &EncodeOptions::default()).unwrap_err() {
+                EncodeError::UnsupportedType { column, .. } => assert_eq!(column, "t"),
+                other => panic!("expected UnsupportedType for {bad:?}, got {other:?}"),
+            }
+        }
+        // Any-case variants other than exact-lowercase "null" are legal on the
+        // server (checkTupleNames compares exactly) and render backtick-quoted.
+        for ok in [Some("NULL"), Some("Null"), Some("a"), None] {
+            encode_block(&named_tuple_batch(ok), &EncodeOptions::default())
+                .unwrap_or_else(|e| panic!("{ok:?} should encode: {e}"));
+        }
+    }
+
+    #[test]
+    fn tuple_duplicate_element_names_are_rejected() {
+        // checkTupleNames rejects duplicates (DUPLICATE_COLUMN). Unnamed
+        // elements do not count as duplicates of each other.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "t".into(),
+                ch_type: ChType::Tuple(vec![
+                    (Some("a".to_string()), ChType::Int8),
+                    (Some("a".to_string()), ChType::Int8),
+                ]),
+            }]),
+            vec![Column::Tuple(TupleColumn::new(
+                vec![
+                    Column::Int8(PrimitiveColumn::new(vec![13])),
+                    Column::Int8(PrimitiveColumn::new(vec![79])),
+                ],
+                1,
+            ))],
+            1,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::UnsupportedType { column, .. } => assert_eq!(column, "t"),
+            other => panic!("expected UnsupportedType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tuple_mixed_named_unnamed_elements_are_rejected() {
+        // The server's tuple type factory rejects mixed named/unnamed
+        // arguments ("Names are specified not for all elements of Tuple
+        // type"), so a mixed ChType is caller-constructed-only and its
+        // rendered header cannot be parsed back by the server.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "t".into(),
+                ch_type: ChType::Tuple(vec![
+                    (Some("a".to_string()), ChType::Int8),
+                    (None, ChType::Int8),
+                ]),
+            }]),
+            vec![Column::Tuple(TupleColumn::new(
+                vec![
+                    Column::Int8(PrimitiveColumn::new(vec![13])),
+                    Column::Int8(PrimitiveColumn::new(vec![79])),
+                ],
+                1,
+            ))],
+            1,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::UnsupportedType { column, .. } => assert_eq!(column, "t"),
+            other => panic!("expected UnsupportedType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_tuple_illegal_names_are_rejected() {
+        // The name legality check applies through nesting: a duplicate-named
+        // tuple as an Array element is rejected by the recursive validation.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "a".into(),
+                ch_type: ChType::Array(Box::new(ChType::Tuple(vec![
+                    (Some("x".to_string()), ChType::Int8),
+                    (Some("x".to_string()), ChType::Int8),
+                ]))),
+            }]),
+            vec![Column::Array(ArrayColumn::new(
+                vec![0, 1],
+                Column::Tuple(TupleColumn::new(
+                    vec![
+                        Column::Int8(PrimitiveColumn::new(vec![13])),
+                        Column::Int8(PrimitiveColumn::new(vec![79])),
+                    ],
+                    1,
+                )),
+            ))],
+            1,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::UnsupportedType { .. } => {}
+            other => panic!("expected UnsupportedType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_tuple_validity_with_nulls_is_rejected() {
+        // A non-Nullable Tuple field whose TupleColumn carries null-marked
+        // validity would have the null map silently dropped (no null map is
+        // written for a non-nullable column), so the generic nullability check
+        // rejects it, the same as every other non-nullable column type.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "t".into(),
+                ch_type: ChType::Tuple(vec![(None, ChType::Int8)]),
+            }]),
+            vec![Column::Tuple(TupleColumn::new_nullable(
+                vec![Column::Int8(PrimitiveColumn::new(vec![13, 0]))],
+                2,
+                Bitmap::from_ch_null_map(&[0x00, 0x01]),
+            ))],
+            2,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_entries_validity_is_rejected() {
+        // The Map entries tuple never carries validity on the wire;
+        // encode_map_data writes no null map for it, so a caller-attached
+        // bitmap (even all-valid) would be silently dropped. Rejected before
+        // any bytes.
+        let entries = Column::Tuple(TupleColumn::new_nullable(
+            vec![
+                Column::Utf8(utf8_column(&[b"a"])),
+                Column::Int32(PrimitiveColumn::new(vec![13])),
+            ],
+            1,
+            Bitmap::from_ch_null_map(&[0x00]),
+        ));
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "m".into(),
+                ch_type: ChType::Map(Box::new(ChType::String), Box::new(ChType::Int32)),
+            }]),
+            vec![Column::Map(MapColumn::new(vec![0, 1], entries))],
+            1,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { detail } => {
+                assert!(detail.contains("entries"), "got detail {detail:?}");
+            }
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tuple_field_count_mismatch_is_rejected() {
+        // The declared type has two elements; the buffer carries one field
+        // column. InconsistentBatch, before any bytes are written.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "t".into(),
+                ch_type: ChType::Tuple(vec![(None, ChType::Int32), (None, ChType::String)]),
+            }]),
+            vec![Column::Tuple(TupleColumn::new(
+                vec![Column::Int32(PrimitiveColumn::new(vec![13]))],
+                1,
+            ))],
+            1,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tuple_ragged_element_lengths_are_rejected() {
+        // Element 0 has two rows, element 1 has one: a ragged tuple would put a
+        // misframed stream on the wire (the server's equal-sizes INCORRECT_DATA
+        // invariant), so it is InconsistentBatch, not a panic.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "t".into(),
+                ch_type: ChType::Tuple(vec![(None, ChType::Int32), (None, ChType::String)]),
+            }]),
+            vec![Column::Tuple(TupleColumn::new(
+                vec![
+                    Column::Int32(PrimitiveColumn::new(vec![13, 79])),
+                    Column::Utf8(utf8_column(&[b"user_1"])),
+                ],
+                2,
+            ))],
+            2,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tuple_mismatched_element_buffer_is_rejected() {
+        // A declared Int64 element over an Int32 buffer is a wrong-buffer
+        // mismatch, not a wrong-width column on the wire.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "t".into(),
+                ch_type: ChType::Tuple(vec![(None, ChType::Int64)]),
+            }]),
+            vec![Column::Tuple(TupleColumn::new(
+                vec![Column::Int32(PrimitiveColumn::new(vec![13]))],
+                1,
+            ))],
+            1,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tuple_type_depth_is_capped_via_worklist() {
+        // A pathologically deep caller-constructed type must be rejected by the
+        // iterative depth walk before any recursive machinery touches it. Tuple
+        // is the multi-child container, so this exercises the worklist path
+        // with a depth well past MAX_TYPE_DEPTH.
+        let mut ch_type = ChType::Int8;
+        let mut column = Column::Int8(PrimitiveColumn::new(vec![13]));
+        for _ in 0..(MAX_TYPE_DEPTH * 4) {
+            ch_type = ChType::Tuple(vec![(None, ch_type)]);
+            column = Column::Tuple(TupleColumn::new(vec![column], 1));
+        }
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "deep".into(),
+                ch_type,
+            }]),
+            vec![column],
+            1,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { detail } => {
+                assert!(detail.contains("nesting exceeds"), "got detail {detail:?}");
+            }
+            other => panic!("expected InconsistentBatch, got {other:?}"),
         }
     }
 

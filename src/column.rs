@@ -397,6 +397,109 @@ impl ArrayColumn {
     }
 }
 
+/// Tuple column in Arrow struct layout (`Tuple(T1, ...)`).
+///
+/// `fields` holds one child `Column` per tuple element, in declaration order,
+/// each of length `len` (the element names live in the schema's
+/// `ChType::Tuple`, not here). `len` is stored explicitly rather than derived
+/// from the children so the zero-element `Tuple()` (which has no child columns
+/// at all, only a placeholder byte per row on the wire) still knows its row
+/// count.
+///
+/// `validity` is the tuple-level validity bitmap, populated only for a
+/// `Nullable(Tuple(...))` (legal on the server:
+/// `DataTypeTuple::canBeInsideNullable()` is true). Per the Arrow spec a
+/// struct's validity is independent of its children; a null tuple row still
+/// carries placeholder (default) values in every child column, exactly as the
+/// server serializes it.
+#[derive(Debug, Clone)]
+pub struct TupleColumn {
+    pub fields: Vec<Column>,
+    pub len: usize,
+    pub validity: Option<Bitmap>,
+}
+
+impl TupleColumn {
+    pub fn new(fields: Vec<Column>, len: usize) -> Self {
+        Self {
+            fields,
+            len,
+            validity: None,
+        }
+    }
+
+    pub fn new_nullable(fields: Vec<Column>, len: usize, validity: Bitmap) -> Self {
+        Self {
+            fields,
+            len,
+            validity: Some(validity),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Tuple-level nulls only (`Nullable(Tuple)`); element-level nulls are
+    /// counted on the element columns.
+    pub fn null_count(&self) -> usize {
+        self.validity.as_ref().map_or(0, |b| b.null_count())
+    }
+}
+
+/// Map column (`Map(K, V)`) in Arrow list-of-struct layout.
+///
+/// Row `i`'s entries are `entries[offsets[i]..offsets[i + 1]]`. `offsets` has
+/// length `num_rows + 1` with the Arrow leading `0`, exactly the
+/// [`ArrayColumn`] offset layout: on the wire a Map is the plain
+/// `Array(Tuple(keys, values))` serialization, so the offsets are the same
+/// cumulative `UInt64` end-offset run, widened to `i64`.
+///
+/// `entries` is the flattened key/value column of length `offsets[num_rows]`:
+/// always a [`Column::Tuple`] with exactly two fields, the keys column then
+/// the values column (the "keys"/"values" names live nowhere; they never
+/// appear on the wire or in the type string). It is a distinct variant from
+/// `Array` so encode and validation stay honest about the Map-specific
+/// invariants (key-type legality), even though the physical layout matches.
+///
+/// A map is never nullable at the map level (`DataTypeMap::canBeInsideNullable()`
+/// is false), so there is no map-level validity bitmap; a nullable VALUE type
+/// keeps its nulls on the values column inside `entries`, and a nullable key
+/// type is illegal.
+#[derive(Debug, Clone)]
+pub struct MapColumn {
+    pub offsets: Vec<i64>,
+    pub entries: Box<Column>,
+}
+
+impl MapColumn {
+    pub fn new(offsets: Vec<i64>, entries: Column) -> Self {
+        Self {
+            offsets,
+            entries: Box::new(entries),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        // offsets always carries the leading 0, so an empty column is `[0]`.
+        self.offsets.len().saturating_sub(1)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Maps are never nullable at the map level; value-level nulls are counted
+    /// on the values column inside `entries`.
+    pub fn null_count(&self) -> usize {
+        0
+    }
+}
+
 /// Enum over all supported column types.
 #[derive(Debug, Clone)]
 pub enum Column {
@@ -443,6 +546,12 @@ pub enum Column {
     // Array(T): Arrow list layout (offsets + a flattened element column). The
     // element column is itself a Column, so this is the first recursive variant.
     Array(ArrayColumn),
+    // Tuple(T1, ...): Arrow struct layout (one child column per element plus an
+    // explicit row count; tuple-level validity for Nullable(Tuple)).
+    Tuple(TupleColumn),
+    // Map(K, V): Arrow list-of-struct layout (Array offsets over a two-field
+    // Tuple entries column), matching the wire's Array(Tuple(keys, values)).
+    Map(MapColumn),
 }
 
 impl Column {
@@ -473,6 +582,8 @@ impl Column {
             Column::Decimal(c) => c.len(),
             Column::Dictionary(c) => c.len(),
             Column::Array(c) => c.len(),
+            Column::Tuple(c) => c.len(),
+            Column::Map(c) => c.len(),
         }
     }
 
@@ -507,6 +618,8 @@ impl Column {
             Column::Decimal(c) => c.null_count(),
             Column::Dictionary(c) => c.null_count(),
             Column::Array(c) => c.null_count(),
+            Column::Tuple(c) => c.null_count(),
+            Column::Map(c) => c.null_count(),
         }
     }
 
@@ -539,6 +652,11 @@ impl Column {
             // Arrays are never nullable at the array level, so there is no
             // array validity bitmap; element nulls live on `values`.
             Column::Array(_) => None,
+            // Tuple-level validity, populated only for Nullable(Tuple(...)).
+            Column::Tuple(c) => c.validity.as_ref(),
+            // Maps are never nullable at the map level; value nulls live on the
+            // values column inside `entries`.
+            Column::Map(_) => None,
         }
     }
 }

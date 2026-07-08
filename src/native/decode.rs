@@ -4,8 +4,8 @@ use std::sync::Arc;
 use crate::batch::{ChunkedBatch, ColBatch};
 use crate::bitmap::Bitmap;
 use crate::column::{
-    ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn,
-    PrimitiveColumn, Utf8Column,
+    ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn, MapColumn,
+    PrimitiveColumn, TupleColumn, Utf8Column,
 };
 use crate::native::varint::ByteReader;
 use crate::schema::{ChType, Field, Schema};
@@ -53,6 +53,14 @@ pub enum DecodeError {
         column: String,
         reason: &'static str,
     },
+    /// A `Tuple` column decoded element columns of unequal lengths. The server
+    /// enforces the same invariant (`INCORRECT_DATA` in Native mode). Every
+    /// element decode here is driven by the same row count, so this is a
+    /// defensive mirror of that check rather than a reachable state.
+    InvalidTuple {
+        column: String,
+        reason: &'static str,
+    },
 }
 
 impl From<io::Error> for DecodeError {
@@ -94,6 +102,9 @@ impl std::fmt::Display for DecodeError {
             }
             DecodeError::InvalidArray { column, reason } => {
                 write!(f, "Invalid Array layout for column '{column}': {reason}")
+            }
+            DecodeError::InvalidTuple { column, reason } => {
+                write!(f, "Invalid Tuple layout for column '{column}': {reason}")
             }
         }
     }
@@ -146,7 +157,7 @@ pub struct DecodeOptions {
 /// Maximum wrapper/container nesting depth the type-name parser accepts.
 ///
 /// The type string is attacker-controlled wire input, and every wrapper level
-/// (`Nullable`, `LowCardinality`, `Array`, and later `Map`/`Tuple`) recurses one
+/// (`Nullable`, `LowCardinality`, `Array`, `Tuple`, `Map`) recurses one
 /// stack frame in [`parse_ch_type_depth`]. An unbounded string like
 /// `Array(Array(...Array(Int32)...))` would overflow the stack and abort the
 /// process (SIGABRT is uncatchable), violating the "malformed bytes return an
@@ -182,23 +193,31 @@ fn parse_ch_type_depth(type_name: &str, depth: usize) -> Option<ChType> {
         return None;
     }
 
-    // Nullable wrapper. ClickHouse forbids a `Nullable`, a `LowCardinality`, or a
-    // container (`Array`, and later `Map`/`Tuple`) directly inside a `Nullable`:
-    // the only legal nesting with LowCardinality is `LowCardinality(Nullable(T))`,
-    // never the reverse, `Nullable(Nullable(T))` does not exist at all, and
+    // Nullable wrapper. ClickHouse forbids a `Nullable`, a `LowCardinality`, or an
+    // `Array` directly inside a `Nullable`: the only legal nesting with
+    // LowCardinality is `LowCardinality(Nullable(T))`, never the reverse,
+    // `Nullable(Nullable(T))` does not exist at all, and
     // `DataTypeArray::canBeInsideNullable()` is false so `Nullable(Array(T))` is
     // not constructible. An honest server never emits any of these, but the type
     // string is untrusted wire input, so reject them here. `decode_column` and
     // `skip_column_data` unwrap exactly one `Nullable` and handle `LowCardinality`
     // and `Array` only at the top level; accepting a nested wrapper would let those
     // inner wrappers reach an `unreachable!` on malformed bytes (AGENTS.md invariant
-    // 2: no panics on malformed input).
+    // 2: no panics on malformed input). `Nullable(Map(K, V))` is likewise not
+    // constructible (`DataTypeMap::canBeInsideNullable()` is false), so `Map` is
+    // rejected here too. `Nullable(Tuple(...))` IS legal
+    // (`DataTypeTuple::canBeInsideNullable()` is true at v26.6.1.1193-stable; the
+    // `enable_nullable_tuple_type` DDL gate is a creation-time concern with no wire
+    // effect), so `Tuple` deliberately passes this guard.
     if let Some(inner) = type_name.strip_prefix("Nullable(") {
         if let Some(inner) = inner.strip_suffix(')') {
             let inner_type = parse_ch_type_depth(inner, depth + 1)?;
             if matches!(
                 inner_type,
-                ChType::Nullable(_) | ChType::LowCardinality(_) | ChType::Array(_)
+                ChType::Nullable(_)
+                    | ChType::LowCardinality(_)
+                    | ChType::Array(_)
+                    | ChType::Map(..)
             ) {
                 return None;
             }
@@ -224,6 +243,43 @@ fn parse_ch_type_depth(type_name: &str, depth: usize) -> Option<ChType> {
         if let Some(inner) = inner.strip_suffix(')') {
             let inner_type = parse_ch_type_depth(inner, depth + 1)?;
             return Some(ChType::Array(Box::new(inner_type)));
+        }
+    }
+
+    // Tuple(...). Unnamed (`Tuple(Int32, String)`), named
+    // (`Tuple(a Int32, b String)`), and backtick-quoted-name
+    // (`Tuple(`a b` Int32)`) forms, per `DataTypeTuple::doGetName` (confirmed at
+    // v26.6.1.1193-stable). The inner list cannot be split naively on `,`: an
+    // element type may carry commas inside its own parentheses
+    // (`Decimal(9, 4)`, a nested `Tuple`), inside an Enum's single-quoted names,
+    // or inside a backtick-quoted element name, so the splitter is
+    // paren/quote-aware. Each element recurses at depth + 1, so the
+    // MAX_TYPE_DEPTH cap bounds a hostile deeply-nested header exactly like the
+    // single-child wrappers. `Tuple()` (zero elements) is accepted: it is
+    // constructible and emittable, with its own one-byte-per-row wire layout.
+    if let Some(inner) = type_name.strip_prefix("Tuple(") {
+        if let Some(inner) = inner.strip_suffix(')') {
+            return parse_tuple_elements(inner, depth).map(ChType::Tuple);
+        }
+    }
+
+    // Map(K, V). Always exactly the two type arguments (`DataTypeMap::doGetName`,
+    // confirmed at v26.6.1.1193-stable); the nested tuple's "keys"/"values" names
+    // never appear in the type string. Split on the top-level comma with the same
+    // paren/quote-aware splitter the Tuple arm uses, since either argument can
+    // carry commas (`Decimal(9, 4)`, a nested `Map`/`Tuple`, an Enum). Key-type
+    // legality (no `Nullable` or `LowCardinality(Nullable(...))` keys) is
+    // enforced by `validate_header_type` at header-read time, not here, so the
+    // encoder's round-trip check and the decoder agree on what parses.
+    if let Some(inner) = type_name.strip_prefix("Map(") {
+        if let Some(inner) = inner.strip_suffix(')') {
+            let parts = split_top_level_commas(inner.trim_matches(' '))?;
+            if parts.len() != 2 {
+                return None;
+            }
+            let key = parse_ch_type_depth(parts[0].trim_matches(' '), depth + 1)?;
+            let value = parse_ch_type_depth(parts[1].trim_matches(' '), depth + 1)?;
+            return Some(ChType::Map(Box::new(key), Box::new(value)));
         }
     }
 
@@ -505,6 +561,200 @@ fn parse_enum_value(bytes: &[u8], pos: &mut usize) -> Option<i64> {
     std::str::from_utf8(&bytes[start..*pos]).ok()?.parse().ok()
 }
 
+/// Parse the inner element list of a `Tuple(...)` type string into
+/// `(optional name, element type)` pairs, preserving declaration order.
+///
+/// An empty (or all-spaces) list is `Tuple()`. Otherwise the list is split on
+/// top-level commas ([`split_top_level_commas`]) and each element is parsed by
+/// [`parse_tuple_element`] at `depth + 1`. Any malformed element (unterminated
+/// quoting, a name without a type, an unknown element type) returns `None`
+/// (-> `UnsupportedType`); the type string is untrusted wire input, so this
+/// never panics. The server rejects empty names, the literal name `null`, and
+/// duplicate names at creation time, so an honest header never carries them;
+/// this parser accepts them as written rather than second-guessing (they are
+/// metadata only and round-trip through `Display`).
+fn parse_tuple_elements(inner: &str, depth: usize) -> Option<Vec<(Option<String>, ChType)>> {
+    let trimmed = inner.trim_matches(' ');
+    if trimmed.is_empty() {
+        return Some(Vec::new());
+    }
+    let parts = split_top_level_commas(trimmed)?;
+    let mut elements = Vec::with_capacity(parts.len());
+    for part in parts {
+        elements.push(parse_tuple_element(part.trim_matches(' '), depth)?);
+    }
+    Some(elements)
+}
+
+/// Split a tuple element list on the commas at nesting depth 0, skipping over
+/// parenthesized groups, single-quoted strings (an Enum element's variant
+/// names, a DateTime timezone), and backtick-quoted element names. Inside
+/// either quote form a backslash consumes the next byte (the server's lexer
+/// never lets `\` close a quote), and inside backticks a doubled backtick is
+/// the escaped-backtick form, not a close-then-reopen. Returns `None` on
+/// unbalanced parentheses or an unterminated quote, which only a malformed
+/// header can produce.
+fn split_top_level_commas(s: &str) -> Option<Vec<&str>> {
+    let bytes = s.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth = depth.checked_sub(1)?;
+                i += 1;
+            }
+            b',' if depth == 0 => {
+                parts.push(&s[start..i]);
+                i += 1;
+                start = i;
+            }
+            quote @ (b'\'' | b'`') => {
+                i += 1;
+                loop {
+                    let b = *bytes.get(i)?; // unterminated quote -> malformed
+                    i += 1;
+                    if b == b'\\' {
+                        // A backslash escape consumes the next byte, so an
+                        // escaped quote cannot close the string. A trailing
+                        // lone backslash is unterminated input.
+                        if i >= bytes.len() {
+                            return None;
+                        }
+                        i += 1;
+                    } else if b == quote {
+                        if quote == b'`' && bytes.get(i) == Some(&b'`') {
+                            i += 1; // doubled backtick: escaped, stay inside
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    // All split points are ASCII delimiters, so every slice boundary is a char
+    // boundary.
+    parts.push(&s[start..]);
+    Some(parts)
+}
+
+/// Parse one tuple element, `part` already trimmed: either a bare type
+/// (`Int32`), a bare-identifier name then the type (`a Int32`), or a
+/// backtick-quoted name then the type (`` `a b` Int32 ``).
+///
+/// The bare named form is unambiguous because no ClickHouse type name contains
+/// a space outside parentheses or quotes: if the text before the first space is
+/// a valid bare identifier (the same [`crate::schema::is_bare_identifier`]
+/// predicate `Display` quotes by, so parse and render agree), the element is
+/// named; otherwise the whole text is parsed as an unnamed type (e.g.
+/// `Decimal(9, 4)`, whose space sits inside its parentheses).
+fn parse_tuple_element(part: &str, depth: usize) -> Option<(Option<String>, ChType)> {
+    let bytes = part.as_bytes();
+    if bytes.first() == Some(&b'`') {
+        let mut pos = 1usize;
+        let name = parse_back_quoted_name(bytes, &mut pos)?;
+        // `pos` sits just past the closing backtick, an ASCII boundary. The
+        // rest, after the separating spaces, must be a parseable element type.
+        let rest = part[pos..].trim_matches(' ');
+        if rest.is_empty() {
+            return None; // a name with no type
+        }
+        let ch_type = parse_ch_type_depth(rest, depth + 1)?;
+        return Some((Some(name), ch_type));
+    }
+    if let Some((first, rest)) = part.split_once(' ') {
+        if crate::schema::is_bare_identifier(first) {
+            let rest = rest.trim_matches(' ');
+            if rest.is_empty() {
+                return None; // a name with no type
+            }
+            let ch_type = parse_ch_type_depth(rest, depth + 1)?;
+            return Some((Some(first.to_string()), ch_type));
+        }
+    }
+    let ch_type = parse_ch_type_depth(part, depth + 1)?;
+    Some((None, ch_type))
+}
+
+/// Read a backtick-quoted tuple element name from `bytes` starting just after
+/// the opening backtick, advancing `pos` past the closing backtick.
+///
+/// The server WRITES only `writeBackQuotedString`'s escapes (`\``, `\\`, and
+/// the C0 letter escapes; see `escape_back_quoted` in `crate::schema`), but its
+/// own READERS are more permissive, and this parser mirrors the reader side
+/// (confirmed at v26.6.1.1193-stable: `Lexer.cpp` `quotedString<'`'>`,
+/// `ReadHelpers.cpp` `readBackQuotedStringWithSQLStyle`, `ReadHelpers.h`
+/// `parseEscapeSequence`): a doubled backtick is one literal backtick, and a
+/// backslash escape accepts `\xAA` (the hex byte), `\N` (empty, nothing
+/// appended), the control escapes `\a \b \e \f \n \r \t \v \0`, and ANY other
+/// `\c` as the literal `c` with the backslash dropped. A lone backslash always
+/// consumes the following byte, so an escaped backtick never closes the name.
+/// Unterminated or truncated input returns `None` (-> `UnsupportedType`),
+/// never a panic. The decoded bytes must be valid UTF-8 (a `\xAA` escape can
+/// break that), or the name is rejected.
+fn parse_back_quoted_name(bytes: &[u8], pos: &mut usize) -> Option<String> {
+    let mut name = Vec::new();
+    loop {
+        let b = *bytes.get(*pos)?;
+        *pos += 1;
+        match b {
+            b'`' => {
+                if bytes.get(*pos) == Some(&b'`') {
+                    // Doubled backtick: the SQL-style escaped form.
+                    *pos += 1;
+                    name.push(b'`');
+                } else {
+                    return String::from_utf8(name).ok();
+                }
+            }
+            b'\\' => {
+                let esc = *bytes.get(*pos)?;
+                *pos += 1;
+                match esc {
+                    b'x' => {
+                        // \xAA: exactly two hex digits for one raw byte.
+                        let hi = hex_digit(*bytes.get(*pos)?)?;
+                        let lo = hex_digit(*bytes.get(*pos + 1)?)?;
+                        *pos += 2;
+                        name.push((hi << 4) | lo);
+                    }
+                    b'N' => {} // \N is the empty escape; nothing appended
+                    b'a' => name.push(0x07),
+                    b'b' => name.push(0x08),
+                    b'e' => name.push(0x1B),
+                    b'f' => name.push(0x0C),
+                    b'n' => name.push(b'\n'),
+                    b'r' => name.push(b'\r'),
+                    b't' => name.push(b'\t'),
+                    b'v' => name.push(0x0B),
+                    b'0' => name.push(0x00),
+                    // Any other escaped byte (including ` and \) is itself.
+                    other => name.push(other),
+                }
+            }
+            other => name.push(other),
+        }
+    }
+}
+
+/// The value of one ASCII hex digit, or `None` for a non-hex byte.
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Column decoders
 // ---------------------------------------------------------------------------
@@ -688,6 +938,36 @@ fn read_state_prefix(
         // `LowCardinality`'s 8-byte key version is consumed here, at the front of
         // the whole Array column, before the offsets.
         ChType::Array(inner) => read_state_prefix(reader, inner, column),
+        // Tuple writes no prefix of its own; `SerializationTuple`'s
+        // `deserializeBinaryBulkStatePrefix` loops over the elements in
+        // declaration order and delegates to each (confirmed at
+        // v26.6.1.1193-stable). So Tuple(LowCardinality(String), Int32) has the
+        // LC 8-byte key version here, at the front of the whole Tuple column,
+        // and nothing for the Int32.
+        ChType::Tuple(elements) => {
+            for (_, element_type) in elements {
+                read_state_prefix(reader, element_type, column)?;
+            }
+            Ok(None)
+        }
+        // Map writes no prefix of its own; its prefix chain is
+        // Map -> Array (nothing) -> Tuple -> key's prefix then value's prefix,
+        // in that order (confirmed at v26.6.1.1193-stable, `SerializationMap`
+        // delegating to the nested `Array(Tuple(...))` serialization). So
+        // Map(LowCardinality(String), Int32) has the LC 8-byte key version at
+        // the very front of the whole column, before the offsets.
+        ChType::Map(key, value) => {
+            read_state_prefix(reader, key, column)?;
+            read_state_prefix(reader, value, column)
+        }
+        // Nullable writes no prefix of its own either;
+        // `SerializationNullable::deserializeBinaryBulkStatePrefix` delegates to
+        // the nested type (confirmed at v26.6.1.1193-stable,
+        // `src/DataTypes/Serializations/SerializationNullable.cpp`). Only a
+        // `Nullable(Tuple(...))` can nest a prefix-bearing type today (a
+        // LowCardinality element), but recursing unconditionally keeps this
+        // faithful to the server for any future nullable-wrappable container.
+        ChType::Nullable(inner) => read_state_prefix(reader, inner, column),
         _ => Ok(None),
     }
 }
@@ -1033,6 +1313,14 @@ fn decode_values(
         return decode_array(reader, inner, num_rows, column);
     }
 
+    // Map is the Array(Tuple(keys, values)) wire layout decoded as a unit; like
+    // Array it is never nullable at this level, so it dispatches before the
+    // Nullable unwrap. The key/value prefixes were consumed by the caller's
+    // `read_state_prefix`.
+    if let ChType::Map(key, value) = ch_type {
+        return decode_map(reader, key, value, num_rows, column);
+    }
+
     let (nullable, inner) = match ch_type {
         ChType::Nullable(inner) => (true, inner.as_ref()),
         other => (false, other),
@@ -1044,7 +1332,88 @@ fn decode_values(
         None
     };
 
+    // Tuple is a container of element columns decoded as a unit (each element
+    // recurses back through this function), dispatched after the Nullable
+    // unwrap because `Nullable(Tuple(...))` is legal: its per-row null map
+    // precedes the tuple body, the ordinary Nullable framing.
+    if let ChType::Tuple(elements) = inner {
+        return decode_tuple(reader, elements, num_rows, column, validity);
+    }
+
     decode_column_body(reader, inner, num_rows, validity)
+}
+
+/// Decode one `Tuple(T1, ...)` column body into an Arrow struct `Column`.
+///
+/// Wire layout per block (server `SerializationTuple`, confirmed at
+/// v26.6.1.1193-stable in `src/DataTypes/Serializations/SerializationTuple.cpp`;
+/// any element state prefixes were already consumed by [`read_state_prefix`],
+/// which recurses into every element in order):
+///
+/// ```text
+/// [element 0 body]   // element 0's FULL run of num_rows rows, its normal bulk
+/// [element 1 body]   // body WITHOUT its state prefix, then element 1's, ...
+/// ...                // column-of-columns: no interleaving, no offsets, no
+///                    // Tuple-level length framing
+/// ```
+///
+/// Each element body is decoded recursively through [`decode_values`], so a
+/// `Nullable`, `LowCardinality`, `Array`, or nested `Tuple` element composes.
+/// The server asserts all element columns come out the same size
+/// (`INCORRECT_DATA` in Native mode); that check is mirrored here, though every
+/// element decode is driven by the same `num_rows` so it cannot fire in
+/// practice.
+///
+/// The zero-element `Tuple()` has a special layout: exactly ONE literal ASCII
+/// '0' byte (0x30) per row and nothing else. The server ignores the byte
+/// values on read (`tryIgnore`), so they are skipped without validation;
+/// truncation is still `UnexpectedEof`. A zero-length run (`num_rows == 0`,
+/// reachable nested inside an empty `Array` run) writes and reads no bytes at
+/// all, for the empty and non-empty element lists alike.
+///
+/// `validity` is the tuple-level null map of a `Nullable(Tuple(...))`, already
+/// decoded by the caller; a null tuple row still carries placeholder values in
+/// every element body.
+fn decode_tuple(
+    reader: &mut ByteReader,
+    elements: &[(Option<String>, ChType)],
+    num_rows: usize,
+    column: &str,
+    validity: Option<Bitmap>,
+) -> Result<Column, DecodeError> {
+    if elements.is_empty() {
+        // Tuple(): one placeholder byte per row, values not validated (the
+        // server writes '0' and ignores on read). `skip` bounds against the
+        // bytes present, so truncation is UnexpectedEof.
+        reader.skip(num_rows)?;
+        return Ok(build_tuple_column(Vec::new(), num_rows, validity));
+    }
+
+    let mut fields = Vec::with_capacity(elements.len());
+    for (_, element_type) in elements {
+        let element = decode_values(reader, element_type, num_rows, column)?;
+        // Mirror the server's equal-sizes assert. Unreachable in practice:
+        // every element decode above is driven by the same num_rows.
+        if element.len() != num_rows {
+            return Err(DecodeError::InvalidTuple {
+                column: column.to_string(),
+                reason: "element column length disagrees with the block row count",
+            });
+        }
+        fields.push(element);
+    }
+    Ok(build_tuple_column(fields, num_rows, validity))
+}
+
+/// Assemble a `Column::Tuple` through the `TupleColumn` constructors, keyed on
+/// whether a tuple-level validity bitmap (a `Nullable(Tuple(...))`) is present.
+/// The single construction point every decode path funnels through, so a
+/// future caller cannot build a tuple column and forget to attach validity.
+fn build_tuple_column(fields: Vec<Column>, len: usize, validity: Option<Bitmap>) -> Column {
+    Column::Tuple(match validity {
+        Some(bm) => TupleColumn::new_nullable(fields, len, bm),
+        None => TupleColumn::new(fields, len),
+    })
 }
 
 /// Decode one `Array(T)` column block into an Arrow list `Column`.
@@ -1088,6 +1457,53 @@ fn decode_array(
     // by the caller's `read_state_prefix`, so decode the values only.
     let values = decode_values(reader, inner, total_elements, column)?;
     Ok(Column::Array(ArrayColumn::new(offsets, values)))
+}
+
+/// Decode one `Map(K, V)` column block into an Arrow list-of-struct `Column`.
+///
+/// On the Native wire a Map is ALWAYS the plain `Array(Tuple(keys, values))`
+/// layout (server `SerializationMap`, confirmed at v26.6.1.1193-stable in
+/// `src/DataTypes/Serializations/SerializationMap.cpp`): the same cumulative
+/// `UInt64` end-offset run as `Array` (one per row, no leading zero), then the
+/// flattened `Tuple(K, V)` body, i.e. K's full flattened run and then V's, per
+/// the Tuple column-of-columns layout. The server's newer bucketed
+/// `WITH_BUCKETS` on-disk serialization NEVER reaches the Native wire in
+/// either direction: `NativeReader` builds its serializations via
+/// `enableAllSupportedSerializations`, which leaves `map_serialization_version`
+/// at `BASIC`, and `NativeWriter` goes through `IDataType::getSerializationInfo`'s
+/// default, also `BASIC`. The key/value state prefixes were already consumed by
+/// [`read_state_prefix`] (Map -> Array -> Tuple -> K then V), so this starts at
+/// the offsets.
+///
+/// The nested tuple's "keys"/"values" names never appear on the wire; `entries`
+/// is a two-field [`TupleColumn`] (keys then values) of length
+/// `total_entries`. Both flattened runs are decoded recursively through
+/// [`decode_values`], so a `LowCardinality` key, a `Nullable` or container
+/// value, and a nested `Map` all compose, including the `limit == 0` gates for
+/// an all-empty-maps block.
+fn decode_map(
+    reader: &mut ByteReader,
+    key: &ChType,
+    value: &ChType,
+    num_rows: usize,
+    column: &str,
+) -> Result<Column, DecodeError> {
+    // Offsets: the shared Array walk (a Map's offsets are byte-identical to an
+    // Array's), building the Arrow-shaped run with the leading 0 and bounding
+    // the entry count against the bytes present.
+    let mut offsets = Vec::new();
+    let total_entries = read_array_offsets(reader, num_rows, column, Some(&mut offsets))?;
+
+    // Flattened entries: the keys' full run then the values' full run, the
+    // Tuple(K, V) body with prefixes already consumed. Both decodes are driven
+    // by the same total, so the two fields cannot come out ragged.
+    let keys = decode_values(reader, key, total_entries, column)?;
+    let values = decode_values(reader, value, total_entries, column)?;
+    // The entries tuple never carries validity: the wire has no null map here
+    // (a map is never nullable at the entries level), so it goes through the
+    // shared constructor with `None`.
+    let entries = build_tuple_column(vec![keys, values], total_entries, None);
+    Ok(Column::Map(MapColumn::new(offsets, entries)))
 }
 
 /// Read and validate one `Array` offsets run: exactly `num_rows` raw LE u64
@@ -1351,13 +1767,17 @@ fn decode_column_body(
         }
         // Defense in depth: `parse_ch_type` rejects a wrapper nested where the
         // single-level unwrap in `decode_values` cannot handle it, and
-        // `LowCardinality` and `Array` are dispatched by `decode_values` before
-        // reaching here (a `Nullable` is unwrapped there too), so these arms cannot
-        // occur for any type this decoder produces. `Array` is never an inner of a
-        // `LowCardinality` dictionary either, the other caller. Return an error
-        // rather than panic so a future regression degrades to a clean decode error
-        // instead of undefined behavior at an FFI boundary.
-        ChType::Nullable(_) | ChType::LowCardinality(_) | ChType::Array(_) => {
+        // `LowCardinality`, `Array`, and `Tuple` are dispatched by `decode_values`
+        // before reaching here (a `Nullable` is unwrapped there too), so these arms
+        // cannot occur for any type this decoder produces. None of them is a legal
+        // inner of a `LowCardinality` dictionary either, the other caller. Return
+        // an error rather than panic so a future regression degrades to a clean
+        // decode error instead of undefined behavior at an FFI boundary.
+        ChType::Nullable(_)
+        | ChType::LowCardinality(_)
+        | ChType::Array(_)
+        | ChType::Tuple(_)
+        | ChType::Map(..) => {
             return Err(DecodeError::UnsupportedType {
                 column: String::new(),
                 type_name: inner_type.to_string(),
@@ -1512,6 +1932,22 @@ fn empty_column(ch_type: &ChType) -> Column {
         ChType::Array(array_inner) => {
             Column::Array(ArrayColumn::new(vec![0i64], empty_column(array_inner)))
         }
+        // A zero-row block reads no Tuple element bodies (and no Tuple()
+        // placeholder bytes), so the empty column is one empty element column
+        // per declared element, built by recursing here, at length 0. A
+        // `Nullable(Tuple)` carries the empty tuple-level validity bitmap like
+        // the other nullable empties.
+        ChType::Tuple(elements) => {
+            let fields = elements.iter().map(|(_, t)| empty_column(t)).collect();
+            build_tuple_column(fields, 0, empty_validity)
+        }
+        // A zero-row block reads no Map offsets or entries (the server gates
+        // `readData` on having rows), so the empty column is offsets `[0]`
+        // (len 0) over an empty two-field entries tuple built by recursing here.
+        ChType::Map(key, value) => Column::Map(MapColumn::new(
+            vec![0i64],
+            build_tuple_column(vec![empty_column(key), empty_column(value)], 0, None),
+        )),
         // The outer `Nullable` was unwrapped above, and `parse_ch_type` never
         // produces a `Nullable` directly inside a `Nullable`, so `inner` is never
         // `Nullable` here. Unlike the decode and scan paths this constructor is
@@ -1690,11 +2126,46 @@ fn validate_header_type(col_name: &str, ch_type: &ChType) -> Result<(), DecodeEr
         }
         // Recurse into the element/inner so a forbidden LC nested inside a
         // container is caught at header time on every path. `Nullable`'s inner is
-        // always concrete (the parser rejects a wrapper inside `Nullable`), so its
-        // recursion is a harmless, future-proof no-op today.
+        // usually concrete (the parser rejects a wrapper inside `Nullable`, with
+        // `Tuple` the one legal container), so its recursion mostly matters for a
+        // `Nullable(Tuple(...))`.
         ChType::Array(inner) => validate_header_type(col_name, inner),
         ChType::Nullable(inner) => validate_header_type(col_name, inner),
+        ChType::Tuple(elements) => {
+            for (_, element_type) in elements {
+                validate_header_type(col_name, element_type)?;
+            }
+            Ok(())
+        }
+        // A Map key must satisfy the server's key constraint; a header that
+        // violates it never comes from an honest server, and accepting it
+        // would decode a column the type system says cannot exist. Both
+        // children then recurse like the Tuple elements.
+        ChType::Map(key, value) => {
+            if !is_valid_map_key_type(key) {
+                return Err(DecodeError::UnsupportedType {
+                    column: col_name.to_string(),
+                    type_name: format!("Map({key}, {value})"),
+                });
+            }
+            validate_header_type(col_name, key)?;
+            validate_header_type(col_name, value)
+        }
         _ => Ok(()),
+    }
+}
+
+/// Whether `key` is a legal `Map(K, V)` key type, the server's
+/// `DataTypeMap::isValidKeyType` (`!isNullableOrLowCardinalityNullable`,
+/// confirmed at v26.6.1.1193-stable): `Nullable(K)` and
+/// `LowCardinality(Nullable(K))` keys are forbidden; a plain
+/// `LowCardinality(K)` key is legal. `pub(crate)` so the encoder's validation
+/// enforces the same constraint on caller-constructed types.
+pub(crate) fn is_valid_map_key_type(key: &ChType) -> bool {
+    match key {
+        ChType::Nullable(_) => false,
+        ChType::LowCardinality(inner) => !matches!(inner.as_ref(), ChType::Nullable(_)),
+        _ => true,
     }
 }
 
@@ -1828,8 +2299,8 @@ fn skip_column_data(
     column: &str,
 ) -> Result<(), DecodeError> {
     // Per-column bulk-state prefix, the same step `decode_column` runs. Zero
-    // bytes for every type except LowCardinality; Array recurses into its
-    // element's prefix.
+    // bytes for every type except LowCardinality; Array, Tuple, and Nullable
+    // recurse into their element/inner prefixes.
     read_state_prefix(reader, ch_type, column)?;
     skip_values(reader, ch_type, num_rows, column)
 }
@@ -1857,6 +2328,12 @@ fn skip_values(
         return skip_array_data(reader, inner, num_rows, column);
     }
 
+    // Map before the Nullable unwrap, mirroring `decode_values`: a map is
+    // never nullable at this level.
+    if let ChType::Map(key, value) = ch_type {
+        return skip_map_data(reader, key, value, num_rows, column);
+    }
+
     let inner = match ch_type {
         ChType::Nullable(inner) => {
             reader.skip(num_rows)?; // null map: 1 byte per row
@@ -1865,7 +2342,52 @@ fn skip_values(
         other => other,
     };
 
+    // Tuple after the Nullable unwrap, mirroring `decode_values`: a
+    // `Nullable(Tuple(...))` walks its per-row null map above, then the tuple
+    // body.
+    if let ChType::Tuple(elements) = inner {
+        return skip_tuple_data(reader, elements, num_rows, column);
+    }
+
     skip_column_body(reader, inner, num_rows)
+}
+
+/// Walk one `Tuple(T1, ...)` column body (after its element state prefixes and
+/// any tuple-level null map) in the completeness scan, consuming exactly what
+/// [`decode_tuple`] reads: each element's full `num_rows` run in declaration
+/// order, or, for the zero-element `Tuple()`, the one placeholder byte per row
+/// (skipped without validating its value, matching the decode).
+fn skip_tuple_data(
+    reader: &mut ByteReader,
+    elements: &[(Option<String>, ChType)],
+    num_rows: usize,
+    column: &str,
+) -> Result<(), DecodeError> {
+    if elements.is_empty() {
+        reader.skip(num_rows)?;
+        return Ok(());
+    }
+    for (_, element_type) in elements {
+        skip_values(reader, element_type, num_rows, column)?;
+    }
+    Ok(())
+}
+
+/// Walk one `Map(K, V)` column block (after its key/value state prefixes) in
+/// the completeness scan, consuming exactly what [`decode_map`] reads: the
+/// `num_rows` raw LE u64 offsets through the same validated
+/// [`read_array_offsets`] walk (here with `collect: None`), then the flattened
+/// key run and the flattened value run.
+fn skip_map_data(
+    reader: &mut ByteReader,
+    key: &ChType,
+    value: &ChType,
+    num_rows: usize,
+    column: &str,
+) -> Result<(), DecodeError> {
+    let total_entries = read_array_offsets(reader, num_rows, column, None)?;
+    skip_values(reader, key, total_entries, column)?;
+    skip_values(reader, value, total_entries, column)
 }
 
 /// Walk one `Array(T)` column block (after its element state prefix) in the
@@ -1933,13 +2455,18 @@ fn skip_column_body(
             }
         }
         // `read_column_header` already rejected unsupported types, Nullable is
-        // unwrapped by the callers, and LowCardinality and Array are dispatched by
-        // `skip_values` above. Defense in depth: `parse_ch_type` also rejects a
-        // wrapper nested where the callers' single-level unwrap cannot reach it, so
-        // these arms cannot occur. Return an error rather than panic to keep the
-        // streaming scan panic-free even if that guarantee ever regresses (a panic
-        // here is undefined behavior across FFI).
-        ChType::Nullable(_) | ChType::LowCardinality(_) | ChType::Array(_) => {
+        // unwrapped by the callers, and LowCardinality, Array, Tuple, and Map
+        // are dispatched by `skip_values` above. Defense in depth:
+        // `parse_ch_type` also rejects a wrapper nested where the callers'
+        // single-level unwrap cannot reach it, so these arms cannot occur.
+        // Return an error rather than panic to keep the streaming scan
+        // panic-free even if that guarantee ever regresses (a panic here is
+        // undefined behavior across FFI).
+        ChType::Nullable(_)
+        | ChType::LowCardinality(_)
+        | ChType::Array(_)
+        | ChType::Tuple(_)
+        | ChType::Map(..) => {
             return Err(DecodeError::UnsupportedType {
                 column: String::new(),
                 type_name: inner_type.to_string(),
@@ -5852,6 +6379,1042 @@ mod tests {
                 ),
                 "scan should reject forbidden LC-in-Array at {num_rows} rows"
             );
+        }
+    }
+
+    #[test]
+    fn test_parse_ch_type_tuple() {
+        // Unnamed elements.
+        assert_eq!(
+            parse_ch_type("Tuple(Int32, String)"),
+            Some(ChType::Tuple(vec![
+                (None, ChType::Int32),
+                (None, ChType::String),
+            ]))
+        );
+        // Zero elements.
+        assert_eq!(parse_ch_type("Tuple()"), Some(ChType::Tuple(vec![])));
+        // Named elements, bare identifiers.
+        assert_eq!(
+            parse_ch_type("Tuple(a Int32, user_2 Nullable(String))"),
+            Some(ChType::Tuple(vec![
+                (Some("a".to_string()), ChType::Int32),
+                (
+                    Some("user_2".to_string()),
+                    ChType::Nullable(Box::new(ChType::String)),
+                ),
+            ]))
+        );
+        // A comma inside an element type's own parentheses must not split.
+        assert_eq!(
+            parse_ch_type("Tuple(Decimal(9, 4), Int8)"),
+            Some(ChType::Tuple(vec![
+                (
+                    None,
+                    ChType::Decimal {
+                        precision: 9,
+                        scale: 4,
+                        bits: 32,
+                    },
+                ),
+                (None, ChType::Int8),
+            ]))
+        );
+        // A comma inside an Enum element's quoted names must not split either.
+        assert_eq!(
+            parse_ch_type("Tuple(e Enum8('a,b' = 1), s String)"),
+            Some(ChType::Tuple(vec![
+                (
+                    Some("e".to_string()),
+                    ChType::Enum8 {
+                        variants: vec![("a,b".to_string(), 1)],
+                    },
+                ),
+                (Some("s".to_string()), ChType::String),
+            ]))
+        );
+        // Backtick-quoted names: spaces and commas just force quoting; a
+        // backtick inside escapes as \` (the server's writeBackQuotedString
+        // form) or as a doubled `` (accepted for parser leniency).
+        assert_eq!(
+            parse_ch_type("Tuple(`a b` Int8, `c,d` Int8, `e\\`f` Int8, `g``h` Int8)"),
+            Some(ChType::Tuple(vec![
+                (Some("a b".to_string()), ChType::Int8),
+                (Some("c,d".to_string()), ChType::Int8),
+                (Some("e`f".to_string()), ChType::Int8),
+                (Some("g`h".to_string()), ChType::Int8),
+            ]))
+        );
+        // Keyword names arrive backtick-quoted from the server.
+        assert_eq!(
+            parse_ch_type("Tuple(`select` Int8)"),
+            Some(ChType::Tuple(vec![(
+                Some("select".to_string()),
+                ChType::Int8,
+            )]))
+        );
+        // Containers compose: Tuple in Array, Array in Tuple, nested Tuple,
+        // Nullable(Tuple).
+        assert_eq!(
+            parse_ch_type("Array(Tuple(Int32, Int32))"),
+            Some(ChType::Array(Box::new(ChType::Tuple(vec![
+                (None, ChType::Int32),
+                (None, ChType::Int32),
+            ]))))
+        );
+        assert_eq!(
+            parse_ch_type("Tuple(a Tuple(b Int8), c Array(String))"),
+            Some(ChType::Tuple(vec![
+                (
+                    Some("a".to_string()),
+                    ChType::Tuple(vec![(Some("b".to_string()), ChType::Int8)]),
+                ),
+                (
+                    Some("c".to_string()),
+                    ChType::Array(Box::new(ChType::String)),
+                ),
+            ]))
+        );
+        assert_eq!(
+            parse_ch_type("Nullable(Tuple(Int32, String))"),
+            Some(ChType::Nullable(Box::new(ChType::Tuple(vec![
+                (None, ChType::Int32),
+                (None, ChType::String),
+            ]))))
+        );
+
+        // Malformed inputs are rejected, never panicked on: an unterminated
+        // backtick, a name with no type, an empty element, unbalanced
+        // parentheses, an unknown element type, and a trailing lone backslash.
+        for bad in [
+            "Tuple(`a Int8)",
+            "Tuple(`a`)",
+            "Tuple(a )",
+            "Tuple(Int32,, String)",
+            "Tuple(Int32, )",
+            "Tuple(Int32))",
+            "Tuple(NotAType)",
+            "Tuple(`a\\",
+        ] {
+            assert_eq!(parse_ch_type(bad), None, "should reject {bad:?}");
+        }
+
+        // The depth cap applies through Tuple nesting like the other containers.
+        let mut deep = String::from("Int8");
+        for _ in 0..(MAX_TYPE_DEPTH + 1) {
+            deep = format!("Tuple({deep})");
+        }
+        assert_eq!(parse_ch_type(&deep), None);
+    }
+
+    #[test]
+    fn test_ch_type_display_round_trips_tuple() {
+        // parse(display(t)) == t for every tuple the parser accepts, and
+        // display(parse(s)) == s for the canonical server strings.
+        for s in [
+            "Tuple(Int32, String)",
+            "Tuple()",
+            "Tuple(a Int32, b Nullable(String))",
+            "Tuple(`a b` Int8, `c,d` Int8, `e\\`f` Int8)",
+            "Tuple(`select` Int8, selected Int8)",
+            "Tuple(`NULL` Int8, nullable Int8)",
+            "Tuple(a Tuple(b Int8), c Array(String))",
+            "Nullable(Tuple(Int32, String))",
+            "Array(Tuple(Int32, Int32))",
+            "Tuple(e Enum8('a,b' = 1), d Decimal(9, 4))",
+            "Tuple(lc LowCardinality(String), n Nullable(Int32))",
+        ] {
+            let parsed = parse_ch_type(s).unwrap_or_else(|| panic!("should parse {s:?}"));
+            assert_eq!(parsed.to_string(), s, "display must render canonically");
+            assert_eq!(
+                parse_ch_type(&parsed.to_string()),
+                Some(parsed),
+                "round-trip failed for {s:?}"
+            );
+        }
+        // The doubled-backtick escape parses but re-renders in the server's
+        // backslash form, so it round-trips by value, not by string.
+        let parsed = parse_ch_type("Tuple(`g``h` Int8)").unwrap();
+        assert_eq!(parsed.to_string(), "Tuple(`g\\`h` Int8)");
+        assert_eq!(parse_ch_type(&parsed.to_string()), Some(parsed));
+    }
+
+    /// Borrow the inner `TupleColumn` of a decoded `Tuple` column.
+    fn as_tuple(column: &Column) -> &crate::column::TupleColumn {
+        match column {
+            Column::Tuple(c) => c,
+            other => panic!("expected Tuple column, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_tuple_plain() {
+        // Tuple(Int32, String): element 0's full Int32 run, then element 1's
+        // full String run, column-of-columns with no interleaving and no
+        // tuple-level framing.
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("t", "Tuple(Int32, String)")
+            .int32_data(&[13, 79, -7])
+            .string_data(&["user_1", "user_2", ""])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        let t = as_tuple(batch.column(0));
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.fields.len(), 2);
+        assert!(t.validity.is_none());
+        match &t.fields[0] {
+            Column::Int32(c) => assert_eq!(c.values.as_slice(), &[13, 79, -7]),
+            other => panic!("expected Int32 element, got {other:?}"),
+        }
+        match &t.fields[1] {
+            Column::Utf8(c) => {
+                assert_eq!(c.value(0), b"user_1");
+                assert_eq!(c.value(1), b"user_2");
+                assert_eq!(c.value(2), b"");
+            }
+            other => panic!("expected Utf8 element, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_named_tuple_with_nullable_element() {
+        // Tuple(a Int32, b Nullable(String)): the names live in the schema's
+        // ChType only; element b's body is its own per-row null map then the
+        // string run, the ordinary Nullable framing at element level.
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("t", "Tuple(a Int32, b Nullable(String))")
+            .int32_data(&[1, 2, 3])
+            .null_map(&[false, true, false])
+            .string_data(&["user_1", "", "user_2"])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(
+            cb.schema.fields[0].ch_type,
+            ChType::Tuple(vec![
+                (Some("a".to_string()), ChType::Int32),
+                (
+                    Some("b".to_string()),
+                    ChType::Nullable(Box::new(ChType::String)),
+                ),
+            ])
+        );
+        let t = as_tuple(cb.chunks[0].column(0));
+        assert_eq!(t.len(), 3);
+        match &t.fields[1] {
+            Column::Utf8(c) => {
+                assert_eq!(c.null_count(), 1);
+                let bm = c.validity.as_ref().expect("element validity");
+                assert!(bm.is_valid(0) && !bm.is_valid(1) && bm.is_valid(2));
+            }
+            other => panic!("expected Utf8 element, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_nullable_tuple() {
+        // Nullable(Tuple(Int32, String)): the ordinary Nullable framing, the
+        // per-row null map first, then the tuple body. Null rows still carry
+        // placeholder element values.
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("t", "Nullable(Tuple(Int32, String))")
+            .null_map(&[false, true, false])
+            .int32_data(&[13, 0, 79])
+            .string_data(&["user_1", "", "user_2"])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let t = as_tuple(cb.chunks[0].column(0));
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.null_count(), 1);
+        let bm = t.validity.as_ref().expect("tuple-level validity");
+        assert!(bm.is_valid(0) && !bm.is_valid(1) && bm.is_valid(2));
+        match &t.fields[0] {
+            Column::Int32(c) => assert_eq!(c.values.as_slice(), &[13, 0, 79]),
+            other => panic!("expected Int32 element, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_tuple_low_cardinality_element_prefix_is_hoisted() {
+        // Tuple(Int32, LowCardinality(String)): the element state prefixes are
+        // written at the very FRONT of the whole Tuple column in declaration
+        // order (SerializationTuple delegates), so the LC 8-byte key version
+        // precedes even element 0's Int32 run, and the LC body itself (element
+        // 1) carries no key version of its own.
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("t", "Tuple(Int32, LowCardinality(String))")
+            // Hoisted prefix: element 1's LC key version.
+            .uint64_data(&[LOW_CARDINALITY_KEY_VERSION])
+            // Element 0: the full Int32 run.
+            .int32_data(&[13, 79, -7])
+            // Element 1: the LC body WITHOUT its key version: index word
+            // (width tag 0 = u8, additional keys), dictionary, row count,
+            // indices.
+            .uint64_data(&[LC_HAS_ADDITIONAL_KEYS_BIT])
+            .uint64_data(&[2]) // num_keys
+            .string_data(&["red", "green"])
+            .uint64_data(&[3]) // num_rows restated
+            .raw_bytes(&[0, 1, 0]) // u8 indices
+            .build();
+
+        // The completeness scan and the decode must agree on the framing.
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len())
+        );
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let t = as_tuple(cb.chunks[0].column(0));
+        assert_eq!(t.len(), 3);
+        match &t.fields[1] {
+            Column::Dictionary(d) => {
+                assert_eq!(d.indices, vec![0, 1, 0]);
+                match d.values.as_ref() {
+                    Column::Utf8(c) => {
+                        assert_eq!(c.value(0), b"red");
+                        assert_eq!(c.value(1), b"green");
+                    }
+                    other => panic!("expected Utf8 dictionary, got {other:?}"),
+                }
+            }
+            other => panic!("expected Dictionary element, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_array_of_tuple() {
+        // Array(Tuple(Int32, Int32)): offsets first (the tuple elements write no
+        // prefix), then the flattened tuple body: element 0's full run of
+        // total_elements rows, then element 1's. Rows: [], [(13, 79)],
+        // [(1, 2), (3, 4)], [(-1, -2)].
+        let data = BlockBuilder::new()
+            .header(1, 4)
+            .column_header("a", "Array(Tuple(Int32, Int32))")
+            .array_offsets(&[0, 1, 3, 4])
+            .int32_data(&[13, 1, 3, -1])
+            .int32_data(&[79, 2, 4, -2])
+            .build();
+
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len())
+        );
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        match cb.chunks[0].column(0) {
+            Column::Array(arr) => {
+                assert_eq!(arr.offsets, vec![0i64, 0, 1, 3, 4]);
+                let t = as_tuple(arr.values.as_ref());
+                assert_eq!(t.len(), 4);
+                match (&t.fields[0], &t.fields[1]) {
+                    (Column::Int32(a), Column::Int32(b)) => {
+                        assert_eq!(a.values.as_slice(), &[13, 1, 3, -1]);
+                        assert_eq!(b.values.as_slice(), &[79, 2, 4, -2]);
+                    }
+                    other => panic!("expected Int32 elements, got {other:?}"),
+                }
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_nested_tuple() {
+        // Tuple(p Tuple(Int8, Int8), s String): the inner tuple's body is its
+        // own two element runs, nested in declaration order inside the outer
+        // tuple's element sequence.
+        let data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("t", "Tuple(p Tuple(Int8, Int8), s String)")
+            .int8_data(&[1, 3])
+            .int8_data(&[2, 4])
+            .string_data(&["user_1", "user_2"])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let outer = as_tuple(cb.chunks[0].column(0));
+        assert_eq!(outer.len(), 2);
+        let inner = as_tuple(&outer.fields[0]);
+        assert_eq!(inner.len(), 2);
+        match (&inner.fields[0], &inner.fields[1]) {
+            (Column::Int8(a), Column::Int8(b)) => {
+                assert_eq!(a.values.as_slice(), &[1, 3]);
+                assert_eq!(b.values.as_slice(), &[2, 4]);
+            }
+            other => panic!("expected Int8 elements, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_empty_tuple() {
+        // Tuple(): exactly one placeholder byte per row and nothing else. The
+        // server writes ASCII '0' and ignores the values on read (tryIgnore),
+        // so arbitrary byte values decode too.
+        for body in [b"0000".as_slice(), &[0xAB, 0x00, 0x30, 0xFF]] {
+            let data = BlockBuilder::new()
+                .header(1, 4)
+                .column_header("t", "Tuple()")
+                .raw_bytes(body)
+                .build();
+
+            assert_eq!(
+                block_end(&data, &DecodeOptions::default()).unwrap(),
+                Some(data.len())
+            );
+            let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+            let t = as_tuple(cb.chunks[0].column(0));
+            assert_eq!(t.len(), 4);
+            assert!(t.fields.is_empty());
+        }
+
+        // Truncated placeholder bytes are "need more bytes", on both paths.
+        let short = BlockBuilder::new()
+            .header(1, 4)
+            .column_header("t", "Tuple()")
+            .raw_bytes(b"000")
+            .build();
+        assert!(matches!(
+            decode_all_bytes(&short, &DecodeOptions::default()),
+            Err(DecodeError::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
+        assert!(matches!(
+            block_end(&short, &DecodeOptions::default()),
+            Err(DecodeError::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[test]
+    fn test_decode_tuple_zero_rows() {
+        // A zero-row block carries only the headers: no element bodies and no
+        // Tuple() placeholder bytes.
+        for type_name in ["Tuple(Int32, String)", "Tuple()", "Nullable(Tuple(Int8))"] {
+            let data = BlockBuilder::new()
+                .header(1, 0)
+                .column_header("t", type_name)
+                .build();
+            let batch = decode_next_block(&mut ByteReader::new(&data), &DecodeOptions::default())
+                .unwrap()
+                .unwrap();
+            let t = as_tuple(batch.column(0));
+            assert_eq!(t.len(), 0);
+            assert_eq!(
+                block_end(&data, &DecodeOptions::default()).unwrap(),
+                Some(data.len())
+            );
+        }
+    }
+
+    #[test]
+    fn test_multi_block_tuple_kept_as_chunks() {
+        let mut data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("t", "Tuple(Int32, String)")
+            .int32_data(&[13, 79])
+            .string_data(&["user_1", "user_2"])
+            .build();
+        data.extend(
+            BlockBuilder::new()
+                .header(1, 1)
+                .column_header("t", "Tuple(Int32, String)")
+                .int32_data(&[-7])
+                .string_data(&["user_3"])
+                .build(),
+        );
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_chunks(), 2);
+        assert_eq!(cb.num_rows(), 3);
+        let t0 = as_tuple(cb.chunks[0].column(0));
+        let t1 = as_tuple(cb.chunks[1].column(0));
+        assert_eq!(t0.len(), 2);
+        assert_eq!(t1.len(), 1);
+        match &t1.fields[0] {
+            Column::Int32(c) => assert_eq!(c.values.as_slice(), &[-7]),
+            other => panic!("expected Int32 element, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_tuple_truncated_element_body_is_eof_not_panic() {
+        // Truncate inside element 1's String run: both the decode and the
+        // completeness scan must report "need more bytes" (UnexpectedEof), the
+        // signal the streaming decoder waits on, and never panic.
+        let full = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("t", "Tuple(Int32, String)")
+            .int32_data(&[13, 79, -7])
+            .string_data(&["user_1", "user_2", "user_3"])
+            .build();
+
+        for end in [full.len() - 1, full.len() - 8, full.len() - 20] {
+            let truncated = &full[..end];
+            assert!(matches!(
+                decode_all_bytes(truncated, &DecodeOptions::default()),
+                Err(DecodeError::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof
+            ));
+            assert!(matches!(
+                block_end(truncated, &DecodeOptions::default()),
+                Err(DecodeError::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof
+            ));
+        }
+    }
+
+    #[test]
+    fn test_array_of_tuple_all_empty_passes_zero_limit_to_elements() {
+        // Array(Tuple(LowCardinality(String), Int32)) with rows > 0 but every
+        // array empty: the hoisted prefix walk still runs (the LC key version
+        // is at the very front), the offsets are all zero, and the element
+        // bodies are entirely absent; the LC element's limit == 0 early-return
+        // gate must fire through the Tuple element path.
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("a", "Array(Tuple(LowCardinality(String), Int32))")
+            .uint64_data(&[LOW_CARDINALITY_KEY_VERSION]) // hoisted LC prefix
+            .array_offsets(&[0, 0, 0])
+            .build();
+
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len())
+        );
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        match cb.chunks[0].column(0) {
+            Column::Array(arr) => {
+                assert_eq!(arr.offsets, vec![0i64, 0, 0, 0]);
+                let t = as_tuple(arr.values.as_ref());
+                assert_eq!(t.len(), 0);
+                match &t.fields[0] {
+                    Column::Dictionary(d) => {
+                        assert!(d.indices.is_empty());
+                        assert_eq!(d.values.len(), 0);
+                    }
+                    other => panic!("expected empty Dictionary element, got {other:?}"),
+                }
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ch_type_map() {
+        assert_eq!(
+            parse_ch_type("Map(String, Int32)"),
+            Some(ChType::Map(
+                Box::new(ChType::String),
+                Box::new(ChType::Int32),
+            ))
+        );
+        // Either argument can carry top-level-looking commas inside its own
+        // parentheses or quotes; the paren/quote-aware splitter must not split
+        // there.
+        assert_eq!(
+            parse_ch_type("Map(String, Decimal(9, 4))"),
+            Some(ChType::Map(
+                Box::new(ChType::String),
+                Box::new(ChType::Decimal {
+                    precision: 9,
+                    scale: 4,
+                    bits: 32,
+                }),
+            ))
+        );
+        // Containers compose: LC key, Nullable value, Array value, nested Map,
+        // Map inside Array, Map inside Tuple.
+        assert_eq!(
+            parse_ch_type("Map(LowCardinality(String), UInt8)"),
+            Some(ChType::Map(
+                Box::new(ChType::LowCardinality(Box::new(ChType::String))),
+                Box::new(ChType::UInt8),
+            ))
+        );
+        assert_eq!(
+            parse_ch_type("Map(Int32, Nullable(String))"),
+            Some(ChType::Map(
+                Box::new(ChType::Int32),
+                Box::new(ChType::Nullable(Box::new(ChType::String))),
+            ))
+        );
+        assert_eq!(
+            parse_ch_type("Map(String, Map(String, Int32))"),
+            Some(ChType::Map(
+                Box::new(ChType::String),
+                Box::new(ChType::Map(
+                    Box::new(ChType::String),
+                    Box::new(ChType::Int32),
+                )),
+            ))
+        );
+        assert_eq!(
+            parse_ch_type("Array(Map(String, Int32))"),
+            Some(ChType::Array(Box::new(ChType::Map(
+                Box::new(ChType::String),
+                Box::new(ChType::Int32),
+            ))))
+        );
+        assert_eq!(
+            parse_ch_type("Tuple(m Map(String, Int32))"),
+            Some(ChType::Tuple(vec![(
+                Some("m".to_string()),
+                ChType::Map(Box::new(ChType::String), Box::new(ChType::Int32)),
+            )]))
+        );
+
+        // Malformed or illegal-at-parse-time forms. Nullable(Map) is not
+        // constructible (DataTypeMap::canBeInsideNullable() is false), so the
+        // Nullable arm rejects it outright.
+        for bad in [
+            "Map(String)",
+            "Map(String, Int32, Int8)",
+            "Map()",
+            "Map(String, NotAType)",
+            "Map(String, Int32))",
+            "Nullable(Map(String, Int32))",
+        ] {
+            assert_eq!(parse_ch_type(bad), None, "should reject {bad:?}");
+        }
+
+        // The depth cap applies through Map nesting like the other containers.
+        let mut deep = String::from("Int8");
+        for _ in 0..(MAX_TYPE_DEPTH + 1) {
+            deep = format!("Map(String, {deep})");
+        }
+        assert_eq!(parse_ch_type(&deep), None);
+    }
+
+    #[test]
+    fn test_ch_type_display_round_trips_map() {
+        for s in [
+            "Map(String, Int32)",
+            "Map(LowCardinality(String), UInt8)",
+            "Map(Int32, Nullable(String))",
+            "Map(String, Array(Int32))",
+            "Map(String, Map(String, Int32))",
+            "Array(Map(String, Int32))",
+            "Map(String, Tuple(a Int32, b String))",
+        ] {
+            let parsed = parse_ch_type(s).unwrap_or_else(|| panic!("should parse {s:?}"));
+            assert_eq!(parsed.to_string(), s, "display must render canonically");
+            assert_eq!(parse_ch_type(&parsed.to_string()), Some(parsed));
+        }
+    }
+
+    /// Borrow the inner `MapColumn` of a decoded `Map` column.
+    fn as_map(column: &Column) -> &crate::column::MapColumn {
+        match column {
+            Column::Map(c) => c,
+            other => panic!("expected Map column, got {other:?}"),
+        }
+    }
+
+    /// Borrow a `MapColumn`'s keys and values columns out of its two-field
+    /// entries tuple.
+    fn map_entries(map: &crate::column::MapColumn) -> (&Column, &Column) {
+        let t = as_tuple(map.entries.as_ref());
+        assert_eq!(t.fields.len(), 2, "entries must be the (keys, values) pair");
+        (&t.fields[0], &t.fields[1])
+    }
+
+    #[test]
+    fn test_decode_map_plain() {
+        // Map(String, Int32): the Array(Tuple(keys, values)) wire layout, the
+        // cumulative end-offsets then the flattened key run then the flattened
+        // value run. Rows: {} / {a: 13} / {a: 1, b: 2} / {k: -7}.
+        let data = BlockBuilder::new()
+            .header(1, 4)
+            .column_header("m", "Map(String, Int32)")
+            .array_offsets(&[0, 1, 3, 4])
+            .string_data(&["a", "a", "b", "k"])
+            .int32_data(&[13, 1, 2, -7])
+            .build();
+
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len())
+        );
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let m = as_map(cb.chunks[0].column(0));
+        assert_eq!(m.len(), 4);
+        assert_eq!(m.offsets, vec![0i64, 0, 1, 3, 4]);
+        assert_eq!(m.null_count(), 0);
+        let (keys, values) = map_entries(m);
+        match keys {
+            Column::Utf8(c) => {
+                assert_eq!(c.len(), 4);
+                assert_eq!(c.value(0), b"a");
+                assert_eq!(c.value(2), b"b");
+                assert_eq!(c.value(3), b"k");
+            }
+            other => panic!("expected Utf8 keys, got {other:?}"),
+        }
+        match values {
+            Column::Int32(c) => assert_eq!(c.values.as_slice(), &[13, 1, 2, -7]),
+            other => panic!("expected Int32 values, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_map_low_cardinality_key_prefix_is_hoisted() {
+        // Map(LowCardinality(String), Int32): the prefix chain is Map -> Array
+        // (nothing) -> Tuple -> key then value, so the LC 8-byte key version
+        // sits at the very FRONT of the whole column, before the offsets; the
+        // LC key run itself carries no key version.
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("m", "Map(LowCardinality(String), Int32)")
+            .uint64_data(&[LOW_CARDINALITY_KEY_VERSION]) // hoisted key prefix
+            .array_offsets(&[1, 1, 3])
+            // Flattened LC key run (3 entries), WITHOUT its key version.
+            .uint64_data(&[LC_HAS_ADDITIONAL_KEYS_BIT])
+            .uint64_data(&[2]) // num_keys
+            .string_data(&["red", "green"])
+            .uint64_data(&[3]) // entry count restated
+            .raw_bytes(&[0, 1, 0]) // u8 indices
+            // Flattened Int32 value run.
+            .int32_data(&[13, 79, -7])
+            .build();
+
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len())
+        );
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let m = as_map(cb.chunks[0].column(0));
+        assert_eq!(m.offsets, vec![0i64, 1, 1, 3]);
+        let (keys, values) = map_entries(m);
+        match keys {
+            Column::Dictionary(d) => {
+                assert_eq!(d.indices, vec![0, 1, 0]);
+                match d.values.as_ref() {
+                    Column::Utf8(c) => {
+                        assert_eq!(c.value(0), b"red");
+                        assert_eq!(c.value(1), b"green");
+                    }
+                    other => panic!("expected Utf8 dictionary, got {other:?}"),
+                }
+            }
+            other => panic!("expected Dictionary keys, got {other:?}"),
+        }
+        match values {
+            Column::Int32(c) => assert_eq!(c.values.as_slice(), &[13, 79, -7]),
+            other => panic!("expected Int32 values, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_map_nullable_value() {
+        // Map(Int32, Nullable(String)): the flattened value run is its own
+        // per-entry null map then the strings, ordinary Nullable framing at the
+        // value level. Rows: {1: user_1} / {2: NULL, 3: user_2}.
+        let data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("m", "Map(Int32, Nullable(String))")
+            .array_offsets(&[1, 3])
+            .int32_data(&[1, 2, 3])
+            .null_map(&[false, true, false])
+            .string_data(&["user_1", "", "user_2"])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let m = as_map(cb.chunks[0].column(0));
+        assert_eq!(m.offsets, vec![0i64, 1, 3]);
+        let (_, values) = map_entries(m);
+        match values {
+            Column::Utf8(c) => {
+                assert_eq!(c.null_count(), 1);
+                let bm = c.validity.as_ref().expect("value validity");
+                assert!(bm.is_valid(0) && !bm.is_valid(1) && bm.is_valid(2));
+                assert_eq!(c.value(0), b"user_1");
+                assert_eq!(c.value(2), b"user_2");
+            }
+            other => panic!("expected Utf8 values, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_map_array_value() {
+        // Map(String, Array(Int32)): the flattened value run is itself an
+        // Array column over the entries: its own offsets then the leaf ints.
+        // Rows: {a: [13]} / {b: [], c: [1, 2]}.
+        let data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("m", "Map(String, Array(Int32))")
+            .array_offsets(&[1, 3]) // map offsets: 3 entries
+            .string_data(&["a", "b", "c"])
+            .array_offsets(&[1, 1, 3]) // value-array offsets over 3 entries
+            .int32_data(&[13, 1, 2])
+            .build();
+
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len())
+        );
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let m = as_map(cb.chunks[0].column(0));
+        assert_eq!(m.offsets, vec![0i64, 1, 3]);
+        let (_, values) = map_entries(m);
+        match values {
+            Column::Array(arr) => {
+                assert_eq!(arr.offsets, vec![0i64, 1, 1, 3]);
+                match arr.values.as_ref() {
+                    Column::Int32(c) => assert_eq!(c.values.as_slice(), &[13, 1, 2]),
+                    other => panic!("expected Int32 leaf, got {other:?}"),
+                }
+            }
+            other => panic!("expected Array values, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_array_of_map() {
+        // Array(Map(String, Int32)): the outer Array offsets count maps; the
+        // flattened element column is a Map over the total, with its own
+        // offsets counting entries. Rows: [] / [{a: 1}] / [{b: 2}, {}].
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("a", "Array(Map(String, Int32))")
+            .array_offsets(&[0, 1, 3]) // outer: 3 flattened maps
+            .array_offsets(&[1, 2, 2]) // map offsets over the 3 maps
+            .string_data(&["a", "b"])
+            .int32_data(&[1, 2])
+            .build();
+
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len())
+        );
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        match cb.chunks[0].column(0) {
+            Column::Array(arr) => {
+                assert_eq!(arr.offsets, vec![0i64, 0, 1, 3]);
+                let m = as_map(arr.values.as_ref());
+                assert_eq!(m.len(), 3);
+                assert_eq!(m.offsets, vec![0i64, 1, 2, 2]);
+                let (keys, values) = map_entries(m);
+                match (keys, values) {
+                    (Column::Utf8(k), Column::Int32(v)) => {
+                        assert_eq!(k.value(0), b"a");
+                        assert_eq!(k.value(1), b"b");
+                        assert_eq!(v.values.as_slice(), &[1, 2]);
+                    }
+                    other => panic!("expected (Utf8, Int32) entries, got {other:?}"),
+                }
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_nested_map() {
+        // Map(String, Map(String, Int32)): the flattened value run is itself a
+        // Map over the outer entries. Rows: {a: {x: 1}} / {b: {y: 2, z: 3}}.
+        let data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("m", "Map(String, Map(String, Int32))")
+            .array_offsets(&[1, 2]) // outer: 2 entries
+            .string_data(&["a", "b"]) // outer keys
+            .array_offsets(&[1, 3]) // inner map offsets over the 2 entries
+            .string_data(&["x", "y", "z"]) // inner keys
+            .int32_data(&[1, 2, 3]) // inner values
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let outer = as_map(cb.chunks[0].column(0));
+        assert_eq!(outer.offsets, vec![0i64, 1, 2]);
+        let (_, outer_values) = map_entries(outer);
+        let inner = as_map(outer_values);
+        assert_eq!(inner.offsets, vec![0i64, 1, 3]);
+        let (inner_keys, inner_values) = map_entries(inner);
+        match (inner_keys, inner_values) {
+            (Column::Utf8(k), Column::Int32(v)) => {
+                assert_eq!(k.value(0), b"x");
+                assert_eq!(k.value(2), b"z");
+                assert_eq!(v.values.as_slice(), &[1, 2, 3]);
+            }
+            other => panic!("expected (Utf8, Int32) inner entries, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_map_zero_rows() {
+        // A zero-row block carries only the header: no prefix, no offsets, no
+        // entry runs.
+        for type_name in ["Map(String, Int32)", "Map(LowCardinality(String), UInt8)"] {
+            let data = BlockBuilder::new()
+                .header(1, 0)
+                .column_header("m", type_name)
+                .build();
+            let batch = decode_next_block(&mut ByteReader::new(&data), &DecodeOptions::default())
+                .unwrap()
+                .unwrap();
+            let m = as_map(batch.column(0));
+            assert_eq!(m.len(), 0);
+            assert_eq!(m.offsets, vec![0i64]);
+            let (keys, values) = map_entries(m);
+            assert_eq!(keys.len(), 0);
+            assert_eq!(values.len(), 0);
+            assert_eq!(
+                block_end(&data, &DecodeOptions::default()).unwrap(),
+                Some(data.len())
+            );
+        }
+    }
+
+    #[test]
+    fn test_multi_block_map_kept_as_chunks() {
+        let mut data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("m", "Map(String, Int32)")
+            .array_offsets(&[1, 2])
+            .string_data(&["a", "b"])
+            .int32_data(&[13, 79])
+            .build();
+        data.extend(
+            BlockBuilder::new()
+                .header(1, 1)
+                .column_header("m", "Map(String, Int32)")
+                .array_offsets(&[1])
+                .string_data(&["c"])
+                .int32_data(&[-7])
+                .build(),
+        );
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_chunks(), 2);
+        assert_eq!(cb.num_rows(), 3);
+        let m1 = as_map(cb.chunks[1].column(0));
+        assert_eq!(m1.offsets, vec![0i64, 1]);
+        let (_, values) = map_entries(m1);
+        match values {
+            Column::Int32(c) => assert_eq!(c.values.as_slice(), &[-7]),
+            other => panic!("expected Int32 values, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_map_all_empty_lc_key_has_no_body() {
+        // Map(LowCardinality(String), Int32) with rows > 0 but every map empty:
+        // the hoisted LC key version and the all-zero offsets are the whole
+        // column; the key and value runs are entirely absent (limit == 0 gates
+        // through the Map path).
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("m", "Map(LowCardinality(String), Int32)")
+            .uint64_data(&[LOW_CARDINALITY_KEY_VERSION])
+            .array_offsets(&[0, 0, 0])
+            .build();
+
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len())
+        );
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let m = as_map(cb.chunks[0].column(0));
+        assert_eq!(m.offsets, vec![0i64, 0, 0, 0]);
+        let (keys, values) = map_entries(m);
+        match keys {
+            Column::Dictionary(d) => {
+                assert!(d.indices.is_empty());
+                assert_eq!(d.values.len(), 0);
+            }
+            other => panic!("expected empty Dictionary keys, got {other:?}"),
+        }
+        assert_eq!(values.len(), 0);
+    }
+
+    #[test]
+    fn test_map_truncated_is_eof_not_panic() {
+        // Truncate at several points (inside the value run, inside the key
+        // run, inside the offsets): decode and scan must both report "need
+        // more bytes" (UnexpectedEof), never panic.
+        let full = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("m", "Map(String, Int32)")
+            .array_offsets(&[1, 2, 4])
+            .string_data(&["a", "b", "c", "d"])
+            .int32_data(&[1, 2, 3, 4])
+            .build();
+
+        for end in [full.len() - 1, full.len() - 17, full.len() - 30] {
+            let truncated = &full[..end];
+            assert!(matches!(
+                decode_all_bytes(truncated, &DecodeOptions::default()),
+                Err(DecodeError::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof
+            ));
+            assert!(matches!(
+                block_end(truncated, &DecodeOptions::default()),
+                Err(DecodeError::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof
+            ));
+        }
+    }
+
+    #[test]
+    fn test_map_illegal_headers_rejected() {
+        // Nullable-key and LowCardinality(Nullable)-key maps violate the
+        // server's DataTypeMap::isValidKeyType and are rejected at header time
+        // on both paths; LowCardinality(Map) violates
+        // canBeInsideLowCardinality. All regardless of row count.
+        // (Nullable(Map) is rejected by the parser itself; see
+        // test_parse_ch_type_map.)
+        for bad in [
+            "Map(Nullable(String), Int32)",
+            "Map(LowCardinality(Nullable(String)), Int32)",
+            "LowCardinality(Map(String, Int32))",
+            "Array(Map(Nullable(String), Int32))",
+        ] {
+            for num_rows in [0usize, 1] {
+                let data = BlockBuilder::new()
+                    .header(1, num_rows)
+                    .column_header("m", bad)
+                    .build();
+                assert!(
+                    matches!(
+                        decode_all_bytes(&data, &DecodeOptions::default()),
+                        Err(DecodeError::UnsupportedType { .. })
+                    ),
+                    "decode should reject {bad:?} at {num_rows} rows"
+                );
+                assert!(
+                    matches!(
+                        block_end(&data, &DecodeOptions::default()),
+                        Err(DecodeError::UnsupportedType { .. })
+                    ),
+                    "scan should reject {bad:?} at {num_rows} rows"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_low_cardinality_tuple_inner_rejected() {
+        // LowCardinality(Tuple(...)) is illegal (Tuple inherits
+        // canBeInsideLowCardinality() == false), rejected at header time on
+        // both paths regardless of row count.
+        for num_rows in [0usize, 1] {
+            let data = BlockBuilder::new()
+                .header(1, num_rows)
+                .column_header("lc", "LowCardinality(Tuple(Int32, String))")
+                .build();
+            assert!(matches!(
+                decode_all_bytes(&data, &DecodeOptions::default()),
+                Err(DecodeError::UnsupportedType { .. })
+            ));
+            assert!(matches!(
+                block_end(&data, &DecodeOptions::default()),
+                Err(DecodeError::UnsupportedType { .. })
+            ));
         }
     }
 }

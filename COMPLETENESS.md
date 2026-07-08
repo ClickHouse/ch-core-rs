@@ -11,10 +11,10 @@ given client happens to support." There are two tracks:
   type and the Native wire features needed to read real results. "Done" for a
   type means its wire layout is confirmed against the server source and its
   decoded values are verified against a live server.
-- **Encode (insert path)** - a confirmed goal, not yet started. Encode columnar
-  input into `FORMAT Native` block bytes for `INSERT`. Sequenced after the decode
-  type model is exercised by more types, so the encoder mirrors a stable buffer
-  model instead of a moving one.
+- **Encode (insert path)** - active since 2026-07-01 and currently at parity
+  with decode: every type the crate decodes it also encodes into `FORMAT Native`
+  block bytes for `INSERT`. Keep parity as decode grows, preferring to land each
+  new type's encode in the same change.
 
 Server version is a first-class concern. New types are added in specific
 ClickHouse releases, and a few types changed wire layout across releases, so what
@@ -47,18 +47,24 @@ point-in-time snapshot for the next agent, not a changelog. Keep it short. Alway
 include a "Recommended next" with a one-line reason, so the next agent has a
 default; the user may override it.
 
-- **Last updated:** 2026-07-02 (encode/insert path: **`LowCardinality(T)` encode**
-  landed on top of `Decimal(P, S)`, `Enum8`/`Enum16`, `UUID`/`IPv4`/`IPv6`,
-  temporal, `Bool` + `Nullable(T)` null map, `String`/`FixedString(N)`, and
-  fixed-width numeric encode slices; unit round-trips are green at rev 0 and rev
-  54485, plain and nullable; the live INSERT tests cover
-  `LowCardinality(String)`, `LowCardinality(Nullable(String))`, and a 260-entry
-  `LowCardinality(FixedString(4))` dictionary that exercises the UInt16 index
-  path, and **run green** against a 26.6.1.1193 server)
-- **Active track:** the **encode/insert path** is now the priority (shifted
-  2026-07-01, at the user's direction). Decode type coverage is paused with
-  `Array(T)` as its next item. See the "Encode / insert path" section for the
-  encode checklist and "Type coverage" for the decode backlog.
+- **Last updated:** 2026-07-08 (**`Tuple(T1, ...)` and `Map(K, V)` decode AND
+  encode** landed together, keeping full encode/decode parity. Tuple is the
+  first multi-child container: elements serialize sequentially in declaration
+  order with no interleaving or framing of their own, the state prefix recurses
+  per element, `Nullable(Tuple)` is legal on the wire and supported, and a
+  zero-element `Tuple()` writes one literal 0x30 byte per row. Map on the
+  Native wire is always the plain `Array(Tuple(keys, values))` layout
+  (cumulative UInt64 offsets, then the flattened key run, then the value run);
+  the server's new bucketed WITH_BUCKETS MergeTree mode never reaches the
+  wire in either direction. Adversarial review (rust-reviewer + codex) passed
+  after three fixes: any-case `null` tuple-element names now back-quote like
+  the server, encode rejects server-unconstructible tuple names, and encode
+  rejects a Map entries tuple carrying a validity bitmap. Live INSERT and
+  recaptured fixtures green against 26.6.1.1193.)
+- **Active track:** containers are done through `Map`; the next growth is
+  Tier 2, starting with the wide integers (`Int128`/`UInt128`/`Int256`/
+  `UInt256`), with `Nested(...)` and the geo aliases now cheap follow-ons on
+  top of `Array` + `Tuple`. See "Type coverage".
 - **Pinned server tag (`.server-ref`):** v26.6.1.1193-stable, protocol revision
   **54485**. The crate, the committed fixtures, and the `CODEC_CONTRACT.md`
   citations are all aligned to this pin. The local `.server-src` checkout and the
@@ -68,34 +74,109 @@ default; the user may override it.
   HTTP `FORMAT Native` does not enable native block-frame compression by default.
   The LZ4/NONE + CityHash128 compressed-block framing in `src/compression/` is
   built and tested but intentionally **unwired** (no caller). See "Out of scope".
-- **Last completed:** **`LowCardinality(T)` encode** (`src/native/encode.rs`).
-  The encoder now accepts `Column::Dictionary` for every decoded
-  `LowCardinality` inner the server permits (`String`, `FixedString`, numeric,
-  `Bool`, `Date`, `Date32`, `DateTime`, `UUID`, `IPv4`, `IPv6`, with optional
-  inner `Nullable`). For nonzero rows it writes the server-confirmed key-version
-  prefix `1`, then index words `0x600..0x603` (`HasAdditionalKeysBit` +
-  `NeedUpdateDictionary` + width tag), dictionary size, removeNullable inner body,
-  row count, and raw fixed-width indexes. The width tag is self-described and
-  server-accepted as long as indexes are in range; this encoder uses UInt8
-  through 255 dictionary entries, UInt16 through 65535, then UInt32/UInt64.
-  Zero-row LC writes only the column header, no LC prefix or body.
-  `LowCardinality(Nullable(T))` preserves the decoded contract:
-  dictionary/index 0 is the NULL sentinel, valid rows may not use index 0, and
-  NULL rows must use index 0.
-- **Build/test status:** Tree builds clean; `cargo test` green (242 unit + 3
+- **Last completed:** **`Tuple(T1, ...)` + `Map(K, V)` decode and encode**
+  (`src/schema.rs`, `src/column.rs`, `src/native/decode.rs`,
+  `src/native/encode.rs`, `src/ffi.rs`, plus fixture/integration/live-insert
+  coverage). `ChType::Tuple(Vec<(Option<String>, ChType)>)` and
+  `ChType::Map(Box<ChType>, Box<ChType>)`; `TupleColumn { fields, len,
+  validity }` and `MapColumn { offsets, entries }` (entries is always a
+  two-field Tuple column, never with its own validity). The prefix/values
+  split carries both: `read_state_prefix`/`write_state_prefix` recurse per
+  tuple element and Map key-then-value, so a `LowCardinality` leaf's 8-byte
+  key version hoists to the very front of the column, before any offsets.
+  `decode_map` reuses `read_array_offsets` and drives the flattened key and
+  value runs off the same entry count, so the entries tuple cannot decode
+  ragged. Arrow export: Tuple = `+s` struct (children named after elements,
+  1-based "1", "2", ... when unnamed); Map = `+L` LargeList with a
+  non-nullable `entries: +s {key, value}` child (never `+m`, whose i32
+  offsets would force a copy; never ARROW_FLAG_MAP_KEYS_SORTED). The
+  type-string parser handles back-quoted element names with the server's full
+  escape table (accepts doubled-backtick AND backslash forms); `Display`
+  renders only the server's backslash convention, including quoting any-case
+  `null`. Decode stays lenient on names the server would reject at creation;
+  encode mirrors `checkTupleNames` (empty / lowercase `null` / duplicate /
+  mixed names -> `UnsupportedType`) and rejects entries validity
+  (`InconsistentBatch`).
+- **Build/test status:** Tree builds clean; `cargo test` green (359 unit + 3
   integration, ignored tests skipped); clippy clean
-  (`cargo clippy --all-targets -- -D warnings`); fmt clean
-  (`cargo fmt --check`). The live INSERT tests in `tests/live_insert.rs` are
-  `#[ignore]` and server-gated; they cover `lc LowCardinality(String)`,
-  `lcn LowCardinality(Nullable(String))`, and a 260-entry
-  `LowCardinality(FixedString(4))` dictionary that exercises UInt16 indexes, and
-  **run green** against the localhost 26.6.1.1193 ClickHouse server.
-- **Recommended next (encode track):** **Sink-based encode**, exposing the
-  existing private `encode_block_into` shape so bindings can write directly into
-  a transport buffer and skip an owned `Vec` handoff. If the decode track resumes
-  instead, its next item is **`Array(T)`** (see "Type coverage"). Compression
-  framing stays implemented but unwired and out of the current HTTP scope.
+  (`cargo clippy --all-targets -- -D warnings`); fmt clean. The live INSERT
+  tests in `tests/live_insert.rs` are `#[ignore]` and server-gated; the sample
+  batch now also covers `tup Tuple(Int32, String)`, `tup_named`, `ntup
+  Nullable(Tuple(...))` (created with `enable_nullable_tuple_type=1`),
+  `arr_tup`, and the Map shapes `m`, `m_lc`, `m_nv`, `m_arr`, `arr_m`, and an
+  all-empty `m_empty`, and **runs green** against the local 26.6.1.1193
+  ClickHouse server. Tuple/Map decode is additionally covered by the same
+  columns in the committed `all_types` fixtures (rev 0 and rev 54485),
+  recaptured from that server and asserted in `tests/integration.rs`. Note:
+  in this environment `localhost` is proxy-intercepted; capture scripts and
+  live tests run against `127.0.0.1` with `no_proxy` set.
+- **Recommended next:** **wide integers `Int128`/`UInt128`/`Int256`/`UInt256`**
+  (Tier 2's first entry): 16/32-byte little-endian passthrough columns, the
+  same host-agnostic buffer shape as `Decimal`, so they are the cheapest
+  remaining coverage win and need no new framing concepts. After that,
+  `Nested(...)` (sugar over `Array(Tuple(...))`; first confirm via the
+  server-reader whether the server ever emits the `Nested` type string in a
+  Native header or always the expanded form) and the geo aliases (`Point` =
+  `Tuple(Float64, Float64)` etc.) are now cheap on top of `Array` + `Tuple`.
+  Per the standing policy, land each new type's encode in the same change.
+  Sink-based encode and the (still unwired) compression framing remain the
+  other standing backlog items.
 - **Active gotchas / context:**
+  - A zero-length `LowCardinality` run (reachable when rows > 0 but every
+    array or map is empty) has NO body bytes at all:
+    `SerializationLowCardinality::serializeBinaryBulkWithMultipleStreams`
+    early-returns at `limit == 0`. Both directions handle it (`decode_values`/
+    `skip_values` gate on `num_rows == 0`; `encode_column_values` writes
+    nothing), and the gates compose through `Tuple` elements and `Map`
+    keys/values (covered by the all-empty fixture columns and unit tests).
+  - The encoder rejects a caller-constructed type nested deeper than
+    `MAX_TYPE_DEPTH` as `InconsistentBatch`, deliberately NOT
+    `UnsupportedType`: that variant clones and `Display`s the `ChType`, both of
+    which recurse to full depth, so the error itself would overflow on the
+    input the check rejects. The `type_depth` walk in `encode.rs` is an
+    explicit worklist since the multi-child containers (`Tuple`, `Map`)
+    landed.
+  - `Nullable(Tuple)` IS legal on the wire (`DataTypeTuple::canBeInsideNullable()`
+    is true; the beta `enable_nullable_tuple_type` setting gates DDL only, not
+    the wire) and is decoded/encoded with the ordinary null-map-then-body
+    framing. `Nullable(Map)`, `LowCardinality(Tuple)`, and
+    `LowCardinality(Map)` are all illegal (`canBeInsideNullable()` false /
+    `canBeInsideLowCardinality()` false) and are rejected.
+  - Map keys: `Nullable(K)` and `LowCardinality(Nullable(K))` are forbidden
+    (`DataTypeMap::isValidKeyType`); plain `LowCardinality(K)` keys are legal.
+    One shared predicate (`is_valid_map_key_type` in `src/native/decode.rs`)
+    is consulted by decode header validation, the scan, and encode, so the
+    sides cannot drift.
+  - A zero-element `Tuple()` is constructible and emittable and writes exactly
+    ONE literal ASCII '0' (0x30) placeholder byte per row; decode skips those
+    bytes without validating their value (the server uses `tryIgnore`).
+  - Map on the Native wire is ALWAYS the plain BASIC `Array(Tuple(K, V))`
+    layout: `NativeReader` uses `enableAllSupportedSerializations()` and
+    `NativeWriter` the `IDataType::getSerializationInfo` default, both leaving
+    `map_serialization_version` at BASIC, so the bucketed WITH_BUCKETS on-disk
+    mode never reaches the wire in either direction.
+  - Tuple element names: decode is lenient (accepts what a server-authored
+    header says, including shapes the server would reject at creation), while
+    encode mirrors `DataTypeTuple::checkTupleNames` plus the factory's
+    all-or-nothing rule (empty name, exact-lowercase `null`, duplicates, and
+    mixed named/unnamed -> `UnsupportedType`). `Display` quotes any-case
+    `null` (the server's `isValidIdentifier` excludes it case-insensitively).
+  - Map exports as Arrow `+L` LargeList of `entries: struct<key, value>`, NOT
+    `+m`: the Arrow map type mandates i32 offsets and has no large variant, so
+    `+m` would force a per-offset narrowing copy. The `entries`/`key`/`value`
+    naming keeps the export shape-isomorphic to Arrow Map; a binding that
+    wants a real Map type does the cast on its side (noted in
+    `CODEC_CONTRACT.md`).
+  - `Array` offsets export as an Arrow **LargeList** (`+L`, 64-bit offsets), not a
+    List (`+l`). Deliberate: ClickHouse offsets are `UInt64` and count elements, so
+    an i32 cap would be a real completeness gap. A binding on a consumer that lacks
+    LargeList support would need its own conversion (noted in `CODEC_CONTRACT.md`).
+  - A new `MAX_TYPE_DEPTH = 100` cap in `parse_ch_type` bounds recursion for the
+    whole decoder (parse -> decode -> scan -> Arrow export all recurse only as deep
+    as the parsed `ChType`). Added with `Array` (an arbitrarily nestable container
+    read from an untrusted header) and it also closes a PRE-EXISTING
+    `LowCardinality(LowCardinality(...))` stack-overflow-on-malformed-input vector.
+    An over-deep type surfaces as `UnsupportedType`.
   - `Decimal` is NOT a legal `LowCardinality` inner: `DataTypeDecimal` is a
     `DataTypeDecimalBase` subclass whose `canBeInsideLowCardinality()` is false, so
     `LowCardinality(Decimal...)` can never appear on the wire. The crate decodes
@@ -136,10 +217,12 @@ default; the user may override it.
     guard only (needed at creation for the numerics, temporals, and `IPv4`/`IPv6`,
     not for `UUID`) and does not affect decoding.
   - The per-column bulk-state prefix is generalized (`read_state_prefix`).
-    `LowCardinality` reads its 8-byte key version through it; every other type
-    reads zero bytes. Later types with a real prefix (Array, Map) declare it
-    there. Note the prefix is emitted per column per block in Native and only
-    when the block has rows, not once per column overall.
+    `LowCardinality` reads its 8-byte key version through it; the containers
+    (`Array`, `Tuple`, `Map`) and `Nullable` write nothing of their own and
+    recurse (Tuple per element in order, Map key then value), so a nested LC
+    leaf's key version hoists to the very front of the column. Every other
+    type reads zero bytes. Note the prefix is emitted per column per block in
+    Native and only when the block has rows, not once per column overall.
 - **Key references:** per-type workflow is in `AGENTS.md` ("Adding A New
   ClickHouse Type"). Output contract is `CODEC_CONTRACT.md`. Deferred
   decisions are in `FINDINGS.md`. Type enum and planned placeholders are in
@@ -253,6 +336,59 @@ is not done, and must not be checked off, until all of these hold:
         width. Forbidden as a `LowCardinality` inner. Confirmed against the server
         source (`SerializationDecimalBase`/`DataTypesDecimal`) and verified with
         the `dec32`/`dec64`/`dec128`/`dec256` live-server fixture columns.
+- [x] `Array(T)` (decode and encode)
+      - the first nested/recursive type. Wire: the element type's state prefix,
+        then `num_rows` cumulative little-endian `UInt64` end-offsets, then the
+        flattened element column of length = the last offset (server
+        `SerializationArray`). Decoded into `ArrayColumn { offsets: Vec<i64> with
+        Arrow's leading 0, values: Box<Column> }`; the element recurses through the
+        shared body path, so `Array(Nullable(T))`, `Array(LowCardinality(T))`, and
+        `Array(Array(T))` all compose. `Nullable(Array(T))` is forbidden by the
+        server (`canBeInsideNullable()` is false). Exported as an Arrow LargeList
+        (`+L`, 64-bit offsets). `read_state_prefix` recurses into the element so an
+        `Array(LowCardinality(T))` consumes the LC key version before the offsets;
+        `decode_column` was split into a prefix step plus a `decode_values` step so
+        the element body decodes without re-reading a prefix, and the completeness
+        scan mirrors this (both walk the offsets through the shared
+        `read_array_offsets`). A `MAX_TYPE_DEPTH` cap bounds recursion against a
+        hostile deeply-nested header, and the encoder enforces the same cap
+        iteratively on caller-constructed types. A zero-length `LowCardinality`
+        element run (all arrays empty) has no LC body at all on the wire; both
+        directions honor the server's `limit == 0` early return. Confirmed against
+        the server source and verified with the
+        `arr`/`arr_s`/`arr_n`/`arr_lc`/`arr_arr`/`arr_lc_empty` live-server fixture
+        columns; encode is verified by round-trip and exact-byte unit tests plus
+        the live INSERT test.
+- [x] `Tuple(T1, ...)` / named tuples (decode and encode)
+      - the first multi-child container. Wire: no framing of its own; each
+        element column is written sequentially in declaration order, the full
+        `num_rows` run each (server `SerializationTuple` loops the elements);
+        the state prefix/suffix recurse per element in order. Named tuples
+        carry names only in the type string (`backQuoteIfNeed` quoting; parse
+        accepts both the doubled-backtick and backslash escape forms, `Display`
+        renders the server's backslash convention, quoting any-case `null`).
+        `Nullable(Tuple)` is wire-legal and supported; `LowCardinality(Tuple)`
+        is illegal. A zero-element `Tuple()` writes one 0x30 byte per row.
+        Decoded into `TupleColumn { fields, len, validity }`; exported as Arrow
+        `+s` struct (children named per element, 1-based indexes when unnamed).
+        Decode enforces equal element lengths; encode mirrors
+        `checkTupleNames`. Confirmed against the server source and verified
+        with the `tup`/`tup_named`/`arr_tup`/`ntup` live-server fixture
+        columns; encode runs green in the live INSERT test.
+- [x] `Map(K, V)` (decode and encode)
+      - always the plain `Array(Tuple(keys, values))` layout on the Native wire
+        (cumulative `UInt64` end-offsets, then the flattened key run, then the
+        value run; the bucketed WITH_BUCKETS MergeTree mode never reaches the
+        wire). State prefix recurses key then value, before the offsets. Keys
+        reject `Nullable`/`LowCardinality(Nullable)` (`isValidKeyType`); plain
+        `LowCardinality(K)` is legal. `Nullable(Map)`/`LowCardinality(Map)`
+        are illegal. Decoded into `MapColumn { offsets, entries }` (entries a
+        two-field Tuple column, never with its own validity); exported as
+        Arrow `+L` LargeList of non-nullable `entries: +s {key, value}` (never
+        `+m`, which mandates i32 offsets). Confirmed against the server source
+        and verified with the `m`/`m_lc`/`m_nv`/`m_arr`/`arr_m`/`m_empty`
+        live-server fixture columns; encode runs green in the live INSERT
+        test.
 
 ---
 
@@ -323,11 +459,30 @@ introduction), so record them per type only when determinable.
       false on `DataTypeDecimalBase`). Confirmed against the server source
       (`SerializationDecimalBase`/`DataTypesDecimal`) and verified with the
       `dec32`/`dec64`/`dec128`/`dec256` live-server fixture columns.
-- [ ] `Array(T)` - offsets stream (cumulative `UInt64`) plus the inner column;
-      first nested type, recurse into `T`.
-- [ ] `Map(K, V)` - serialized as `Array(Tuple(K, V))`; depends on `Array` and
-      `Tuple`.
-- [ ] `Tuple(T1, ...)` / named tuples - one nested column per element.
+- [x] `Array(T)` - decode AND encode done. The first nested/recursive type.
+      Wire layout (server `SerializationArray`, confirmed at v26.6.1.1193-stable):
+      the element type's state prefix first (so `Array(LowCardinality(T))` reads the
+      LC 8-byte key version before the offsets), then `num_rows` cumulative absolute
+      little-endian `UInt64` end-offsets (monotonically non-decreasing; equal
+      adjacent = an empty-array row), then the flattened element body of length =
+      the last offset. Decoded into `Column::Array(ArrayColumn { offsets: Vec<i64>
+      with Arrow's leading 0, values: Box<Column> })`; the element recurses through
+      the shared per-type body path, so `Array(Nullable(T))` (per-element null map
+      after the offsets), `Array(LowCardinality(T))`, and nested `Array(Array(T))`
+      all compose. `Nullable(Array(T))` is illegal (`DataTypeArray::canBeInsideNullable()`
+      is false). Exported as an Arrow LargeList `+L` (64-bit offsets, one `item`
+      child), zero-copy. Recursion across parse/decode/scan/export is bounded by
+      `MAX_TYPE_DEPTH`. Verified with the `arr`, `arr_s`, `arr_n`, `arr_lc`,
+      `arr_arr`, `arr_lc_empty` live-server fixture columns. Encode is the exact
+      inverse (see "Encode / insert path") and runs green in the live INSERT test.
+- [x] `Map(K, V)` - decode AND encode done. Serialized as the nested
+      `Array(Tuple(keys, values))` on the Native wire, always in the BASIC
+      (non-bucketed) mode. See "Implemented" for the full summary; type
+      section in `CODEC_CONTRACT.md`.
+- [x] `Tuple(T1, ...)` / named tuples - decode AND encode done. Sequential
+      element columns, per-element prefix recursion, `Nullable(Tuple)`
+      supported, `Tuple()` one-byte-per-row placeholder handled. See
+      "Implemented" for the full summary; type section in `CODEC_CONTRACT.md`.
 
 ### Tier 2 - less common, still in scope
 
@@ -562,6 +717,51 @@ bring encode to parity with what the decoder already supports.
       tests, rejection tests, and live INSERT tests against localhost, including
       String, nullable String, and a 260-entry FixedString dictionary that
       exercises UInt16 indexes.
+- [x] `Array(T)` (offsets + flattened element body, the write-side of the
+      prefix/values split). `write_state_prefix` mirrors decode's
+      `read_state_prefix`: `Array` writes nothing of its own and recurses, so a
+      leaf `LowCardinality` key version is hoisted once to the very front of the
+      column, before the offsets, across all nesting levels. `encode_array_data`
+      writes `offsets[1..]` as raw LE `u64` (the Arrow leading 0 is model-only;
+      validation proved non-negativity, so the i64 bytes are the wire u64's) via
+      the `encode_primitive!` bulk-copy fast path, then the element body through
+      the shared `encode_column_values` path without re-emitting a prefix, so
+      `Nullable`, `LowCardinality`, and nested `Array` elements compose.
+      Zero-row blocks write no data section at all; a zero-length nested LC run
+      writes no LC body (the server's `limit == 0` early return, which also
+      required the matching decode-side gate in `decode_values`/`skip_values`).
+      Pre-write `validate_array` rejects wrong offset counts, a missing leading
+      zero, non-monotonic or negative offsets, and a last offset that disagrees
+      with the flattened element count, then validates the element column
+      recursively; `validate_column` also caps caller-constructed type nesting
+      at `MAX_TYPE_DEPTH` iteratively (encode input never passes through
+      `parse_ch_type`). Verified by rev 0 / rev 54485 round-trips (plain,
+      nullable-element, LC-element, all-empty LC-element, nested), exact-byte
+      pins (`rev0_frames_array_int32_bytes`,
+      `rev0_frames_array_low_cardinality_all_empty_bytes`), zero-row and
+      multi-block `encode_chunked` round-trips, rejection tests, the recaptured
+      `arr_lc_empty` fixture column, and the live INSERT test
+      (`arr_i32`/`arr_ns`/`arr_lc`/`arr_arr`/`arr_lc_empty`) green against
+      26.6.1.1193. With this, encode coverage equals decode coverage.
+- [x] `Tuple(T1, ...)` (sequential element bodies through the shared
+      `encode_column_values` path, per-element `write_state_prefix` recursion,
+      `Tuple()` writes 0x30 per row). Pre-write `validate_tuple` rejects
+      field-count mismatches and ragged element lengths (`InconsistentBatch`)
+      and server-unconstructible element names per `checkTupleNames` plus the
+      factory's all-or-nothing rule (empty, exact-lowercase `null`, duplicate,
+      or mixed named/unnamed -> `UnsupportedType`); a plain (non-Nullable)
+      Tuple with null-marked validity is rejected by the generic
+      `null_count() > 0` check. Verified by round-trips at rev 0 and 54485,
+      exact-byte pins, rejection tests, and the live INSERT test.
+- [x] `Map(K, V)` (offsets `[1..]` via the bulk path, then the key and value
+      runs through `encode_column_values`; `write_state_prefix` recurses key
+      then value so an LC key's version hoists before the offsets). Pre-write
+      `validate_map` enforces the Array offset invariants, key-type legality
+      (shared `is_valid_map_key_type` -> `UnsupportedType`), a two-field
+      entries tuple, and rejects entries validity (`InconsistentBatch`).
+      Verified by round-trips at rev 0 and 54485, exact-byte pins (including
+      the all-empty LC-key hoisted-prefix pin), rejection tests, and the live
+      INSERT test.
 - [x] Round-trip tests (encode then decode equals the original buffers) for the
       numerics, plus a live-server `INSERT` acceptance test
       (`tests/live_insert.rs`, `#[ignore]`, curl over HTTP). Extend both as each

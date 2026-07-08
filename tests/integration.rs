@@ -239,6 +239,75 @@ fn assert_all_types(batch: &ChunkedBatch) {
                 "arr_lc_empty",
                 ChType::Array(Box::new(ChType::LowCardinality(Box::new(ChType::String)))),
             ),
+            // Tuple(T1, ...): unnamed, named (names live in the type string
+            // only), inside Array, and inside Nullable (legal:
+            // DataTypeTuple::canBeInsideNullable() is true).
+            Expected::Exact(
+                "tup",
+                ChType::Tuple(vec![(None, ChType::Int32), (None, ChType::String)]),
+            ),
+            Expected::Exact(
+                "tup_named",
+                ChType::Tuple(vec![
+                    (Some("a".to_string()), ChType::Int32),
+                    (
+                        Some("b".to_string()),
+                        ChType::Nullable(Box::new(ChType::String)),
+                    ),
+                ]),
+            ),
+            Expected::Exact(
+                "arr_tup",
+                ChType::Array(Box::new(ChType::Tuple(vec![
+                    (None, ChType::Int32),
+                    (None, ChType::Int32),
+                ]))),
+            ),
+            Expected::Exact(
+                "ntup",
+                ChType::Nullable(Box::new(ChType::Tuple(vec![
+                    (None, ChType::Int32),
+                    (None, ChType::String),
+                ]))),
+            ),
+            // Map(K, V): the Array(Tuple(keys, values)) wire layout. Keys may
+            // be LowCardinality (but never Nullable); values are unrestricted.
+            Expected::Exact(
+                "m",
+                ChType::Map(Box::new(ChType::String), Box::new(ChType::Int32)),
+            ),
+            Expected::Exact(
+                "m_lc",
+                ChType::Map(
+                    Box::new(ChType::LowCardinality(Box::new(ChType::String))),
+                    Box::new(ChType::UInt8),
+                ),
+            ),
+            Expected::Exact(
+                "m_nv",
+                ChType::Map(
+                    Box::new(ChType::String),
+                    Box::new(ChType::Nullable(Box::new(ChType::String))),
+                ),
+            ),
+            Expected::Exact(
+                "m_arr",
+                ChType::Map(
+                    Box::new(ChType::String),
+                    Box::new(ChType::Array(Box::new(ChType::Int32))),
+                ),
+            ),
+            Expected::Exact(
+                "arr_m",
+                ChType::Array(Box::new(ChType::Map(
+                    Box::new(ChType::String),
+                    Box::new(ChType::Int32),
+                ))),
+            ),
+            Expected::Exact(
+                "m_empty",
+                ChType::Map(Box::new(ChType::String), Box::new(ChType::Int32)),
+            ),
         ],
     );
 
@@ -690,6 +759,226 @@ fn assert_all_types(batch: &ChunkedBatch) {
             }
             other => panic!("expected empty Dictionary elements, got {other:?}"),
         }
+    }
+
+    // Tuple(Int32, String): each element's full run in declaration order
+    // (column-of-columns). Rows (-13, user_0), (-6, user_1), (1, user_2),
+    // (8, user_3).
+    {
+        let t = as_tuple(block.column(44));
+        assert_eq!(t.len, 4);
+        assert!(t.validity.is_none());
+        match &t.fields[0] {
+            Column::Int32(c) => assert_eq!(c.values.as_slice(), &[-13, -6, 1, 8]),
+            other => panic!("expected Int32 tuple element, got {other:?}"),
+        }
+        match &t.fields[1] {
+            Column::Utf8(c) => {
+                assert_utf8_column(c, &[b"user_0" as &[u8], b"user_1", b"user_2", b"user_3"])
+            }
+            other => panic!("expected Utf8 tuple element, got {other:?}"),
+        }
+    }
+
+    // Tuple(a Int32, b Nullable(String)): element b carries its own null map
+    // inside its element body; rows 1 and 3 are NULL there. The names are type
+    // metadata only.
+    {
+        let t = as_tuple(block.column(45));
+        assert_eq!(t.len, 4);
+        match &t.fields[0] {
+            Column::Int32(c) => assert_eq!(c.values.as_slice(), &[0, 1, 2, 3]),
+            other => panic!("expected Int32 tuple element, got {other:?}"),
+        }
+        match &t.fields[1] {
+            Column::Utf8(c) => {
+                assert_eq!(c.null_count(), 2);
+                let bm = c.validity.as_ref().expect("element validity");
+                let got: Vec<bool> = (0..4).map(|i| bm.is_valid(i)).collect();
+                assert_eq!(got, vec![true, false, true, false]);
+                assert_eq!(c.value(0), b"user_0");
+                assert_eq!(c.value(2), b"user_2");
+            }
+            other => panic!("expected Utf8 tuple element, got {other:?}"),
+        }
+    }
+
+    // Array(Tuple(Int32, Int32)): rows [] / [(13, 79)] / [(1, 2), (3, 4)] /
+    // [(-1, -2)]. The flattened tuple column holds 4 rows; the offsets carry
+    // Arrow's leading 0.
+    {
+        let arr = as_array(block.column(46));
+        assert_eq!(arr.offsets, vec![0i64, 0, 1, 3, 4]);
+        let t = as_tuple(arr.values.as_ref());
+        assert_eq!(t.len, 4);
+        match (&t.fields[0], &t.fields[1]) {
+            (Column::Int32(a), Column::Int32(b)) => {
+                assert_eq!(a.values.as_slice(), &[13, 1, 3, -1]);
+                assert_eq!(b.values.as_slice(), &[79, 2, 4, -2]);
+            }
+            other => panic!("expected Int32 tuple elements, got {other:?}"),
+        }
+    }
+
+    // Nullable(Tuple(Int32, String)): the tuple-level null map precedes the
+    // tuple body; rows 1 and 3 are NULL and carry element defaults (0, '') in
+    // the element bodies.
+    {
+        let t = as_tuple(block.column(47));
+        assert_eq!(t.len, 4);
+        assert_eq!(t.null_count(), 2);
+        let bm = t.validity.as_ref().expect("tuple-level validity");
+        let got: Vec<bool> = (0..4).map(|i| bm.is_valid(i)).collect();
+        assert_eq!(got, vec![true, false, true, false]);
+        match &t.fields[0] {
+            Column::Int32(c) => assert_eq!(c.values.as_slice(), &[0, 0, 2, 0]),
+            other => panic!("expected Int32 tuple element, got {other:?}"),
+        }
+        match &t.fields[1] {
+            Column::Utf8(c) => {
+                assert_eq!(c.value(0), b"user_0");
+                assert_eq!(c.value(1), b"");
+                assert_eq!(c.value(2), b"user_2");
+                assert_eq!(c.value(3), b"");
+            }
+            other => panic!("expected Utf8 tuple element, got {other:?}"),
+        }
+    }
+
+    // Map(String, Int32): rows {} / {a: 13} / {a: 1, b: 2} / {k: -7}. The
+    // offsets carry Arrow's leading 0; the entries are the flattened keys run
+    // then the flattened values run.
+    {
+        let m = as_map(block.column(48));
+        assert_eq!(m.offsets, vec![0i64, 0, 1, 3, 4]);
+        let (keys, values) = map_entries(m);
+        match (keys, values) {
+            (Column::Utf8(k), Column::Int32(v)) => {
+                assert_utf8_column(k, &[b"a" as &[u8], b"a", b"b", b"k"]);
+                assert_eq!(v.values.as_slice(), &[13, 1, 2, -7]);
+            }
+            other => panic!("expected (Utf8, Int32) entries, got {other:?}"),
+        }
+    }
+
+    // Map(LowCardinality(String), UInt8): rows {red: 1} / {} / {red: 2,
+    // blue: 3} / {green: 4}. The LC key version is hoisted ahead of the
+    // offsets; the flattened keys resolve through the per-block dictionary.
+    {
+        let m = as_map(block.column(49));
+        assert_eq!(m.offsets, vec![0i64, 1, 1, 3, 4]);
+        let (keys, values) = map_entries(m);
+        assert_dictionary_string_values(
+            keys,
+            &[
+                Some(b"red" as &[u8]),
+                Some(b"red"),
+                Some(b"blue"),
+                Some(b"green"),
+            ],
+        );
+        match values {
+            Column::UInt8(v) => assert_eq!(v.values.as_slice(), &[1, 2, 3, 4]),
+            other => panic!("expected UInt8 values, got {other:?}"),
+        }
+    }
+
+    // Map(String, Nullable(String)): rows {a: user_1} / {b: NULL} / {} /
+    // {c: user_2, d: NULL}. The flattened value run carries its own null map.
+    {
+        let m = as_map(block.column(50));
+        assert_eq!(m.offsets, vec![0i64, 1, 2, 2, 4]);
+        let (keys, values) = map_entries(m);
+        match keys {
+            Column::Utf8(k) => assert_utf8_column(k, &[b"a" as &[u8], b"b", b"c", b"d"]),
+            other => panic!("expected Utf8 keys, got {other:?}"),
+        }
+        match values {
+            Column::Utf8(v) => {
+                assert_eq!(v.null_count(), 2);
+                let bm = v.validity.as_ref().expect("value validity");
+                let got: Vec<bool> = (0..4).map(|i| bm.is_valid(i)).collect();
+                assert_eq!(got, vec![true, false, true, false]);
+                assert_eq!(v.value(0), b"user_1");
+                assert_eq!(v.value(2), b"user_2");
+            }
+            other => panic!("expected Utf8 values, got {other:?}"),
+        }
+    }
+
+    // Map(String, Array(Int32)): rows {a: [13]} / {} / {b: [], c: [1, 2]} /
+    // {d: [79]}. The flattened value run is itself an Array column over the
+    // entries.
+    {
+        let m = as_map(block.column(51));
+        assert_eq!(m.offsets, vec![0i64, 1, 1, 3, 4]);
+        let (keys, values) = map_entries(m);
+        match keys {
+            Column::Utf8(k) => assert_utf8_column(k, &[b"a" as &[u8], b"b", b"c", b"d"]),
+            other => panic!("expected Utf8 keys, got {other:?}"),
+        }
+        match values {
+            Column::Array(arr) => {
+                assert_eq!(arr.offsets, vec![0i64, 1, 1, 3, 4]);
+                match arr.values.as_ref() {
+                    Column::Int32(c) => assert_eq!(c.values.as_slice(), &[13, 1, 2, 79]),
+                    other => panic!("expected Int32 leaf, got {other:?}"),
+                }
+            }
+            other => panic!("expected Array values, got {other:?}"),
+        }
+    }
+
+    // Array(Map(String, Int32)): rows [] / [{a: 1}] / [{b: 2}, {}] / [{c: 3}].
+    {
+        let arr = as_array(block.column(52));
+        assert_eq!(arr.offsets, vec![0i64, 0, 1, 3, 4]);
+        let m = as_map(arr.values.as_ref());
+        assert_eq!(m.offsets, vec![0i64, 1, 2, 2, 3]);
+        let (keys, values) = map_entries(m);
+        match (keys, values) {
+            (Column::Utf8(k), Column::Int32(v)) => {
+                assert_utf8_column(k, &[b"a" as &[u8], b"b", b"c"]);
+                assert_eq!(v.values.as_slice(), &[1, 2, 3]);
+            }
+            other => panic!("expected (Utf8, Int32) entries, got {other:?}"),
+        }
+    }
+
+    // Map(String, Int32) with EVERY row empty: the server writes the all-zero
+    // offsets and NOTHING for the key/value runs.
+    {
+        let m = as_map(block.column(53));
+        assert_eq!(m.offsets, vec![0i64, 0, 0, 0, 0]);
+        let (keys, values) = map_entries(m);
+        assert_eq!(keys.len(), 0);
+        assert_eq!(values.len(), 0);
+    }
+}
+
+/// Borrow the inner `MapColumn` of a decoded `Map` column, panicking with a
+/// useful message on any other variant.
+fn as_map(column: &Column) -> &ch_core_rs::column::MapColumn {
+    match column {
+        Column::Map(m) => m,
+        other => panic!("expected Map column, got {other:?}"),
+    }
+}
+
+/// Borrow a `MapColumn`'s keys and values columns out of its two-field entries
+/// tuple.
+fn map_entries(map: &ch_core_rs::column::MapColumn) -> (&Column, &Column) {
+    let t = as_tuple(map.entries.as_ref());
+    assert_eq!(t.fields.len(), 2, "entries must be the (keys, values) pair");
+    (&t.fields[0], &t.fields[1])
+}
+
+/// Borrow the inner `TupleColumn` of a decoded `Tuple` column, panicking with a
+/// useful message on any other variant.
+fn as_tuple(column: &Column) -> &ch_core_rs::column::TupleColumn {
+    match column {
+        Column::Tuple(t) => t,
+        other => panic!("expected Tuple column, got {other:?}"),
     }
 }
 

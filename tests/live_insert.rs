@@ -29,8 +29,8 @@ use std::process::{Command, Stdio};
 use ch_core_rs::batch::ColBatch;
 use ch_core_rs::bitmap::Bitmap;
 use ch_core_rs::column::{
-    ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn,
-    PrimitiveColumn, Utf8Column,
+    ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn, MapColumn,
+    PrimitiveColumn, TupleColumn, Utf8Column,
 };
 use ch_core_rs::native::decode::{decode_all_bytes, DecodeOptions};
 use ch_core_rs::native::encode::{encode_block, EncodeOptions};
@@ -192,6 +192,70 @@ fn sample_batch() -> ColBatch {
         (
             "arr_lc_empty",
             ChType::Array(Box::new(ChType::LowCardinality(Box::new(ChType::String)))),
+        ),
+        (
+            "tup",
+            ChType::Tuple(vec![(None, ChType::Int32), (None, ChType::String)]),
+        ),
+        (
+            "tup_named",
+            ChType::Tuple(vec![
+                (Some("a".to_string()), ChType::Int32),
+                (
+                    Some("b".to_string()),
+                    ChType::Nullable(Box::new(ChType::String)),
+                ),
+            ]),
+        ),
+        (
+            "arr_tup",
+            ChType::Array(Box::new(ChType::Tuple(vec![
+                (None, ChType::Int32),
+                (None, ChType::Int32),
+            ]))),
+        ),
+        (
+            "ntup",
+            ChType::Nullable(Box::new(ChType::Tuple(vec![
+                (None, ChType::Int32),
+                (None, ChType::String),
+            ]))),
+        ),
+        (
+            "m",
+            ChType::Map(Box::new(ChType::String), Box::new(ChType::Int32)),
+        ),
+        (
+            "m_lc",
+            ChType::Map(
+                Box::new(ChType::LowCardinality(Box::new(ChType::String))),
+                Box::new(ChType::UInt8),
+            ),
+        ),
+        (
+            "m_nv",
+            ChType::Map(
+                Box::new(ChType::String),
+                Box::new(ChType::Nullable(Box::new(ChType::String))),
+            ),
+        ),
+        (
+            "m_arr",
+            ChType::Map(
+                Box::new(ChType::String),
+                Box::new(ChType::Array(Box::new(ChType::Int32))),
+            ),
+        ),
+        (
+            "arr_m",
+            ChType::Array(Box::new(ChType::Map(
+                Box::new(ChType::String),
+                Box::new(ChType::Int32),
+            ))),
+        ),
+        (
+            "m_empty",
+            ChType::Map(Box::new(ChType::String), Box::new(ChType::Int32)),
         ),
     ]
     .into_iter()
@@ -394,9 +458,119 @@ fn sample_batch() -> ColBatch {
                 Column::Utf8(utf8_column(&[])),
             )),
         )),
+        // Tuple(Int32, String): each element's full run in declaration order,
+        // no tuple-level framing. Rows (13, user_1), (-7, ""), (79, user_2),
+        // (0, user_3).
+        Column::Tuple(TupleColumn::new(
+            vec![
+                Column::Int32(PrimitiveColumn::new(vec![13, -7, 79, 0])),
+                Column::Utf8(utf8_column(&[b"user_1", b"", b"user_2", b"user_3"])),
+            ],
+            4,
+        )),
+        // Tuple(a Int32, b Nullable(String)): element b carries its own null
+        // map inside its element body (valid, null, valid, null).
+        Column::Tuple(TupleColumn::new(
+            vec![
+                Column::Int32(PrimitiveColumn::new(vec![1, 2, 3, 4])),
+                Column::Utf8({
+                    let mut b = utf8_column(&[b"user_1", b"", b"user_2", b""]);
+                    b.validity = Some(validity());
+                    b
+                }),
+            ],
+            4,
+        )),
+        // Array(Tuple(Int32, Int32)): [(13, 79)], [], [(1, 2), (3, 4)],
+        // [(-1, -2)] -> offsets [0, 1, 1, 3, 4] over a 4-row flattened tuple.
+        Column::Array(ArrayColumn::new(
+            vec![0, 1, 1, 3, 4],
+            Column::Tuple(TupleColumn::new(
+                vec![
+                    Column::Int32(PrimitiveColumn::new(vec![13, 1, 3, -1])),
+                    Column::Int32(PrimitiveColumn::new(vec![79, 2, 4, -2])),
+                ],
+                4,
+            )),
+        )),
+        // Nullable(Tuple(Int32, String)): the tuple-level null map precedes
+        // the tuple body; null rows carry element defaults (0, "") so the
+        // server's read-back placeholders compare equal.
+        Column::Tuple(TupleColumn::new_nullable(
+            vec![
+                Column::Int32(PrimitiveColumn::new(vec![13, 0, 79, 0])),
+                Column::Utf8(utf8_column(&[b"user_1", b"", b"user_2", b""])),
+            ],
+            4,
+            validity(),
+        )),
+        // Map(String, Int32): {a: 13} / {} / {a: 1, b: 2} / {k: -7}. The
+        // entries column is the (keys, values) tuple over the flattened runs.
+        Column::Map(map_column(
+            vec![0, 1, 1, 3, 4],
+            Column::Utf8(utf8_column(&[b"a", b"a", b"b", b"k"])),
+            Column::Int32(PrimitiveColumn::new(vec![13, 1, 2, -7])),
+        )),
+        // Map(LowCardinality(String), UInt8): the LC key version is hoisted
+        // ahead of the offsets. {red: 1} / {red: 2, blue: 3} / {} / {green: 4}.
+        Column::Map(map_column(
+            vec![0, 1, 3, 3, 4],
+            Column::Dictionary(DictionaryColumn::new(
+                vec![1, 1, 2, 3],
+                Column::Utf8(utf8_column(&[b"", b"red", b"blue", b"green"])),
+            )),
+            Column::UInt8(PrimitiveColumn::new(vec![1, 2, 3, 4])),
+        )),
+        // Map(String, Nullable(String)): the flattened value run carries its
+        // own null map. {a: user_1} / {b: NULL} / {} / {c: user_2, d: NULL}.
+        Column::Map(map_column(
+            vec![0, 1, 2, 2, 4],
+            Column::Utf8(utf8_column(&[b"a", b"b", b"c", b"d"])),
+            Column::Utf8({
+                let mut v = utf8_column(&[b"user_1", b"", b"user_2", b""]);
+                v.validity = Some(validity());
+                v
+            }),
+        )),
+        // Map(String, Array(Int32)): the flattened value run is itself an
+        // Array. {a: [13]} / {} / {b: [], c: [1, 2]} / {d: [79]}.
+        Column::Map(map_column(
+            vec![0, 1, 1, 3, 4],
+            Column::Utf8(utf8_column(&[b"a", b"b", b"c", b"d"])),
+            Column::Array(ArrayColumn::new(
+                vec![0, 1, 1, 3, 4],
+                Column::Int32(PrimitiveColumn::new(vec![13, 1, 2, 79])),
+            )),
+        )),
+        // Array(Map(String, Int32)): [] / [{a: 1}] / [{b: 2}, {}] / [{c: 3}].
+        Column::Array(ArrayColumn::new(
+            vec![0, 0, 1, 3, 4],
+            Column::Map(map_column(
+                vec![0, 1, 2, 2, 3],
+                Column::Utf8(utf8_column(&[b"a", b"b", b"c"])),
+                Column::Int32(PrimitiveColumn::new(vec![1, 2, 3])),
+            )),
+        )),
+        // Map(String, Int32) with EVERY row empty: all-zero offsets, no
+        // key/value runs at all on the wire.
+        Column::Map(map_column(
+            vec![0, 0, 0, 0, 0],
+            Column::Utf8(utf8_column(&[])),
+            Column::Int32(PrimitiveColumn::new(vec![])),
+        )),
     ];
 
     ColBatch::new(Schema::new(fields), columns, 4)
+}
+
+/// Build a `MapColumn` from Arrow-shaped offsets plus the keys and values
+/// columns.
+fn map_column(offsets: Vec<i64>, keys: Column, values: Column) -> MapColumn {
+    let total = keys.len();
+    MapColumn::new(
+        offsets,
+        Column::Tuple(TupleColumn::new(vec![keys, values], total)),
+    )
 }
 
 /// A focused LowCardinality batch whose dictionary has more than 255 entries,
@@ -506,7 +680,14 @@ impl Server {
     /// This is a POST (unlike `--get`, which curl would turn into a read-only GET
     /// that rejects DDL).
     fn ddl(&self, sql: &str) {
-        let url = self.base_url.clone();
+        self.ddl_with_params(sql, "");
+    }
+
+    /// Send a DDL statement with extra URL query parameters (per-query server
+    /// settings, e.g. the `enable_nullable_tuple_type` DDL gate for a
+    /// `Nullable(Tuple(...))` column).
+    fn ddl_with_params(&self, sql: &str, params: &str) {
+        let url = format!("{}{params}", self.base_url);
         self.exec_empty(&url, &["--data-binary", sql], None, sql);
     }
 
@@ -587,6 +768,21 @@ fn raw_column_repr(column: &Column) -> Vec<String> {
                 .map(|&idx| values[idx as usize].clone())
                 .collect()
         }
+        // Tuple renders each row as the parenthesized joined element values,
+        // resolved recursively through the element columns. Element-level
+        // validity is not applied here, matching the raw (pre-validity)
+        // rendering of the Dictionary and Array arms; the sent and decoded
+        // sides render placeholders identically. Tuple() rows render as bare
+        // "()" (the placeholder wire byte carries no value).
+        Column::Tuple(c) => {
+            let element_reprs: Vec<Vec<String>> = c.fields.iter().map(raw_column_repr).collect();
+            (0..c.len)
+                .map(|row| {
+                    let parts: Vec<&str> = element_reprs.iter().map(|e| e[row].as_str()).collect();
+                    format!("({})", parts.join(", "))
+                })
+                .collect()
+        }
         // Array renders each row as its bracketed element sub-slice, resolved
         // recursively through the flattened element column. Element-level validity
         // is not applied here, matching the raw (pre-validity) rendering of the
@@ -598,6 +794,19 @@ fn raw_column_repr(column: &Column) -> Vec<String> {
                     let start = c.offsets[i] as usize;
                     let end = c.offsets[i + 1] as usize;
                     format!("{:?}", &elems[start..end])
+                })
+                .collect()
+        }
+        // Map renders each row as its braced key: value entry sub-slice; the
+        // entries column is the two-field keys/values tuple, resolved
+        // recursively like the Array arm.
+        Column::Map(c) => {
+            let entries = raw_column_repr(c.entries.as_ref());
+            (0..c.len())
+                .map(|i| {
+                    let start = c.offsets[i] as usize;
+                    let end = c.offsets[i + 1] as usize;
+                    format!("{{{}}}", entries[start..end].join(", "))
                 })
                 .collect()
         }
@@ -632,9 +841,12 @@ fn insert_roundtrips_through_server() {
     let batch = sample_batch();
 
     // Clean slate, then a Memory table matching the batch's columns and order.
+    // The Nullable(Tuple) column needs the enable_nullable_tuple_type DDL gate
+    // (a creation-time setting with no wire effect).
     server.ddl(&format!("DROP TABLE IF EXISTS {TABLE}"));
-    server.ddl(&format!(
-        "CREATE TABLE {TABLE} (\
+    server.ddl_with_params(
+        &format!(
+            "CREATE TABLE {TABLE} (\
          i8 Int8, i16 Int16, i32 Int32, i64 Int64, \
          u8 UInt8, u16 UInt16, u32 UInt32, u64 UInt64, \
          f32 Float32, f64 Float64, \
@@ -652,8 +864,20 @@ fn insert_roundtrips_through_server() {
          arr_i32 Array(Int32), arr_ns Array(Nullable(String)), \
          arr_lc Array(LowCardinality(String)), \
          arr_arr Array(Array(Int32)), \
-         arr_lc_empty Array(LowCardinality(String))) ENGINE = Memory"
-    ));
+         arr_lc_empty Array(LowCardinality(String)), \
+         tup Tuple(Int32, String), \
+         tup_named Tuple(a Int32, b Nullable(String)), \
+         arr_tup Array(Tuple(Int32, Int32)), \
+         ntup Nullable(Tuple(Int32, String)), \
+         m Map(String, Int32), \
+         m_lc Map(LowCardinality(String), UInt8), \
+         m_nv Map(String, Nullable(String)), \
+         m_arr Map(String, Array(Int32)), \
+         arr_m Array(Map(String, Int32)), \
+         m_empty Map(String, Int32)) ENGINE = Memory"
+        ),
+        "?enable_nullable_tuple_type=1",
+    );
 
     // Encode at revision 0: HTTP INSERT parses the body with server_revision 0,
     // so no BlockInfo preamble and no custom-serialization marker.
@@ -673,7 +897,9 @@ fn insert_roundtrips_through_server() {
         "SELECT i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, s, lc, lcn, fs, b, \
          d, d32, dt, dt64, u, ip4, ip6, e8, e16, \
          dec32, dec64, dec128, dec256, ni32, ns, nb, nu, ndec, \
-         arr_i32, arr_ns, arr_lc, arr_arr, arr_lc_empty \
+         arr_i32, arr_ns, arr_lc, arr_arr, arr_lc_empty, \
+         tup, tup_named, arr_tup, ntup, \
+         m, m_lc, m_nv, m_arr, arr_m, m_empty \
          FROM {TABLE} ORDER BY i32 FORMAT Native"
     ));
     let decoded = decode_all_bytes(

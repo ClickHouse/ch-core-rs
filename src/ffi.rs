@@ -286,6 +286,26 @@ fn arrow_format(ch_type: &ChType) -> String {
         // per-value copy in the hot path we deliberately avoid. LargeList is
         // the zero-copy match for the i64 offsets the decoder already produces.
         ChType::Array(_) => "+L".into(),
+        // Tuple(T1, ...) exports as an Arrow struct (`+s`). The element types
+        // are NOT in this format string; each element is a child schema
+        // recursively described by `write_field_schema`, named by the
+        // ClickHouse element name (verbatim) for a named tuple and by the
+        // 1-based decimal position ("1", "2", ...) for an unnamed one. The
+        // zero-element `Tuple()` is `+s` with no children. A
+        // `Nullable(Tuple(...))` reaches this arm through the `Nullable`
+        // recursion above; struct validity is independent of the children per
+        // the C Data spec (consumers AND them), so the nullable flag plus the
+        // buffers[0] validity bitmap compose like any other nullable column.
+        ChType::Tuple(_) => "+s".into(),
+        // Map(K, V) exports as LargeList-of-struct (`+L` over an `entries`
+        // struct child with `key`/`value` grandchildren), NOT as the Arrow map
+        // type `+m`: the C Data spec mandates i32 offsets for `+m` and defines
+        // no large-map format, while ClickHouse map offsets are `UInt64` stored
+        // as i64, so `+m` would force a per-offset copy and an i32 cap. The
+        // chosen naming makes the export shape-isomorphic to Arrow Map minus
+        // the offset width, so bindings can cast cheaply.
+        // `ARROW_FLAG_MAP_KEYS_SORTED` is never set (it is `+m`-only).
+        ChType::Map(..) => "+L".into(),
     }
 }
 
@@ -366,22 +386,67 @@ unsafe fn write_field_schema(out: *mut ArrowSchema, name: &str, ch_type: &ChType
         ptr::null_mut()
     };
 
-    // An `Array(T)` LargeList field describes its element type in a single
-    // conventionally-named `item` child schema. Recursing through
-    // `write_field_schema` fully describes the element, including its own
+    // Container fields describe their element type(s) in child schemas, owned
+    // by this field's private data (in `children`, exactly like the top-level
+    // record-batch schema owns its column children), so `release_schema`
+    // releases and frees them when this field is released. Recursing through
+    // `write_field_schema` fully describes each child, including its own
     // nullable flag (`Array(Nullable(T))`), its dictionary child
-    // (`Array(LowCardinality(T))`), or a further nested list (`Array(Array(T))`).
-    // The child is owned by this field's private data (in `children`, exactly
-    // like the top-level record-batch schema owns its column children), so
-    // `release_schema` releases and frees it when this field is released.
+    // (`Array(LowCardinality(T))`), or a further nested container. The match is
+    // on the Nullable-unwrapped value type so a `Nullable(Tuple(...))` still
+    // emits its element children (an `Array` is never inside a `Nullable`, so
+    // its arm is unaffected by the unwrap).
     let mut children: Vec<*mut ArrowSchema> = Vec::new();
-    if let ChType::Array(inner) = ch_type {
-        // Safety: an all-zero `ArrowSchema` is a valid initial value, the same
-        // niche argument as the dictionary child above; `write_field_schema`
-        // overwrites every field before any consumer observes it.
-        let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
-        write_field_schema(child, "item", inner);
-        children.push(child);
+    match ch_type.inner() {
+        // An `Array(T)` LargeList field: one conventionally-named `item` child.
+        ChType::Array(inner) => {
+            // Safety: an all-zero `ArrowSchema` is a valid initial value, the same
+            // niche argument as the dictionary child above; `write_field_schema`
+            // overwrites every field before any consumer observes it.
+            let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+            write_field_schema(child, "item", inner);
+            children.push(child);
+        }
+        // A `Tuple(T1, ...)` struct field: one child per element, in declaration
+        // order, named by the ClickHouse element name (verbatim; it flows through
+        // `cstring_lossy` inside the recursion, like every wire-origin name) or by
+        // the 1-based decimal position for an unnamed element. `Tuple()` emits no
+        // children.
+        ChType::Tuple(elements) => {
+            for (i, (element_name, element_type)) in elements.iter().enumerate() {
+                // Safety: an all-zero `ArrowSchema` is a valid initial value, the
+                // same niche argument as the dictionary child above;
+                // `write_field_schema` overwrites every field before any consumer
+                // observes it.
+                let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+                match element_name {
+                    Some(n) => write_field_schema(child, n, element_type),
+                    None => write_field_schema(child, &(i + 1).to_string(), element_type),
+                }
+                children.push(child);
+            }
+        }
+        // A `Map(K, V)` LargeList-of-struct field: one child named `entries`,
+        // a non-nullable struct whose `key`/`value` grandchildren describe the
+        // key and value types. Synthesizing a transient two-element named
+        // `ChType::Tuple` and recursing reuses the Tuple arm above verbatim
+        // (the struct format, flags 0, and the recursive key/value description
+        // including the value's own nullable flag); the two `ChType` clones are
+        // per schema export, never per row.
+        ChType::Map(key, value) => {
+            let entries_type = ChType::Tuple(vec![
+                (Some("key".to_string()), key.as_ref().clone()),
+                (Some("value".to_string()), value.as_ref().clone()),
+            ]);
+            // Safety: an all-zero `ArrowSchema` is a valid initial value, the
+            // same niche argument as the dictionary child above;
+            // `write_field_schema` overwrites every field before any consumer
+            // observes it.
+            let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+            write_field_schema(child, "entries", &entries_type);
+            children.push(child);
+        }
+        _ => {}
     }
     let n_children = children.len() as i64;
 
@@ -577,6 +642,50 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
             export_one_column(batch, &c.values, child);
             children.push(child);
         }
+        // Arrow struct (`+s`): 1 buffer, the validity slot. Populated only for
+        // a `Nullable(Tuple(...))` (struct validity is independent of the
+        // children per the C Data spec; consumers AND them); a plain Tuple
+        // pushes null with null_count 0, which the spec permits. One child per
+        // element column, in declaration order, exported recursively so any
+        // element type (`Nullable`, `LowCardinality`, `Array`, a nested
+        // `Tuple`) composes; a zero-element `Tuple()` has no children and its
+        // length comes from the explicit `TupleColumn::len`. The children are
+        // owned by this array's private data (in `children`), so
+        // `release_array` releases and frees them, and the `_batch` clone keeps
+        // every borrowed element buffer alive until release.
+        Column::Tuple(c) => {
+            match &c.validity {
+                Some(bm) => buffers.push(bm.as_bytes().as_ptr() as *const c_void),
+                None => buffers.push(ptr::null()),
+            }
+            for element in &c.fields {
+                // Safety: an all-zero `ArrowArray` is a valid initial value, the
+                // same niche argument as the `Dictionary` arm's `dict_child`
+                // above; `export_one_column` overwrites every field before any
+                // consumer observes it.
+                let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+                export_one_column(batch, element, child);
+                children.push(child);
+            }
+        }
+        // Map(K, V) exports byte-identically to the `Array` arm above: 2
+        // buffers (validity, always null here since a map is never nullable at
+        // the map level, then the i64 offsets handed over verbatim) and one
+        // child, the flattened `entries` tuple column, exported recursively
+        // (its own Tuple arm yields the struct node with the key and value
+        // children). Ownership follows the same private-data pattern.
+        Column::Map(c) => {
+            buffers.push(ptr::null());
+            buffers.push(c.offsets.as_ptr() as *const c_void);
+
+            // Safety: an all-zero `ArrowArray` is a valid initial value, the
+            // same niche argument as the `Dictionary` arm's `dict_child` above;
+            // `export_one_column` overwrites every field before any consumer
+            // observes it.
+            let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+            export_one_column(batch, &c.entries, child);
+            children.push(child);
+        }
     }
 
     let n_children = children.len() as i64;
@@ -597,7 +706,8 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
     array.n_children = n_children;
     // `pd.children` heap buffer is stable across the `Box::into_raw(pd)` move
     // below, so this pointer stays valid until release. Null when there are no
-    // children (every arm except `Array`).
+    // children (every arm except the container arms `Array`, `Tuple` with
+    // elements, and `Map`).
     array.children = if pd.children.is_empty() {
         ptr::null_mut()
     } else {
@@ -1818,6 +1928,331 @@ mod tests {
             assert!(!item.dictionary.is_null(), "dictionary child still present");
             let dict_array = &*item.dictionary;
             assert_eq!(dict_array.length, 0, "empty dictionary");
+            (array.release.unwrap())(&mut array);
+        }
+    }
+
+    #[test]
+    fn test_arrow_format_tuple() {
+        // Tuple exports as an Arrow struct (`+s`); the element types live in
+        // the child schemas, never in the format string. Nullable(Tuple)
+        // recurses to the same format.
+        assert_eq!(
+            arrow_format(&ChType::Tuple(vec![
+                (None, ChType::Int32),
+                (None, ChType::String),
+            ])),
+            "+s"
+        );
+        assert_eq!(arrow_format(&ChType::Tuple(vec![])), "+s");
+        assert_eq!(
+            arrow_format(&ChType::Nullable(Box::new(ChType::Tuple(vec![(
+                None,
+                ChType::Int32,
+            )])))),
+            "+s"
+        );
+    }
+
+    #[test]
+    fn test_export_tuple_schema() {
+        // Schema of a named Tuple(a Int32, b Nullable(String)) and an unnamed
+        // Tuple(Int32, String): format `+s`, one child per element. Named
+        // elements keep their ClickHouse names verbatim; unnamed elements are
+        // named by 1-based position. A Nullable element carries its own
+        // nullable flag on the child.
+        let schema = Schema::new(vec![
+            Field {
+                name: "tn".into(),
+                ch_type: ChType::Tuple(vec![
+                    (Some("a".to_string()), ChType::Int32),
+                    (
+                        Some("b".to_string()),
+                        ChType::Nullable(Box::new(ChType::String)),
+                    ),
+                ]),
+            },
+            Field {
+                name: "t".into(),
+                ch_type: ChType::Tuple(vec![(None, ChType::Int32), (None, ChType::String)]),
+            },
+            Field {
+                name: "t0".into(),
+                ch_type: ChType::Tuple(vec![]),
+            },
+        ]);
+
+        unsafe {
+            let mut schema_out: ArrowSchema = std::mem::zeroed();
+            export_schema(&schema, &mut schema_out);
+
+            let tn = &**schema_out.children.add(0);
+            assert_eq!(CStr::from_ptr(tn.format).to_str().unwrap(), "+s");
+            assert_eq!(tn.flags & 2, 0, "plain tuple is not nullable");
+            assert_eq!(tn.n_children, 2);
+            assert!(tn.dictionary.is_null());
+            let a = &**tn.children.add(0);
+            assert_eq!(CStr::from_ptr(a.name).to_str().unwrap(), "a");
+            assert_eq!(CStr::from_ptr(a.format).to_str().unwrap(), "i");
+            let b = &**tn.children.add(1);
+            assert_eq!(CStr::from_ptr(b.name).to_str().unwrap(), "b");
+            assert_eq!(CStr::from_ptr(b.format).to_str().unwrap(), "u");
+            assert_eq!(b.flags & 2, 2, "Nullable element child is nullable");
+
+            let t = &**schema_out.children.add(1);
+            assert_eq!(t.n_children, 2);
+            let e1 = &**t.children.add(0);
+            assert_eq!(CStr::from_ptr(e1.name).to_str().unwrap(), "1");
+            let e2 = &**t.children.add(1);
+            assert_eq!(CStr::from_ptr(e2.name).to_str().unwrap(), "2");
+
+            let t0 = &**schema_out.children.add(2);
+            assert_eq!(CStr::from_ptr(t0.format).to_str().unwrap(), "+s");
+            assert_eq!(t0.n_children, 0, "Tuple() exports with no children");
+
+            (schema_out.release.unwrap())(&mut schema_out);
+        }
+    }
+
+    #[test]
+    fn test_export_tuple_buffers() {
+        use crate::column::TupleColumn;
+
+        // Tuple(Int32, String) over 2 rows: struct node with 1 buffer (null
+        // validity slot, null_count 0), 2 children exported recursively; and a
+        // zero-element Tuple() whose node still carries its explicit length.
+        let schema = Schema::new(vec![
+            Field {
+                name: "t".into(),
+                ch_type: ChType::Tuple(vec![(None, ChType::Int32), (None, ChType::String)]),
+            },
+            Field {
+                name: "t0".into(),
+                ch_type: ChType::Tuple(vec![]),
+            },
+        ]);
+        let columns = vec![
+            Column::Tuple(TupleColumn::new(
+                vec![
+                    Column::Int32(PrimitiveColumn::new(vec![13, 79])),
+                    Column::Utf8(Utf8Column::new(vec![0, 2, 2], b"hi".to_vec())),
+                ],
+                2,
+            )),
+            Column::Tuple(TupleColumn::new(vec![], 2)),
+        ];
+        let batch = Arc::new(ColBatch::new(schema, columns, 2));
+
+        unsafe {
+            let mut array: ArrowArray = std::mem::zeroed();
+            export_batch_array(&batch, &mut array);
+
+            let t = &**array.children.add(0);
+            assert_eq!(t.length, 2);
+            assert_eq!(t.null_count, 0);
+            assert_eq!(t.n_buffers, 1, "struct: validity slot only");
+            assert!((*t.buffers.add(0)).is_null(), "plain tuple validity null");
+            assert_eq!(t.n_children, 2);
+            assert!(t.dictionary.is_null());
+            let e1 = &**t.children.add(0);
+            assert_eq!(e1.length, 2);
+            let vals = *e1.buffers.add(1) as *const i32;
+            assert_eq!(*vals, 13);
+            assert_eq!(*vals.add(1), 79);
+            let e2 = &**t.children.add(1);
+            assert_eq!(e2.length, 2);
+            assert_eq!(e2.n_buffers, 3, "utf8 element: validity, offsets, data");
+
+            let t0 = &**array.children.add(1);
+            assert_eq!(t0.length, 2, "Tuple() length from the explicit len");
+            assert_eq!(t0.n_buffers, 1);
+            assert_eq!(t0.n_children, 0);
+
+            (array.release.unwrap())(&mut array);
+        }
+    }
+
+    #[test]
+    fn test_export_nullable_tuple() {
+        use crate::bitmap::Bitmap;
+        use crate::column::TupleColumn;
+
+        // Nullable(Tuple(Int32)): the struct node carries the nullable flag on
+        // the schema and the validity bitmap in buffers[0] with a matching
+        // null_count; children stay independent per the C Data spec.
+        let schema = Schema::new(vec![Field {
+            name: "nt".into(),
+            ch_type: ChType::Nullable(Box::new(ChType::Tuple(vec![(None, ChType::Int32)]))),
+        }]);
+        let columns = vec![Column::Tuple(TupleColumn::new_nullable(
+            vec![Column::Int32(PrimitiveColumn::new(vec![13, 0, 79]))],
+            3,
+            Bitmap::from_ch_null_map(&[0x00, 0x01, 0x00]),
+        ))];
+        let batch = Arc::new(ColBatch::new(schema, columns, 3));
+
+        unsafe {
+            let mut schema_out: ArrowSchema = std::mem::zeroed();
+            export_schema(&batch.schema, &mut schema_out);
+            let c0 = &**schema_out.children.add(0);
+            assert_eq!(CStr::from_ptr(c0.format).to_str().unwrap(), "+s");
+            assert_eq!(c0.flags & 2, 2, "Nullable(Tuple) sets the nullable flag");
+            assert_eq!(c0.n_children, 1, "element children still described");
+            (schema_out.release.unwrap())(&mut schema_out);
+
+            let mut array: ArrowArray = std::mem::zeroed();
+            export_batch_array(&batch, &mut array);
+            let c0 = &**array.children.add(0);
+            assert_eq!(c0.length, 3);
+            assert_eq!(c0.null_count, 1);
+            assert_eq!(c0.n_buffers, 1);
+            assert!(
+                !(*c0.buffers.add(0)).is_null(),
+                "tuple-level validity bitmap present in buffers[0]"
+            );
+            let child = &**c0.children.add(0);
+            assert_eq!(child.length, 3, "children carry placeholders for nulls");
+            (array.release.unwrap())(&mut array);
+        }
+    }
+
+    #[test]
+    fn test_arrow_format_map() {
+        // Map exports as LargeList-of-struct (`+L`), never `+m` (whose i32
+        // offsets would force a copy of the i64 offset buffer).
+        assert_eq!(
+            arrow_format(&ChType::Map(
+                Box::new(ChType::String),
+                Box::new(ChType::Int32),
+            )),
+            "+L"
+        );
+    }
+
+    #[test]
+    fn test_export_map_schema() {
+        // Schema of Map(String, Nullable(Int32)): field format `+L`, flags 0
+        // (maps are never nullable at the map level), one child named
+        // "entries" (a non-nullable struct), with grandchildren "key" (flags 0)
+        // and "value" (nullable flag per the value type). No
+        // ARROW_FLAG_MAP_KEYS_SORTED anywhere (it is +m-only).
+        let schema = Schema::new(vec![Field {
+            name: "m".into(),
+            ch_type: ChType::Map(
+                Box::new(ChType::String),
+                Box::new(ChType::Nullable(Box::new(ChType::Int32))),
+            ),
+        }]);
+
+        unsafe {
+            let mut schema_out: ArrowSchema = std::mem::zeroed();
+            export_schema(&schema, &mut schema_out);
+
+            let c0 = &**schema_out.children.add(0);
+            assert_eq!(CStr::from_ptr(c0.format).to_str().unwrap(), "+L");
+            assert_eq!(c0.flags, 0, "map level is not nullable, no sorted-keys");
+            assert_eq!(c0.n_children, 1);
+            assert!(c0.dictionary.is_null());
+
+            let entries = &**c0.children.add(0);
+            assert_eq!(CStr::from_ptr(entries.name).to_str().unwrap(), "entries");
+            assert_eq!(CStr::from_ptr(entries.format).to_str().unwrap(), "+s");
+            assert_eq!(entries.flags, 0, "entries struct is non-nullable");
+            assert_eq!(entries.n_children, 2);
+
+            let key = &**entries.children.add(0);
+            assert_eq!(CStr::from_ptr(key.name).to_str().unwrap(), "key");
+            assert_eq!(CStr::from_ptr(key.format).to_str().unwrap(), "u");
+            assert_eq!(key.flags & 2, 0, "keys are never nullable");
+            let value = &**entries.children.add(1);
+            assert_eq!(CStr::from_ptr(value.name).to_str().unwrap(), "value");
+            assert_eq!(CStr::from_ptr(value.format).to_str().unwrap(), "i");
+            assert_eq!(value.flags & 2, 2, "Nullable value child is nullable");
+
+            (schema_out.release.unwrap())(&mut schema_out);
+        }
+    }
+
+    #[test]
+    fn test_export_map_lc_key_schema() {
+        // Map(LowCardinality(String), UInt8): the key grandchild is a
+        // dictionary field (index format `i`, values in the dictionary child),
+        // composing through the entries struct exactly like a top-level LC.
+        let schema = Schema::new(vec![Field {
+            name: "m".into(),
+            ch_type: ChType::Map(
+                Box::new(ChType::LowCardinality(Box::new(ChType::String))),
+                Box::new(ChType::UInt8),
+            ),
+        }]);
+
+        unsafe {
+            let mut schema_out: ArrowSchema = std::mem::zeroed();
+            export_schema(&schema, &mut schema_out);
+            let c0 = &**schema_out.children.add(0);
+            let entries = &**c0.children.add(0);
+            let key = &**entries.children.add(0);
+            assert_eq!(CStr::from_ptr(key.format).to_str().unwrap(), "i");
+            assert!(!key.dictionary.is_null(), "LC key has a dictionary child");
+            let dict = &*key.dictionary;
+            assert_eq!(CStr::from_ptr(dict.format).to_str().unwrap(), "u");
+            (schema_out.release.unwrap())(&mut schema_out);
+        }
+    }
+
+    #[test]
+    fn test_export_map_buffers() {
+        use crate::column::{MapColumn, TupleColumn};
+
+        // Map(String, Int32) over 3 rows including an empty row: the map node
+        // is byte-identical in shape to an Array node (2 buffers: null
+        // validity, i64 offsets), with the entries struct as the single child
+        // and the key/value columns as its children.
+        // Rows: {a: 13} / {} / {b: 1, c: 2} -> offsets [0, 1, 1, 3].
+        let schema = Schema::new(vec![Field {
+            name: "m".into(),
+            ch_type: ChType::Map(Box::new(ChType::String), Box::new(ChType::Int32)),
+        }]);
+        let entries = Column::Tuple(TupleColumn::new(
+            vec![
+                Column::Utf8(Utf8Column::new(vec![0, 1, 2, 3], b"abc".to_vec())),
+                Column::Int32(PrimitiveColumn::new(vec![13, 1, 2])),
+            ],
+            3,
+        ));
+        let col = Column::Map(MapColumn::new(vec![0, 1, 1, 3], entries));
+        let batch = Arc::new(ColBatch::new(schema, vec![col], 3));
+
+        unsafe {
+            let mut array: ArrowArray = std::mem::zeroed();
+            export_batch_array(&batch, &mut array);
+
+            let c0 = &**array.children.add(0);
+            assert_eq!(c0.length, 3, "map length is the row count");
+            assert_eq!(c0.null_count, 0);
+            assert_eq!(c0.n_buffers, 2, "LargeList shape: validity + offsets");
+            assert!((*c0.buffers.add(0)).is_null(), "map validity always null");
+            let offsets = *c0.buffers.add(1) as *const i64;
+            assert_eq!(*offsets, 0, "leading 0");
+            assert_eq!(*offsets.add(2), 1, "empty row -> repeated offset");
+            assert_eq!(*offsets.add(3), 3, "last offset == total entries");
+
+            assert_eq!(c0.n_children, 1);
+            let entries = &**c0.children.add(0);
+            assert_eq!(entries.length, 3, "entry count == last offset");
+            assert_eq!(entries.null_count, 0);
+            assert_eq!(entries.n_buffers, 1, "struct: validity slot only");
+            assert!((*entries.buffers.add(0)).is_null());
+            assert_eq!(entries.n_children, 2);
+            let key = &**entries.children.add(0);
+            assert_eq!(key.length, 3);
+            assert_eq!(key.n_buffers, 3, "utf8 keys: validity, offsets, data");
+            let value = &**entries.children.add(1);
+            assert_eq!(value.length, 3);
+            let vals = *value.buffers.add(1) as *const i32;
+            assert_eq!(*vals, 13);
+            assert_eq!(*vals.add(2), 2);
+
             (array.release.unwrap())(&mut array);
         }
     }
