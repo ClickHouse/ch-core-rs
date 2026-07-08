@@ -268,6 +268,8 @@ than an error.
 | `Nullable(T)`     | `Nullable(T)`    | inner T's variant | inner's      | inner's, validity populated | n/a      |
 | `LowCardinality(T)` for an allowed inner `T` (see the type section) | `LowCardinality(Box<ChType>)` | `Dictionary` | `i` (index type; values type in the dictionary child) | validity, i32 indices (+ dictionary child) | via inner `Nullable` |
 | `Array(T)` for any supported element `T` | `Array(Box<ChType>)` | `Array` | `+L` (LargeList; element type in the item child) | validity, i64 offsets (+ item child) | no (array level); element nulls via `Array(Nullable(T))` |
+| `Tuple(T1, ...)` / `Tuple(name1 T1, ...)` for supported element types, incl. `Tuple()` | `Tuple(Vec<(Option<String>, ChType)>)` | `Tuple` | `+s` (struct; element types in the children) | validity (one child per element) | yes (`Nullable(Tuple(...))` is legal) |
+| `Map(K, V)` for a legal key type and supported `K`/`V` | `Map(Box<ChType>, Box<ChType>)` | `Map` | `+L` (LargeList of an `entries` struct with `key`/`value` children) | validity, i64 offsets (+ entries child) | no (map level); value nulls via `Map(K, Nullable(V))` |
 
 Any type not in this matrix is rejected. See "Unsupported types" below.
 
@@ -741,7 +743,8 @@ little-endian hosts, byte-swapped per element on big-endian hosts. Confirmed at
 ### Nullable(T)
 
 **Type string(s):** `Nullable(T)` where `T` is any supported non-wrapper type
-above, for example `Nullable(Int64)` or `Nullable(String)`.
+above, for example `Nullable(Int64)` or `Nullable(String)`, plus the one legal
+container nesting `Nullable(Tuple(...))` (see the `Tuple` section).
 
 **Logical type:** `ChType::Nullable(Box<ChType>)`.
 
@@ -762,7 +765,10 @@ is carried by the inner column's `validity`.
 **Notes:**
 
 - Only one level of `Nullable` is meaningful, matching ClickHouse. The inner
-  type must be a concrete supported type, not another wrapper.
+  type must be a concrete supported type, never `Nullable`, `LowCardinality`,
+  or `Array`. `Tuple` is the one container ClickHouse permits inside `Nullable`
+  (`DataTypeTuple::canBeInsideNullable()` is true); it keeps the ordinary
+  framing here, with the tuple body as the inner payload.
 - For a null row the inner buffer still holds a value. Always consult validity
   before reading a value. The placeholder is whatever the server wrote, commonly
   zero, but do not rely on that.
@@ -1013,6 +1019,217 @@ non-decreasing-offsets enforcement (`INCORRECT_DATA`) in the same serialization
 file. `DataTypeArray::canBeInsideNullable()` (false) is in
 `src/DataTypes/DataTypeArray.cpp`. Confirmed at `v26.6.1.1193-stable`.
 
+### Tuple(T1, ...)
+
+**Type string(s):** `Tuple(T1, T2, ...)` for unnamed elements and
+`Tuple(name1 T1, name2 T2, ...)` when explicit names exist
+(`DataTypeTuple::doGetName` renders names all-or-nothing; the parser stores them
+per element so any received header is preserved exactly). Element types are any
+supported types, including `Nullable(T)`, `LowCardinality(T)`, `Array(T)`, and a
+nested `Tuple`. The zero-element `Tuple()` is constructible and emittable.
+`Nullable(Tuple(...))` is legal (`DataTypeTuple::canBeInsideNullable()` is true;
+the `enable_nullable_tuple_type` setting is a DDL creation gate with no wire
+effect). `LowCardinality(Tuple(...))` is illegal (`canBeInsideLowCardinality()`
+is false) and rejected at header time.
+
+Element names are rendered with the server's `backQuoteIfNeed`: a name stays
+bare only if it is a valid ASCII identifier (`[A-Za-z_][A-Za-z0-9_]*`), not
+any-case `null` (excluded by `isValidIdentifier` itself, since a bare NULL
+would read back as the NULL keyword), and not one of the case-insensitive
+keywords `distinct`/`all`/`table`/`select`/`from`/`values`; otherwise it is
+backtick-quoted, with a backtick inside escaping as `` \` `` and a backslash
+as `\\` (`writeBackQuotedString` -> `writeAnyEscapedString<'`'>`, plus the
+two-char C0 letter escapes). The parser accepts a superset on read, mirroring
+the server's own reader (`Lexer.cpp`, `readBackQuotedStringWithSQLStyle`,
+`parseEscapeSequence`): the doubled `` `` `` backtick escape, `\xAA` hex
+bytes, `\N` (empty), the control escapes `\a \b \e \f \n \r \t \v \0`, and any
+other `\c` as the literal `c`. `Display` re-renders in the canonical server
+form, so `parse(display(x)) == x` always holds. Names can contain spaces and
+commas (they just force quoting). The server rejects empty names, the
+exact-lowercase reserved name `null`, duplicates, and mixed named/unnamed
+elements at creation (`checkTupleNames` and the type factory), so they never
+appear in an honest header; the DECODE parser accepts them as received rather
+than second-guessing, while ENCODE rejects them pre-write (see the encoding
+preconditions), since a rendered header carrying them is one the server cannot
+parse back.
+
+**Logical type:** `ChType::Tuple(Vec<(Option<String>, ChType)>)`.
+
+**Introduction version:** undetermined from the shallow checkout at the pinned
+tag; `Tuple` is a foundational ClickHouse type, stable at `v26.6.1.1193-stable`.
+
+**Wire payload:** per Tuple column per block, only when the block has rows
+(`NativeReader::readData` gates on `if (rows)`), the bytes are, in order:
+
+```text
+[state prefix]      // SerializationTuple writes NOTHING of its own; its
+                    // (de)serializeBinaryBulkStatePrefix loops over the
+                    // elements in declaration order and delegates. So for
+                    // Tuple(LowCardinality(String), Int32) the LC 8-byte key
+                    // version sits HERE, at the very front of the whole
+                    // column, before ANY element body; the Int32 contributes
+                    // nothing. SerializationNullable delegates its prefix the
+                    // same way, so Nullable(Tuple(...)) hoists identically.
+[element 0 body]    // element 0's FULL run of num_rows rows: the element
+[element 1 body]    // type's normal bulk body WITHOUT its state prefix, then
+...                 // element 1's full run, and so on, in declaration order.
+                    // Column-of-columns: no interleaving, no offsets, and no
+                    // Tuple-level length framing.
+```
+
+The server asserts all element columns come out the same size (`INCORRECT_DATA`
+in Native mode); the decoder mirrors the check, though its element decodes are
+all driven by the block row count so it cannot fire in practice.
+
+The zero-element `Tuple()` has a special layout: exactly ONE literal ASCII '0'
+byte (0x30) per row and no other bytes. The reader ignores the byte values
+(`tryIgnore`), so the decoder skips `num_rows` bytes without validating them;
+truncation is still `UnexpectedEof`. Encode writes the canonical 0x30 per row.
+
+A zero-row block reads no state prefix, no element bodies, and no `Tuple()`
+placeholder bytes. A zero-length run with rows in the block (e.g.
+`Array(Tuple(...))` whose arrays are all empty) passes `limit == 0` down to
+every element, so each element's own zero-limit behavior applies: in
+particular, a `LowCardinality` element's body is entirely absent (the server's
+`limit == 0` early return), and a `Tuple()` in that position writes nothing.
+
+For `Nullable(Tuple(...))` the ordinary Nullable framing applies: the per-row
+null map first, then the tuple body as above. Null rows still carry
+placeholder (default) element values in every element body.
+
+**Arrow export:** Arrow struct, format string `+s`. The element types are NOT
+in the format string; each element is a child `ArrowSchema`/`ArrowArray`
+described recursively, so `Nullable`, `LowCardinality`, `Array`, and nested
+`Tuple` elements compose exactly like the `Array` `item` child does. Child
+names are the ClickHouse element names verbatim for a named tuple (flowing
+through the same lossy-NUL C-string path as every wire-origin name) and the
+1-based decimal strings "1", "2", ... for unnamed elements. The struct node
+carries 1 buffer, the validity slot: null with `null_count` 0 for a plain
+Tuple, and the tuple-level validity bitmap for a `Nullable(Tuple(...))`
+(whose schema also sets the nullable flag). Struct validity is independent of
+the children per the C Data spec; consumers AND them. `Tuple()` exports as
+`+s` with `n_children == 0`.
+
+**Rust buffer:** `Column::Tuple(TupleColumn)` where `TupleColumn` is
+`{ fields: Vec<Column>, len: usize, validity: Option<Bitmap> }`. `fields` holds
+one child column per element in declaration order, each of length `len`; the
+element names live in the schema's `ChType::Tuple`, not on the column. `len` is
+explicit so the zero-field `Tuple()` cannot desync from the row count.
+`validity` is `Some` only for `Nullable(Tuple(...))`.
+
+**Notes:**
+
+- Ragged element columns cannot be produced by decode (every element run is
+  driven by the same row count); the defensive mirror of the server's check is
+  `DecodeError::InvalidTuple`. On the encode side a ragged `TupleColumn` or a
+  field-count mismatch against the declared type is
+  `EncodeError::InconsistentBatch`, rejected before any bytes are written.
+- `Map(K, V)` is wire-serialized as `Array(Tuple(key, value))` and builds on
+  this element-decode path; see its own type section below.
+
+**Server reference:** `SerializationTuple` (the delegate-per-element state
+prefix and the sequential element bodies; the equal-sizes `INCORRECT_DATA`
+check) in `src/DataTypes/Serializations/SerializationTuple.cpp`, with
+`DataTypeTuple::doGetName` and `canBeInsideNullable()` in
+`src/DataTypes/DataTypeTuple.cpp`, name quoting in
+`src/Common/quoteString.cpp` (`backQuoteIfNeed` ->
+`writeProbablyBackQuotedString`) and `src/IO/WriteHelpers.h`
+(`writeAnyEscapedString`), and the permissive read side in
+`src/Parsers/Lexer.cpp` and `src/IO/ReadHelpers.cpp`
+(`readBackQuotedStringWithSQLStyle` / `parseEscapeSequence`).
+`SerializationNullable`'s prefix delegation is in
+`src/DataTypes/Serializations/SerializationNullable.cpp`. Confirmed at
+`v26.6.1.1193-stable`.
+
+### Map(K, V)
+
+**Type string(s):** `Map(K, V)`, always exactly the two type arguments
+(`DataTypeMap::doGetName`); the nested tuple's "keys"/"values" names never
+appear in the type string or as wire bytes (`SerializationNamed` is a pure
+forwarder). The key type must satisfy `DataTypeMap::isValidKeyType`
+(`!isNullableOrLowCardinalityNullable`): `Nullable(K)` and
+`LowCardinality(Nullable(K))` keys are forbidden and rejected at header time
+(`UnsupportedType`); a plain `LowCardinality(K)` key is legal. The value type
+is unrestricted among supported types, including `Nullable(V)`,
+`LowCardinality(V)`, `Array(V)`, `Tuple(...)`, and a nested `Map`. The map
+itself is never inside `Nullable` (`canBeInsideNullable()` is false; the
+parser rejects `Nullable(Map(...))` like `Nullable(Array(...))`) or
+`LowCardinality`; `Map` inside `Array` and inside `Tuple` composes.
+
+**Logical type:** `ChType::Map(Box<ChType>, Box<ChType>)`.
+
+**Introduction version:** undetermined from the shallow checkout at the pinned
+tag; stable at `v26.6.1.1193-stable`.
+
+**Wire payload:** on the Native wire a Map is ALWAYS the plain
+`Array(Tuple(keys, values))` layout. The server's newer bucketed `WITH_BUCKETS`
+on-disk serialization never reaches the Native wire in either direction:
+`NativeReader` builds serializations via `enableAllSupportedSerializations`,
+which leaves `map_serialization_version` at `BASIC`, and `NativeWriter` goes
+through `IDataType::getSerializationInfo`'s default, also `BASIC`. Per Map
+column per block, only when the block has rows, the bytes are, in order:
+
+```text
+[state prefix]      // SerializationMap writes NOTHING of its own; the chain is
+                    // Map -> Array (nothing) -> Tuple -> K's prefix then V's
+                    // prefix, in that order. So Map(LowCardinality(String), V)
+                    // has the LC 8-byte key version HERE, at the very front of
+                    // the column, before the offsets.
+[num_rows * 8]      offsets   // raw LE u64, cumulative ABSOLUTE end-offsets in
+                    //   ENTRIES, no leading zero, monotonically non-decreasing;
+                    //   identical framing to the Array offsets and validated by
+                    //   the same shared walk (a decrease is INCORRECT_DATA).
+[key run]           // the flattened keys column of length total_entries (= the
+                    //   last offset), K's normal bulk body WITHOUT its prefix.
+[value run]         // the flattened values column of length total_entries, V's
+                    //   normal bulk body WITHOUT its prefix.
+```
+
+A zero-row block reads no state prefix, no offsets, and no runs. When the
+block has rows but every map is empty, the offsets are still written (all
+zeros) and the nested tuple gets `limit == 0`, so each run takes its own
+zero-limit behavior: a `LowCardinality` key or value writes NO body at all
+(the `limit == 0` early return), everything else degrades to zero bytes.
+There are no protocol-revision branches.
+
+**Arrow export:** LargeList-of-struct, NOT the Arrow map type: there is no
+large-map format string and `+m` mandates i32 offsets, which would force a
+per-offset copy of the i64 buffer (the same reasoning as the Array LargeList
+note). The field format is `+L` with flags 0 (`Nullable(Map)` is impossible)
+and one child named `entries`: a non-nullable `+s` struct (null validity,
+`null_count` 0) whose children are named `key` (flags 0; naturally
+non-nullable given the key constraint) and `value` (nullable flag per the
+value type). The map array node is byte-identical in shape to the Array
+export: 2 buffers (always-null validity, then the verbatim i64 offsets) and
+the recursively exported entries child. `ARROW_FLAG_MAP_KEYS_SORTED` is never
+set (it is `+m`-only). This naming makes the export shape-isomorphic to Arrow
+Map minus the offset width, so bindings can cast cheaply.
+
+**Rust buffer:** `Column::Map(MapColumn)` where `MapColumn` is
+`{ offsets: Vec<i64>, entries: Box<Column> }`. `offsets` has length
+`num_rows + 1` with Arrow's leading `0` (row `i`'s entries are
+`entries[offsets[i]..offsets[i + 1]]`). `entries` is always a two-field
+`Column::Tuple` holding the keys column then the values column, each of length
+`offsets[num_rows]`. There is no map-level validity bitmap.
+
+**Notes:**
+
+- A malformed offsets run fails with `DecodeError::InvalidArray` (the shared
+  offsets walk), on both the allocating decode and the streaming scan.
+- On the encode side an illegal key type is `EncodeError::UnsupportedType`;
+  ragged keys/values runs, an entries buffer that is not a two-field tuple, or
+  offsets that disagree with the entries length are
+  `EncodeError::InconsistentBatch`, all rejected before any bytes are written.
+
+**Server reference:** `SerializationMap` (the delegate-through-nested prefix
+and the `Array(Tuple(keys, values))` bulk body) in
+`src/DataTypes/Serializations/SerializationMap.cpp`, with
+`DataTypeMap::doGetName`, `isValidKeyType`, and `canBeInsideNullable()` in
+`src/DataTypes/DataTypeMap.cpp`, and the BASIC-only Native wire mode via
+`enableAllSupportedSerializations` in `src/Formats/NativeReader.cpp` and
+`IDataType::getSerializationInfo`'s default on the write side. Confirmed at
+`v26.6.1.1193-stable`.
+
 ---
 
 ## Encoding
@@ -1066,14 +1283,18 @@ defensive fall-through that validation already rules out.
 ### Coverage
 
 Encode coverage is kept a subset of decode coverage and grows the same
-one-type-at-a-time way; as of `Array(T)` landing, the two are at parity.
+one-type-at-a-time way; as of `Map(K, V)` landing, the two are at parity.
 Encodable today: `Bool`, the fixed-width numerics (`Int8`..`Int64`,
 `UInt8`..`UInt64`, `Float32`, `Float64`), the temporals (`Date`, `Date32`,
 `DateTime`, `DateTime64`), `UUID`, `IPv4`, `IPv6`, `String`, `FixedString(N)`,
 `Enum8`/`Enum16`, `Decimal(P, S)`, `LowCardinality(T)` for the same allowed
-inner types decode accepts, and `Array(T)` over any encodable element type
-(including a `Nullable`, `LowCardinality`, or nested `Array` element), the
-non-wrapper types each optionally wrapped in `Nullable`. Any other type is
+inner types decode accepts, `Array(T)` over any encodable element type
+(including a `Nullable`, `LowCardinality`, or nested `Array` element),
+`Tuple(T1, ...)` over encodable element types (named or unnamed, the
+zero-element `Tuple()` included, composing inside `Array` and inside
+`Nullable`), and `Map(K, V)` for a legal key type over encodable key/value
+types (composing inside `Array` and `Tuple`), the non-wrapper types and
+`Tuple` each optionally wrapped in `Nullable`. Any other type is
 `UnsupportedType`, at every row count including zero. This is deliberately
 stricter than decode, whose `empty_column` builds an empty column for any
 decodable type in a zero-row block: encode fails fast rather than write a header
@@ -1171,6 +1392,31 @@ would never produce.
   `Nullable` element's validity length, `LowCardinality` invariants, string
   offsets, fixed-binary widths, a nested `Array`) applies to the flattened
   buffer too.
+- **Tuple elements.** The buffer carries exactly one field column per declared
+  element (a count mismatch is `InconsistentBatch`), and each element column is
+  validated recursively as its own column of `num_rows` rows, so a ragged
+  element length, a wrong element buffer variant, or any element-level
+  invariant violation is rejected before any bytes are written (the server
+  enforces equal element sizes as `INCORRECT_DATA`). `Tuple()` needs no
+  per-element checks; its `TupleColumn::len` is the row count checked by the
+  batch-shape rule.
+- **Tuple element names.** The names must be a set the server can construct
+  (`DataTypeTuple`'s factory and `checkTupleNames`): all-or-nothing named,
+  never empty, never the exact-lowercase reserved `null`, never duplicated.
+  Violations are `UnsupportedType` (the type cannot exist on the server), the
+  same classification as an illegal Map key, applied through nesting via the
+  recursive validation. The decode parser deliberately round-trips these
+  shapes, so the type-string round-trip check alone cannot catch them.
+- **Map key legality and entries.** The key type must satisfy the server's
+  `DataTypeMap::isValidKeyType` (never `Nullable` or
+  `LowCardinality(Nullable(...))`), reported as `UnsupportedType` since the
+  type itself cannot exist. The offsets get the same Arrow list checks as
+  `Array` (count, zero start, monotonic, final offset equal to the entries
+  length), and the entries buffer must be a two-field `Tuple` column, carrying
+  NO validity bitmap (the wire has no null map at the entries level, so one
+  would be silently dropped; `InconsistentBatch`), whose keys and values
+  columns are validated recursively as their own columns of
+  `offsets[num_rows]` rows.
 
 ### Encoder choices
 
@@ -1208,6 +1454,24 @@ one valid wire form, and encode commits to these:
   `limit == 0` early return in
   `SerializationLowCardinality::serializeBinaryBulkWithMultipleStreams`; every
   other element writer degrades naturally to zero bytes at count 0.
+- **Tuple.** The element bodies are written one after another in declaration
+  order through the shared value path, with no tuple-level framing. Element
+  state prefixes are hoisted by the same `write_state_prefix` recursion
+  (`SerializationTuple` delegates per element, `SerializationNullable` to its
+  nested type), so a `LowCardinality` element's key version lands once at the
+  front of the whole column, before any element body. `Tuple()` writes the
+  canonical ASCII '0' placeholder byte per row (the decoder accepts any byte
+  values, matching the server's `tryIgnore`). A zero-length tuple run nested
+  inside an all-empty `Array` writes nothing, each element taking its own
+  `limit == 0` behavior.
+- **Map.** Encode always writes the BASIC `Array(Tuple(keys, values))` wire
+  form (the only form the Native wire carries; the bucketed on-disk mode never
+  applies): the offsets exactly as the `Array` bullet above, then the
+  flattened key run and the flattened value run through the shared value path.
+  The key and value prefixes are hoisted by the same `write_state_prefix`
+  recursion (key first, then value), so a `LowCardinality` key's version lands
+  at the very front of the column, before the offsets. An all-empty-maps block
+  with rows writes the all-zero offsets and nothing else.
 
 ### Round-trip guarantees
 
@@ -1234,7 +1498,8 @@ A zero-row block still writes its `BlockInfo` preamble (at revision > 0), the
 column and row counts, and, for every column, the name, type string, and
 custom-serialization marker (at revision >= 54454). It writes no column data
 section at all: no state prefix (not a `LowCardinality` key version, even one
-hoisted through an `Array`), no `Array` offsets, and no body, matching
+hoisted through an `Array`, a `Tuple`, or a `Map`), no `Array`/`Map` offsets,
+no `Tuple()` placeholder bytes, and no body, matching
 `NativeWriter::write`'s `rows > 0` gate around `writeData`. A not-yet-encodable
 type is still rejected at zero rows (see coverage). This is the write-side
 mirror of the "Zero-row output" section below.
@@ -1262,6 +1527,12 @@ directly (`empty_column` in `src/native/decode.rs`), the empty shapes are:
   of `T`, built recursively. The same shape stands in for a zero-length
   `LowCardinality` element run nested inside an `Array` (the server's
   `limit == 0` early return writes no LC body at all).
+- `Tuple(T1, ...)`: one empty element column per declared element, built
+  recursively, with `len == 0`. `Tuple()` is no element columns at all.
+  `Nullable(Tuple(...))` carries an empty tuple-level validity bitmap.
+- `Map(K, V)`: offsets `[0]` (the leading zero only) over an empty two-field
+  entries tuple (an empty keys column and an empty values column, built
+  recursively).
 
 In all cases length is 0 and `null_count` is 0.
 
@@ -1284,16 +1555,22 @@ Not yet supported, tracked as planned phases in `src/schema.rs`:
   `Decimal`, and `Enum8`/`Enum16`, all of which the server itself forbids as LC
   inners (`canBeInsideLowCardinality()` is false), so they never appear in that
   position on the wire.
-- Containers: `Tuple(...)`, `Map(K, V)`. `Array(T)` is fully supported, decode
-  and encode (see its type section and the "Encoding" section).
 - Wide integers: `Int128`, `UInt128`, `Int256`, `UInt256`.
+
+The containers `Array(T)`, `Tuple(T1, ...)`, and `Map(K, V)` are all fully
+supported, decode and encode (see their type sections and the "Encoding"
+section). A `Map` header with an illegal key type (`Nullable` or
+`LowCardinality(Nullable(...))`) is rejected as `UnsupportedType`, matching
+the server's `DataTypeMap::isValidKeyType`.
 
 A malformed `LowCardinality` payload (a bad key version, the
 `NeedGlobalDictionaryBit` set, an index width tag outside `0..=3`, an out-of-range
 index, or a row count that disagrees with the block header) fails with
 `DecodeError::InvalidLowCardinality` rather than `UnsupportedType`. A malformed
 `Array` payload (offsets that decrease or exceed `i64::MAX`) fails with
-`DecodeError::InvalidArray` rather than `UnsupportedType`.
+`DecodeError::InvalidArray` rather than `UnsupportedType`. `Tuple` has the
+analogous `DecodeError::InvalidTuple` (unequal element lengths), a defensive
+mirror of the server's check that its row-count-driven decode cannot reach.
 
 When one of these is implemented, move it into the support matrix and add a type
 section here.
