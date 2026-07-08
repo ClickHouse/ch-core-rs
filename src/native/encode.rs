@@ -12,16 +12,17 @@
 //! Scope: this encodes `Bool`, the fixed-width numeric types (`Int8`..`Int64`,
 //! `UInt8`..`UInt64`, `Float32`, `Float64`), the temporal types (`Date`,
 //! `Date32`, `DateTime`, `DateTime64`), `UUID`, `IPv4`, `IPv6`, `String`,
-//! `FixedString(N)`, `Enum8`/`Enum16`, `Decimal(P, S)`, and
-//! `LowCardinality(T)` for the allowed inner types this crate decodes. The
-//! plain types also compose inside a `Nullable(T)` wrapper (a per-row null map
-//! precedes the inner values). Every other column type returns
+//! `FixedString(N)`, `Enum8`/`Enum16`, `Decimal(P, S)`, `LowCardinality(T)`
+//! for the allowed inner types this crate decodes, and `Array(T)` over any
+//! encodable element type (including nested arrays). The plain types also
+//! compose inside a `Nullable(T)` wrapper (a per-row null map precedes the
+//! inner values). Every other column type returns
 //! [`EncodeError::UnsupportedType`] until its encoder lands, the same
 //! one-type-at-a-time growth the decode path follows.
 
 use crate::batch::{ChunkedBatch, ColBatch};
 use crate::column::{
-    BoolColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn, Utf8Column,
+    ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn, Utf8Column,
 };
 use crate::schema::{ChType, Field};
 
@@ -29,6 +30,7 @@ use super::decode::{
     decimal_bits_from_precision, is_low_cardinality_inner, parse_ch_type,
     DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION, DBMS_MIN_REVISION_WITH_OUT_OF_ORDER_BUCKETS,
     LC_HAS_ADDITIONAL_KEYS_BIT, LC_NEED_UPDATE_DICTIONARY_BIT, LOW_CARDINALITY_KEY_VERSION,
+    MAX_TYPE_DEPTH,
 };
 use super::varint::write_varint;
 
@@ -175,6 +177,27 @@ fn validate_block(batch: &ColBatch) -> Result<(), EncodeError> {
 /// not-yet-encodable type is rejected even in a zero-row block (see the note on
 /// [`encode_block`]).
 fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<(), EncodeError> {
+    // Bound the declared type's nesting depth before anything walks it.
+    // Encode input is caller-constructed and never passes through
+    // `parse_ch_type`'s depth cap, and `column_variant_matches`, `is_encodable`,
+    // `write_state_prefix`, and `ChType`'s `Display` all recurse one stack frame
+    // per wrapper level, so a pathologically deep type (say 10^6 nested Arrays)
+    // would overflow the stack before any other check fires. The walk below is
+    // iterative, and the rejection deliberately avoids `EncodeError::
+    // UnsupportedType`: that variant clones the `ChType` and renders it via
+    // `Display`, both of which recurse to full depth, so the error itself would
+    // overflow. Reusing the decode parser's `MAX_TYPE_DEPTH` keeps the two
+    // directions accepting the same depths: a deeper type renders a header the
+    // decode side would reject anyway.
+    if type_depth(&field.ch_type) > MAX_TYPE_DEPTH {
+        return Err(EncodeError::InconsistentBatch {
+            detail: format!(
+                "column {:?} type nesting exceeds the maximum depth of {MAX_TYPE_DEPTH} wrapper/container levels",
+                field.name
+            ),
+        });
+    }
+
     // Row count: the column must carry exactly the rows the block declares.
     if column.len() != num_rows {
         return Err(EncodeError::InconsistentBatch {
@@ -294,6 +317,10 @@ fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<()
         validate_low_cardinality(field, inner, c, num_rows)?;
     }
 
+    if let (ChType::Array(inner), Column::Array(c)) = (value_type, column) {
+        validate_array(field, inner, c, num_rows)?;
+    }
+
     // A `Bool` column is unpacked from its packed bitmap positionally, so the
     // bitmap must hold at least `len.div_ceil(8)` bytes. `BoolColumn`'s fields are
     // public and `ColBatch::new` only debug-asserts, so a release-mode caller could
@@ -342,6 +369,28 @@ fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<()
     }
 
     Ok(())
+}
+
+/// Count the wrapper/container nesting levels of `ch_type`, iteratively.
+///
+/// Used by [`validate_column`] to reject a pathologically deep
+/// caller-constructed type before any of the encoder's recursive walks touch
+/// it, so this must not recurse itself. Every current wrapper (`Nullable`,
+/// `LowCardinality`, `Array`) has exactly one child, so a loop suffices; a
+/// future multi-child container (`Tuple`, `Map`) must switch this to an
+/// explicit worklist, still without recursion.
+fn type_depth(ch_type: &ChType) -> usize {
+    let mut depth = 0;
+    let mut current = ch_type;
+    loop {
+        current = match current {
+            ChType::Nullable(inner) | ChType::LowCardinality(inner) | ChType::Array(inner) => {
+                depth += 1;
+                inner
+            }
+            _ => return depth,
+        };
+    }
 }
 
 /// Shared misframe guard for fixed-width binary bodies (`FixedString(N)`,
@@ -551,15 +600,94 @@ fn validate_low_cardinality(
     Ok(())
 }
 
+/// Validate an `Array(T)` column before any bytes are written.
+///
+/// [`encode_array_data`] writes `offsets[1..]` verbatim as raw `u64` and then
+/// the flattened element column, so the Arrow LargeList invariants must hold
+/// first: `num_rows + 1` offsets starting at 0, monotonically non-decreasing
+/// (which, from the zero start, also proves every offset non-negative, so the
+/// `i64` little-endian bytes written are exactly the wire `UInt64`'s), and a
+/// final offset equal to the flattened element count (a smaller value would
+/// silently drop trailing elements from the wire, a larger one would declare
+/// elements the body does not carry, a misframed stream the server rejects with
+/// `INCORRECT_DATA`). The element column is then validated recursively as its
+/// own column of `offsets[num_rows]` rows, so every element-level guard (a
+/// `Nullable` element's validity length, `LowCardinality` invariants, string
+/// offsets, fixed-binary widths, a nested `Array`) applies to the flattened
+/// buffer too.
+fn validate_array(
+    field: &Field,
+    inner: &ChType,
+    col: &ArrayColumn,
+    num_rows: usize,
+) -> Result<(), EncodeError> {
+    let reject = |detail: String| Err(EncodeError::InconsistentBatch { detail });
+
+    // Arrow list layout: a leading 0 plus one end-offset per row. Mostly implied
+    // by the `column.len() == num_rows` check earlier in `validate_column`
+    // (`ArrayColumn::len()` is `offsets.len().saturating_sub(1)`), but that
+    // saturates, so an empty offsets vector still reports 0 rows; assert the
+    // exact length so `offsets[0]` and `offsets[num_rows]` below are in range.
+    if col.offsets.len() != num_rows + 1 {
+        return reject(format!(
+            "column {:?} declares {num_rows} rows so it needs {} Array offsets (a leading 0 plus one end-offset per row), but carries {}",
+            field.name,
+            num_rows + 1,
+            col.offsets.len()
+        ));
+    }
+    if col.offsets[0] != 0 {
+        return reject(format!(
+            "column {:?} has a nonzero first Array offset {}; Arrow list offsets start at 0",
+            field.name, col.offsets[0]
+        ));
+    }
+    // Monotonic non-decreasing from the zero start also proves every offset is
+    // non-negative, so the `as u64` casts in `encode_array_data` cannot change
+    // the value. Equal adjacent offsets (empty rows) are fine, matching the
+    // server's own non-decreasing check in `deserializeOffsetsBinaryBulk`.
+    for pair in col.offsets.windows(2) {
+        if pair[1] < pair[0] {
+            return reject(format!(
+                "column {:?} has non-monotonic Array offsets ({} then {})",
+                field.name, pair[0], pair[1]
+            ));
+        }
+    }
+    let total_elements = col.offsets[num_rows];
+    let element_rows = col.values.len();
+    if i64::try_from(element_rows) != Ok(total_elements) {
+        return reject(format!(
+            "column {:?} Array offsets end at {total_elements} but the flattened element column holds {element_rows} rows",
+            field.name
+        ));
+    }
+
+    let element_field = Field {
+        name: format!("{} element", field.name),
+        ch_type: inner.clone(),
+    };
+    validate_column(&element_field, col.values.as_ref(), element_rows)
+}
+
 /// Whether `value_type` (the unwrapped inner value type) and `column` form a
 /// supported, matching pair this encoder can write.
 ///
 /// This must list exactly the matching arms of [`encode_column_body`], plus
-/// `LowCardinality`'s [`encode_low_cardinality_data`] path; keep it in sync the
-/// same way [`is_encodable`] is. [`validate_column`] uses it to reject a
-/// wrong-buffer or not-yet-encodable column before any bytes are written, which is
-/// what lets [`write_block_into`] treat the body match as structurally infallible.
+/// `LowCardinality`'s [`encode_low_cardinality_data`] path and `Array`'s
+/// [`encode_array_data`] path; keep it in sync the same way [`is_encodable`] is.
+/// [`validate_column`] uses it to reject a wrong-buffer or not-yet-encodable
+/// column before any bytes are written, which is what lets [`write_block_into`]
+/// treat the body match as structurally infallible.
 fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
+    // `Array(T)` matches only if the flattened element column matches the
+    // element value type in turn, recursing the same way `decode_array` decodes
+    // through `decode_values`. A `Nullable` element unwraps to its inner here
+    // (the element column carries the inner variant plus validity), exactly like
+    // the top-level unwrap in `validate_column`.
+    if let (ChType::Array(inner), Column::Array(c)) = (value_type, column) {
+        return column_variant_matches(inner.inner(), c.values.as_ref());
+    }
     matches!(
         (value_type, column),
         (ChType::Bool, Column::Bool(_))
@@ -622,7 +750,13 @@ fn write_block_into(
         if options.protocol_revision >= DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION {
             buf.push(0x00);
         }
-        encode_column_data(buf, field, column)?;
+        // A zero-row block carries only the column headers: `NativeWriter::write`
+        // gates `writeData` (the state prefix included, so not even a
+        // LowCardinality key version) on `rows > 0`, and `NativeReader::read`
+        // skips symmetrically (confirmed at v26.6.1.1193-stable).
+        if batch.num_rows > 0 {
+            encode_column_data(buf, field, column)?;
+        }
     }
     Ok(())
 }
@@ -684,42 +818,98 @@ macro_rules! encode_primitive {
     }};
 }
 
-/// Encode one column into `buf` (no header): the `Nullable` null map if the
-/// declared type is a wrapper, then the value body.
-///
-/// A `Nullable(T)` is the inverse of [`super::decode::decode_column`]: the per-row
-/// null map is written first, then the inner type's body from the same physical
-/// column buffer, which carries the inner variant plus the validity bitmap. A
-/// plain type goes straight to its body.
+/// Encode one column into `buf` (no header): the per-column bulk-state prefix,
+/// then the value payload, the inverse of [`super::decode::decode_column`].
+/// Called only for blocks with rows (see [`write_block_into`]), matching the
+/// server's `rows > 0` gate around `writeData`.
 fn encode_column_data(
     buf: &mut Vec<u8>,
     field: &Field,
     column: &Column,
 ) -> Result<(), EncodeError> {
-    if let ChType::LowCardinality(inner) = &field.ch_type {
+    write_state_prefix(buf, &field.ch_type);
+    encode_column_values(buf, field, &field.ch_type, column)
+}
+
+/// Write the per-column bulk-state prefix, the inverse of
+/// [`super::decode::read_state_prefix`] and the encode side of the server's
+/// `serializeBinaryBulkStatePrefix` recursion.
+///
+/// `SerializationArray::serializeBinaryBulkStatePrefix` writes nothing of its
+/// own and recurses into the element type (confirmed at v26.6.1.1193-stable,
+/// `src/DataTypes/Serializations/SerializationArray.cpp`), so a leaf
+/// `LowCardinality`'s 8-byte key version is hoisted to the very front of the
+/// whole column's data, before any `Array` offsets, across every nesting level.
+/// `SerializationLowCardinality::serializeBinaryBulkStatePrefix` writes that one
+/// UInt64 LE key version (`SharedDictionariesWithAdditionalKeys` = 1); every
+/// other supported type writes a zero-byte prefix.
+fn write_state_prefix(buf: &mut Vec<u8>, ch_type: &ChType) {
+    match ch_type {
+        ChType::LowCardinality(_) => {
+            buf.extend_from_slice(&LOW_CARDINALITY_KEY_VERSION.to_le_bytes());
+        }
+        ChType::Array(inner) => write_state_prefix(buf, inner),
+        _ => {}
+    }
+}
+
+/// Encode one column's value payload once its state prefix has been written,
+/// the inverse of [`super::decode::decode_values`].
+///
+/// Split from [`encode_column_data`] so [`encode_array_data`] can write its
+/// flattened element column WITHOUT re-emitting a state prefix: the server
+/// hoists the element prefix to the front of the whole `Array` column and never
+/// repeats it per element run. A `Nullable(T)` writes the per-row null map
+/// first, then the inner type's body from the same physical column buffer,
+/// which carries the inner variant plus the validity bitmap. A plain type goes
+/// straight to its body.
+fn encode_column_values(
+    buf: &mut Vec<u8>,
+    field: &Field,
+    ch_type: &ChType,
+    column: &Column,
+) -> Result<(), EncodeError> {
+    if let ChType::LowCardinality(inner) = ch_type {
         if let Column::Dictionary(c) = column {
+            // A zero-length run writes no LowCardinality body at all: no index
+            // word, no dictionary, no row count, no indexes.
+            // `SerializationLowCardinality::serializeBinaryBulkWithMultipleStreams`
+            // early-returns when limit == 0 (confirmed at v26.6.1.1193-stable).
+            // Reachable only nested inside an Array whose arrays are all empty;
+            // a zero-row block skips the column data, prefix included, in
+            // `write_block_into`.
             if c.is_empty() {
                 return Ok(());
             }
             return encode_low_cardinality_data(buf, field, inner, c);
         }
-        return Err(column_error(field, &field.ch_type));
+        return Err(column_error(field, ch_type));
     }
-    if let ChType::Nullable(inner) = &field.ch_type {
+    if let ChType::Array(inner) = ch_type {
+        if let Column::Array(c) = column {
+            return encode_array_data(buf, field, inner, c);
+        }
+        return Err(column_error(field, ch_type));
+    }
+    if let ChType::Nullable(inner) = ch_type {
         encode_null_map(buf, column);
         return encode_column_body(buf, field, inner, column);
     }
-    encode_column_body(buf, field, &field.ch_type, column)
+    encode_column_body(buf, field, ch_type, column)
 }
 
-/// Encode one `LowCardinality(T)` column body.
+/// Encode one `LowCardinality(T)` column body, after its 8-byte key-version
+/// state prefix ([`write_state_prefix`] writes that separately so it hoists
+/// correctly through an `Array` wrapper).
 ///
-/// Confirmed at `v26.6.1.1193-stable`: Native writes the per-column key-version
-/// prefix (`SharedDictionariesWithAdditionalKeys` = 1), then an index word with
-/// `HasAdditionalKeysBit` and `NeedUpdateDictionary` set, then the per-block
-/// dictionary as the removeNullable inner type's plain body, then the row count
-/// and fixed-width raw indexes. Zero-row blocks skip this function entirely,
-/// matching `NativeWriter::write`'s `rows > 0` gate.
+/// Confirmed at `v26.6.1.1193-stable`: after the prefix, Native writes an index
+/// word with `HasAdditionalKeysBit` and `NeedUpdateDictionary` set, then the
+/// per-block dictionary as the removeNullable inner type's plain body, then the
+/// row count and fixed-width raw indexes. A zero-row block skips the column
+/// data entirely in [`write_block_into`], matching `NativeWriter::write`'s
+/// `rows > 0` gate, and a zero-length nested run is skipped by
+/// [`encode_column_values`], matching the server's `limit == 0` early return,
+/// so this always writes at least one index.
 fn encode_low_cardinality_data(
     buf: &mut Vec<u8>,
     field: &Field,
@@ -732,7 +922,6 @@ fn encode_low_cardinality_data(
     };
     let (index_width, width_tag) = low_cardinality_index_width(col.values.len());
 
-    buf.extend_from_slice(&LOW_CARDINALITY_KEY_VERSION.to_le_bytes());
     let index_word = width_tag | LC_HAS_ADDITIONAL_KEYS_BIT | LC_NEED_UPDATE_DICTIONARY_BIT;
     buf.extend_from_slice(&index_word.to_le_bytes());
     buf.extend_from_slice(&(col.values.len() as u64).to_le_bytes());
@@ -786,6 +975,49 @@ fn low_cardinality_index_width(num_keys: usize) -> (usize, u64) {
     } else {
         (8, 3)
     }
+}
+
+/// Encode one `Array(T)` column body: the offsets run, then the flattened
+/// element column, the inverse of [`super::decode::decode_array`].
+///
+/// Wire layout per block (server `SerializationArray`, confirmed at
+/// v26.6.1.1193-stable in `src/DataTypes/Serializations/SerializationArray.cpp`;
+/// the element type's state prefix was already hoisted to the front of the
+/// whole column by [`write_state_prefix`], so nothing here re-emits it):
+///
+/// ```text
+/// [num_rows * 8]  offsets   // raw LE u64, cumulative ABSOLUTE end-offsets, no
+///                           // leading zero and no count; equal adjacent values
+///                           // are empty rows
+/// [element body]            // the flattened element column of length
+///                           // `offsets[num_rows]`, the element type's normal
+///                           // bulk body WITHOUT its state prefix (a nested
+///                           // Array recurses here; a zero-length
+///                           // LowCardinality run writes nothing at all)
+/// ```
+///
+/// `ArrayColumn::offsets` is the Arrow LargeList layout (a leading 0 plus one
+/// i64 end-offset per row), so the wire run is exactly `offsets[1..]`.
+/// [`validate_array`] proved the offsets start at 0 and are monotonically
+/// non-decreasing, so every offset is non-negative and each i64's little-endian
+/// bytes are exactly the wire UInt64's; on little-endian targets the whole run
+/// is one `extend_from_slice` via `encode_primitive!` (per-element
+/// `to_le_bytes` on big-endian hosts), with no per-row allocation. The element
+/// body then goes through the shared [`encode_column_values`] path, so a
+/// `Nullable`, `LowCardinality`, or nested `Array` element all compose.
+fn encode_array_data(
+    buf: &mut Vec<u8>,
+    field: &Field,
+    inner: &ChType,
+    col: &ArrayColumn,
+) -> Result<(), EncodeError> {
+    // `get(1..)` rather than `[1..]`: validation guarantees the leading 0
+    // exists, but stay panic-free if a caller reaches this without validating
+    // (the same defensive posture as `encode_column_body`'s fall-through arm).
+    if let Some(end_offsets) = col.offsets.get(1..) {
+        encode_primitive!(buf, end_offsets, i64);
+    }
+    encode_column_values(buf, field, inner, col.values.as_ref())
 }
 
 /// Encode a `Nullable(T)` null map: one byte per row, 0x00 = valid, 0x01 = NULL,
@@ -1092,10 +1324,11 @@ fn column_error(field: &Field, ch_type: &ChType) -> EncodeError {
 /// subset of decode coverage, and this predicate is the single place that lists
 /// it, so [`column_error`] can tell a wrong-buffer mismatch (`InconsistentBatch`)
 /// apart from a genuinely unsupported type (`UnsupportedType`). It lists the
-/// unwrapped value types plus `LowCardinality`, whose wrapper framing is handled
-/// by [`encode_low_cardinality_data`]. The `Nullable` wrapper composes with any
-/// non-wrapper type here via [`encode_null_map`]. Extend it as each new type's arm
-/// lands in [`encode_column_body`] or [`encode_column_data`].
+/// unwrapped value types plus the `LowCardinality` and `Array` wrappers, whose
+/// framing is handled by [`encode_low_cardinality_data`] and
+/// [`encode_array_data`]. The `Nullable` wrapper composes with any non-wrapper
+/// type here via [`encode_null_map`]. Extend it as each new type's arm lands in
+/// [`encode_column_body`] or [`encode_column_values`].
 fn is_encodable(ch_type: &ChType) -> bool {
     match ch_type {
         ChType::LowCardinality(inner) => {
@@ -1128,6 +1361,12 @@ fn is_encodable(ch_type: &ChType) -> bool {
         | ChType::Enum8 { .. }
         | ChType::Enum16 { .. }
         | ChType::Decimal { .. } => true,
+        // `Array(T)` only frames offsets around its element body
+        // (`encode_array_data`), so it is encodable exactly when its element
+        // value type is. A `Nullable` element unwraps like the top level does;
+        // `parse_ch_type` never nests `Array` directly inside `Nullable`, so
+        // `inner()` cannot hide a second `Array` wrapper.
+        ChType::Array(inner) => is_encodable(inner.inner()),
         ChType::Nullable(_) => false,
     }
 }
@@ -1719,6 +1958,94 @@ mod tests {
         ColBatch::new(Schema::new(fields), columns, 4)
     }
 
+    /// An `Array(Int32)` column over four rows: `[13, 79]`, `[]` (an empty row,
+    /// so an adjacent-equal offset pair), `[21]`, `[34, 55, 89]`.
+    fn array_int32_batch() -> ColBatch {
+        let fields = vec![Field {
+            name: "a".into(),
+            ch_type: ChType::Array(Box::new(ChType::Int32)),
+        }];
+        let columns = vec![Column::Array(ArrayColumn::new(
+            vec![0, 2, 2, 3, 6],
+            Column::Int32(PrimitiveColumn::new(vec![13, 79, 21, 34, 55, 89])),
+        ))];
+        ColBatch::new(Schema::new(fields), columns, 4)
+    }
+
+    /// An `Array(Nullable(String))` column over three rows: `["user_1", NULL]`,
+    /// `[]`, `["user_2"]`. The element null map covers the flattened element
+    /// run, so its validity lives on the flattened Utf8 column, not the array.
+    fn array_nullable_string_batch() -> ColBatch {
+        let mut elements = utf8_column(&[b"user_1", b"", b"user_2"]);
+        elements.validity = Some(Bitmap::from_ch_null_map(&[0, 1, 0]));
+        let fields = vec![Field {
+            name: "ans".into(),
+            ch_type: ChType::Array(Box::new(ChType::Nullable(Box::new(ChType::String)))),
+        }];
+        let columns = vec![Column::Array(ArrayColumn::new(
+            vec![0, 2, 2, 3],
+            Column::Utf8(elements),
+        ))];
+        ColBatch::new(Schema::new(fields), columns, 3)
+    }
+
+    /// An `Array(LowCardinality(String))` column over three rows:
+    /// `[user_1, user_2]`, `[]`, `[user_1]`. The element column is one
+    /// dictionary over the flattened run, and the LC key version is hoisted to
+    /// the front of the whole column, before the offsets.
+    fn array_low_cardinality_batch() -> ColBatch {
+        let fields = vec![Field {
+            name: "alc".into(),
+            ch_type: ChType::Array(Box::new(ChType::LowCardinality(Box::new(ChType::String)))),
+        }];
+        let columns = vec![Column::Array(ArrayColumn::new(
+            vec![0, 2, 2, 3],
+            Column::Dictionary(DictionaryColumn::new(
+                vec![1, 2, 1],
+                Column::Utf8(utf8_column(&[b"", b"user_1", b"user_2"])),
+            )),
+        ))];
+        ColBatch::new(Schema::new(fields), columns, 3)
+    }
+
+    /// An `Array(LowCardinality(String))` column with rows > 0 but EVERY array
+    /// empty, so the flattened element run has zero length and the LC element
+    /// body must be entirely absent: the wire is `[key version][zero offsets]`
+    /// and nothing else (the server's `limit == 0` early return).
+    fn array_low_cardinality_all_empty_batch() -> ColBatch {
+        let fields = vec![Field {
+            name: "alc".into(),
+            ch_type: ChType::Array(Box::new(ChType::LowCardinality(Box::new(ChType::String)))),
+        }];
+        let columns = vec![Column::Array(ArrayColumn::new(
+            vec![0, 0, 0],
+            Column::Dictionary(DictionaryColumn::new(
+                vec![],
+                Column::Utf8(utf8_column(&[])),
+            )),
+        ))];
+        ColBatch::new(Schema::new(fields), columns, 2)
+    }
+
+    /// An `Array(Array(Int32))` column over three rows:
+    /// `[[13, 79], [21]]`, `[]`, `[[34, 55, 89]]`. The outer offsets count inner
+    /// arrays, the inner offsets count leaf ints, and only one offsets run per
+    /// level is written (no prefixes anywhere for an Int32 leaf).
+    fn array_of_array_batch() -> ColBatch {
+        let fields = vec![Field {
+            name: "aa".into(),
+            ch_type: ChType::Array(Box::new(ChType::Array(Box::new(ChType::Int32)))),
+        }];
+        let columns = vec![Column::Array(ArrayColumn::new(
+            vec![0, 2, 2, 3],
+            Column::Array(ArrayColumn::new(
+                vec![0, 2, 3, 6],
+                Column::Int32(PrimitiveColumn::new(vec![13, 79, 21, 34, 55, 89])),
+            )),
+        ))];
+        ColBatch::new(Schema::new(fields), columns, 3)
+    }
+
     /// Compare two columns for the types this encoder covers. Used recursively
     /// for `LowCardinality` dictionary values.
     fn assert_columns_eq(left: &Column, right: &Column, label: &str) {
@@ -1773,6 +2100,11 @@ mod tests {
                 assert_eq!(x.indices, y.indices, "{label} dictionary indices differ");
                 let dict_label = format!("{label} dictionary");
                 assert_columns_eq(x.values.as_ref(), y.values.as_ref(), &dict_label);
+            }
+            (Column::Array(x), Column::Array(y)) => {
+                assert_eq!(x.offsets, y.offsets, "{label} array offsets differ");
+                let elem_label = format!("{label} array elements");
+                assert_columns_eq(x.values.as_ref(), y.values.as_ref(), &elem_label);
             }
             (other_a, other_b) => panic!("{label}: unexpected {other_a:?} vs {other_b:?}"),
         }
@@ -1977,6 +2309,59 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_array_int32_rev0() {
+        roundtrip(&array_int32_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_array_int32_tcp_revision() {
+        roundtrip(&array_int32_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_array_nullable_string_rev0() {
+        roundtrip(&array_nullable_string_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_array_nullable_string_tcp_revision() {
+        roundtrip(&array_nullable_string_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_array_low_cardinality_rev0() {
+        roundtrip(&array_low_cardinality_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_array_low_cardinality_tcp_revision() {
+        roundtrip(&array_low_cardinality_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_array_low_cardinality_all_empty_rev0() {
+        roundtrip(&array_low_cardinality_all_empty_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_array_low_cardinality_all_empty_tcp_revision() {
+        roundtrip(
+            &array_low_cardinality_all_empty_batch(),
+            DBMS_TCP_PROTOCOL_VERSION,
+        );
+    }
+
+    #[test]
+    fn roundtrip_array_of_array_rev0() {
+        roundtrip(&array_of_array_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_array_of_array_tcp_revision() {
+        roundtrip(&array_of_array_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
     fn zero_row_block_roundtrips_schema() {
         // A zero-row block still carries full column headers. The decoder keeps
         // the schema but drops the empty block from `chunks`.
@@ -2019,6 +2404,14 @@ mod tests {
                     ChType::String,
                 )))),
             },
+            Field {
+                name: "a".into(),
+                ch_type: ChType::Array(Box::new(ChType::Int32)),
+            },
+            Field {
+                name: "alc".into(),
+                ch_type: ChType::Array(Box::new(ChType::LowCardinality(Box::new(ChType::String)))),
+            },
         ];
         let columns = vec![
             Column::Int32(PrimitiveColumn::new(vec![])),
@@ -2035,6 +2428,19 @@ mod tests {
                 vec![],
                 Column::Utf8(utf8_column(&[])),
                 Bitmap::from_ch_null_map(&[]),
+            )),
+            // A zero-row Array carries only the leading-0 offset and writes no
+            // data at all, not even the hoisted LC key version of an LC element.
+            Column::Array(ArrayColumn::new(
+                vec![0],
+                Column::Int32(PrimitiveColumn::new(vec![])),
+            )),
+            Column::Array(ArrayColumn::new(
+                vec![0],
+                Column::Dictionary(DictionaryColumn::new(
+                    vec![],
+                    Column::Utf8(utf8_column(&[])),
+                )),
             )),
         ];
         let batch = ColBatch::new(Schema::new(fields), columns, 0);
@@ -2203,6 +2609,55 @@ mod tests {
         assert_eq!(decoded.num_chunks(), 2);
         for (sent, got) in batch.chunks.iter().zip(&decoded.chunks) {
             assert_batches_eq(sent, got);
+        }
+    }
+
+    #[test]
+    fn encode_chunked_roundtrips_array_blocks() {
+        // Array element data is block-local (offsets restart at 0 per block).
+        // Two Array(Int32) chunks with different shapes must stay separate
+        // after decode, never concatenated.
+        let field = Field {
+            name: "a".into(),
+            ch_type: ChType::Array(Box::new(ChType::Int32)),
+        };
+        let chunk = |offsets: Vec<i64>, values: Vec<i32>| {
+            let n = offsets.len() - 1;
+            std::sync::Arc::new(ColBatch::new(
+                Schema::new(vec![field.clone()]),
+                vec![Column::Array(ArrayColumn::new(
+                    offsets,
+                    Column::Int32(PrimitiveColumn::new(values)),
+                ))],
+                n,
+            ))
+        };
+        let batch = ChunkedBatch {
+            schema: Schema::new(vec![field.clone()]),
+            chunks: vec![
+                chunk(vec![0, 2, 2, 3], vec![13, 79, 21]),
+                chunk(vec![0, 2], vec![34, 55]),
+            ],
+        };
+        for revision in [0, DBMS_TCP_PROTOCOL_VERSION] {
+            let bytes = encode_chunked(
+                &batch,
+                &EncodeOptions {
+                    protocol_revision: revision,
+                },
+            )
+            .unwrap();
+            let decoded = decode_all_bytes(
+                &bytes,
+                &DecodeOptions {
+                    protocol_revision: revision,
+                },
+            )
+            .unwrap_or_else(|e| panic!("decode at rev {revision} failed: {e}"));
+            assert_eq!(decoded.num_chunks(), 2);
+            for (sent, got) in batch.chunks.iter().zip(&decoded.chunks) {
+                assert_batches_eq(sent, got);
+            }
         }
     }
 
@@ -2539,6 +2994,68 @@ mod tests {
             0x02, b'l', b'c', // name "lc"
             0x16, b'L', b'o', b'w', b'C', b'a', b'r', b'd', b'i', b'n', b'a', b'l', b'i', b't',
             b'y', b'(', b'S', b't', b'r', b'i', b'n', b'g', b')',
+        ];
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn rev0_frames_array_int32_bytes() {
+        // Pin the Array body framing: one raw LE u64 cumulative end-offset per
+        // row with NO leading zero and no count, then the flattened element
+        // body. Two rows [13, 79] and [] (the empty row repeats the previous
+        // end-offset).
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "a".into(),
+                ch_type: ChType::Array(Box::new(ChType::Int32)),
+            }]),
+            vec![Column::Array(ArrayColumn::new(
+                vec![0, 2, 2],
+                Column::Int32(PrimitiveColumn::new(vec![13, 79])),
+            ))],
+            2,
+        );
+        let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+        let expected = [
+            0x01, // num_cols = 1
+            0x02, // num_rows = 2
+            0x01, b'a', // name "a"
+            0x0C, b'A', b'r', b'r', b'a', b'y', b'(', b'I', b'n', b't', b'3', b'2',
+            b')', // type "Array(Int32)"
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // offset row 0 = 2
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // offset row 1 = 2
+            0x0D, 0x00, 0x00, 0x00, // Int32 13, little-endian
+            0x4F, 0x00, 0x00, 0x00, // Int32 79, little-endian
+        ];
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn rev0_frames_array_low_cardinality_all_empty_bytes() {
+        // Pin the all-empty Array(LowCardinality(String)) shape: the hoisted LC
+        // key version FIRST (the element state prefix, before the offsets), then
+        // the all-zero offsets, then NOTHING for the LC element run
+        // (`SerializationLowCardinality::serializeBinaryBulkWithMultipleStreams`
+        // early-returns at limit == 0; confirmed at v26.6.1.1193-stable). An
+        // index word, key count, or row count here would make the server
+        // misparse the INSERT.
+        let bytes = encode_block(
+            &array_low_cardinality_all_empty_batch(),
+            &EncodeOptions::default(),
+        )
+        .unwrap();
+        let expected = [
+            0x01, // num_cols = 1
+            0x02, // num_rows = 2
+            0x03, b'a', b'l', b'c', // name "alc"
+            0x1D, b'A', b'r', b'r', b'a', b'y', b'(', b'L', b'o', b'w', b'C', b'a', b'r', b'd',
+            b'i', b'n', b'a', b'l', b'i', b't', b'y', b'(', b'S', b't', b'r', b'i', b'n', b'g',
+            b')', b')', // type "Array(LowCardinality(String))"
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // hoisted LC key version = 1
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // offset row 0 = 0
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, // offset row 1 = 0
+                  // nothing else: zero-length LC element run writes no body
         ];
         assert_eq!(bytes, expected);
     }
@@ -3088,6 +3605,172 @@ mod tests {
         match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
             EncodeError::InconsistentBatch { .. } => {}
             other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    /// Build a one-column `Array(Int32)` batch directly from raw offsets and
+    /// leaf values so a malformed offset array reaches the encoder. `num_rows`
+    /// is passed explicitly so only the Array invariants under test, not the
+    /// row-count check, are exercised.
+    fn array_batch_from_parts(offsets: Vec<i64>, values: Vec<i32>, num_rows: usize) -> ColBatch {
+        ColBatch {
+            schema: Schema::new(vec![Field {
+                name: "a".into(),
+                ch_type: ChType::Array(Box::new(ChType::Int32)),
+            }]),
+            columns: vec![Column::Array(ArrayColumn::new(
+                offsets,
+                Column::Int32(PrimitiveColumn::new(values)),
+            ))],
+            num_rows,
+        }
+    }
+
+    #[test]
+    fn array_non_monotonic_offsets_are_rejected() {
+        // Decreasing offsets would frame a stream the server rejects with
+        // INCORRECT_DATA (and would slice out of bounds on our own decode).
+        let batch = array_batch_from_parts(vec![0, 3, 1], vec![13, 79, 21], 2);
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn array_offset_element_count_mismatch_is_rejected() {
+        // A final offset that does not equal the flattened element count would
+        // either silently drop trailing elements (too small) or declare
+        // elements the body does not carry (too large). Both directions.
+        for (offsets, values) in [
+            (vec![0i64, 2], vec![13, 79, 21]), // ends at 2, holds 3
+            (vec![0i64, 3], vec![13, 79]),     // ends at 3, holds 2
+        ] {
+            let batch = array_batch_from_parts(offsets, values, 1);
+            match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+                EncodeError::InconsistentBatch { .. } => {}
+                other => panic!("expected InconsistentBatch, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn array_missing_leading_zero_offset_is_rejected() {
+        // Arrow list offsets start at 0; a nonzero first offset means the
+        // leading zero is missing and row 0's slice would drop leading elements.
+        let batch = array_batch_from_parts(vec![1, 3], vec![13, 79, 21], 1);
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn array_wrong_offsets_length_is_rejected() {
+        // An empty offsets vector reports 0 rows through the saturating len()
+        // and so passes the row-count check at num_rows = 0, but it is not the
+        // well-formed `[0]` shape; the explicit num_rows + 1 length check
+        // rejects it before `offsets[0]` is read.
+        let batch = array_batch_from_parts(vec![], vec![], 0);
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn array_negative_offset_is_rejected() {
+        // A negative offset would wrap through the i64 -> u64 cast into a huge
+        // wire offset. The monotonic check from the zero start catches it.
+        let batch = array_batch_from_parts(vec![0, -1], vec![], 1);
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn array_element_validation_failure_is_rejected() {
+        // Element-level guards must apply to the flattened element column: a
+        // String element whose Utf8 offsets point past its data buffer would
+        // panic mid-write, so the recursive element validation rejects it
+        // through the Array before any bytes are written.
+        let batch = ColBatch {
+            schema: Schema::new(vec![Field {
+                name: "a".into(),
+                ch_type: ChType::Array(Box::new(ChType::String)),
+            }]),
+            columns: vec![Column::Array(ArrayColumn::new(
+                vec![0, 1],
+                Column::Utf8(Utf8Column::new(vec![0, 10], b"abc".to_vec())),
+            ))],
+            num_rows: 1,
+        };
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn over_deep_type_nesting_is_rejected() {
+        // Encode input never passes through `parse_ch_type`, so its
+        // MAX_TYPE_DEPTH cap does not protect the encoder: a caller-constructed
+        // pathologically deep type would recurse one stack frame per wrapper
+        // level in `column_variant_matches` / `is_encodable` / `Display` /
+        // `write_state_prefix` and overflow the stack. The iterative depth walk
+        // in `validate_column` rejects it first, and does so without cloning or
+        // rendering the deep type (both recurse to full depth), which is why the
+        // rejection is InconsistentBatch rather than UnsupportedType.
+        let mut ch_type = ChType::Int32;
+        for _ in 0..(MAX_TYPE_DEPTH + 100) {
+            ch_type = ChType::Array(Box::new(ch_type));
+        }
+        let batch = ColBatch {
+            schema: Schema::new(vec![Field {
+                name: "deep".into(),
+                ch_type,
+            }]),
+            columns: vec![Column::Int32(PrimitiveColumn::new(vec![]))],
+            num_rows: 0,
+        };
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { detail } => {
+                assert!(detail.contains("nesting"), "unexpected detail: {detail}");
+            }
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn array_forbidden_low_cardinality_element_is_unsupported() {
+        // Decimal is encodable as a plain column but forbidden inside
+        // LowCardinality (`canBeInsideLowCardinality()` is false), and nesting
+        // that LC inside an Array must not launder it: the element validation
+        // recurses and reports UnsupportedType before any bytes are written.
+        let batch = ColBatch {
+            schema: Schema::new(vec![Field {
+                name: "a".into(),
+                ch_type: ChType::Array(Box::new(ChType::LowCardinality(Box::new(
+                    ChType::Decimal {
+                        precision: 9,
+                        scale: 4,
+                        bits: 32,
+                    },
+                )))),
+            }]),
+            columns: vec![Column::Array(ArrayColumn::new(
+                vec![0, 1],
+                Column::Dictionary(DictionaryColumn::new(
+                    vec![0],
+                    Column::Decimal(DecimalColumn::new(vec![0u8; 4], 4, 9, 4)),
+                )),
+            ))],
+            num_rows: 1,
+        };
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::UnsupportedType { .. } => {}
+            other => panic!("expected UnsupportedType, got {other:?}"),
         }
     }
 

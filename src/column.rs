@@ -344,6 +344,59 @@ impl DictionaryColumn {
     }
 }
 
+/// Array column in Arrow list layout (`Array(T)`).
+///
+/// Row `i`'s elements are `values[offsets[i]..offsets[i + 1]]`. `offsets` has
+/// length `num_rows + 1` with `offsets[0] == 0`, exactly Arrow's list offset
+/// layout.
+///
+/// ClickHouse serializes the cumulative end-offset per row as a raw `UInt64`
+/// run with no leading zero (server `SerializationArray`); decode prepends the
+/// `0` and widens each offset to `i64`, so the column exports as an Arrow
+/// LargeList (`+L`, 64-bit offsets). i64 is used rather than i32 because
+/// ClickHouse offsets are `UInt64` and count elements, not bytes, so a per-block
+/// element count can legitimately exceed `i32::MAX` (unlike the `Utf8Column`
+/// byte offsets, which cap a chunk at 2 GiB). No artificial cap is imposed.
+///
+/// `values` is the flattened element column of length `offsets[num_rows]`, its
+/// own [`Column`] (recursively any supported element type, including a nested
+/// `Array`, a `Nullable`, or a `LowCardinality`). Each Native block carries its
+/// own element data, and blocks stay separate chunks, so `values` is local to
+/// this chunk.
+///
+/// The array itself is never nullable (ClickHouse forbids `Nullable(Array(T))`),
+/// so `ArrayColumn` carries no validity bitmap; a nullable *element* type keeps
+/// its nulls in `values`' own validity (an `Array(Nullable(T))`).
+#[derive(Debug, Clone)]
+pub struct ArrayColumn {
+    pub offsets: Vec<i64>,
+    pub values: Box<Column>,
+}
+
+impl ArrayColumn {
+    pub fn new(offsets: Vec<i64>, values: Column) -> Self {
+        Self {
+            offsets,
+            values: Box::new(values),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        // offsets always carries the leading 0, so an empty column is `[0]`.
+        self.offsets.len().saturating_sub(1)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Arrays are never nullable in ClickHouse, so the array level has no nulls.
+    /// Element-level nulls (an `Array(Nullable(T))`) are counted on `values`.
+    pub fn null_count(&self) -> usize {
+        0
+    }
+}
+
 /// Enum over all supported column types.
 #[derive(Debug, Clone)]
 pub enum Column {
@@ -387,6 +440,9 @@ pub enum Column {
     // host materialization is a binding concern.
     Decimal(DecimalColumn),
     Dictionary(DictionaryColumn),
+    // Array(T): Arrow list layout (offsets + a flattened element column). The
+    // element column is itself a Column, so this is the first recursive variant.
+    Array(ArrayColumn),
 }
 
 impl Column {
@@ -416,6 +472,7 @@ impl Column {
             Column::Enum16(c) => c.len(),
             Column::Decimal(c) => c.len(),
             Column::Dictionary(c) => c.len(),
+            Column::Array(c) => c.len(),
         }
     }
 
@@ -449,6 +506,7 @@ impl Column {
             Column::Enum16(c) => c.null_count(),
             Column::Decimal(c) => c.null_count(),
             Column::Dictionary(c) => c.null_count(),
+            Column::Array(c) => c.null_count(),
         }
     }
 
@@ -478,6 +536,9 @@ impl Column {
             Column::Enum16(c) => c.validity.as_ref(),
             Column::Decimal(c) => c.validity.as_ref(),
             Column::Dictionary(c) => c.validity.as_ref(),
+            // Arrays are never nullable at the array level, so there is no
+            // array validity bitmap; element nulls live on `values`.
+            Column::Array(_) => None,
         }
     }
 }

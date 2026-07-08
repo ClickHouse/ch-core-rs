@@ -4,8 +4,8 @@ use std::sync::Arc;
 use crate::batch::{ChunkedBatch, ColBatch};
 use crate::bitmap::Bitmap;
 use crate::column::{
-    BoolColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn, PrimitiveColumn,
-    Utf8Column,
+    ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn,
+    PrimitiveColumn, Utf8Column,
 };
 use crate::native::varint::ByteReader;
 use crate::schema::{ChType, Field, Schema};
@@ -42,6 +42,14 @@ pub enum DecodeError {
     /// set (Native never uses a shared global dictionary), an index width tag
     /// outside `0..=3`, or an index value that does not fit Arrow's i32 index.
     InvalidLowCardinality {
+        column: String,
+        reason: &'static str,
+    },
+    /// An `Array` column carried an offset run this decoder rejects: offsets that
+    /// are not monotonically non-decreasing (the server enforces this in Native
+    /// mode, a decrease is `INCORRECT_DATA`), or an absolute offset that exceeds
+    /// `i64::MAX` (the Arrow LargeList offset width the column widens into).
+    InvalidArray {
         column: String,
         reason: &'static str,
     },
@@ -83,6 +91,9 @@ impl std::fmt::Display for DecodeError {
                     f,
                     "Invalid LowCardinality layout for column '{column}': {reason}"
                 )
+            }
+            DecodeError::InvalidArray { column, reason } => {
+                write!(f, "Invalid Array layout for column '{column}': {reason}")
             }
         }
     }
@@ -132,24 +143,63 @@ pub struct DecodeOptions {
 // Type name parsing
 // ---------------------------------------------------------------------------
 
+/// Maximum wrapper/container nesting depth the type-name parser accepts.
+///
+/// The type string is attacker-controlled wire input, and every wrapper level
+/// (`Nullable`, `LowCardinality`, `Array`, and later `Map`/`Tuple`) recurses one
+/// stack frame in [`parse_ch_type_depth`]. An unbounded string like
+/// `Array(Array(...Array(Int32)...))` would overflow the stack and abort the
+/// process (SIGABRT is uncatchable), violating the "malformed bytes return an
+/// error, never crash" invariant. Capping the PARSER caps every downstream
+/// recursion too: decode, the completeness scan, and the Arrow export only recurse
+/// as deep as the parsed `ChType`, so a rejected over-deep header never reaches
+/// them. 100 far exceeds any real ClickHouse schema (real nested types are a
+/// handful of levels deep) and stays safe even on small worker-thread stacks.
+/// ClickHouse's own analogous guard is `max_parser_depth` (default 1000).
+/// `pub(crate)` so the encoder's `validate_column` can enforce the same cap on
+/// caller-constructed types, which never pass through this parser.
+pub(crate) const MAX_TYPE_DEPTH: usize = 100;
+
 /// Parse a ClickHouse type name string into a ChType.
 ///
 /// `pub(crate)` so the encoder can confirm a rendered type string round-trips
-/// (a header this parser rejects is one the server rejects too).
+/// (a header this parser rejects is one the server rejects too). Delegates to the
+/// depth-tracked [`parse_ch_type_depth`], which bounds recursion against a hostile
+/// header (see [`MAX_TYPE_DEPTH`]).
 pub(crate) fn parse_ch_type(type_name: &str) -> Option<ChType> {
-    // Nullable wrapper. ClickHouse forbids a `Nullable` or a `LowCardinality`
-    // directly inside a `Nullable`: the only legal nesting with LowCardinality is
-    // `LowCardinality(Nullable(T))`, never the reverse, and `Nullable(Nullable(T))`
-    // does not exist at all. An honest server never emits either, but the type
-    // string is untrusted wire input, so reject both here. `decode_column` and
+    parse_ch_type_depth(type_name, 0)
+}
+
+/// Parse a ClickHouse type name at nesting depth `depth`, rejecting anything past
+/// [`MAX_TYPE_DEPTH`] so an unbounded hostile type string cannot overflow the
+/// stack. Each recursing arm (`Nullable`, `LowCardinality`, `Array`) calls this
+/// with `depth + 1`; the non-recursive leaf arms are depth independent.
+fn parse_ch_type_depth(type_name: &str, depth: usize) -> Option<ChType> {
+    // Bound recursion before doing any work at this level. A rejected over-deep
+    // type surfaces as `UnsupportedType`, exactly like any other unparseable
+    // header.
+    if depth > MAX_TYPE_DEPTH {
+        return None;
+    }
+
+    // Nullable wrapper. ClickHouse forbids a `Nullable`, a `LowCardinality`, or a
+    // container (`Array`, and later `Map`/`Tuple`) directly inside a `Nullable`:
+    // the only legal nesting with LowCardinality is `LowCardinality(Nullable(T))`,
+    // never the reverse, `Nullable(Nullable(T))` does not exist at all, and
+    // `DataTypeArray::canBeInsideNullable()` is false so `Nullable(Array(T))` is
+    // not constructible. An honest server never emits any of these, but the type
+    // string is untrusted wire input, so reject them here. `decode_column` and
     // `skip_column_data` unwrap exactly one `Nullable` and handle `LowCardinality`
-    // only at the top level; accepting a nested wrapper would let those inner
-    // wrappers reach an `unreachable!` on malformed bytes (AGENTS.md invariant 2:
-    // no panics on malformed input).
+    // and `Array` only at the top level; accepting a nested wrapper would let those
+    // inner wrappers reach an `unreachable!` on malformed bytes (AGENTS.md invariant
+    // 2: no panics on malformed input).
     if let Some(inner) = type_name.strip_prefix("Nullable(") {
         if let Some(inner) = inner.strip_suffix(')') {
-            let inner_type = parse_ch_type(inner)?;
-            if matches!(inner_type, ChType::Nullable(_) | ChType::LowCardinality(_)) {
+            let inner_type = parse_ch_type_depth(inner, depth + 1)?;
+            if matches!(
+                inner_type,
+                ChType::Nullable(_) | ChType::LowCardinality(_) | ChType::Array(_)
+            ) {
                 return None;
             }
             return Some(ChType::Nullable(Box::new(inner_type)));
@@ -160,7 +210,20 @@ pub(crate) fn parse_ch_type(type_name: &str) -> Option<ChType> {
     // LowCardinality(Nullable(String)) yields LowCardinality(Nullable(String)).
     if let Some(inner) = type_name.strip_prefix("LowCardinality(") {
         if let Some(inner) = inner.strip_suffix(')') {
-            return parse_ch_type(inner).map(|t| ChType::LowCardinality(Box::new(t)));
+            return parse_ch_type_depth(inner, depth + 1)
+                .map(|t| ChType::LowCardinality(Box::new(t)));
+        }
+    }
+
+    // Array wrapper. The element type is parsed recursively, so
+    // `Array(LowCardinality(String))` yields `Array(LowCardinality(String))`. The
+    // element may itself be `Nullable`, `LowCardinality`, or a further `Array`;
+    // there is no inner-type restriction. The array is never wrapped in an outer
+    // `Nullable` (rejected by the guard in the `Nullable(` arm above).
+    if let Some(inner) = type_name.strip_prefix("Array(") {
+        if let Some(inner) = inner.strip_suffix(')') {
+            let inner_type = parse_ch_type_depth(inner, depth + 1)?;
+            return Some(ChType::Array(Box::new(inner_type)));
         }
     }
 
@@ -619,6 +682,12 @@ fn read_state_prefix(
             }
             Ok(Some(key_version))
         }
+        // Array writes no prefix of its own; `SerializationArray`'s
+        // `deserializeBinaryBulkStatePrefix` recurses into the element type's
+        // prefix (confirmed at v26.6.1.1193-stable). This is how a leaf
+        // `LowCardinality`'s 8-byte key version is consumed here, at the front of
+        // the whole Array column, before the offsets.
+        ChType::Array(inner) => read_state_prefix(reader, inner, column),
         _ => Ok(None),
     }
 }
@@ -918,14 +987,50 @@ fn decode_column(
     column: &str,
 ) -> Result<Column, DecodeError> {
     // Per-column bulk-state prefix. Zero bytes for every type except
-    // LowCardinality, which reads its key version here.
+    // LowCardinality, which reads its key version here; Array recurses into its
+    // element type's prefix (so a leaf LowCardinality key version is consumed
+    // here, before the offsets).
     read_state_prefix(reader, ch_type, column)?;
+    decode_values(reader, ch_type, num_rows, column)
+}
 
+/// Decode a column's value payload once its per-column state prefix has been
+/// consumed by [`read_state_prefix`].
+///
+/// Split out from [`decode_column`] so [`decode_array`] can decode its flattened
+/// element column WITHOUT re-consuming a state prefix: `SerializationArray` emits
+/// the element type's prefix once, at the very front of the Array column (before
+/// the offsets), not again per element run.
+fn decode_values(
+    reader: &mut ByteReader,
+    ch_type: &ChType,
+    num_rows: usize,
+    column: &str,
+) -> Result<Column, DecodeError> {
     // LowCardinality carries its own dictionary, indexes, and (for a Nullable
     // inner type) null handling, so it is decoded as a unit rather than going
     // through the Nullable null-map unwrap below.
     if let ChType::LowCardinality(inner) = ch_type {
+        // A zero-length run carries no LowCardinality body at all: the server's
+        // `SerializationLowCardinality::serializeBinaryBulkWithMultipleStreams`
+        // early-returns whenever limit == 0, before writing the index-type word,
+        // dictionary, row count, or indexes (confirmed at v26.6.1.1193-stable).
+        // That early return is universal, not tied to any particular wrapper:
+        // today the only zero-count entry point is an Array whose arrays are all
+        // empty (a zero-row block skips column data entirely and never reaches
+        // here), but any future one (Map values, Tuple elements) gets the same
+        // absent body and takes this same gate.
+        if num_rows == 0 {
+            return Ok(empty_column(ch_type));
+        }
         return decode_low_cardinality(reader, inner, num_rows, column);
+    }
+
+    // Array is offsets plus a flattened element column, decoded as a unit; its
+    // element type's prefix was already consumed by the caller's
+    // `read_state_prefix`.
+    if let ChType::Array(inner) = ch_type {
+        return decode_array(reader, inner, num_rows, column);
     }
 
     let (nullable, inner) = match ch_type {
@@ -940,6 +1045,132 @@ fn decode_column(
     };
 
     decode_column_body(reader, inner, num_rows, validity)
+}
+
+/// Decode one `Array(T)` column block into an Arrow list `Column`.
+///
+/// Wire layout per block (server `SerializationArray`, confirmed at
+/// v26.6.1.1193-stable; the element type's state prefix was already consumed by
+/// [`read_state_prefix`], which recurses into the element for an `Array`, so this
+/// starts at the offsets):
+///
+/// ```text
+/// [num_rows * 8]  offsets   // raw LE u64, cumulative ABSOLUTE end-offsets (the
+///                           // element index one past this row's last element),
+///                           // no leading zero, no count, monotonically
+///                           // non-decreasing (equal adjacent = an empty row)
+/// [element body]            // the flattened element column of length
+///                           // `total_elements` (= the last offset), the element
+///                           // type's normal bulk body WITHOUT its state prefix
+/// ```
+///
+/// The decoded column prepends Arrow's leading `0` and widens each offset to
+/// `i64`, so it exports as an Arrow LargeList (64-bit offsets). The element
+/// column is decoded recursively through [`decode_values`] (its prefix already
+/// consumed), so a nested `Array`, a `Nullable` element, or a `LowCardinality`
+/// element all compose. The array itself is never nullable (server
+/// `DataTypeArray::canBeInsideNullable()` is false), so there is no array-level
+/// null map.
+fn decode_array(
+    reader: &mut ByteReader,
+    inner: &ChType,
+    num_rows: usize,
+    column: &str,
+) -> Result<Column, DecodeError> {
+    // Offsets: the shared walk reads and validates the run and builds the
+    // Arrow-shaped offsets (leading 0, each wire offset widened to i64),
+    // bounding both the allocation and the returned element count against the
+    // bytes present.
+    let mut offsets = Vec::new();
+    let total_elements = read_array_offsets(reader, num_rows, column, Some(&mut offsets))?;
+
+    // Element body: the flattened element column. The state prefix was consumed
+    // by the caller's `read_state_prefix`, so decode the values only.
+    let values = decode_values(reader, inner, total_elements, column)?;
+    Ok(Column::Array(ArrayColumn::new(offsets, values)))
+}
+
+/// Read and validate one `Array` offsets run: exactly `num_rows` raw LE u64
+/// cumulative absolute end-offsets. Shared by [`decode_array`] (which passes
+/// `Some` and receives the Arrow-shaped offsets: the leading `0` plus one
+/// i64-widened end-offset per row) and [`skip_array_data`] (which passes `None`
+/// and only validates), so the allocating decode and the streaming completeness
+/// scan can never drift apart on the framing or the rejection order.
+///
+/// Enforces, in order per offset: monotonically non-decreasing (the server
+/// rejects a decrease as `INCORRECT_DATA` in Native mode), then representable
+/// as i64 (the Arrow LargeList offset width). Returns `total_elements`, the
+/// last offset (0 for a zero-row run, reachable for a nested empty inner
+/// array), after bounding it against the remaining bytes via
+/// [`check_header_count`] so a hostile offset cannot drive a huge element
+/// decode in the caller.
+fn read_array_offsets(
+    reader: &mut ByteReader,
+    num_rows: usize,
+    column: &str,
+    mut collect: Option<&mut Vec<i64>>,
+) -> Result<usize, DecodeError> {
+    // `checked_mul` guards a hostile num_rows that overflows usize when scaled
+    // to bytes (mirrors `decode_primitive!`/`decode_fixed_binary_data`);
+    // `read_slice` then bounds the run against the bytes present.
+    let total_bytes = num_rows.checked_mul(8).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "Array offset byte length overflows usize",
+        )
+    })?;
+    let raw = reader.read_slice(total_bytes)?;
+    if let Some(offsets) = collect.as_deref_mut() {
+        // Reserve only after `read_slice` proved the bytes are present, so the
+        // allocation is bounded by real input. `num_rows + 1` cannot overflow:
+        // `num_rows * 8` did not just above.
+        offsets.reserve(num_rows + 1);
+        offsets.push(0i64);
+    }
+
+    let mut prev: u64 = 0;
+    for chunk in raw.chunks_exact(8) {
+        // `chunks_exact(8)` guarantees an 8-byte chunk, so the array conversion
+        // cannot fail; this mirrors the big-endian arm of `decode_primitive!`,
+        // which unwraps the same fixed-size `try_into`.
+        let cur = u64::from_le_bytes(chunk.try_into().unwrap());
+        if cur < prev {
+            return Err(DecodeError::InvalidArray {
+                column: column.to_string(),
+                reason: "offsets are not monotonically non-decreasing",
+            });
+        }
+        // Reject an offset in (i64::MAX, u64::MAX] on both paths identically.
+        // Without this, the scan would only fail later via `check_header_count`
+        // as `UnexpectedEof`, so `StreamDecoder` would treat a fully-present
+        // corrupt block as "need more bytes" and stall instead of surfacing
+        // `InvalidArray`.
+        let widened = i64::try_from(cur).map_err(|_| DecodeError::InvalidArray {
+            column: column.to_string(),
+            reason: "offset exceeds i64::MAX",
+        })?;
+        if let Some(offsets) = collect.as_deref_mut() {
+            offsets.push(widened);
+        }
+        prev = cur;
+    }
+
+    // total_elements is the last absolute offset. On a 32-bit target an offset
+    // in (usize::MAX, i64::MAX] cannot index memory; it is reported as
+    // `UnexpectedEof` under the same narrowing policy as `varint_usize` (an
+    // element count that large can never be satisfied by the bytes present, so
+    // the streaming decoder treats it as "need more bytes" rather than a
+    // corruption it must surface). A no-op conversion on 64-bit targets. Bound
+    // it against the remaining bytes BEFORE the caller recurses into the
+    // element body.
+    let total_elements = usize::try_from(prev).map_err(|_| {
+        DecodeError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "Array element count overflows usize",
+        ))
+    })?;
+    check_header_count(total_elements, "Array element count", reader)?;
+    Ok(total_elements)
 }
 
 /// Decode one column's value payload for a concrete inner type, after any
@@ -1118,13 +1349,15 @@ fn decode_column_body(
                 None => Column::Decimal(DecimalColumn::new(data, width, *precision, *scale)),
             }
         }
-        // Defense in depth: `parse_ch_type` rejects a `Nullable`/`LowCardinality`
-        // nested where the single-level unwrap in `decode_column` cannot handle it,
-        // and both wrappers are stripped by the callers before reaching here, so
-        // these arms cannot occur for any type this decoder produces. Return an
-        // error rather than panic so a future regression degrades to a clean decode
-        // error instead of undefined behavior at an FFI boundary.
-        ChType::Nullable(_) | ChType::LowCardinality(_) => {
+        // Defense in depth: `parse_ch_type` rejects a wrapper nested where the
+        // single-level unwrap in `decode_values` cannot handle it, and
+        // `LowCardinality` and `Array` are dispatched by `decode_values` before
+        // reaching here (a `Nullable` is unwrapped there too), so these arms cannot
+        // occur for any type this decoder produces. `Array` is never an inner of a
+        // `LowCardinality` dictionary either, the other caller. Return an error
+        // rather than panic so a future regression degrades to a clean decode error
+        // instead of undefined behavior at an FFI boundary.
+        ChType::Nullable(_) | ChType::LowCardinality(_) | ChType::Array(_) => {
             return Err(DecodeError::UnsupportedType {
                 column: String::new(),
                 type_name: inner_type.to_string(),
@@ -1272,6 +1505,13 @@ fn empty_column(ch_type: &ChType) -> Column {
                 DictionaryColumn::new(vec![], empty_values)
             })
         }
+        // A zero-row block reads no Array offsets or element body (the server
+        // gates `readData` on having rows), so the empty column is offsets `[0]`
+        // (len 0) with an empty element column built by recursing here. The recursion
+        // handles a `Nullable`, `LowCardinality`, or nested `Array` element.
+        ChType::Array(array_inner) => {
+            Column::Array(ArrayColumn::new(vec![0i64], empty_column(array_inner)))
+        }
         // The outer `Nullable` was unwrapped above, and `parse_ch_type` never
         // produces a `Nullable` directly inside a `Nullable`, so `inner` is never
         // `Nullable` here. Unlike the decode and scan paths this constructor is
@@ -1418,27 +1658,44 @@ fn read_column_header(
 
 /// Reject a header type this crate parses but cannot decode, at header-read time.
 ///
-/// Currently this is a `LowCardinality` whose (removeNullable) inner type is not in
+/// The core case is a `LowCardinality` whose (removeNullable) inner type is not in
 /// [`is_low_cardinality_inner`]. Checking here, in the header path shared by the
 /// allocating decode, the completeness scan, and the zero-row `empty_column` path,
 /// makes all three agree on which columns are accepted. Without it a zero-row
 /// `LowCardinality(Decimal(9, 4))` block would decode (its `empty_column` never
 /// consults the allowlist) while the same type with rows errors, an inconsistency
 /// the streaming decoder could hit as a block fills.
+///
+/// It recurses through container/wrapper types so a forbidden `LowCardinality`
+/// inner nested inside an `Array` (e.g. `Array(LowCardinality(Decimal(9, 4)))`) is
+/// rejected regardless of row count. A row-bearing block rejects it in
+/// `decode_low_cardinality_dictionary`, but the zero-row `empty_column` path
+/// recurses past the array without consulting the allowlist, so the two would
+/// disagree without this recursion. The recursion is bounded: it runs only after
+/// [`parse_ch_type`] succeeds, and that parser caps nesting at [`MAX_TYPE_DEPTH`].
 fn validate_header_type(col_name: &str, ch_type: &ChType) -> Result<(), DecodeError> {
-    if let ChType::LowCardinality(inner) = ch_type {
-        let dict_value_type = match inner.as_ref() {
-            ChType::Nullable(t) => t.as_ref(),
-            other => other,
-        };
-        if !is_low_cardinality_inner(dict_value_type) {
-            return Err(DecodeError::UnsupportedType {
-                column: col_name.to_string(),
-                type_name: format!("LowCardinality({dict_value_type})"),
-            });
+    match ch_type {
+        ChType::LowCardinality(inner) => {
+            let dict_value_type = match inner.as_ref() {
+                ChType::Nullable(t) => t.as_ref(),
+                other => other,
+            };
+            if !is_low_cardinality_inner(dict_value_type) {
+                return Err(DecodeError::UnsupportedType {
+                    column: col_name.to_string(),
+                    type_name: format!("LowCardinality({dict_value_type})"),
+                });
+            }
+            Ok(())
         }
+        // Recurse into the element/inner so a forbidden LC nested inside a
+        // container is caught at header time on every path. `Nullable`'s inner is
+        // always concrete (the parser rejects a wrapper inside `Nullable`), so its
+        // recursion is a harmless, future-proof no-op today.
+        ChType::Array(inner) => validate_header_type(col_name, inner),
+        ChType::Nullable(inner) => validate_header_type(col_name, inner),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// Narrow a `u64` varint (a count or length read from the wire) to `usize`.
@@ -1571,11 +1828,33 @@ fn skip_column_data(
     column: &str,
 ) -> Result<(), DecodeError> {
     // Per-column bulk-state prefix, the same step `decode_column` runs. Zero
-    // bytes for every type except LowCardinality.
+    // bytes for every type except LowCardinality; Array recurses into its
+    // element's prefix.
     read_state_prefix(reader, ch_type, column)?;
+    skip_values(reader, ch_type, num_rows, column)
+}
 
+/// Advance `reader` past one column's value payload once its per-column state
+/// prefix has been consumed, the scan-side mirror of [`decode_values`]. Split out
+/// so [`skip_array_data`] can walk its flattened element column without
+/// re-consuming a state prefix, exactly as [`decode_array`] decodes it.
+fn skip_values(
+    reader: &mut ByteReader,
+    ch_type: &ChType,
+    num_rows: usize,
+    column: &str,
+) -> Result<(), DecodeError> {
     if let ChType::LowCardinality(inner) = ch_type {
+        // A zero-length run has no LowCardinality body bytes at all (see the
+        // matching gate in `decode_values`), so there is nothing to walk.
+        if num_rows == 0 {
+            return Ok(());
+        }
         return skip_low_cardinality_data(reader, inner, num_rows, column);
+    }
+
+    if let ChType::Array(inner) = ch_type {
+        return skip_array_data(reader, inner, num_rows, column);
     }
 
     let inner = match ch_type {
@@ -1587,6 +1866,27 @@ fn skip_column_data(
     };
 
     skip_column_body(reader, inner, num_rows)
+}
+
+/// Walk one `Array(T)` column block (after its element state prefix) in the
+/// completeness scan, consuming exactly what [`decode_array`] reads: the
+/// `num_rows` raw LE u64 offsets and then the flattened element body.
+///
+/// The offsets are read and validated through the same [`read_array_offsets`]
+/// walk the decode uses (here with `collect: None`, so nothing is
+/// materialized), so the streaming scan surfaces the same
+/// [`DecodeError::InvalidArray`] rejections in the same order rather than
+/// walking framing the decode refuses (mirroring how
+/// [`skip_low_cardinality_data`] mirrors [`decode_low_cardinality`]'s
+/// rejections).
+fn skip_array_data(
+    reader: &mut ByteReader,
+    inner: &ChType,
+    num_rows: usize,
+    column: &str,
+) -> Result<(), DecodeError> {
+    let total_elements = read_array_offsets(reader, num_rows, column, None)?;
+    skip_values(reader, inner, total_elements, column)
 }
 
 /// Advance `reader` past one column's value payload for a concrete inner type,
@@ -1633,12 +1933,13 @@ fn skip_column_body(
             }
         }
         // `read_column_header` already rejected unsupported types, Nullable is
-        // unwrapped by the callers, and LowCardinality is handled above. Defense in
-        // depth: `parse_ch_type` also rejects a wrapper nested where the callers'
-        // single-level unwrap cannot reach it, so these arms cannot occur. Return an
-        // error rather than panic to keep the streaming scan panic-free even if that
-        // guarantee ever regresses (a panic here is undefined behavior across FFI).
-        ChType::Nullable(_) | ChType::LowCardinality(_) => {
+        // unwrapped by the callers, and LowCardinality and Array are dispatched by
+        // `skip_values` above. Defense in depth: `parse_ch_type` also rejects a
+        // wrapper nested where the callers' single-level unwrap cannot reach it, so
+        // these arms cannot occur. Return an error rather than panic to keep the
+        // streaming scan panic-free even if that guarantee ever regresses (a panic
+        // here is undefined behavior across FFI).
+        ChType::Nullable(_) | ChType::LowCardinality(_) | ChType::Array(_) => {
             return Err(DecodeError::UnsupportedType {
                 column: String::new(),
                 type_name: inner_type.to_string(),
@@ -1944,6 +2245,19 @@ mod tests {
         fn null_map(mut self, nulls: &[bool]) -> Self {
             for &is_null in nulls {
                 self.buf.push(if is_null { 0x01 } else { 0x00 });
+            }
+            self
+        }
+
+        /// `Array(T)` offsets: exactly `num_rows` raw little-endian u64 cumulative
+        /// absolute end-offsets, with NO leading zero and no count, exactly what
+        /// `SerializationArray` writes ahead of the flattened element body. The
+        /// element body is appended afterward with the ordinary typed helpers
+        /// (`int32_data`, `string_data`, `null_map`, `low_cardinality_*`, or a
+        /// further `array_offsets` for a nested `Array`).
+        fn array_offsets(mut self, offsets: &[u64]) -> Self {
+            for &o in offsets {
+                self.buf.extend_from_slice(&o.to_le_bytes());
             }
             self
         }
@@ -5050,5 +5364,494 @@ mod tests {
             decode_all_bytes(&data, &DecodeOptions::default()),
             Err(DecodeError::UnsupportedType { .. })
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Array(T)
+    // -----------------------------------------------------------------------
+
+    /// Borrow the inner `ArrayColumn` of a decoded `Array` column, panicking with
+    /// a useful message on any other variant. Keeps the assertions below terse.
+    fn as_array(col: &Column) -> &ArrayColumn {
+        match col {
+            Column::Array(a) => a,
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ch_type_array() {
+        assert_eq!(
+            parse_ch_type("Array(Int32)"),
+            Some(ChType::Array(Box::new(ChType::Int32)))
+        );
+        // Element may itself be Nullable, LowCardinality, or a further Array; there
+        // is no inner-type restriction on the parser.
+        assert_eq!(
+            parse_ch_type("Array(Nullable(Int32))"),
+            Some(ChType::Array(Box::new(ChType::Nullable(Box::new(
+                ChType::Int32
+            )))))
+        );
+        assert_eq!(
+            parse_ch_type("Array(LowCardinality(String))"),
+            Some(ChType::Array(Box::new(ChType::LowCardinality(Box::new(
+                ChType::String
+            )))))
+        );
+        assert_eq!(
+            parse_ch_type("Array(Array(Int32))"),
+            Some(ChType::Array(Box::new(ChType::Array(Box::new(
+                ChType::Int32
+            )))))
+        );
+    }
+
+    #[test]
+    fn test_ch_type_display_round_trips_array() {
+        for t in [
+            ChType::Array(Box::new(ChType::Int32)),
+            ChType::Array(Box::new(ChType::String)),
+            ChType::Array(Box::new(ChType::Nullable(Box::new(ChType::Int32)))),
+            ChType::Array(Box::new(ChType::LowCardinality(Box::new(ChType::String)))),
+            ChType::Array(Box::new(ChType::Array(Box::new(ChType::Int32)))),
+        ] {
+            assert_eq!(parse_ch_type(&t.to_string()), Some(t.clone()));
+        }
+    }
+
+    #[test]
+    fn test_parse_ch_type_nullable_array_is_rejected() {
+        // `Nullable(Array(T))` is not a constructible server type
+        // (`DataTypeArray::canBeInsideNullable()` is false), so the parser rejects
+        // it rather than producing a shape decode/scan cannot unwrap.
+        assert_eq!(parse_ch_type("Nullable(Array(Int32))"), None);
+
+        // The rejection must hold on both the allocating decode and the scan, at
+        // zero and nonzero rows, matching the other illegal-nesting guards.
+        for num_rows in [0usize, 1] {
+            let data = BlockBuilder::new()
+                .header(1, num_rows)
+                .column_header("a", "Nullable(Array(Int32))")
+                .build();
+            assert!(matches!(
+                decode_all_bytes(&data, &DecodeOptions::default()),
+                Err(DecodeError::UnsupportedType { .. })
+            ));
+            assert!(matches!(
+                block_end(&data, &DecodeOptions::default()),
+                Err(DecodeError::UnsupportedType { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn test_decode_array_int32() {
+        // Three rows, cumulative absolute end-offsets [2, 2, 5] (no leading zero):
+        // row 0 has two elements, row 1 is EMPTY (equal adjacent offsets), row 2
+        // has three. The flattened element body is the five Int32 values.
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("a", "Array(Int32)")
+            .array_offsets(&[2, 2, 5])
+            .int32_data(&[13, 79, 21, 34, 55])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let arr = as_array(cb.chunks[0].column(0));
+        // Arrow list offsets carry the leading 0 and are i64.
+        assert_eq!(arr.offsets, vec![0i64, 2, 2, 5]);
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr.null_count(), 0);
+        match arr.values.as_ref() {
+            Column::Int32(v) => {
+                assert!(v.validity.is_none());
+                assert_eq!(v.values, vec![13, 79, 21, 34, 55]);
+            }
+            other => panic!("expected Int32 element values, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_array_string() {
+        // Variable-length element body after the offsets: row 0 has two strings,
+        // row 1 has one.
+        let data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("a", "Array(String)")
+            .array_offsets(&[2, 3])
+            .string_data(&["user_1", "user_2", "user_3"])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let arr = as_array(cb.chunks[0].column(0));
+        assert_eq!(arr.offsets, vec![0i64, 2, 3]);
+        match arr.values.as_ref() {
+            Column::Utf8(v) => {
+                assert_eq!(v.len(), 3);
+                assert_eq!(v.value(0), b"user_1");
+                assert_eq!(v.value(1), b"user_2");
+                assert_eq!(v.value(2), b"user_3");
+            }
+            other => panic!("expected Utf8 element values, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_array_nullable_int32() {
+        // For `Array(Nullable(Int32))` the element body is a `total_elements` null
+        // map then the `total_elements` values. Element-level nulls live on the
+        // element column's validity, never on the array itself.
+        let data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("a", "Array(Nullable(Int32))")
+            .array_offsets(&[2, 3])
+            .null_map(&[false, true, false]) // element 1 is null
+            .int32_data(&[13, 0, 79])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let arr = as_array(cb.chunks[0].column(0));
+        assert_eq!(arr.offsets, vec![0i64, 2, 3]);
+        // The array level is never nullable.
+        assert_eq!(arr.null_count(), 0);
+        match arr.values.as_ref() {
+            Column::Int32(v) => {
+                assert_eq!(v.values, vec![13, 0, 79]);
+                let bm = v.validity.as_ref().expect("nullable element validity");
+                assert!(bm.is_valid(0));
+                assert!(!bm.is_valid(1));
+                assert!(bm.is_valid(2));
+                assert_eq!(v.null_count(), 1);
+            }
+            other => panic!("expected Int32 element values, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_array_low_cardinality_string() {
+        // `Array(LowCardinality(String))`: SerializationArray recurses into the
+        // element prefix, so the LC 8-byte key version is written FIRST, before the
+        // offsets. The LC body (index word / dictionary / row count / indexes) is
+        // the flattened element column and comes AFTER the offsets. Build a full
+        // LC(String) block, then move its leading 8-byte key version ahead of the
+        // offsets to match the wire order.
+        let dictionary = ["", "user_1", "user_2"];
+        let element_indices = [1u64, 2, 1]; // three flattened elements
+        let lc_full = BlockBuilder::new()
+            .low_cardinality_string(&dictionary, &element_indices, 1)
+            .build();
+        let (key_version, lc_body) = lc_full.split_at(8);
+
+        let data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("a", "Array(LowCardinality(String))")
+            .raw_bytes(key_version) // element state prefix, ahead of the offsets
+            .array_offsets(&[2, 3]) // row 0: two elements, row 1: one element
+            .raw_bytes(lc_body) // LC index word / dict / row count / indexes
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let arr = as_array(cb.chunks[0].column(0));
+        assert_eq!(arr.offsets, vec![0i64, 2, 3]);
+        // The element column is a per-block dictionary.
+        match arr.values.as_ref() {
+            Column::Dictionary(d) => {
+                assert_eq!(d.indices, vec![1, 2, 1]);
+                assert!(d.validity.is_none());
+                match d.values.as_ref() {
+                    Column::Utf8(v) => {
+                        assert_eq!(v.value(0), b"");
+                        assert_eq!(v.value(1), b"user_1");
+                        assert_eq!(v.value(2), b"user_2");
+                    }
+                    other => panic!("expected Utf8 dictionary values, got {other:?}"),
+                }
+            }
+            other => panic!("expected Dictionary element values, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_array_low_cardinality_all_empty() {
+        // Rows > 0 but every array empty: the server writes the hoisted LC key
+        // version, then all-zero offsets, then NOTHING for the LC element run
+        // (`SerializationLowCardinality::serializeBinaryBulkWithMultipleStreams`
+        // early-returns at limit == 0, confirmed at v26.6.1.1193-stable). The
+        // decoder must read zero LC body bytes rather than fail with EOF.
+        let data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("a", "Array(LowCardinality(String))")
+            .raw_bytes(&1u64.to_le_bytes()) // hoisted LC key version
+            .array_offsets(&[0, 0]) // both rows empty
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let arr = as_array(cb.chunks[0].column(0));
+        assert_eq!(arr.offsets, vec![0i64, 0, 0]);
+        match arr.values.as_ref() {
+            Column::Dictionary(d) => {
+                assert!(d.indices.is_empty());
+                assert!(d.validity.is_none());
+                assert_eq!(d.values.len(), 0);
+            }
+            other => panic!("expected empty Dictionary element values, got {other:?}"),
+        }
+
+        // The completeness scan must consume exactly the same zero LC body bytes.
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len())
+        );
+    }
+
+    #[test]
+    fn test_decode_array_of_array_int32() {
+        // `Array(Array(Int32))`: outer offsets, then the inner array's offsets (its
+        // flattened element column), then the leaf Int32 body. The Int32 leaf has
+        // no state prefix, so nothing precedes the outer offsets.
+        //
+        // Outer 2 rows: row 0 = [[13, 79], [21]], row 1 = [[34, 55, 89]].
+        // Outer offsets count inner arrays: [2, 3] -> 3 inner arrays total.
+        // Inner offsets count leaf ints: [2, 3, 6] -> 6 leaf ints total.
+        let data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("a", "Array(Array(Int32))")
+            .array_offsets(&[2, 3]) // outer
+            .array_offsets(&[2, 3, 6]) // inner
+            .int32_data(&[13, 79, 21, 34, 55, 89]) // leaf
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let outer = as_array(cb.chunks[0].column(0));
+        assert_eq!(outer.offsets, vec![0i64, 2, 3]);
+        let inner = as_array(outer.values.as_ref());
+        assert_eq!(inner.offsets, vec![0i64, 2, 3, 6]);
+        match inner.values.as_ref() {
+            Column::Int32(v) => assert_eq!(v.values, vec![13, 79, 21, 34, 55, 89]),
+            other => panic!("expected Int32 leaf values, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_array_zero_rows() {
+        // A zero-row Array block contributes the schema but no chunk, and reads no
+        // offsets or element body. `empty_column` builds the offsets `[0]` shape.
+        let data = BlockBuilder::new()
+            .header(1, 0)
+            .column_header("a", "Array(Int32)")
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_rows(), 0);
+        assert_eq!(cb.num_chunks(), 0);
+        assert_eq!(cb.num_columns(), 1);
+        assert_eq!(
+            cb.schema.fields[0].ch_type,
+            ChType::Array(Box::new(ChType::Int32))
+        );
+
+        // The zero-row column shape: offsets `[0]` (len 0) over an empty element
+        // column.
+        let empty = empty_column(&ChType::Array(Box::new(ChType::Int32)));
+        let arr = as_array(&empty);
+        assert_eq!(arr.offsets, vec![0i64]);
+        assert_eq!(arr.len(), 0);
+        match arr.values.as_ref() {
+            Column::Int32(v) => assert!(v.values.is_empty()),
+            other => panic!("expected empty Int32 element values, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_multi_block_array_separate_chunks() {
+        // Native blocks stay separate chunks; two Array(Int32) blocks must not be
+        // concatenated.
+        let mut data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("a", "Array(Int32)")
+            .array_offsets(&[1, 3])
+            .int32_data(&[13, 79, 21])
+            .build();
+        data.extend(
+            BlockBuilder::new()
+                .header(1, 1)
+                .column_header("a", "Array(Int32)")
+                .array_offsets(&[2])
+                .int32_data(&[34, 55])
+                .build(),
+        );
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_chunks(), 2);
+        assert_eq!(cb.num_rows(), 3);
+
+        let chunk0 = as_array(cb.chunks[0].column(0));
+        assert_eq!(chunk0.offsets, vec![0i64, 1, 3]);
+        match chunk0.values.as_ref() {
+            Column::Int32(v) => assert_eq!(v.values, vec![13, 79, 21]),
+            other => panic!("expected Int32, got {other:?}"),
+        }
+        let chunk1 = as_array(cb.chunks[1].column(0));
+        assert_eq!(chunk1.offsets, vec![0i64, 2]);
+        match chunk1.values.as_ref() {
+            Column::Int32(v) => assert_eq!(v.values, vec![34, 55]),
+            other => panic!("expected Int32, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_block_end_scans_array() {
+        // The completeness scan must walk an Array column to the exact block end
+        // and report a one-byte-short buffer as "need more bytes".
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("a", "Array(Int32)")
+            .array_offsets(&[2, 2, 5])
+            .int32_data(&[13, 79, 21, 34, 55])
+            .build();
+
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len())
+        );
+        let truncated = &data[..data.len() - 1];
+        let err = block_end(truncated, &DecodeOptions::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::Io(ref e) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[test]
+    fn test_array_rejects_non_monotonic_offsets() {
+        // Decreasing offsets are INCORRECT_DATA on the server and corrupt here; the
+        // decoder rejects them as InvalidArray rather than slicing out of bounds.
+        let data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("a", "Array(Int32)")
+            .array_offsets(&[3, 1]) // 1 < 3 -> reject
+            .int32_data(&[13, 79, 21])
+            .build();
+        assert!(matches!(
+            decode_all_bytes(&data, &DecodeOptions::default()),
+            Err(DecodeError::InvalidArray { .. })
+        ));
+        // The completeness scan surfaces the same error rather than stalling.
+        assert!(matches!(
+            block_end(&data, &DecodeOptions::default()),
+            Err(DecodeError::InvalidArray { .. })
+        ));
+    }
+
+    #[test]
+    fn test_parse_ch_type_rejects_over_deep_nesting() {
+        // The type string is untrusted wire input; an unbounded nesting like
+        // `Array(Array(...Array(Int32)...))` would overflow the stack (an
+        // uncatchable SIGABRT) without a depth cap. Past MAX_TYPE_DEPTH the parser
+        // returns None, which surfaces as UnsupportedType, never a crash.
+        let n = MAX_TYPE_DEPTH + 100;
+        let over_deep = format!("{}Int32{}", "Array(".repeat(n), ")".repeat(n));
+        assert_eq!(parse_ch_type(&over_deep), None);
+
+        // A zero-row block carrying that over-deep type must degrade to a clean
+        // UnsupportedType error, not abort the process.
+        let data = BlockBuilder::new()
+            .header(1, 0)
+            .column_header("a", &over_deep)
+            .build();
+        assert!(matches!(
+            decode_all_bytes(&data, &DecodeOptions::default()),
+            Err(DecodeError::UnsupportedType { .. })
+        ));
+        assert!(matches!(
+            block_end(&data, &DecodeOptions::default()),
+            Err(DecodeError::UnsupportedType { .. })
+        ));
+    }
+
+    #[test]
+    fn test_decode_array_nested_three_deep() {
+        // A modestly nested type (well within MAX_TYPE_DEPTH) still parses and
+        // decodes: `Array(Array(Array(Int32)))` with one outer row -> one middle
+        // array -> one inner array -> two leaf ints. Each level writes its own
+        // absolute end-offsets; the Int32 leaf has no state prefix.
+        assert_eq!(
+            parse_ch_type("Array(Array(Array(Int32)))"),
+            Some(ChType::Array(Box::new(ChType::Array(Box::new(
+                ChType::Array(Box::new(ChType::Int32))
+            )))))
+        );
+
+        let data = BlockBuilder::new()
+            .header(1, 1)
+            .column_header("a", "Array(Array(Array(Int32)))")
+            .array_offsets(&[1]) // outer: 1 middle array
+            .array_offsets(&[1]) // middle: 1 inner array
+            .array_offsets(&[2]) // inner: 2 leaf ints
+            .int32_data(&[13, 79]) // leaf
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let outer = as_array(cb.chunks[0].column(0));
+        assert_eq!(outer.offsets, vec![0i64, 1]);
+        let middle = as_array(outer.values.as_ref());
+        assert_eq!(middle.offsets, vec![0i64, 1]);
+        let inner = as_array(middle.values.as_ref());
+        assert_eq!(inner.offsets, vec![0i64, 2]);
+        match inner.values.as_ref() {
+            Column::Int32(v) => assert_eq!(v.values, vec![13, 79]),
+            other => panic!("expected Int32 leaf values, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_array_rejects_offset_above_i64_max() {
+        // An absolute offset in (i64::MAX, u64::MAX] cannot widen into the i64
+        // LargeList offset. Both the allocating decode and the completeness scan
+        // must reject it as InvalidArray for the SAME bytes; if the scan instead
+        // returned UnexpectedEof, StreamDecoder would treat a fully-present corrupt
+        // block as "need more bytes" and stall.
+        let data = BlockBuilder::new()
+            .header(1, 1)
+            .column_header("a", "Array(Int32)")
+            .array_offsets(&[u64::MAX])
+            .build();
+        assert!(matches!(
+            decode_all_bytes(&data, &DecodeOptions::default()),
+            Err(DecodeError::InvalidArray { .. })
+        ));
+        assert!(matches!(
+            block_end(&data, &DecodeOptions::default()),
+            Err(DecodeError::InvalidArray { .. })
+        ));
+    }
+
+    #[test]
+    fn test_array_forbidden_low_cardinality_inner_rejected_regardless_of_rows() {
+        // A forbidden LowCardinality inner (Decimal is not `canBeInsideLowCardinality`)
+        // nested inside an Array must be rejected at header-read time on BOTH the
+        // zero-row and the with-rows paths, so `empty_column` (which never consults
+        // the allowlist) cannot silently accept what a row-bearing block rejects.
+        for num_rows in [0usize, 1] {
+            let data = BlockBuilder::new()
+                .header(1, num_rows)
+                .column_header("a", "Array(LowCardinality(Decimal(9, 4)))")
+                .build();
+            assert!(
+                matches!(
+                    decode_all_bytes(&data, &DecodeOptions::default()),
+                    Err(DecodeError::UnsupportedType { .. })
+                ),
+                "decode should reject forbidden LC-in-Array at {num_rows} rows"
+            );
+            assert!(
+                matches!(
+                    block_end(&data, &DecodeOptions::default()),
+                    Err(DecodeError::UnsupportedType { .. })
+                ),
+                "scan should reject forbidden LC-in-Array at {num_rows} rows"
+            );
+        }
     }
 }

@@ -67,8 +67,14 @@ pub enum ChType {
     // Wrappers
     Nullable(Box<ChType>),
     LowCardinality(Box<ChType>),
+
     // Containers (Phase 4)
-    // Array(Box<ChType>),
+    // The first nested container: `Array(T)` recurses into an element type `T`,
+    // which is itself any supported type, including `Nullable(T)`,
+    // `LowCardinality(T)`, or a further `Array`. The array itself is never
+    // `Nullable` (the server's `DataTypeArray::canBeInsideNullable()` is false),
+    // so element-level nulls live in the element type, not in the array.
+    Array(Box<ChType>),
     // Tuple(Vec<(Option<String>, ChType)>),
     // Map(Box<ChType>, Box<ChType>),
 }
@@ -143,6 +149,7 @@ impl std::fmt::Display for ChType {
             ChType::Enum16 { variants } => write_enum(f, "Enum16", variants),
             ChType::Nullable(inner) => write!(f, "Nullable({inner})"),
             ChType::LowCardinality(inner) => write!(f, "LowCardinality({inner})"),
+            ChType::Array(inner) => write!(f, "Array({inner})"),
         }
     }
 }

@@ -29,8 +29,8 @@ use std::process::{Command, Stdio};
 use ch_core_rs::batch::ColBatch;
 use ch_core_rs::bitmap::Bitmap;
 use ch_core_rs::column::{
-    BoolColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn, PrimitiveColumn,
-    Utf8Column,
+    ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn,
+    PrimitiveColumn, Utf8Column,
 };
 use ch_core_rs::native::decode::{decode_all_bytes, DecodeOptions};
 use ch_core_rs::native::encode::{encode_block, EncodeOptions};
@@ -74,8 +74,10 @@ fn decimal_column(width: usize, precision: u8, scale: u8, values: &[&[u8]]) -> D
 
 /// The batch to insert: every encodable type over four rows (the ten fixed-width
 /// numerics, `String`, `FixedString(4)`, `Bool`, the four temporal types,
-/// `UUID`, `IPv4`, `IPv6`, `Enum8`/`Enum16`, four Decimal widths, and five
-/// `Nullable` columns).
+/// `UUID`, `IPv4`, `IPv6`, `Enum8`/`Enum16`, four Decimal widths, five
+/// `Nullable` columns, and four `Array` shapes covering a plain, `Nullable`,
+/// `LowCardinality`, and nested `Array` element, each with at least one empty
+/// row).
 /// The `i32` column is strictly ascending so `ORDER BY i32` on read-back is
 /// deterministic and matches insertion order, which lets the other columns line up
 /// row-for-row too. The `Nullable` columns use the null pattern valid, null, valid,
@@ -173,6 +175,23 @@ fn sample_batch() -> ColBatch {
                 scale: 9,
                 bits: 64,
             })),
+        ),
+        ("arr_i32", ChType::Array(Box::new(ChType::Int32))),
+        (
+            "arr_ns",
+            ChType::Array(Box::new(ChType::Nullable(Box::new(ChType::String)))),
+        ),
+        (
+            "arr_lc",
+            ChType::Array(Box::new(ChType::LowCardinality(Box::new(ChType::String)))),
+        ),
+        (
+            "arr_arr",
+            ChType::Array(Box::new(ChType::Array(Box::new(ChType::Int32)))),
+        ),
+        (
+            "arr_lc_empty",
+            ChType::Array(Box::new(ChType::LowCardinality(Box::new(ChType::String)))),
         ),
     ]
     .into_iter()
@@ -331,6 +350,50 @@ fn sample_batch() -> ColBatch {
         )),
         Column::Uuid(nu),
         Column::Decimal(ndec),
+        // Array(Int32): [13, 79], [], [21], [34, 55]. The empty row exercises
+        // the adjacent-equal offset pair on a live INSERT.
+        Column::Array(ArrayColumn::new(
+            vec![0, 2, 2, 3, 5],
+            Column::Int32(PrimitiveColumn::new(vec![13, 79, 21, 34, 55])),
+        )),
+        // Array(Nullable(String)): ["user_1", NULL], [], ["user_2"], [NULL].
+        // The element null map covers the flattened run of four elements.
+        Column::Array(ArrayColumn::new(vec![0, 2, 2, 3, 4], {
+            let mut elements = utf8_column(&[b"user_1", b"", b"user_2", b""]);
+            elements.validity = Some(Bitmap::from_ch_null_map(&[0, 1, 0, 1]));
+            Column::Utf8(elements)
+        })),
+        // Array(LowCardinality(String)): [user_1, user_2], [], [user_1], [].
+        // The LC key version is hoisted ahead of the offsets and the element
+        // dictionary covers the flattened run of three elements.
+        Column::Array(ArrayColumn::new(
+            vec![0, 2, 2, 3, 3],
+            Column::Dictionary(DictionaryColumn::new(
+                vec![1, 2, 1],
+                Column::Utf8(utf8_column(&[b"", b"user_1", b"user_2"])),
+            )),
+        )),
+        // Array(Array(Int32)): [[13, 79], [21]], [], [[34]], [[], [55, 89]].
+        // Outer offsets count inner arrays; the inner level includes its own
+        // empty array.
+        Column::Array(ArrayColumn::new(
+            vec![0, 2, 2, 3, 5],
+            Column::Array(ArrayColumn::new(
+                vec![0, 2, 3, 4, 4, 6],
+                Column::Int32(PrimitiveColumn::new(vec![13, 79, 21, 34, 55, 89])),
+            )),
+        )),
+        // Array(LowCardinality(String)) with EVERY row empty: the wire must be
+        // the hoisted LC key version, four zero offsets, and NOTHING for the LC
+        // element run (the server's limit == 0 early return); an index word or
+        // key count here would make the server misparse the INSERT.
+        Column::Array(ArrayColumn::new(
+            vec![0, 0, 0, 0, 0],
+            Column::Dictionary(DictionaryColumn::new(
+                vec![],
+                Column::Utf8(utf8_column(&[])),
+            )),
+        )),
     ];
 
     ColBatch::new(Schema::new(fields), columns, 4)
@@ -524,6 +587,20 @@ fn raw_column_repr(column: &Column) -> Vec<String> {
                 .map(|&idx| values[idx as usize].clone())
                 .collect()
         }
+        // Array renders each row as its bracketed element sub-slice, resolved
+        // recursively through the flattened element column. Element-level validity
+        // is not applied here, matching the raw (pre-validity) rendering of the
+        // Dictionary arm above.
+        Column::Array(c) => {
+            let elems = raw_column_repr(c.values.as_ref());
+            (0..c.len())
+                .map(|i| {
+                    let start = c.offsets[i] as usize;
+                    let end = c.offsets[i + 1] as usize;
+                    format!("{:?}", &elems[start..end])
+                })
+                .collect()
+        }
     }
 }
 
@@ -571,7 +648,11 @@ fn insert_roundtrips_through_server() {
          dec32 Decimal(9, 4), dec64 Decimal(18, 9), \
          dec128 Decimal(38, 10), dec256 Decimal(76, 20), \
          ni32 Nullable(Int32), ns Nullable(String), nb Nullable(Bool), \
-         nu Nullable(UUID), ndec Nullable(Decimal(18, 9))) ENGINE = Memory"
+         nu Nullable(UUID), ndec Nullable(Decimal(18, 9)), \
+         arr_i32 Array(Int32), arr_ns Array(Nullable(String)), \
+         arr_lc Array(LowCardinality(String)), \
+         arr_arr Array(Array(Int32)), \
+         arr_lc_empty Array(LowCardinality(String))) ENGINE = Memory"
     ));
 
     // Encode at revision 0: HTTP INSERT parses the body with server_revision 0,
@@ -591,7 +672,8 @@ fn insert_roundtrips_through_server() {
     let native = server.select(&format!(
         "SELECT i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, s, lc, lcn, fs, b, \
          d, d32, dt, dt64, u, ip4, ip6, e8, e16, \
-         dec32, dec64, dec128, dec256, ni32, ns, nb, nu, ndec \
+         dec32, dec64, dec128, dec256, ni32, ns, nb, nu, ndec, \
+         arr_i32, arr_ns, arr_lc, arr_arr, arr_lc_empty \
          FROM {TABLE} ORDER BY i32 FORMAT Native"
     ));
     let decoded = decode_all_bytes(

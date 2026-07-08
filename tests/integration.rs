@@ -218,6 +218,27 @@ fn assert_all_types(batch: &ChunkedBatch) {
             // plain UInt32 column body; IPv6's is raw 16-byte rows.
             Expected::Exact("lc_ipv4", ChType::LowCardinality(Box::new(ChType::Ipv4))),
             Expected::Exact("lc_ipv6", ChType::LowCardinality(Box::new(ChType::Ipv6))),
+            // Array(T): Arrow list layout. The element type may itself be
+            // Nullable, LowCardinality, or a further Array; the array is never
+            // nullable at the array level. Order matches the SELECT list.
+            Expected::Exact("arr", ChType::Array(Box::new(ChType::Int32))),
+            Expected::Exact("arr_s", ChType::Array(Box::new(ChType::String))),
+            Expected::Exact(
+                "arr_n",
+                ChType::Array(Box::new(ChType::Nullable(Box::new(ChType::Int32)))),
+            ),
+            Expected::Exact(
+                "arr_lc",
+                ChType::Array(Box::new(ChType::LowCardinality(Box::new(ChType::String)))),
+            ),
+            Expected::Exact(
+                "arr_arr",
+                ChType::Array(Box::new(ChType::Array(Box::new(ChType::Int32)))),
+            ),
+            Expected::Exact(
+                "arr_lc_empty",
+                ChType::Array(Box::new(ChType::LowCardinality(Box::new(ChType::String)))),
+            ),
         ],
     );
 
@@ -572,6 +593,113 @@ fn assert_all_types(batch: &ChunkedBatch) {
             Some(&ipv6_v4mapped),
         ],
     );
+
+    // Array(Int32): rows [] / [13] / [79, -13] / [1, 2, 3]. The decoded offsets
+    // carry Arrow's leading 0 and are i64; the empty row 0 shows as equal adjacent
+    // offsets (0, 0). The flattened element column is a plain Int32 buffer.
+    {
+        let arr = as_array(block.column(38));
+        assert_eq!(arr.offsets, vec![0i64, 0, 1, 3, 6]);
+        assert_eq!(arr.null_count(), 0); // never nullable at the array level
+        match arr.values.as_ref() {
+            Column::Int32(c) => {
+                assert!(c.validity.is_none());
+                assert_eq!(c.values.as_slice(), &[13, 79, -13, 1, 2, 3]);
+            }
+            other => panic!("expected Int32 array elements, got {other:?}"),
+        }
+    }
+
+    // Array(String): rows [] / ['user_1'] / ['a', 'user_2'] / ['x']. Variable-length
+    // element body after the offsets.
+    {
+        let arr = as_array(block.column(39));
+        assert_eq!(arr.offsets, vec![0i64, 0, 1, 3, 4]);
+        match arr.values.as_ref() {
+            Column::Utf8(c) => assert_utf8_column(c, &[b"user_1" as &[u8], b"a", b"user_2", b"x"]),
+            other => panic!("expected Utf8 array elements, got {other:?}"),
+        }
+    }
+
+    // Array(Nullable(Int32)): rows [] / [13, NULL] / [NULL] / [79, -1, NULL]. The
+    // per-element null map follows the offsets, so element-level nulls live on the
+    // element column's validity, never on the array. The null slots decode to the
+    // inner default 0 in the buffer.
+    {
+        let arr = as_array(block.column(40));
+        assert_eq!(arr.offsets, vec![0i64, 0, 2, 3, 6]);
+        assert_eq!(arr.null_count(), 0);
+        match arr.values.as_ref() {
+            Column::Int32(c) => {
+                assert_eq!(c.values.as_slice(), &[13, 0, 0, 79, -1, 0]);
+                assert_eq!(c.null_count(), 3);
+                let bm = c.validity.as_ref().expect("nullable element validity");
+                let got: Vec<bool> = (0..c.values.len()).map(|i| bm.is_valid(i)).collect();
+                assert_eq!(got, vec![true, false, false, true, true, false]);
+            }
+            other => panic!("expected nullable Int32 array elements, got {other:?}"),
+        }
+    }
+
+    // Array(LowCardinality(String)): rows [] / ['red', 'red'] / ['green'] /
+    // ['red', 'blue']. The element column is a per-block dictionary; resolving each
+    // flattened element through it gives red, red, green, red, blue.
+    {
+        let arr = as_array(block.column(41));
+        assert_eq!(arr.offsets, vec![0i64, 0, 2, 3, 5]);
+        assert_dictionary_string_values(
+            arr.values.as_ref(),
+            &[
+                Some(b"red" as &[u8]),
+                Some(b"red"),
+                Some(b"green"),
+                Some(b"red"),
+                Some(b"blue"),
+            ],
+        );
+    }
+
+    // Array(Array(Int32)): rows [] / [[13]] / [[79, 13], []] / [[1], [2, 3]]. Two
+    // offset levels then the leaf. The outer offsets count inner arrays; the inner
+    // offsets count leaf ints (with an empty inner array as equal adjacent offsets
+    // 3, 3).
+    {
+        let outer = as_array(block.column(42));
+        assert_eq!(outer.offsets, vec![0i64, 0, 1, 3, 5]);
+        let inner = as_array(outer.values.as_ref());
+        assert_eq!(inner.offsets, vec![0i64, 1, 3, 3, 4, 6]);
+        match inner.values.as_ref() {
+            Column::Int32(c) => assert_eq!(c.values.as_slice(), &[13, 79, 13, 1, 2, 3]),
+            other => panic!("expected Int32 leaf elements, got {other:?}"),
+        }
+    }
+
+    // Array(LowCardinality(String)) with EVERY row empty: the server writes only
+    // the hoisted LC key version and the four all-zero offsets, and NOTHING for
+    // the LC element run (`SerializationLowCardinality::
+    // serializeBinaryBulkWithMultipleStreams` early-returns at limit == 0), so
+    // the element column decodes to an empty dictionary.
+    {
+        let arr = as_array(block.column(43));
+        assert_eq!(arr.offsets, vec![0i64, 0, 0, 0, 0]);
+        match arr.values.as_ref() {
+            Column::Dictionary(d) => {
+                assert!(d.indices.is_empty());
+                assert!(d.validity.is_none());
+                assert_eq!(d.values.len(), 0);
+            }
+            other => panic!("expected empty Dictionary elements, got {other:?}"),
+        }
+    }
+}
+
+/// Borrow the inner `ArrayColumn` of a decoded `Array` column, panicking with a
+/// useful message on any other variant.
+fn as_array(column: &Column) -> &ch_core_rs::column::ArrayColumn {
+    match column {
+        Column::Array(a) => a,
+        other => panic!("expected Array, got {other:?}"),
+    }
 }
 
 /// Read row `index` of a 4-byte (Decimal32-backed) decimal column as the raw

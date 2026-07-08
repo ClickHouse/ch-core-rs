@@ -79,7 +79,6 @@ struct SchemaPrivateData {
     format: CString,
     name: CString,
     children: Vec<*mut ArrowSchema>,
-    _child_data: Vec<SchemaPrivateData>,
     /// The dictionary value-type child schema for a `LowCardinality(T)` field,
     /// owned here so it is freed when this field's schema is released. Null for
     /// every non-dictionary field.
@@ -90,7 +89,6 @@ struct ArrayPrivateData {
     buffers: Vec<*const c_void>,
     children: Vec<*mut ArrowArray>,
     _batch: Arc<ColBatch>,
-    _child_data: Vec<ArrayPrivateData>,
     /// The dictionary values child array for a `LowCardinality(T)` column, owned
     /// here so it is freed when this column's array is released. Null for every
     /// non-dictionary column.
@@ -252,12 +250,11 @@ fn arrow_format(ch_type: &ChType) -> String {
         // we deliberately do NOT widen narrow decimals to 128 bits, which would
         // cost a forbidden per-value copy in the hot path.
         //
-        // NOTE for the arrow-ffi-specialist: `decimal32`/`decimal64`/`decimal256`
-        // are newer in the Arrow C Data Interface than `decimal128`. The
-        // `d:P,S,bits` spelling is the documented form, but consumer support for
-        // the non-128 widths varies by Arrow implementation/version. Confirm the
-        // exact format-string spelling and consumer compatibility before relying
-        // on the 32/64/256-bit exports downstream.
+        // NOTE: `decimal32`/`decimal64`/`decimal256` are newer in the Arrow C
+        // Data Interface than `decimal128`. The `d:P,S,bits` spelling is the
+        // documented form, but consumer support for the non-128 widths varies by
+        // Arrow implementation/version. Confirm consumer compatibility before
+        // relying on the 32/64/256-bit exports downstream.
         ChType::Decimal {
             precision,
             scale,
@@ -274,6 +271,21 @@ fn arrow_format(ch_type: &ChType) -> String {
         // type lives in the schema's `dictionary` child. Index width is
         // normalized to i32 by the decoder, so the index format is always `i`.
         ChType::LowCardinality(_) => "i".into(),
+        // Array(T) exports as an Arrow LargeList (`+L`, 64-bit offsets), NOT a
+        // List (`+l`, 32-bit). The element type is NOT in this format string; it
+        // is fully described by a single `item` child schema (see
+        // `write_field_schema`). ClickHouse array offsets are `UInt64` element
+        // counts and the decoder stores them as `i64` with no artificial i32 cap,
+        // so the `offsets: Vec<i64>` buffer is the exact LargeList offsets buffer
+        // and is handed over verbatim, zero-copy.
+        //
+        // NOTE: LargeList consumer support is slightly less universal than
+        // List, but is supported by pyarrow, arrow-rs, polars, and duckdb. A
+        // `+l` (32-bit) variant would require copying every offset into a fresh
+        // i32 buffer (and capping/erroring on element counts above i32::MAX), a
+        // per-value copy in the hot path we deliberately avoid. LargeList is
+        // the zero-copy match for the i64 offsets the decoder already produces.
+        ChType::Array(_) => "+L".into(),
     }
 }
 
@@ -354,11 +366,29 @@ unsafe fn write_field_schema(out: *mut ArrowSchema, name: &str, ch_type: &ChType
         ptr::null_mut()
     };
 
+    // An `Array(T)` LargeList field describes its element type in a single
+    // conventionally-named `item` child schema. Recursing through
+    // `write_field_schema` fully describes the element, including its own
+    // nullable flag (`Array(Nullable(T))`), its dictionary child
+    // (`Array(LowCardinality(T))`), or a further nested list (`Array(Array(T))`).
+    // The child is owned by this field's private data (in `children`, exactly
+    // like the top-level record-batch schema owns its column children), so
+    // `release_schema` releases and frees it when this field is released.
+    let mut children: Vec<*mut ArrowSchema> = Vec::new();
+    if let ChType::Array(inner) = ch_type {
+        // Safety: an all-zero `ArrowSchema` is a valid initial value, the same
+        // niche argument as the dictionary child above; `write_field_schema`
+        // overwrites every field before any consumer observes it.
+        let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+        write_field_schema(child, "item", inner);
+        children.push(child);
+    }
+    let n_children = children.len() as i64;
+
     let pd = Box::new(SchemaPrivateData {
         format,
         name: name_cstr,
-        children: Vec::new(),
-        _child_data: Vec::new(),
+        children,
         dictionary,
     });
 
@@ -367,8 +397,15 @@ unsafe fn write_field_schema(out: *mut ArrowSchema, name: &str, ch_type: &ChType
     schema.name = pd.name.as_ptr();
     schema.metadata = ptr::null();
     schema.flags = if field_is_nullable(ch_type) { 2 } else { 0 };
-    schema.n_children = 0;
-    schema.children = ptr::null_mut();
+    schema.n_children = n_children;
+    // `pd.children` heap buffer is stable across the `Box::into_raw(pd)` move
+    // below (moving the Box moves the struct fields, not the Vec's heap buffer),
+    // so this pointer stays valid until release. Null when there are no children.
+    schema.children = if pd.children.is_empty() {
+        ptr::null_mut()
+    } else {
+        pd.children.as_ptr() as *mut *mut ArrowSchema
+    };
     schema.dictionary = pd.dictionary;
     schema.release = Some(release_schema);
     schema.private_data = Box::into_raw(pd) as *mut c_void;
@@ -400,7 +437,6 @@ pub unsafe fn export_schema(schema_in: &Schema, out: *mut ArrowSchema) {
         format,
         name,
         children: child_schemas.clone(),
-        _child_data: Vec::new(),
         dictionary: ptr::null_mut(),
     });
 
@@ -433,6 +469,7 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
     let null_count = col.null_count() as i64;
 
     let mut buffers: Vec<*const c_void> = Vec::new();
+    let mut children: Vec<*mut ArrowArray> = Vec::new();
     let mut dictionary: *mut ArrowArray = ptr::null_mut();
 
     match col {
@@ -516,13 +553,38 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
             export_one_column(batch, &c.values, dict_child);
             dictionary = dict_child;
         }
+        // Arrow LargeList: 2 buffers in Arrow order, buffer[0] = validity and
+        // buffer[1] = the i64 offsets. Arrays are never null at the array level
+        // (ClickHouse forbids `Nullable(Array(T))`), so validity is always null.
+        // The `offsets` Vec has length `num_rows + 1` with a leading 0 (including
+        // the zero-row `[0]` case) and is handed over verbatim, zero-copy. The
+        // flattened element column is the single Arrow child, exported
+        // recursively so any element type (including `Nullable`,
+        // `LowCardinality`, or a further nested `Array`) is fully exported. The
+        // child is owned by this array's private data (in `children`), so
+        // `release_array` releases and frees it when this array is released. The
+        // `_batch` clone keeps the borrowed `offsets` and element buffers alive
+        // until release.
+        Column::Array(c) => {
+            buffers.push(ptr::null());
+            buffers.push(c.offsets.as_ptr() as *const c_void);
+
+            // Safety: an all-zero `ArrowArray` is a valid initial value, the same
+            // niche argument as the `Dictionary` arm's `dict_child` above;
+            // `export_one_column` overwrites every field before any consumer
+            // observes it.
+            let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+            export_one_column(batch, &c.values, child);
+            children.push(child);
+        }
     }
+
+    let n_children = children.len() as i64;
 
     let pd = Box::new(ArrayPrivateData {
         buffers,
-        children: Vec::new(),
+        children,
         _batch: Arc::clone(batch),
-        _child_data: Vec::new(),
         dictionary,
     });
 
@@ -532,8 +594,15 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
     array.offset = 0;
     array.n_buffers = pd.buffers.len() as i64;
     array.buffers = pd.buffers.as_ptr() as *mut *const c_void;
-    array.n_children = 0;
-    array.children = ptr::null_mut();
+    array.n_children = n_children;
+    // `pd.children` heap buffer is stable across the `Box::into_raw(pd)` move
+    // below, so this pointer stays valid until release. Null when there are no
+    // children (every arm except `Array`).
+    array.children = if pd.children.is_empty() {
+        ptr::null_mut()
+    } else {
+        pd.children.as_ptr() as *mut *mut ArrowArray
+    };
     array.dictionary = pd.dictionary;
     array.release = Some(release_array);
     array.private_data = Box::into_raw(pd) as *mut c_void;
@@ -574,7 +643,6 @@ pub unsafe fn export_batch_array(batch: &Arc<ColBatch>, out: *mut ArrowArray) {
         buffers: vec![ptr::null()],
         children: child_arrays.clone(),
         _batch: Arc::clone(batch),
-        _child_data: Vec::new(),
         dictionary: ptr::null_mut(),
     });
 
@@ -1315,6 +1383,442 @@ mod tests {
             assert_eq!(count, 3);
 
             (stream.release.unwrap())(&mut stream);
+        }
+    }
+
+    #[test]
+    fn test_arrow_format_array() {
+        // Array(T) is an Arrow LargeList: `+L`. The element type is NOT in this
+        // format string, it lives in the `item` child schema.
+        assert_eq!(arrow_format(&ChType::Array(Box::new(ChType::Int32))), "+L");
+        // Nesting does not change the top-level format string.
+        assert_eq!(
+            arrow_format(&ChType::Array(Box::new(ChType::Array(Box::new(
+                ChType::Int32
+            ))))),
+            "+L"
+        );
+    }
+
+    #[test]
+    fn test_export_array_int32_schema() {
+        // Schema of Array(Int32): field format `+L`, flags clear (array level is
+        // never nullable), one child named `item` with the element format `i`.
+        let schema = Schema::new(vec![Field {
+            name: "arr".into(),
+            ch_type: ChType::Array(Box::new(ChType::Int32)),
+        }]);
+
+        unsafe {
+            let mut schema_out: ArrowSchema = std::mem::zeroed();
+            export_schema(&schema, &mut schema_out);
+
+            let c0 = &**schema_out.children.add(0);
+            assert_eq!(CStr::from_ptr(c0.format).to_str().unwrap(), "+L");
+            assert_eq!(c0.flags & 2, 0, "array level is not nullable");
+            assert_eq!(c0.n_children, 1);
+            assert!(c0.dictionary.is_null(), "array field has no dictionary");
+
+            let item = &**c0.children.add(0);
+            assert_eq!(CStr::from_ptr(item.format).to_str().unwrap(), "i");
+            assert_eq!(CStr::from_ptr(item.name).to_str().unwrap(), "item");
+            assert_eq!(item.flags & 2, 0, "plain Int32 element is not nullable");
+
+            (schema_out.release.unwrap())(&mut schema_out);
+        }
+    }
+
+    #[test]
+    fn test_export_array_int32_buffers() {
+        // Array(Int32) over 3 rows including an empty row (row 1). LargeList:
+        // 2 buffers (null validity, i64 offsets), 1 child holding the flattened
+        // elements.
+        // Rows: [[10,20,30], [], [40]] -> offsets [0,3,3,4], values [10,20,30,40].
+        let schema = Schema::new(vec![Field {
+            name: "arr".into(),
+            ch_type: ChType::Array(Box::new(ChType::Int32)),
+        }]);
+        let values = Column::Int32(PrimitiveColumn::new(vec![10, 20, 30, 40]));
+        let col = Column::Array(crate::column::ArrayColumn::new(vec![0, 3, 3, 4], values));
+        let batch = Arc::new(ColBatch::new(schema, vec![col], 3));
+
+        unsafe {
+            let mut array: ArrowArray = std::mem::zeroed();
+            export_batch_array(&batch, &mut array);
+
+            let c0 = &**array.children.add(0);
+            assert_eq!(c0.length, 3, "array length is the row count");
+            assert_eq!(c0.null_count, 0);
+            assert_eq!(c0.n_buffers, 2, "LargeList: validity + offsets");
+            assert!(
+                (*c0.buffers.add(0)).is_null(),
+                "array level validity is always null"
+            );
+            let offsets = *c0.buffers.add(1) as *const i64;
+            assert_eq!(*offsets, 0, "leading 0");
+            assert_eq!(*offsets.add(1), 3);
+            assert_eq!(*offsets.add(2), 3, "empty row -> repeated offset");
+            assert_eq!(*offsets.add(3), 4, "last offset == total elements");
+
+            assert_eq!(c0.n_children, 1);
+            let item = &**c0.children.add(0);
+            assert_eq!(item.length, 4, "element count == last offset");
+            assert_eq!(item.n_buffers, 2, "int32 element: validity + values");
+            let vals = *item.buffers.add(1) as *const i32;
+            assert_eq!(*vals, 10);
+            assert_eq!(*vals.add(3), 40);
+
+            (array.release.unwrap())(&mut array);
+        }
+    }
+
+    #[test]
+    fn test_export_array_nullable_int32() {
+        use crate::bitmap::Bitmap;
+
+        // Array(Nullable(Int32)): the `item` child schema carries the nullable
+        // flag, the element array's validity is non-null with a matching
+        // null_count, and the array-level validity stays null.
+        // Rows: [[10, null], [30]] -> offsets [0,2,3], values [10, _, 30] with
+        // element index 1 null.
+        let schema = Schema::new(vec![Field {
+            name: "arr".into(),
+            ch_type: ChType::Array(Box::new(ChType::Nullable(Box::new(ChType::Int32)))),
+        }]);
+        // ClickHouse null map: 1 = null. Element index 1 is null.
+        let validity = Bitmap::from_ch_null_map(&[0x00, 0x01, 0x00]);
+        let values = Column::Int32(PrimitiveColumn::new_nullable(vec![10, 0, 30], validity));
+        let col = Column::Array(crate::column::ArrayColumn::new(vec![0, 2, 3], values));
+        let batch = Arc::new(ColBatch::new(schema, vec![col], 2));
+
+        unsafe {
+            let mut schema_out: ArrowSchema = std::mem::zeroed();
+            export_schema(&batch.schema, &mut schema_out);
+            let c0 = &**schema_out.children.add(0);
+            assert_eq!(CStr::from_ptr(c0.format).to_str().unwrap(), "+L");
+            assert_eq!(c0.flags & 2, 0, "array level not nullable");
+            let item = &**c0.children.add(0);
+            assert_eq!(CStr::from_ptr(item.format).to_str().unwrap(), "i");
+            assert_eq!(item.flags & 2, 2, "nullable element flag set");
+            (schema_out.release.unwrap())(&mut schema_out);
+
+            let mut array: ArrowArray = std::mem::zeroed();
+            export_batch_array(&batch, &mut array);
+            let c0 = &**array.children.add(0);
+            assert_eq!(c0.length, 2);
+            assert_eq!(c0.null_count, 0, "array level has no nulls");
+            assert!(
+                (*c0.buffers.add(0)).is_null(),
+                "array level validity stays null"
+            );
+            let item = &**c0.children.add(0);
+            assert_eq!(item.length, 3);
+            assert_eq!(item.null_count, 1, "one null element");
+            assert!(
+                !(*item.buffers.add(0)).is_null(),
+                "element validity buffer present"
+            );
+            (array.release.unwrap())(&mut array);
+        }
+    }
+
+    #[test]
+    fn test_export_array_low_cardinality_string() {
+        use crate::column::DictionaryColumn;
+
+        // Array(LowCardinality(String)): the `item` child schema is a dictionary
+        // (format `i`) with a non-null dictionary child of format `u`; the
+        // element array carries the index buffers plus a dictionary child.
+        // Rows: [["user_1"], ["user_2","user_1"]] -> offsets [0,1,3].
+        // Dictionary values ["user_1","user_2"], indices [0,1,0].
+        let schema = Schema::new(vec![Field {
+            name: "arr".into(),
+            ch_type: ChType::Array(Box::new(ChType::LowCardinality(Box::new(ChType::String)))),
+        }]);
+        let dict_values = Column::Utf8(Utf8Column::new(vec![0, 6, 12], b"user_1user_2".to_vec()));
+        let dict = DictionaryColumn::new(vec![0, 1, 0], dict_values);
+        let col = Column::Array(crate::column::ArrayColumn::new(
+            vec![0, 1, 3],
+            Column::Dictionary(dict),
+        ));
+        let batch = Arc::new(ColBatch::new(schema, vec![col], 2));
+
+        unsafe {
+            let mut schema_out: ArrowSchema = std::mem::zeroed();
+            export_schema(&batch.schema, &mut schema_out);
+            let c0 = &**schema_out.children.add(0);
+            assert_eq!(CStr::from_ptr(c0.format).to_str().unwrap(), "+L");
+            let item = &**c0.children.add(0);
+            assert_eq!(CStr::from_ptr(item.format).to_str().unwrap(), "i");
+            assert!(!item.dictionary.is_null(), "dictionary child present");
+            let dict_schema = &*item.dictionary;
+            assert_eq!(CStr::from_ptr(dict_schema.format).to_str().unwrap(), "u");
+            (schema_out.release.unwrap())(&mut schema_out);
+
+            let mut array: ArrowArray = std::mem::zeroed();
+            export_batch_array(&batch, &mut array);
+            let c0 = &**array.children.add(0);
+            assert_eq!(c0.length, 2);
+            let item = &**c0.children.add(0);
+            assert_eq!(item.length, 3, "3 flattened index rows");
+            assert_eq!(item.n_buffers, 2, "dictionary: validity + i32 indices");
+            let idx = *item.buffers.add(1) as *const i32;
+            assert_eq!(*idx, 0);
+            assert_eq!(*idx.add(1), 1);
+            assert!(!item.dictionary.is_null(), "dictionary child array present");
+            let dict_array = &*item.dictionary;
+            assert_eq!(dict_array.length, 2, "2 dictionary entries");
+            assert_eq!(
+                dict_array.n_buffers, 3,
+                "utf8 values: validity, offsets, data"
+            );
+            (array.release.unwrap())(&mut array);
+        }
+    }
+
+    #[test]
+    fn test_export_array_of_array_int32() {
+        // Array(Array(Int32)): the `item` child schema is itself `+L` with its own
+        // `item` child of format `i`; nested child arrays have the right lengths.
+        // Outer rows: [[[1,2],[3]], [[4]]] -> outer offsets [0,2,3].
+        // Inner arrays (3 of them): offsets [0,2,3,4], values [1,2,3,4].
+        let schema = Schema::new(vec![Field {
+            name: "arr".into(),
+            ch_type: ChType::Array(Box::new(ChType::Array(Box::new(ChType::Int32)))),
+        }]);
+        let inner_values = Column::Int32(PrimitiveColumn::new(vec![1, 2, 3, 4]));
+        let inner = Column::Array(crate::column::ArrayColumn::new(
+            vec![0, 2, 3, 4],
+            inner_values,
+        ));
+        let outer = Column::Array(crate::column::ArrayColumn::new(vec![0, 2, 3], inner));
+        let batch = Arc::new(ColBatch::new(schema, vec![outer], 2));
+
+        unsafe {
+            let mut schema_out: ArrowSchema = std::mem::zeroed();
+            export_schema(&batch.schema, &mut schema_out);
+            let c0 = &**schema_out.children.add(0);
+            assert_eq!(CStr::from_ptr(c0.format).to_str().unwrap(), "+L");
+            let item = &**c0.children.add(0);
+            assert_eq!(CStr::from_ptr(item.format).to_str().unwrap(), "+L");
+            assert_eq!(item.n_children, 1);
+            let leaf = &**item.children.add(0);
+            assert_eq!(CStr::from_ptr(leaf.format).to_str().unwrap(), "i");
+            assert_eq!(CStr::from_ptr(leaf.name).to_str().unwrap(), "item");
+            (schema_out.release.unwrap())(&mut schema_out);
+
+            let mut array: ArrowArray = std::mem::zeroed();
+            export_batch_array(&batch, &mut array);
+            let c0 = &**array.children.add(0);
+            assert_eq!(c0.length, 2, "2 outer rows");
+            let offsets = *c0.buffers.add(1) as *const i64;
+            assert_eq!(*offsets, 0);
+            assert_eq!(*offsets.add(2), 3, "3 inner arrays total");
+
+            let item = &**c0.children.add(0);
+            assert_eq!(item.length, 3, "3 inner arrays == outer last offset");
+            let inner_offsets = *item.buffers.add(1) as *const i64;
+            assert_eq!(*inner_offsets.add(3), 4, "4 leaf elements total");
+
+            let leaf = &**item.children.add(0);
+            assert_eq!(leaf.length, 4, "4 leaf int32 elements");
+            let vals = *leaf.buffers.add(1) as *const i32;
+            assert_eq!(*vals, 1);
+            assert_eq!(*vals.add(3), 4);
+            (array.release.unwrap())(&mut array);
+        }
+    }
+
+    #[test]
+    fn test_export_empty_array_column() {
+        // A zero-row Array column has offsets == [0]: length 0, offsets buffer
+        // still non-null with a single leading 0, and an empty element child.
+        let schema = Schema::new(vec![Field {
+            name: "arr".into(),
+            ch_type: ChType::Array(Box::new(ChType::Int32)),
+        }]);
+        let values = Column::Int32(PrimitiveColumn::new(vec![]));
+        let col = Column::Array(crate::column::ArrayColumn::new(vec![0], values));
+        let batch = Arc::new(ColBatch::new(schema, vec![col], 0));
+
+        unsafe {
+            let mut array: ArrowArray = std::mem::zeroed();
+            export_batch_array(&batch, &mut array);
+            let c0 = &**array.children.add(0);
+            assert_eq!(c0.length, 0);
+            assert_eq!(c0.n_buffers, 2);
+            assert!((*c0.buffers.add(0)).is_null());
+            let offsets = *c0.buffers.add(1) as *const i64;
+            assert_eq!(*offsets, 0, "the leading 0 for a zero-row column");
+            let item = &**c0.children.add(0);
+            assert_eq!(item.length, 0, "no elements");
+            (array.release.unwrap())(&mut array);
+        }
+    }
+
+    #[test]
+    fn test_release_array_skips_moved_out_child() {
+        // Spec "Moving child arrays": a consumer may take ownership of a child
+        // by bitwise-copying its struct and marking the SOURCE released
+        // (release = None) WITHOUT calling the source's release callback, then
+        // must release the parent. The parent's release must skip the moved
+        // child while still freeing the producer-owned child shell, and the
+        // moved copy must stay independently valid (it holds its own
+        // Arc<ColBatch> in private data) until its own, idempotent release.
+        let schema = Schema::new(vec![Field {
+            name: "arr".into(),
+            ch_type: ChType::Array(Box::new(ChType::Int32)),
+        }]);
+        let values = Column::Int32(PrimitiveColumn::new(vec![10, 20, 30, 40]));
+        let col = Column::Array(crate::column::ArrayColumn::new(vec![0, 3, 3, 4], values));
+        let batch = Arc::new(ColBatch::new(schema, vec![col], 3));
+
+        unsafe {
+            let mut array: ArrowArray = std::mem::zeroed();
+            export_batch_array(&batch, &mut array);
+            // Drop our own Arc so the export's private-data clones are the only
+            // owners of the buffers from here on.
+            drop(batch);
+
+            let list_ptr = *array.children.add(0);
+            let item_ptr = *(*list_ptr).children.add(0);
+
+            // Consumer move: bitwise copy the item child out of the producer's
+            // shell, then mark the source released without calling its
+            // callback.
+            let mut moved: ArrowArray = ptr::read(item_ptr);
+            (*item_ptr).release = None;
+
+            // Per spec the parent must be released after moving a child out.
+            // Its release must skip the moved-out item (null release), freeing
+            // only the producer-owned shell; the moved copy stays valid.
+            (array.release.unwrap())(&mut array);
+            assert!(array.release.is_none(), "parent marked released");
+
+            // The moved child still owns its buffers through its own private
+            // data: length and values remain readable after the parent (and
+            // our Arc) are gone.
+            assert_eq!(moved.length, 4);
+            assert_eq!(moved.n_buffers, 2);
+            let vals = *moved.buffers.add(1) as *const i32;
+            assert_eq!(*vals, 10);
+            assert_eq!(*vals.add(3), 40);
+
+            // Releasing the moved copy frees its private data exactly once and
+            // marks it released; a second call through the producer callback is
+            // a no-op (private_data was cleared).
+            (moved.release.unwrap())(&mut moved);
+            assert!(moved.release.is_none(), "moved child marked released");
+            release_array(&mut moved);
+        }
+    }
+
+    #[test]
+    fn test_stream_with_array_column() {
+        // A stream whose batch carries an Array(Array(Int32)) column: the first
+        // exported type with real `children`, so `get_schema` and `get_next`
+        // must agree on the child shape all the way down.
+        // One row: [[[7], [9, 11]]] -> outer offsets [0, 2], inner offsets
+        // [0, 1, 3], leaf values [7, 9, 11].
+        let schema = Schema::new(vec![Field {
+            name: "arr".into(),
+            ch_type: ChType::Array(Box::new(ChType::Array(Box::new(ChType::Int32)))),
+        }]);
+        let leaf = Column::Int32(PrimitiveColumn::new(vec![7, 9, 11]));
+        let inner = Column::Array(crate::column::ArrayColumn::new(vec![0, 1, 3], leaf));
+        let outer = Column::Array(crate::column::ArrayColumn::new(vec![0, 2], inner));
+        let batch = Arc::new(ColBatch::new(schema.clone(), vec![outer], 1));
+
+        unsafe {
+            let mut stream: ArrowArrayStream = std::mem::zeroed();
+            export_chunks_to_stream(schema, vec![batch], &mut stream);
+
+            let mut schema_out: ArrowSchema = std::mem::zeroed();
+            let rc = (stream.get_schema.unwrap())(&mut stream, &mut schema_out);
+            assert_eq!(rc, 0);
+            let s0 = &**schema_out.children.add(0);
+            assert_eq!(CStr::from_ptr(s0.format).to_str().unwrap(), "+L");
+            assert_eq!(s0.n_children, 1);
+            let s_item = &**s0.children.add(0);
+            assert_eq!(CStr::from_ptr(s_item.format).to_str().unwrap(), "+L");
+            assert_eq!(s_item.n_children, 1);
+            let s_leaf = &**s_item.children.add(0);
+            assert_eq!(CStr::from_ptr(s_leaf.format).to_str().unwrap(), "i");
+
+            let mut array: ArrowArray = std::mem::zeroed();
+            let rc = (stream.get_next.unwrap())(&mut stream, &mut array);
+            assert_eq!(rc, 0);
+            assert!(array.release.is_some());
+            assert_eq!(array.n_children, schema_out.n_children);
+            let a0 = &**array.children.add(0);
+            assert_eq!(a0.length, 1, "1 outer row");
+            assert_eq!(a0.n_children, s0.n_children);
+            let a_item = &**a0.children.add(0);
+            assert_eq!(a_item.length, 2, "outer last offset");
+            assert_eq!(a_item.n_children, s_item.n_children);
+            let a_leaf = &**a_item.children.add(0);
+            assert_eq!(a_leaf.length, 3, "inner last offset");
+            let vals = *a_leaf.buffers.add(1) as *const i32;
+            assert_eq!(*vals, 7);
+            assert_eq!(*vals.add(2), 11);
+            (array.release.unwrap())(&mut array);
+            (schema_out.release.unwrap())(&mut schema_out);
+
+            // End of stream after the single chunk.
+            let mut array2: ArrowArray = std::mem::zeroed();
+            let rc = (stream.get_next.unwrap())(&mut stream, &mut array2);
+            assert_eq!(rc, 0);
+            assert!(array2.release.is_none());
+
+            (stream.release.unwrap())(&mut stream);
+        }
+    }
+
+    #[test]
+    fn test_export_array_all_rows_empty_low_cardinality() {
+        use crate::column::DictionaryColumn;
+
+        // Rows but every array empty: offsets [0, 0, 0] over an empty element
+        // column. This is the shape the decoder produces for the documented
+        // wire quirk where a rows-but-all-empty `Array(LowCardinality(String))`
+        // column carries no element body at all (see CODEC_CONTRACT.md). The
+        // offsets buffer must still be non-null with num_rows + 1 entries, and
+        // the item child (and its dictionary) must export with length 0.
+        let schema = Schema::new(vec![Field {
+            name: "arr".into(),
+            ch_type: ChType::Array(Box::new(ChType::LowCardinality(Box::new(ChType::String)))),
+        }]);
+        let dict_values = Column::Utf8(Utf8Column::new(vec![0], Vec::new()));
+        let dict = DictionaryColumn::new(Vec::new(), dict_values);
+        let col = Column::Array(crate::column::ArrayColumn::new(
+            vec![0, 0, 0],
+            Column::Dictionary(dict),
+        ));
+        let batch = Arc::new(ColBatch::new(schema, vec![col], 2));
+
+        unsafe {
+            let mut array: ArrowArray = std::mem::zeroed();
+            export_batch_array(&batch, &mut array);
+            let c0 = &**array.children.add(0);
+            assert_eq!(c0.length, 2, "2 rows, all empty");
+            assert_eq!(c0.null_count, 0);
+            assert_eq!(c0.n_buffers, 2);
+            assert!((*c0.buffers.add(0)).is_null());
+            let offsets_ptr = *c0.buffers.add(1);
+            assert!(!offsets_ptr.is_null(), "offsets buffer stays non-null");
+            let offsets = offsets_ptr as *const i64;
+            assert_eq!(*offsets, 0);
+            assert_eq!(*offsets.add(1), 0);
+            assert_eq!(*offsets.add(2), 0, "num_rows + 1 all-zero offsets");
+
+            assert_eq!(c0.n_children, 1);
+            let item = &**c0.children.add(0);
+            assert_eq!(item.length, 0, "no flattened elements");
+            assert_eq!(item.null_count, 0);
+            assert!(!item.dictionary.is_null(), "dictionary child still present");
+            let dict_array = &*item.dictionary;
+            assert_eq!(dict_array.length, 0, "empty dictionary");
+            (array.release.unwrap())(&mut array);
         }
     }
 }

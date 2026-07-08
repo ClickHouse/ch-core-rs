@@ -137,7 +137,40 @@ SELECT
     -- LowCardinality(IPv6): 16 raw bytes per dictionary entry in network byte
     -- order, the same body shape as LowCardinality(UUID). Values repeat. Rows
     -- resolve to 2001:db8::68, fe80::1, 2001:db8::68, ::ffff:192.0.2.235.
-    CAST(multiIf(n = 0, '2001:db8::68', n = 1, 'fe80::1', n = 2, '2001:db8::68', '::ffff:192.0.2.235'), 'LowCardinality(IPv6)') AS lc_ipv6
+    CAST(multiIf(n = 0, '2001:db8::68', n = 1, 'fe80::1', n = 2, '2001:db8::68', '::ffff:192.0.2.235'), 'LowCardinality(IPv6)') AS lc_ipv6,
+    -- Array(T): SerializationArray writes num_rows cumulative LE UInt64 end-offsets
+    -- (no leading zero), then the flattened element body of length = the last
+    -- offset. The decoder prepends Arrow's leading 0 and widens to i64. Rows cover
+    -- an empty array (n=0), varying lengths, and a negative element:
+    -- [] / [13] / [79, -13] / [1, 2, 3], so the decoded offsets are [0, 0, 1, 3, 6]
+    -- and the flattened Int32 values are 13, 79, -13, 1, 2, 3.
+    CAST(multiIf(n = 0, [], n = 1, [13], n = 2, [79, -13], [1, 2, 3]), 'Array(Int32)') AS arr,
+    -- Array(String): variable-length element body after the offsets.
+    -- [] / ['user_1'] / ['a', 'user_2'] / ['x'] -> offsets [0, 0, 1, 3, 4],
+    -- flattened strings user_1, a, user_2, x.
+    CAST(multiIf(n = 0, [], n = 1, ['user_1'], n = 2, ['a', 'user_2'], ['x']), 'Array(String)') AS arr_s,
+    -- Array(Nullable(Int32)): after the offsets the element body is a per-element
+    -- null map then the element values; element-level nulls live on the element
+    -- column. [] / [13, NULL] / [NULL] / [79, -1, NULL] -> offsets [0, 0, 2, 3, 6],
+    -- element validity [T, F, F, T, T, F].
+    CAST(multiIf(n = 0, [], n = 1, [13, NULL], n = 2, [NULL], [79, -1, NULL]), 'Array(Nullable(Int32))') AS arr_n,
+    -- Array(LowCardinality(String)): the element type's state prefix recurses, so
+    -- the LC 8-byte key version is written BEFORE the array offsets, and the LC body
+    -- (index word / dictionary / indexes) comes AFTER. [] / ['red', 'red'] /
+    -- ['green'] / ['red', 'blue'] -> offsets [0, 0, 2, 3, 5], flattened elements
+    -- red, red, green, red, blue resolved through the per-block dictionary.
+    CAST(multiIf(n = 0, [], n = 1, ['red', 'red'], n = 2, ['green'], ['red', 'blue']), 'Array(LowCardinality(String))') AS arr_lc,
+    -- Array(Array(Int32)): two offset levels then the leaf. [] / [[13]] /
+    -- [[79, 13], []] / [[1], [2, 3]] -> outer offsets [0, 0, 1, 3, 5], inner offsets
+    -- [0, 1, 3, 3, 4, 6], leaf Int32 values 13, 79, 13, 1, 2, 3.
+    CAST(multiIf(n = 0, [], n = 1, [[13]], n = 2, [[79, 13], []], [[1], [2, 3]]), 'Array(Array(Int32))') AS arr_arr,
+    -- Array(LowCardinality(String)) with EVERY row empty: the flattened element
+    -- run has zero length, so the server writes only the hoisted LC 8-byte key
+    -- version and the four all-zero offsets, and NOTHING for the LC element body
+    -- (SerializationLowCardinality::serializeBinaryBulkWithMultipleStreams
+    -- early-returns at limit == 0). Decodes to offsets [0, 0, 0, 0, 0] over an
+    -- empty dictionary element column.
+    CAST([], 'Array(LowCardinality(String))') AS arr_lc_empty
 FROM numbers(4)
 SETTINGS allow_suspicious_low_cardinality_types = 1
 FORMAT Native

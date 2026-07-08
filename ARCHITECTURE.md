@@ -72,20 +72,21 @@ thing:
    decoded blocks come out as soon as they complete, instead of buffering a
    whole response first.
 
-End-to-end POCs in the Node and Python clients validated the performance
-claim through the full client stacks; the headline numbers and their scoping
-live in `README.md`. Two details matter when interpreting them:
+End-to-end throughput is mostly a property of the binding and transport, not
+this core, so benchmark numbers belong with the bindings. A few design
+characteristics are worth calling out because they shape what a binding can
+expect:
 
-- The Arrow path wins end to end because the core streams with overlapped
-  decode while the v1 clients buffer the entire response
-  (`wait_end_of_query=1`) before the first byte arrives. In a decode-isolated
-  comparison, server `ArrowStream` still beats Native -> Arrow, since the
-  server already emits Arrow memory layout. The end-to-end win is real; its
-  cause is pipeline overlap, not a faster Arrow transform.
-- Under heavy server-side compression on localhost the Arrow lead can invert.
-  This was measured to be bounded by server compression throughput, not
-  client code. All measurements are localhost; Native's smaller wire size is
-  an unmeasured additional advantage on real networks.
+- Streaming with overlapped decode is where end-to-end wins come from: the core
+  emits decoded blocks as they complete, while a client that buffers the whole
+  response (`wait_end_of_query=1`) waits for the last byte first. In a
+  decode-isolated comparison the server's `ArrowStream` still beats
+  Native -> Arrow, since the server already emits Arrow memory layout; the
+  advantage is pipeline overlap, not a faster transform.
+- Under heavy server-side compression the Arrow advantage can invert, bounded by
+  server compression throughput rather than client code. Native's smaller wire
+  size is an additional advantage over a real network that a localhost
+  comparison cannot show.
 
 ---
 

@@ -267,6 +267,7 @@ than an error.
 | `DateTime64(P)`, `DateTime64(P, '<tz>')` | `DateTime64 { precision, timezone }` | `DateTime64` | `ts{unit}:{tz}` for P in {0,3,6,9}, else `l` | validity, values | yes |
 | `Nullable(T)`     | `Nullable(T)`    | inner T's variant | inner's      | inner's, validity populated | n/a      |
 | `LowCardinality(T)` for an allowed inner `T` (see the type section) | `LowCardinality(Box<ChType>)` | `Dictionary` | `i` (index type; values type in the dictionary child) | validity, i32 indices (+ dictionary child) | via inner `Nullable` |
+| `Array(T)` for any supported element `T` | `Array(Box<ChType>)` | `Array` | `+L` (LargeList; element type in the item child) | validity, i64 offsets (+ item child) | no (array level); element nulls via `Array(Nullable(T))` |
 
 Any type not in this matrix is rejected. See "Unsupported types" below.
 
@@ -921,6 +922,99 @@ and the index-0 NULL sentinel are in `IndexesSerializationType` and
 
 ---
 
+### Array(T)
+
+**Type string(s):** `Array(T)` for any element type `T` this crate supports. The
+element may itself be `Nullable(T)`, `LowCardinality(T)`, or a further `Array(T)`,
+so containers nest. The array is never wrapped in an outer `Nullable`:
+`Nullable(Array(T))` is not constructible on the server
+(`DataTypeArray::canBeInsideNullable()` is false), and the parser rejects it. The
+parser caps wrapper/container nesting depth (`MAX_TYPE_DEPTH = 100`) so a hostile
+`Array(Array(...))` header returns `UnsupportedType` instead of overflowing the
+stack; that cap bounds decode, the completeness scan, and the Arrow export too.
+
+**Logical type:** `ChType::Array(Box<ChType>)`.
+
+**Introduction version:** `Array` is a foundational ClickHouse type, stable at the
+pinned tag `v26.6.1.1193-stable`.
+
+**Wire payload:** per Array column per block, only when the block has rows
+(`NativeReader::readData` gates on `if (rows)`), the bytes are, in order:
+
+```text
+[state prefix]      // SerializationArray writes NOTHING of its own; it recurses
+                    // into the element type's deserializeBinaryBulkStatePrefix.
+                    // Zero bytes for String / Nullable / plain Array elements. For
+                    // Array(LowCardinality(T)) the LC 8-byte key version is emitted
+                    // HERE, at the very front, BEFORE the offsets.
+[num_rows * 8]      offsets   // raw LE u64, cumulative ABSOLUTE end-offsets (the
+                    //   element index one past this row's last element). NO leading
+                    //   zero, no count, no per-row framing. Monotonically
+                    //   non-decreasing (equal adjacent = an empty array row); a
+                    //   decrease is INCORRECT_DATA on the server and rejected here.
+[element body]      // the flattened element column of length total_elements (= the
+                    //   last offset value), the element type's normal bulk body
+                    //   WITHOUT its state prefix (already consumed above).
+```
+
+For `Array(Nullable(T))` the element body is the per-element null map
+(`total_elements` bytes, one per element) followed by the `total_elements` element
+values, so element-level nulls live on the element column, never on the array. For
+`Array(Array(T))` the element body is the inner array's offsets (`total_elements`
+values) then the leaf body, recursively. For `Array(LowCardinality(T))` the element
+body is the LowCardinality index word / dictionary / row count / index array (its
+key version was consumed by the state prefix at the front).
+
+A zero-row block reads no state prefix, no offsets, and no element body.
+
+When the block has rows but every array is empty (the flattened element run has
+zero length), the element body is entirely absent for a `LowCardinality`
+element: `SerializationLowCardinality::serializeBinaryBulkWithMultipleStreams`
+early-returns whenever `limit == 0`, writing neither the index word nor the
+dictionary, row count, or indexes, so the on-wire column is exactly
+`[LC key version][num_rows zero offsets]` and nothing else (verified against a
+live 26.6.1.1193 capture of `SELECT []::Array(LowCardinality(String))`). Other
+element types degrade naturally to zero body bytes at count 0 (an empty null map
+plus no values, an empty offsets run, and so on).
+
+**Arrow export:** Arrow `large_list(item: T)`, format string `+L`. The array
+carries 2 buffers in order: validity (always null here, arrays are never nullable
+at the array level) then the i64 offset buffer. It has one child, the flattened
+element array, exported recursively as a column of `T` (so a `Nullable`,
+`LowCardinality`, or nested `Array` element composes through the child). 64-bit
+(LargeList) offsets are used, not 32-bit, because ClickHouse offsets are `UInt64`
+element counts and a per-block element count can legitimately exceed `i32::MAX`.
+
+**Rust buffer:** `Column::Array(ArrayColumn)` where `ArrayColumn` is
+`{ offsets: Vec<i64>, values: Box<Column> }`. `offsets` has length `num_rows + 1`
+and carries Arrow's leading `0` (so row `i`'s elements are
+`values[offsets[i]..offsets[i + 1]]`), widened from the wire `UInt64` run. An
+empty array row is equal adjacent offsets. `values` is the flattened element
+column of length `offsets[num_rows]`, its own `Column` (recursively any supported
+element type). There is no array-level validity bitmap; a nullable element type
+keeps its nulls on `values`' own validity.
+
+**Notes:**
+
+- The element data is local to each chunk, like every other column; blocks stay
+  separate chunks and are never concatenated.
+- An absolute offset above `i64::MAX`, or offsets that decrease, fail with
+  `DecodeError::InvalidArray` (not `UnsupportedType`), on both the allocating
+  decode and the streaming completeness scan, so `StreamDecoder` surfaces the same
+  error rather than stalling.
+
+**Server reference:** `SerializationArray::deserializeBinaryBulkStatePrefix` (the
+recurse-into-element prefix) and
+`SerializationArray::deserializeBinaryBulkWithMultipleStreams` (the offset run then
+the flattened element body) in
+`src/DataTypes/Serializations/SerializationArray.cpp`, with the `if (rows)` gate in
+`NativeReader::readData` (`src/Formats/NativeReader.cpp`) and the
+non-decreasing-offsets enforcement (`INCORRECT_DATA`) in the same serialization
+file. `DataTypeArray::canBeInsideNullable()` (false) is in
+`src/DataTypes/DataTypeArray.cpp`. Confirmed at `v26.6.1.1193-stable`.
+
+---
+
 ## Encoding
 
 `src/native/encode.rs` is the inverse of the decode path: it turns a `ColBatch`
@@ -971,16 +1065,19 @@ defensive fall-through that validation already rules out.
 
 ### Coverage
 
-Encode coverage is a subset of decode coverage and grows the same
-one-type-at-a-time way. Encodable today: `Bool`, the fixed-width numerics
-(`Int8`..`Int64`, `UInt8`..`UInt64`, `Float32`, `Float64`), the temporals
-(`Date`, `Date32`, `DateTime`, `DateTime64`), `UUID`, `IPv4`, `IPv6`, `String`,
-`FixedString(N)`, `Enum8`/`Enum16`, `Decimal(P, S)`, and `LowCardinality(T)` for
-the same allowed inner types decode accepts, each optionally wrapped in
-`Nullable`. Any other type is `UnsupportedType`, at every row count including
-zero. This is deliberately stricter than decode, whose `empty_column` builds an
-empty column for any decodable type in a zero-row block: encode fails fast rather
-than write a header for a type it cannot write rows of.
+Encode coverage is kept a subset of decode coverage and grows the same
+one-type-at-a-time way; as of `Array(T)` landing, the two are at parity.
+Encodable today: `Bool`, the fixed-width numerics (`Int8`..`Int64`,
+`UInt8`..`UInt64`, `Float32`, `Float64`), the temporals (`Date`, `Date32`,
+`DateTime`, `DateTime64`), `UUID`, `IPv4`, `IPv6`, `String`, `FixedString(N)`,
+`Enum8`/`Enum16`, `Decimal(P, S)`, `LowCardinality(T)` for the same allowed
+inner types decode accepts, and `Array(T)` over any encodable element type
+(including a `Nullable`, `LowCardinality`, or nested `Array` element), the
+non-wrapper types each optionally wrapped in `Nullable`. Any other type is
+`UnsupportedType`, at every row count including zero. This is deliberately
+stricter than decode, whose `empty_column` builds an empty column for any
+decodable type in a zero-row block: encode fails fast rather than write a header
+for a type it cannot write rows of.
 
 ### Encode framing
 
@@ -1018,6 +1115,15 @@ would never produce.
 - **Batch shape.** The column count equals the schema field count, and every
   column's `len()` equals the block's `num_rows`. For `encode_chunked`, every
   chunk's schema equals the batch schema.
+- **Type nesting depth.** The declared type's wrapper/container nesting is
+  capped at the decode parser's `MAX_TYPE_DEPTH` (100), checked iteratively
+  before anything walks the type. Encode input never passes through
+  `parse_ch_type`, so without this a caller-constructed pathologically deep
+  type (say 10^6 nested `Array`s) would overflow the stack in the encoder's
+  recursive walks. The rejection is `InconsistentBatch` rather than
+  `UnsupportedType`, deliberately: `UnsupportedType` clones and `Display`s the
+  `ChType`, both of which recurse to full depth, so the error itself would
+  overflow on the input the check exists to reject.
 - **Type/buffer match.** The `Column` variant matches the field's `ChType` (for
   a `Nullable(T)`, the inner `T`). A supported type paired with the wrong buffer
   variant (say `Int64` over a `Column::Int32`) is rejected here rather than
@@ -1055,6 +1161,16 @@ would never produce.
   `LowCardinality(Nullable(T))`, NULL rows use dictionary index 0 and valid rows
   do not. The dictionary column is validated recursively as its own inner-typed
   column.
+- **Array offsets.** The Arrow LargeList invariants are checked: exactly
+  `num_rows + 1` offsets, `offsets[0] == 0`, monotonically non-decreasing
+  (which, from the zero start, also proves every offset non-negative), and a
+  final offset equal to the flattened element column's length (a smaller value
+  would silently drop trailing elements, a larger one would declare elements
+  the body does not carry). The element column is then validated recursively as
+  its own column of `offsets[num_rows]` rows, so every element-level guard (a
+  `Nullable` element's validity length, `LowCardinality` invariants, string
+  offsets, fixed-binary widths, a nested `Array`) applies to the flattened
+  buffer too.
 
 ### Encoder choices
 
@@ -1078,6 +1194,20 @@ one valid wire form, and encode commits to these:
   (u8 through 255 entries, then u16, u32, u64). The dictionary is written exactly
   as the `DictionaryColumn` carries it, in slot order; encode does not re-dedup or
   reorder it. Indexes are written as a raw little-endian array at the chosen width.
+- **Array.** The wire offsets are `offsets[1..]` written as raw little-endian
+  `u64`: the model's leading 0 is Arrow-only and never hits the wire, and
+  validation proved every offset non-negative, so each i64's little-endian bytes
+  are exactly the wire `UInt64`'s. The element state prefix is hoisted by
+  `write_state_prefix`, the mirror of decode's `read_state_prefix`: `Array`
+  writes nothing of its own and recurses into the element, so a leaf
+  `LowCardinality`'s 8-byte key version lands exactly once at the very front of
+  the whole column, before any offsets, across every nesting level; the element
+  body is then written through the shared value path without re-emitting a
+  prefix. A zero-length element run (rows > 0 but every array empty) writes NO
+  `LowCardinality` body at all, not even the index word, matching the server's
+  `limit == 0` early return in
+  `SerializationLowCardinality::serializeBinaryBulkWithMultipleStreams`; every
+  other element writer degrades naturally to zero bytes at count 0.
 
 ### Round-trip guarantees
 
@@ -1102,11 +1232,12 @@ one valid wire form, and encode commits to these:
 
 A zero-row block still writes its `BlockInfo` preamble (at revision > 0), the
 column and row counts, and, for every column, the name, type string, and
-custom-serialization marker (at revision >= 54454). It writes no column body: a
-fixed-width body is empty, and a `LowCardinality` column writes not even the
-key-version prefix, matching `NativeWriter::write`'s `rows > 0` gate. A
-not-yet-encodable type is still rejected at zero rows (see coverage). This is the
-write-side mirror of the "Zero-row output" section below.
+custom-serialization marker (at revision >= 54454). It writes no column data
+section at all: no state prefix (not a `LowCardinality` key version, even one
+hoisted through an `Array`), no `Array` offsets, and no body, matching
+`NativeWriter::write`'s `rows > 0` gate around `writeData`. A not-yet-encodable
+type is still rejected at zero rows (see coverage). This is the write-side
+mirror of the "Zero-row output" section below.
 
 ---
 
@@ -1127,6 +1258,10 @@ directly (`empty_column` in `src/native/decode.rs`), the empty shapes are:
 - `Nullable(T)`: as above with an empty validity bitmap.
 - `LowCardinality(T)`: empty indices, an empty values dictionary column, and (for
   a nullable inner type) an empty index validity bitmap.
+- `Array(T)`: offsets `[0]` (the leading zero only) over an empty element column
+  of `T`, built recursively. The same shape stands in for a zero-length
+  `LowCardinality` element run nested inside an `Array` (the server's
+  `limit == 0` early return writes no LC body at all).
 
 In all cases length is 0 and `null_count` is 0.
 
@@ -1149,13 +1284,16 @@ Not yet supported, tracked as planned phases in `src/schema.rs`:
   `Decimal`, and `Enum8`/`Enum16`, all of which the server itself forbids as LC
   inners (`canBeInsideLowCardinality()` is false), so they never appear in that
   position on the wire.
-- Containers: `Array(T)`, `Tuple(...)`, `Map(K, V)`.
+- Containers: `Tuple(...)`, `Map(K, V)`. `Array(T)` is fully supported, decode
+  and encode (see its type section and the "Encoding" section).
 - Wide integers: `Int128`, `UInt128`, `Int256`, `UInt256`.
 
 A malformed `LowCardinality` payload (a bad key version, the
 `NeedGlobalDictionaryBit` set, an index width tag outside `0..=3`, an out-of-range
 index, or a row count that disagrees with the block header) fails with
-`DecodeError::InvalidLowCardinality` rather than `UnsupportedType`.
+`DecodeError::InvalidLowCardinality` rather than `UnsupportedType`. A malformed
+`Array` payload (offsets that decrease or exceed `i64::MAX`) fails with
+`DecodeError::InvalidArray` rather than `UnsupportedType`.
 
 When one of these is implemented, move it into the support matrix and add a type
 section here.
