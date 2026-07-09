@@ -171,13 +171,17 @@ pub struct DecodeOptions {
 /// caller-constructed types, which never pass through this parser.
 pub(crate) const MAX_TYPE_DEPTH: usize = 100;
 
-/// Parse a ClickHouse type name string into a ChType.
+/// Parse a ClickHouse type name string into a [`crate::schema::ChType`].
 ///
-/// `pub(crate)` so the encoder can confirm a rendered type string round-trips
-/// (a header this parser rejects is one the server rejects too). Delegates to the
-/// depth-tracked [`parse_ch_type_depth`], which bounds recursion against a hostile
-/// header (see [`MAX_TYPE_DEPTH`]).
-pub(crate) fn parse_ch_type(type_name: &str) -> Option<ChType> {
+/// Accepts the canonical spellings the server writes in Native block headers,
+/// including the `Nullable`, `LowCardinality`, `Array`, `Tuple`, and `Map`
+/// container forms. Returns `None` for an unsupported or malformed name. The
+/// input is treated as untrusted wire data: parsing is depth-bounded (see
+/// `MAX_TYPE_DEPTH`) and never panics. Also used by the encoder to confirm a
+/// rendered type string round-trips (a header this parser rejects is one the
+/// server rejects too), and by bindings that map type names to columns without
+/// decoding a block.
+pub fn parse_ch_type(type_name: &str) -> Option<ChType> {
     parse_ch_type_depth(type_name, 0)
 }
 
