@@ -12,7 +12,8 @@
 //! Scope: this encodes `Bool`, the fixed-width numeric types (`Int8`..`Int64`,
 //! `UInt8`..`UInt64`, `Float32`, `Float64`), the temporal types (`Date`,
 //! `Date32`, `DateTime`, `DateTime64`), `UUID`, `IPv4`, `IPv6`, `String`,
-//! `FixedString(N)`, `Enum8`/`Enum16`, `Decimal(P, S)`, `LowCardinality(T)`
+//! `FixedString(N)`, `Enum8`/`Enum16`, `Decimal(P, S)`, the wide integers
+//! (`Int128`/`UInt128`/`Int256`/`UInt256`), `LowCardinality(T)`
 //! for the allowed inner types this crate decodes, `Array(T)` over any
 //! encodable element type (including nested arrays), `Tuple(T1, ...)`
 //! (named or unnamed, including the zero-element `Tuple()`) over encodable
@@ -362,6 +363,16 @@ fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<()
         }
         (ChType::Uuid, Column::Uuid(c)) | (ChType::Ipv6, Column::Ipv6(c)) => {
             validate_fixed_binary(field, value_type, c, 16, num_rows)?;
+        }
+        // Wide integers are verbatim fixed-width bodies (16 bytes/row for the
+        // 128-bit pair, 32 for the 256-bit pair) with the same misframe guard as
+        // UUID/IPv6: reject a stored width that disagrees with the type and any
+        // body length != width * num_rows before writing.
+        (ChType::Int128, Column::Int128(c)) | (ChType::UInt128, Column::UInt128(c)) => {
+            validate_fixed_binary(field, value_type, c, 16, num_rows)?;
+        }
+        (ChType::Int256, Column::Int256(c)) | (ChType::UInt256, Column::UInt256(c)) => {
+            validate_fixed_binary(field, value_type, c, 32, num_rows)?;
         }
         (
             ChType::Decimal {
@@ -941,6 +952,10 @@ fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
             | (ChType::Enum8 { .. }, Column::Enum8(_))
             | (ChType::Enum16 { .. }, Column::Enum16(_))
             | (ChType::Decimal { .. }, Column::Decimal(_))
+            | (ChType::Int128, Column::Int128(_))
+            | (ChType::UInt128, Column::UInt128(_))
+            | (ChType::Int256, Column::Int256(_))
+            | (ChType::UInt256, Column::UInt256(_))
             | (ChType::LowCardinality(_), Column::Dictionary(_))
     )
 }
@@ -1476,6 +1491,16 @@ fn encode_column_body(
         (ChType::String, Column::Utf8(c)) => encode_string_data(buf, c),
         (ChType::FixedString(_), Column::FixedBinary(c)) => encode_fixed_binary_data(buf, c),
         (ChType::Decimal { .. }, Column::Decimal(c)) => encode_decimal_data(buf, c),
+        // Wide-int bodies are the contiguous little-endian fixed-width bytes
+        // written verbatim from the width-16/32 fixed-binary buffer, the inverse
+        // of the decoder's passthrough arms and byte-identical to a
+        // Decimal128/256 body. No reordering, no host byteswap; signedness is in
+        // the type string only. `validate_column` already confirmed the width and
+        // that `data.len() == width * num_rows`, so this is a single copy.
+        (ChType::Int128, Column::Int128(c))
+        | (ChType::UInt128, Column::UInt128(c))
+        | (ChType::Int256, Column::Int256(c))
+        | (ChType::UInt256, Column::UInt256(c)) => encode_fixed_binary_data(buf, c),
         // Defensive: `validate_column` rejects every unsupported type and every
         // mismatched `(type, buffer)` pair before the write phase, so this arm
         // cannot occur for a validated batch. It returns the same error validation
@@ -1704,7 +1729,11 @@ fn is_encodable(ch_type: &ChType) -> bool {
         | ChType::FixedString(_)
         | ChType::Enum8 { .. }
         | ChType::Enum16 { .. }
-        | ChType::Decimal { .. } => true,
+        | ChType::Decimal { .. }
+        | ChType::Int128
+        | ChType::UInt128
+        | ChType::Int256
+        | ChType::UInt256 => true,
         // `Array(T)` only frames offsets around its element body
         // (`encode_array_data`), so it is encodable exactly when its element
         // value type is. A `Nullable` element unwraps like the top level does;
@@ -2254,6 +2283,102 @@ mod tests {
         )
     }
 
+    /// Build a wide-int `FixedBinaryColumn` of the given width (16 or 32) from
+    /// equal-width raw wire-order byte values. Physically a FixedBinaryColumn, so
+    /// this delegates to `fixed_binary_column`.
+    fn wide_int_column(width: usize, values: &[&[u8]]) -> FixedBinaryColumn {
+        fixed_binary_column(width, values)
+    }
+
+    /// All four wide-int types over three rows each, with sign and high-bit
+    /// boundary values so any accidental sign/endianness/reorder bug is caught:
+    /// the signed types include -1 (all 0xFF) and the width MIN (MSB-only); the
+    /// unsigned types include a high-bit-set value and the all-0xFF max. The core
+    /// stores the raw wire bytes verbatim, so these are already wire-order.
+    fn wide_int_batch() -> ColBatch {
+        let mut i128_min = [0u8; 16];
+        i128_min[15] = 0x80;
+        let mut u128_high = [0u8; 16];
+        u128_high[15] = 0x80;
+        let mut w16_13 = [0u8; 16];
+        w16_13[0] = 13;
+        let mut w16_79 = [0u8; 16];
+        w16_79[0] = 79;
+
+        let mut i256_min = [0u8; 32];
+        i256_min[31] = 0x80;
+        let mut u256_high = [0u8; 32];
+        u256_high[31] = 0x80;
+        let mut w32_13 = [0u8; 32];
+        w32_13[0] = 13;
+        let mut w32_79 = [0u8; 32];
+        w32_79[0] = 79;
+
+        let fields = vec![
+            Field {
+                name: "i128".into(),
+                ch_type: ChType::Int128,
+            },
+            Field {
+                name: "u128".into(),
+                ch_type: ChType::UInt128,
+            },
+            Field {
+                name: "i256".into(),
+                ch_type: ChType::Int256,
+            },
+            Field {
+                name: "u256".into(),
+                ch_type: ChType::UInt256,
+            },
+        ];
+        let columns = vec![
+            Column::Int128(wide_int_column(16, &[&w16_13, &[0xFFu8; 16], &i128_min])),
+            Column::UInt128(wide_int_column(16, &[&w16_79, &u128_high, &[0xFFu8; 16]])),
+            Column::Int256(wide_int_column(32, &[&w32_13, &[0xFFu8; 32], &i256_min])),
+            Column::UInt256(wide_int_column(32, &[&w32_79, &u256_high, &[0xFFu8; 32]])),
+        ];
+        ColBatch::new(Schema::new(fields), columns, 3)
+    }
+
+    /// A `Nullable(Int128)` column with valid, null, valid, null rows.
+    fn nullable_wide_int_batch() -> ColBatch {
+        let validity = Bitmap::from_ch_null_map(&[0, 1, 0, 1]);
+        let mut thirteen = [0u8; 16];
+        thirteen[0] = 13;
+        let mut col = wide_int_column(16, &[&thirteen, &[0u8; 16], &[0xFFu8; 16], &[0u8; 16]]);
+        col.validity = Some(validity);
+        ColBatch::new(
+            Schema::new(vec![Field {
+                name: "nw".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::Int128)),
+            }]),
+            vec![Column::Int128(col)],
+            4,
+        )
+    }
+
+    /// A `LowCardinality(Int256)` column, so the encode LC path is exercised for
+    /// a wide-int inner. Dictionary slot 0 is the reserved default, real rows
+    /// reference slots 1...
+    fn low_cardinality_wide_int_batch() -> ColBatch {
+        let mut thirteen = [0u8; 32];
+        thirteen[0] = 13;
+        let mut seventy_nine = [0u8; 32];
+        seventy_nine[0] = 79;
+        ColBatch::new(
+            Schema::new(vec![Field {
+                name: "lc_i256".into(),
+                ch_type: ChType::LowCardinality(Box::new(ChType::Int256)),
+            }]),
+            vec![Column::Dictionary(DictionaryColumn::new(
+                vec![1, 2, 1],
+                Column::Int256(wide_int_column(32, &[&[0u8; 32], &thirteen, &seventy_nine])),
+            ))],
+            3,
+        )
+    }
+
     /// A plain `LowCardinality(String)` and `LowCardinality(UInt32)` over four
     /// rows. The dictionary includes the server's reserved default slot 0 and
     /// rows reference real values in slots 1.., matching server-produced Native
@@ -2401,6 +2526,28 @@ mod tests {
                 vec![0, 2, 3, 6],
                 Column::Int32(PrimitiveColumn::new(vec![13, 79, 21, 34, 55, 89])),
             )),
+        ))];
+        ColBatch::new(Schema::new(fields), columns, 3)
+    }
+
+    /// An `Array(Int128)` column over three rows, exercising a wide int as a
+    /// container element: `[13, INT128_MIN]`, `[]` (an empty row, adjacent-equal
+    /// offsets), `[-1]`. INT128_MIN is the sign-boundary value whose only high
+    /// byte is set (byte 15 = 0x80). A byte-reversal turns it into a small
+    /// positive value and a sign bug mangles it, so either fails the round-trip.
+    /// The core stores the raw wire bytes verbatim, so these are wire-order.
+    fn array_int128_batch() -> ColBatch {
+        let mut i128_min = [0u8; 16];
+        i128_min[15] = 0x80;
+        let mut thirteen = [0u8; 16];
+        thirteen[0] = 13;
+        let fields = vec![Field {
+            name: "a".into(),
+            ch_type: ChType::Array(Box::new(ChType::Int128)),
+        }];
+        let columns = vec![Column::Array(ArrayColumn::new(
+            vec![0, 2, 2, 3],
+            Column::Int128(wide_int_column(16, &[&thirteen, &i128_min, &[0xFFu8; 16]])),
         ))];
         ColBatch::new(Schema::new(fields), columns, 3)
     }
@@ -2606,6 +2753,27 @@ mod tests {
         ColBatch::new(Schema::new(fields), columns, 3)
     }
 
+    /// A `Map(String, Int256)` column over three rows, exercising a wide int as
+    /// a map value: `{}`, `{k1: INT256_MIN}`, `{k1: 13, k2: -1}`. INT256_MIN is
+    /// the sign-boundary value whose only high byte is set (byte 31 = 0x80), so
+    /// a byte-reversal or sign bug in the value run fails the round-trip.
+    fn map_string_int256_batch() -> ColBatch {
+        let mut i256_min = [0u8; 32];
+        i256_min[31] = 0x80;
+        let mut thirteen = [0u8; 32];
+        thirteen[0] = 13;
+        let fields = vec![Field {
+            name: "m".into(),
+            ch_type: ChType::Map(Box::new(ChType::String), Box::new(ChType::Int256)),
+        }];
+        let columns = vec![Column::Map(map_column(
+            vec![0, 0, 1, 3],
+            Column::Utf8(utf8_column(&[b"k1", b"k1", b"k2"])),
+            Column::Int256(wide_int_column(32, &[&i256_min, &thirteen, &[0xFFu8; 32]])),
+        ))];
+        ColBatch::new(Schema::new(fields), columns, 3)
+    }
+
     /// Map(LowCardinality(String), UInt8) (the hoisted key prefix) plus
     /// Map(String, Array(Int32)) and a nested Map value.
     fn lc_and_nested_map_batch() -> ColBatch {
@@ -2721,7 +2889,12 @@ mod tests {
             (Column::Enum8(x), Column::Enum8(y)) => eq!(x, y),
             (Column::Enum16(x), Column::Enum16(y)) => eq!(x, y),
             (Column::Ipv4(x), Column::Ipv4(y)) => eq!(x, y),
-            (Column::Uuid(x), Column::Uuid(y)) | (Column::Ipv6(x), Column::Ipv6(y)) => {
+            (Column::Uuid(x), Column::Uuid(y))
+            | (Column::Ipv6(x), Column::Ipv6(y))
+            | (Column::Int128(x), Column::Int128(y))
+            | (Column::UInt128(x), Column::UInt128(y))
+            | (Column::Int256(x), Column::Int256(y))
+            | (Column::UInt256(x), Column::UInt256(y)) => {
                 assert_eq!(x.width, y.width, "{label} width differ");
                 assert_eq!(x.data, y.data, "{label} data differ");
             }
@@ -2948,6 +3121,36 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_wide_int_rev0() {
+        roundtrip(&wide_int_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_wide_int_tcp_revision() {
+        roundtrip(&wide_int_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_nullable_wide_int_rev0() {
+        roundtrip(&nullable_wide_int_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_nullable_wide_int_tcp_revision() {
+        roundtrip(&nullable_wide_int_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_low_cardinality_wide_int_rev0() {
+        roundtrip(&low_cardinality_wide_int_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_low_cardinality_wide_int_tcp_revision() {
+        roundtrip(&low_cardinality_wide_int_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
     fn roundtrip_low_cardinality_rev0() {
         roundtrip(&low_cardinality_batch(), 0);
     }
@@ -3021,6 +3224,16 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_array_int128_rev0() {
+        roundtrip(&array_int128_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_array_int128_tcp_revision() {
+        roundtrip(&array_int128_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
     fn roundtrip_tuple_rev0() {
         roundtrip(&tuple_batch(), 0);
     }
@@ -3058,6 +3271,16 @@ mod tests {
     #[test]
     fn roundtrip_map_tcp_revision() {
         roundtrip(&map_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_map_string_int256_rev0() {
+        roundtrip(&map_string_int256_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_map_string_int256_tcp_revision() {
+        roundtrip(&map_string_int256_batch(), DBMS_TCP_PROTOCOL_VERSION);
     }
 
     #[test]
@@ -3353,6 +3576,14 @@ mod tests {
                 ch_type: ChType::Ipv6,
             },
             Field {
+                name: "i128".into(),
+                ch_type: ChType::Int128,
+            },
+            Field {
+                name: "u256".into(),
+                ch_type: ChType::UInt256,
+            },
+            Field {
                 name: "dec".into(),
                 ch_type: ChType::Decimal {
                     precision: 9,
@@ -3400,6 +3631,8 @@ mod tests {
             Column::Uuid(FixedBinaryColumn::new(Vec::new(), 16)),
             Column::Ipv4(PrimitiveColumn::new(Vec::new())),
             Column::Ipv6(FixedBinaryColumn::new(Vec::new(), 16)),
+            Column::Int128(FixedBinaryColumn::new(Vec::new(), 16)),
+            Column::UInt256(FixedBinaryColumn::new(Vec::new(), 32)),
             Column::Decimal(DecimalColumn::new(Vec::new(), 4, 9, 4)),
             Column::Dictionary(DictionaryColumn::new(
                 vec![],
@@ -3567,6 +3800,45 @@ mod tests {
         let batch = ChunkedBatch {
             schema: Schema::new(vec![field.clone()]),
             chunks: vec![chunk(vec![-13, 0]), chunk(vec![79])],
+        };
+        let bytes = encode_chunked(&batch, &EncodeOptions::default()).unwrap();
+        let decoded = decode_all_bytes(&bytes, &DecodeOptions::default()).unwrap();
+        assert_eq!(decoded.num_chunks(), 2);
+        for (sent, got) in batch.chunks.iter().zip(&decoded.chunks) {
+            assert_batches_eq(sent, got);
+        }
+    }
+
+    #[test]
+    fn encode_chunked_roundtrips_wide_int_blocks() {
+        // Wide-int blocks stay separate chunks, never concatenated. Each 16-byte
+        // row is written verbatim; block A carries a value and -1 (all 0xFF),
+        // block B a single value.
+        let field = Field {
+            name: "w".into(),
+            ch_type: ChType::Int128,
+        };
+        let chunk = |rows: Vec<[u8; 16]>| {
+            let mut data = Vec::with_capacity(rows.len() * 16);
+            for r in &rows {
+                data.extend_from_slice(r);
+            }
+            std::sync::Arc::new(ColBatch::new(
+                Schema::new(vec![field.clone()]),
+                vec![Column::Int128(FixedBinaryColumn::new(data, 16))],
+                rows.len(),
+            ))
+        };
+        let mut thirteen = [0u8; 16];
+        thirteen[0] = 13;
+        let mut seventy_nine = [0u8; 16];
+        seventy_nine[0] = 79;
+        let batch = ChunkedBatch {
+            schema: Schema::new(vec![field.clone()]),
+            chunks: vec![
+                chunk(vec![thirteen, [0xFFu8; 16]]),
+                chunk(vec![seventy_nine]),
+            ],
         };
         let bytes = encode_chunked(&batch, &EncodeOptions::default()).unwrap();
         let decoded = decode_all_bytes(&bytes, &DecodeOptions::default()).unwrap();
@@ -4265,6 +4537,62 @@ mod tests {
     }
 
     #[test]
+    fn rev0_frames_int128_bytes() {
+        // Pin the wide-int body framing: 16 raw bytes per row, passthrough in
+        // wire (little-endian) order, no reordering and no per-row framing. One
+        // Int128 column "w", single row with 16 distinct bytes so any byte
+        // shuffle or byteswap on encode would break the exact comparison.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "w".into(),
+                ch_type: ChType::Int128,
+            }]),
+            vec![Column::Int128(fixed_binary_column(
+                16,
+                &[b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10"],
+            ))],
+            1,
+        );
+        let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+        let expected = [
+            0x01, // num_cols = 1
+            0x01, // num_rows = 1
+            0x01, b'w', // name "w"
+            0x06, b'I', b'n', b't', b'1', b'2', b'8', // type "Int128"
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // 16 raw bytes,
+            0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, // buffer order
+        ];
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn rev0_frames_uint256_bytes() {
+        // Pin the 32-byte wide-int body framing. One UInt256 column "w", single
+        // row whose only set byte is the most-significant (b[31] = 0x80 = 2^255):
+        // it must land at the END of the 32-byte run, proving little-endian
+        // passthrough and that the unsigned high bit is not treated as a sign.
+        let mut value = [0u8; 32];
+        value[31] = 0x80;
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "w".into(),
+                ch_type: ChType::UInt256,
+            }]),
+            vec![Column::UInt256(fixed_binary_column(32, &[&value]))],
+            1,
+        );
+        let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+        let mut expected = vec![
+            0x01, // num_cols = 1
+            0x01, // num_rows = 1
+            0x01, b'w', // name "w"
+            0x07, b'U', b'I', b'n', b't', b'2', b'5', b'6', // type "UInt256"
+        ];
+        expected.extend_from_slice(&value); // 31 zero bytes then 0x80
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
     fn rev0_frames_low_cardinality_string_bytes() {
         // Pin the LowCardinality body framing at rev 0. The server-confirmed
         // Native index word sets both HasAdditionalKeysBit and
@@ -4645,6 +4973,62 @@ mod tests {
             ))],
             num_rows: 1,
         };
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wide_int_width_mismatch_is_rejected() {
+        // Int128 is 16 bytes per row, so a width-32 buffer misframes the body
+        // under the truthful type string.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "w".into(),
+                ch_type: ChType::Int128,
+            }]),
+            vec![Column::Int128(FixedBinaryColumn::new(vec![0u8; 32], 32))],
+            1,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wide_int_ragged_data_is_rejected() {
+        // A wide-int buffer whose byte count is not exactly width * num_rows
+        // reports the right row count via truncating division but would put too
+        // many bytes on the wire.
+        let batch = ColBatch {
+            schema: Schema::new(vec![Field {
+                name: "w".into(),
+                ch_type: ChType::UInt256,
+            }]),
+            columns: vec![Column::UInt256(FixedBinaryColumn::new(vec![0u8; 40], 32))],
+            num_rows: 1,
+        };
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wide_int_signedness_variant_mismatch_is_rejected() {
+        // An Int128 type over a UInt128 buffer is a mismatched column variant:
+        // the four wide-int types map 1:1 to their Column variants, so this is
+        // caught before any bytes are written even though both are width 16.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "w".into(),
+                ch_type: ChType::Int128,
+            }]),
+            vec![Column::UInt128(FixedBinaryColumn::new(vec![0u8; 16], 16))],
+            1,
+        );
         match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
             EncodeError::InconsistentBatch { .. } => {}
             other => panic!("expected InconsistentBatch, got {other:?}"),

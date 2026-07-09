@@ -17,8 +17,18 @@ pub enum ChType {
     Float32,
     Float64,
 
-    // Extended numerics (Phase 6)
-    // Int128, UInt128, Int256, UInt256,
+    // Wide integers. Each is a raw contiguous little-endian two's-complement
+    // (signed) or unsigned fixed-width integer on the wire, 16 bytes for the
+    // 128-bit pair and 32 bytes for the 256-bit pair, the same host-agnostic
+    // passthrough as `Decimal` minus the precision/scale metadata. The core has
+    // no native `i128`/`i256` and needs none: the bytes are stored verbatim and
+    // signedness lives only in the type name (the four variants), which the
+    // binding reads to recover the host value. `SerializationNumber<T>` on the
+    // wire, byte-identical to a `Decimal128`/`Decimal256` integer body.
+    Int128,
+    UInt128,
+    Int256,
+    UInt256,
 
     // Strings
     String,
@@ -138,6 +148,10 @@ impl std::fmt::Display for ChType {
             ChType::UInt64 => write!(f, "UInt64"),
             ChType::Float32 => write!(f, "Float32"),
             ChType::Float64 => write!(f, "Float64"),
+            ChType::Int128 => write!(f, "Int128"),
+            ChType::UInt128 => write!(f, "UInt128"),
+            ChType::Int256 => write!(f, "Int256"),
+            ChType::UInt256 => write!(f, "UInt256"),
             ChType::String => write!(f, "String"),
             ChType::FixedString(n) => write!(f, "FixedString({n})"),
             ChType::Uuid => write!(f, "UUID"),

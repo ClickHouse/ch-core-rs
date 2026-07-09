@@ -266,6 +266,17 @@ fn arrow_format(ch_type: &ChType) -> String {
                 format!("d:{precision},{scale},{bits}")
             }
         }
+        // Wide integers export as Arrow FixedSizeBinary: `w:16` for the 128-bit
+        // pair, `w:32` for the 256-bit pair, zero-copy over the verbatim
+        // little-endian bytes. NOT the decimal format `d:P,0,bits`: Arrow caps
+        // decimal128 at precision 38 and decimal256 at 76, which cannot represent
+        // the full 128/256-bit range (2^127-1 is 39 digits), and decimal is
+        // signed so an unsigned high-bit value would read as negative.
+        // FixedSizeBinary is opaque bytes and universally supported; the binding
+        // recovers the integer (and its signedness) from the ChType/type name,
+        // exactly as it separates UUID from IPv6, both `w:16`.
+        ChType::Int128 | ChType::UInt128 => "w:16".into(),
+        ChType::Int256 | ChType::UInt256 => "w:32".into(),
         ChType::Nullable(inner) => arrow_format(inner),
         // A dictionary array's top-level format is the INDEX type. The value
         // type lives in the schema's `dictionary` child. Index width is
@@ -582,7 +593,16 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
         // values), exactly like Int8/Int16.
         Column::Enum8(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
         Column::Enum16(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
-        Column::Ipv6(c) | Column::Uuid(c) => {
+        // UUID, IPv6, and the wide integers are all width-16/32 fixed-binary
+        // buffers exported as 2 buffers (validity, then the contiguous rows),
+        // zero-copy. The Arrow format string (`w:16`/`w:32`) is chosen by
+        // `arrow_format` from the ChType; the buffers are identical here.
+        Column::Ipv6(c)
+        | Column::Uuid(c)
+        | Column::Int128(c)
+        | Column::UInt128(c)
+        | Column::Int256(c)
+        | Column::UInt256(c) => {
             match &c.validity {
                 Some(bm) => buffers.push(bm.as_bytes().as_ptr() as *const c_void),
                 None => buffers.push(ptr::null()),

@@ -261,6 +261,10 @@ than an error.
 | `Enum8(...)`      | `Enum8 { variants }`  | `Enum8`      | `c`          | validity, values            | yes      |
 | `Enum16(...)`     | `Enum16 { variants }` | `Enum16`     | `s`          | validity, values            | yes      |
 | `Decimal(P, S)`   | `Decimal { precision, scale, bits }` | `Decimal` | `d:P,S` (128-bit) or `d:P,S,bits` (32/64/256-bit) | validity, data | yes |
+| `Int128`          | `Int128`         | `Int128`          | `w:16`       | validity, data              | yes      |
+| `UInt128`         | `UInt128`        | `UInt128`         | `w:16`       | validity, data              | yes      |
+| `Int256`          | `Int256`         | `Int256`          | `w:32`       | validity, data              | yes      |
+| `UInt256`         | `UInt256`        | `UInt256`         | `w:32`       | validity, data              | yes      |
 | `Date`            | `Date`           | `Date`            | `S`          | validity, values            | yes      |
 | `Date32`          | `Date32`         | `Date32`          | `tdD`        | validity, values            | yes      |
 | `DateTime`, `DateTime('<tz>')` | `DateTime { timezone }` | `DateTime` | `I` | validity, values         | yes      |
@@ -657,6 +661,80 @@ type string and the precision-to-width mapping), in `src/DataTypes/`.
 `deserializeBinaryBulkStatePrefix` reads zero bytes and the custom-serialization
 marker is 0x00. Confirmed at `v26.6.1.1193-stable`.
 
+### Int128 / UInt128 / Int256 / UInt256
+
+**Type string(s):** `Int128`, `UInt128`, `Int256`, and `UInt256`, the exact
+case-sensitive spellings the server emits via `DataTypeNumber<T>::doGetName`. No
+parameters, no aliases; `parse_ch_type` matches only these.
+
+**Logical type:** `ChType::Int128`, `ChType::UInt128`, `ChType::Int256`, and
+`ChType::UInt256`.
+
+**Wire payload:** `num_rows * width` bytes, contiguous, no per-row framing, where
+`width` is 16 for the 128-bit pair and 32 for the 256-bit pair. Each row is one
+fixed-width integer in straight little-endian byte order: two's-complement signed
+for `Int128`/`Int256`, unsigned for `UInt128`/`UInt256`. Byte 0 is the
+least-significant byte and the last byte is the most-significant (the sign byte
+for the signed types). This is BYTE-IDENTICAL to how `Decimal128`/`Decimal256`
+serialize their underlying integer, which the crate already treats as a raw
+little-endian passthrough. The per-column bulk-state prefix reads zero bytes and
+the custom-serialization marker is 0x00, same as a plain numeric. These are legal
+`LowCardinality` inners (see the `LowCardinality(T)` section) and legal
+`Nullable` inners.
+
+**Arrow export:** Arrow FixedSizeBinary, `w:16` for `Int128`/`UInt128` and `w:32`
+for `Int256`/`UInt256`. 2 buffers in order: validity, then the contiguous data
+buffer, zero-copy. There is no offsets buffer; row `i` is
+`data[i * width .. (i + 1) * width]`. This is NOT the Arrow decimal format
+`d:P,0,bits`: Arrow caps `decimal128` at precision 38 and `decimal256` at 76,
+neither of which can represent the full 128/256-bit range (`2^127 - 1` is 39
+digits), and Arrow decimal is signed so an unsigned high-bit value would read as
+negative. FixedSizeBinary is opaque bytes, universally supported, and a
+zero-copy handoff of the decoded `Vec<u8>`; the `Arc<ColBatch>` keeps it alive.
+No endianness handling happens in the export (the bytes are opaque). Signedness
+and integer-vs-blob are NOT carried by the format string: `w:16` is shared by
+`Int128`/`UInt128`/`UUID`/`IPv6` and `w:32` by `Int256`/`UInt256`. That matches
+the existing contract; the binding disambiguates via the `ChType`/type-name
+channel, exactly as it already separates `UUID` from `IPv6`.
+
+**Rust buffer:** `Column::Int128`, `Column::UInt128`, `Column::Int256`, and
+`Column::UInt256`, each a `FixedBinaryColumn`
+(`{ data: Vec<u8>, width: usize, validity: Option<Bitmap> }`) with `width` 16 or
+32. Four distinct `Column` variants back the shared physical shape, mirroring the
+UUID/IPv6 precedent (both width-16 `FixedBinaryColumn`s under distinct variants).
+`data` is the wire bytes verbatim.
+
+**Notes:**
+
+- **Decode is a host-agnostic raw passthrough.** The fixed-width bytes are stored
+  unchanged, with no reinterpretation into a native integer, so the buffer stays
+  correct on big-endian hosts and the core needs no native `i128`/`i256`. This is
+  deliberately the `Decimal` path, NOT the `decode_primitive!` numeric path
+  (which byte-swaps into a native `Vec<T>` on big-endian hosts); wide ints are
+  never byte-swapped on decode.
+- **Binding recovery.** Read the `width` bytes of a row as a LITTLE-ENDIAN integer
+  of that width. Signedness comes from the ClickHouse type name (the `ChType`
+  variant), not from the Arrow format string: `Int128`/`Int256` are
+  two's-complement signed, `UInt128`/`UInt256` are unsigned. There is no scale,
+  unlike `Decimal`. The host representation (a Python `int`, a JS `BigInt`, and so
+  on) is a binding concern.
+- **Sign / high bit.** A signed `-1` is all-`0xFF` bytes of the width. An unsigned
+  value with the top bit set (for example `2^127` for `UInt128`) is a positive
+  value with its most-significant byte's high bit set, never a negative.
+
+**Introduction version:** undetermined at this pin (the local shallow
+`.server-src` checkout's `CHANGELOG.md` only reaches 26.1 and the git history is
+shallow); not guessed from memory. Stable at `v26.6.1.1193-stable`.
+
+**Server reference:** `SerializationNumber<T>::serializeBinaryBulk` /
+`deserializeBinaryBulk` in
+`src/DataTypes/Serializations/SerializationNumber.cpp` (the same template as
+`Int8`..`Int64`), over `DataTypeNumber<T>` in `src/DataTypes/DataTypesNumber.cpp`;
+the underlying `wide::integer` stores `items[0]` as the least-significant 64-bit
+limb, so the on-wire blob is canonical little-endian on little-endian server
+builds. `canBeInsideLowCardinality()` is final-true on `DataTypeNumberBase`.
+Confirmed at `v26.6.1.1193-stable`.
+
 ### Temporal types
 
 This covers `Date`, `Date32`, `DateTime`, and `DateTime64`. All four are plain
@@ -789,12 +867,13 @@ rejects any other inner as `UnsupportedType`.
 
 **Allowed inner types (after `removeNullable`):** `String`, `FixedString(N)`,
 the fixed-width numerics (`Int8`/`Int16`/`Int32`/`Int64`,
-`UInt8`/`UInt16`/`UInt32`/`UInt64`, `Float32`/`Float64`), `Bool`, the
-number-backed temporals `Date`, `Date32`, and `DateTime`, and `UUID`/`IPv4`/`IPv6`.
-The dictionary values are that inner type serialized as a plain column body
-(varint-length strings for `String`, raw fixed-width bytes otherwise: 4 bytes per
-`IPv4` entry, 16 bytes per `UUID`/`IPv6` entry), so support follows directly from
-the per-type body decoder.
+`UInt8`/`UInt16`/`UInt32`/`UInt64`, `Float32`/`Float64`), the wide integers
+(`Int128`/`UInt128`/`Int256`/`UInt256`), `Bool`, the number-backed temporals
+`Date`, `Date32`, and `DateTime`, and `UUID`/`IPv4`/`IPv6`. The dictionary values
+are that inner type serialized as a plain column body (varint-length strings for
+`String`, raw fixed-width bytes otherwise: 4 bytes per `IPv4` entry, 16 bytes per
+`UUID`/`IPv6`/`Int128`/`UInt128` entry, 32 bytes per `Int256`/`UInt256` entry), so
+support follows directly from the per-type body decoder.
 
 This allowlist is exactly `IDataType::canBeInsideLowCardinality()` intersected
 with the types this crate decodes, confirmed against the server source at
@@ -815,6 +894,13 @@ with the types this crate decodes, confirmed against the server source at
   by this crate, so a `LowCardinality` over them decodes through the dictionary
   path: a `UUID`/`IPv6` dictionary value column is a `FixedBinary` of width 16 and
   an `IPv4` dictionary value column is a `UInt32`-backed column.
+- The wide integers (`Int128`/`UInt128`/`Int256`/`UInt256`) **are** permitted,
+  unlike `Decimal`/`Enum`: they are `DataTypeNumberBase` subclasses whose
+  `canBeInsideLowCardinality()` is final-true (the server ships tests
+  `02125_low_cardinality_int256` and `02459_low_cardinality_uint128_aggregator`).
+  A `LowCardinality` over them decodes through the dictionary path with a
+  width-16/32 `FixedBinary`-backed dictionary value column
+  (`Int128`/`UInt128`/`Int256`/`UInt256`).
 
 The fixed-width numeric and temporal inners, and `IPv4`/`IPv6`, require the server
 setting `allow_suspicious_low_cardinality_types=1` at table-creation time. That is
@@ -1287,7 +1373,10 @@ one-type-at-a-time way; as of `Map(K, V)` landing, the two are at parity.
 Encodable today: `Bool`, the fixed-width numerics (`Int8`..`Int64`,
 `UInt8`..`UInt64`, `Float32`, `Float64`), the temporals (`Date`, `Date32`,
 `DateTime`, `DateTime64`), `UUID`, `IPv4`, `IPv6`, `String`, `FixedString(N)`,
-`Enum8`/`Enum16`, `Decimal(P, S)`, `LowCardinality(T)` for the same allowed
+`Enum8`/`Enum16`, `Decimal(P, S)`, the wide integers
+(`Int128`/`UInt128`/`Int256`/`UInt256`, a verbatim fixed-width body byte-identical
+to a `Decimal128`/`256` body, the exact inverse of the decode passthrough),
+`LowCardinality(T)` for the same allowed
 inner types decode accepts, `Array(T)` over any encodable element type
 (including a `Nullable`, `LowCardinality`, or nested `Array` element),
 `Tuple(T1, ...)` over encodable element types (named or unnamed, the
@@ -1364,11 +1453,14 @@ would never produce.
   non-`Nullable` inner) must have `null_count() == 0`. Encode writes no null map
   for a non-nullable column, so a null bit there would silently encode that row's
   placeholder value as a real value.
-- **Fixed-width bodies.** For `FixedString(N)`, `UUID`, and `IPv6`, the stored
+- **Fixed-width bodies.** For `FixedString(N)`, `UUID`, `IPv6`, and the wide
+  integers (`Int128`/`UInt128` width 16, `Int256`/`UInt256` width 32), the stored
   buffer width must equal the declared or implied width and the data length must
   be exactly `width * num_rows`. `FixedBinaryColumn::len()` truncates, so a
   misframed buffer would otherwise pass the row-count check and put a different
-  number of bytes on the wire.
+  number of bytes on the wire. The four wide-int types map 1:1 to their `Column`
+  variants, so an `Int128` type over a `UInt128` buffer (both width 16) is a
+  mismatched-variant `InconsistentBatch`, caught before any bytes are written.
 - **Decimal.** `scale <= precision`, `precision` in `1..=76`, the column's
   `precision`/`scale`/`width` agree with the type, and the width is derived from
   precision (not trusted from `ChType`'s `bits`), with data length exactly
@@ -1549,13 +1641,12 @@ Not yet supported, tracked as planned phases in `src/schema.rs`:
 
 - `LowCardinality(T)` for an inner type outside the allowlist in the
   `LowCardinality(T)` section. The wrapper and its allowed inners (String,
-  FixedString, the fixed-width numerics, Bool, Date, Date32, DateTime,
-  UUID/IPv4/IPv6, with or without an inner `Nullable`) are supported; any other
-  inner is rejected as `UnsupportedType`. This includes `DateTime64`, every
-  `Decimal`, and `Enum8`/`Enum16`, all of which the server itself forbids as LC
-  inners (`canBeInsideLowCardinality()` is false), so they never appear in that
+  FixedString, the fixed-width numerics, the wide integers, Bool, Date, Date32,
+  DateTime, UUID/IPv4/IPv6, with or without an inner `Nullable`) are supported;
+  any other inner is rejected as `UnsupportedType`. This includes `DateTime64`,
+  every `Decimal`, and `Enum8`/`Enum16`, all of which the server itself forbids as
+  LC inners (`canBeInsideLowCardinality()` is false), so they never appear in that
   position on the wire.
-- Wide integers: `Int128`, `UInt128`, `Int256`, `UInt256`.
 
 The containers `Array(T)`, `Tuple(T1, ...)`, and `Map(K, V)` are all fully
 supported, decode and encode (see their type sections and the "Encoding"

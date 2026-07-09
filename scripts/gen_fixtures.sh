@@ -221,7 +221,31 @@ SELECT
     -- Map(String, Int32) with EVERY row empty: the offsets are still written
     -- (all zeros), and the key/value runs are entirely absent (limit == 0
     -- passes to the nested tuple).
-    CAST(map(), 'Map(String, Int32)') AS m_empty
+    CAST(map(), 'Map(String, Int32)') AS m_empty,
+    -- Wide integers: Int128/UInt128/Int256/UInt256 are raw contiguous
+    -- little-endian fixed-width integers (16 bytes for the 128-bit pair, 32 for
+    -- the 256-bit pair), the same SerializationNumber template as Int8..Int64,
+    -- byte-identical to a Decimal128/256 integer body. Signed rows include -1
+    -- (all 0xFF two's-complement) and the type MAX; unsigned rows include a
+    -- high-bit-set value (2^(width-1)) that must stay positive, and the type MAX.
+    -- i128 rows: -1, 0, 79, 2^127-1.
+    CAST(multiIf(n = 0, '-1', n = 1, '0', n = 2, '79', '170141183460469231731687303715884105727'), 'Int128') AS i128,
+    -- u128 rows: 0, 13, 2^127, 2^128-1.
+    CAST(multiIf(n = 0, '0', n = 1, '13', n = 2, '170141183460469231731687303715884105728', '340282366920938463463374607431768211455'), 'UInt128') AS u128,
+    -- i256 rows: -1, 0, 79, 2^255-1.
+    CAST(multiIf(n = 0, '-1', n = 1, '0', n = 2, '79', '57896044618658097711785492504343953926634992332820282019728792003956564819967'), 'Int256') AS i256,
+    -- u256 rows: 0, 13, 2^255, 2^256-1.
+    CAST(multiIf(n = 0, '0', n = 1, '13', n = 2, '57896044618658097711785492504343953926634992332820282019728792003956564819968', '115792089237316195423570985008687907853269984665640564039457584007913129639935'), 'UInt256') AS u256,
+    -- Nullable(Int128): rows 1 and 3 NULL, rows 0 and 2 real (13, -1). The
+    -- Nullable null map precedes the 16-byte body; null rows carry the server's
+    -- placeholder (0).
+    CAST(multiIf(n = 1, NULL, n = 3, NULL, n = 0, '13', '-1'), 'Nullable(Int128)') AS ni128,
+    -- LowCardinality(Int256): a wide-int LC inner (canBeInsideLowCardinality is
+    -- true), gated at creation by allow_suspicious_low_cardinality_types (set in
+    -- SETTINGS below; no wire effect). Values repeat (13, 79, 13, 258) so the
+    -- per-block dictionary is smaller than the row count. The dictionary body is
+    -- the plain 32-byte-per-entry Int256 run.
+    CAST(multiIf(n = 0, '13', n = 1, '79', n = 2, '13', '258'), 'LowCardinality(Int256)') AS lc_i256
 FROM numbers(4)
 SETTINGS allow_suspicious_low_cardinality_types = 1, enable_nullable_tuple_type = 1
 FORMAT Native

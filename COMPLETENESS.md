@@ -47,24 +47,36 @@ point-in-time snapshot for the next agent, not a changelog. Keep it short. Alway
 include a "Recommended next" with a one-line reason, so the next agent has a
 default; the user may override it.
 
-- **Last updated:** 2026-07-08 (**`Tuple(T1, ...)` and `Map(K, V)` decode AND
-  encode** landed together, keeping full encode/decode parity. Tuple is the
-  first multi-child container: elements serialize sequentially in declaration
-  order with no interleaving or framing of their own, the state prefix recurses
-  per element, `Nullable(Tuple)` is legal on the wire and supported, and a
-  zero-element `Tuple()` writes one literal 0x30 byte per row. Map on the
-  Native wire is always the plain `Array(Tuple(keys, values))` layout
-  (cumulative UInt64 offsets, then the flattened key run, then the value run);
-  the server's new bucketed WITH_BUCKETS MergeTree mode never reaches the
-  wire in either direction. Adversarial review (rust-reviewer + codex) passed
-  after three fixes: any-case `null` tuple-element names now back-quote like
-  the server, encode rejects server-unconstructible tuple names, and encode
-  rejects a Map entries tuple carrying a validity bitmap. Live INSERT and
-  recaptured fixtures green against 26.6.1.1193.)
-- **Active track:** containers are done through `Map`; the next growth is
-  Tier 2, starting with the wide integers (`Int128`/`UInt128`/`Int256`/
-  `UInt256`), with `Nested(...)` and the geo aliases now cheap follow-ons on
-  top of `Array` + `Tuple`. See "Type coverage".
+- **Last updated:** 2026-07-09 (**wide integers `Int128`/`UInt128`/`Int256`/
+  `UInt256` decode AND encode** landed together, opening Tier 2 and keeping full
+  encode/decode parity. All four go through the server's generic
+  `SerializationNumber<T>`: a raw contiguous fixed-width dump, 16 bytes
+  (128-bit) / 32 bytes (256-bit), straight little-endian two's-complement,
+  byte-identical to the integer body under `Decimal128`/`Decimal256`. Decode is
+  a host-agnostic verbatim byte passthrough (the `Decimal`/`FixedBinary` path,
+  NOT the `decode_primitive!` host-byteswap path), so no native `i128`/`i256`
+  is used and the buffer stays correct on big-endian hosts. Unlike `Decimal`
+  and `Enum`, all four are legal `Nullable` AND `LowCardinality` inners
+  (`DataTypeNumberBase::canBeInsideLowCardinality()` is final/true), so they
+  were added to the `is_low_cardinality_inner` allowlist. Arrow export is
+  FixedSizeBinary `w:16`/`w:32` (never decimal: Arrow's precision-38/76 caps
+  cannot hold the full 128/256-bit range and would misread unsigned high-bit
+  values as negative); signedness rides the `ChType`/type-name channel, not the
+  Arrow format string (`w:16` is shared with `UUID`/`IPv6`). Adversarial review
+  (rust-reviewer + codex) found no correctness defects; two minor polish items
+  applied after (type-neutral fixed-width overflow message; `Array(Int128)` +
+  `Map(String, Int256)` container-element round-trips). Live INSERT and
+  recaptured fixtures green against 26.6.1.1193, including `lc_i256
+  LowCardinality(Int256)`.)
+- **Active track:** Tier 1 plus the wide integers are done; the rest of Tier 2
+  is the current growth, all cheap and needing no new framing: the
+  simple-integer-backed temporals `Time` (Int32) / `Time64(P)` (DateTime64
+  layout) and the 11 `Interval*` kinds (Int64), then `BFloat16` (2-byte),
+  `Nothing` (zero-width edge), `SimpleAggregateFunction` (parse-only, decodes as
+  the inner `T`), `Nested(...)` (sugar over the done `Array(Tuple(...))`), and
+  the geo aliases (`Point` = `Tuple(Float64, Float64)`, etc.). Tier 3
+  (`Variant`/`Dynamic`/`JSON` and the `Geometry`/`QBit` dependents) is the hard,
+  version-sensitive endgame. See "Type coverage".
 - **Pinned server tag (`.server-ref`):** v26.6.1.1193-stable, protocol revision
   **54485**. The crate, the committed fixtures, and the `CODEC_CONTRACT.md`
   citations are all aligned to this pin. The local `.server-src` checkout and the
@@ -74,53 +86,50 @@ default; the user may override it.
   HTTP `FORMAT Native` does not enable native block-frame compression by default.
   The LZ4/NONE + CityHash128 compressed-block framing in `src/compression/` is
   built and tested but intentionally **unwired** (no caller). See "Out of scope".
-- **Last completed:** **`Tuple(T1, ...)` + `Map(K, V)` decode and encode**
-  (`src/schema.rs`, `src/column.rs`, `src/native/decode.rs`,
+- **Last completed:** **wide integers `Int128`/`UInt128`/`Int256`/`UInt256`
+  decode and encode** (`src/schema.rs`, `src/column.rs`, `src/native/decode.rs`,
   `src/native/encode.rs`, `src/ffi.rs`, plus fixture/integration/live-insert
-  coverage). `ChType::Tuple(Vec<(Option<String>, ChType)>)` and
-  `ChType::Map(Box<ChType>, Box<ChType>)`; `TupleColumn { fields, len,
-  validity }` and `MapColumn { offsets, entries }` (entries is always a
-  two-field Tuple column, never with its own validity). The prefix/values
-  split carries both: `read_state_prefix`/`write_state_prefix` recurse per
-  tuple element and Map key-then-value, so a `LowCardinality` leaf's 8-byte
-  key version hoists to the very front of the column, before any offsets.
-  `decode_map` reuses `read_array_offsets` and drives the flattened key and
-  value runs off the same entry count, so the entries tuple cannot decode
-  ragged. Arrow export: Tuple = `+s` struct (children named after elements,
-  1-based "1", "2", ... when unnamed); Map = `+L` LargeList with a
-  non-nullable `entries: +s {key, value}` child (never `+m`, whose i32
-  offsets would force a copy; never ARROW_FLAG_MAP_KEYS_SORTED). The
-  type-string parser handles back-quoted element names with the server's full
-  escape table (accepts doubled-backtick AND backslash forms); `Display`
-  renders only the server's backslash convention, including quoting any-case
-  `null`. Decode stays lenient on names the server would reject at creation;
-  encode mirrors `checkTupleNames` (empty / lowercase `null` / duplicate /
-  mixed names -> `UnsupportedType`) and rejects entries validity
-  (`InconsistentBatch`).
-- **Build/test status:** Tree builds clean; `cargo test` green (359 unit + 3
-  integration, ignored tests skipped); clippy clean
-  (`cargo clippy --all-targets -- -D warnings`); fmt clean. The live INSERT
-  tests in `tests/live_insert.rs` are `#[ignore]` and server-gated; the sample
-  batch now also covers `tup Tuple(Int32, String)`, `tup_named`, `ntup
-  Nullable(Tuple(...))` (created with `enable_nullable_tuple_type=1`),
-  `arr_tup`, and the Map shapes `m`, `m_lc`, `m_nv`, `m_arr`, `arr_m`, and an
-  all-empty `m_empty`, and **runs green** against the local 26.6.1.1193
-  ClickHouse server. Tuple/Map decode is additionally covered by the same
-  columns in the committed `all_types` fixtures (rev 0 and rev 54485),
-  recaptured from that server and asserted in `tests/integration.rs`. Note:
-  in this environment `localhost` is proxy-intercepted; capture scripts and
-  live tests run against `127.0.0.1` with `no_proxy` set.
-- **Recommended next:** **wide integers `Int128`/`UInt128`/`Int256`/`UInt256`**
-  (Tier 2's first entry): 16/32-byte little-endian passthrough columns, the
-  same host-agnostic buffer shape as `Decimal`, so they are the cheapest
-  remaining coverage win and need no new framing concepts. After that,
-  `Nested(...)` (sugar over `Array(Tuple(...))`; first confirm via the
-  server-reader whether the server ever emits the `Nested` type string in a
-  Native header or always the expanded form) and the geo aliases (`Point` =
-  `Tuple(Float64, Float64)` etc.) are now cheap on top of `Array` + `Tuple`.
-  Per the standing policy, land each new type's encode in the same change.
-  Sink-based encode and the (still unwired) compression framing remain the
-  other standing backlog items.
+  coverage). Four distinct `ChType` variants and four distinct `Column`
+  variants, each backed by the existing `FixedBinaryColumn`
+  (`{ data: Vec<u8>, width, validity }`, width 16 or 32), mirroring the
+  UUID/IPv6-over-shared-fixed-binary precedent so `column_variant_matches`
+  catches an `Int128`-typed `UInt128` buffer (or a `UUID`/`IPv6`, all `w:16`).
+  `parse_ch_type` matches the four exact case-sensitive spellings (no params, no
+  aliases). Decode reuses `decode_fixed_binary_data` (raw `to_vec`, no
+  reinterpretation, `num_rows.checked_mul(width)` bounds the body); encode
+  reuses `encode_fixed_binary_data` (`extend_from_slice`); `validate_column`
+  rejects a width mismatch or a `data.len() != width * num_rows` body via
+  `checked_mul` before any bytes are written. `Nullable` composes via the
+  null-map wrapper and `LowCardinality` via the existing dictionary/index path
+  (both verified end to end, including a zero-length LC run).
+- **Build/test status:** Tree builds clean; `cargo test` green (386 unit + 3
+  integration, live-insert + doctest ignored); clippy clean
+  (`cargo clippy --all-targets -- -D warnings`); fmt clean. `all_types` now has
+  60 columns: the wide ints are covered by `i128`/`u128`/`i256`/`u256`, a
+  `ni128 Nullable(Int128)`, and `lc_i256 LowCardinality(Int256)` in the
+  committed fixtures (rev 0 and rev 54485, recaptured from the local 26.6.1.1193
+  server) and asserted in `tests/integration.rs`, plus the same columns in
+  `tests/live_insert.rs` (the `LowCardinality(Int256)` DDL uses
+  `allow_suspicious_low_cardinality_types=1`, a CREATE-time-only guard that does
+  not gate the wire). Encode is additionally covered by round-trip unit tests
+  (rev 0 and rev 54485), exact-byte framing pins, and the `Array(Int128)` /
+  `Map(String, Int256)` container round-trips. The `#[ignore]` live INSERT tests
+  run green against the local 26.6.1.1193 server. Note: in this environment
+  `localhost` is proxy-intercepted; capture scripts and live tests run against
+  `127.0.0.1` with `no_proxy` set.
+- **Recommended next:** continue the Tier 2 batch with the simple-integer-backed
+  temporals **`Time` + `Time64(P)`**: `Time` is a 4-byte LE `Int32` of seconds
+  (can be negative, no timezone), `Time64(P)` an 8-byte LE `Int64` wire-identical
+  to `DateTime64`, so both reuse the existing primitive/temporal machinery with
+  no new Column or Arrow concept (layouts already recorded in "Type coverage").
+  Then the 11 `Interval*` kinds (Int64), then `BFloat16`, `Nothing`, and
+  `SimpleAggregateFunction`. `Nested(...)` (first confirm via the server-reader
+  whether the server ever emits the `Nested` type string in a Native header or
+  always the expanded `Array(Tuple(...))`) and the geo aliases (`Point` =
+  `Tuple(Float64, Float64)` etc.) are cheap follow-ons on top of `Array` +
+  `Tuple`. Per the standing policy, land each new type's encode in the same
+  change. Sink-based encode and the (still unwired) compression framing remain
+  the other standing backlog items.
 - **Active gotchas / context:**
   - A zero-length `LowCardinality` run (reachable when rows > 0 but every
     array or map is empty) has NO body bytes at all:
@@ -199,6 +208,22 @@ default; the user may override it.
     The crate decodes `Enum8`/`Enum16` as ordinary columns but `is_low_cardinality_inner`
     still rejects them, so a (never-emitted) `LowCardinality(Enum...)` surfaces as
     `UnsupportedType`. Do not add `Enum` to the LC allowlist.
+  - Wide integers (`Int128`/`UInt128`/`Int256`/`UInt256`) ARE legal
+    `LowCardinality` and `Nullable` inners, in contrast to
+    `Decimal`/`Enum`/`DateTime64` above: they are numerics, and
+    `DataTypeNumberBase::canBeInsideLowCardinality()` is final/true, so
+    `LowCardinality(Int128)` etc. appear on the wire and are IN the
+    `is_low_cardinality_inner` allowlist (server tests `02125_low_cardinality_int256`
+    and `02459_low_cardinality_uint128_aggregator` corroborate). They decode as a
+    host-agnostic verbatim little-endian passthrough (the `Decimal` path, NOT
+    `decode_primitive!`, so no host byteswap and no native `i128`/`i256`), export
+    as Arrow FixedSizeBinary `w:16`/`w:32`, and carry signedness only in the
+    `ChType`: the Arrow format string does not, and `w:16` is shared with
+    `UUID`/`IPv6`. A binding recovers the integer by reading the 16/32 bytes as a
+    little-endian value of that width, two's-complement signed for
+    `Int128`/`Int256`. `allow_suspicious_low_cardinality_types` is a CREATE-time
+    guard only and does not gate the wire. Introduction version undetermined from
+    the shallow pin.
   - V1 done (v26.6.1.1193-stable): the Tier lists are authoritative against
     `DataTypeFactory`. `Geometry` and `QBit(T, N)` are registered and GA in Tier 3;
     `QBit`'s `SerializationQBit` wire layout is still unexamined - read it via the
@@ -389,6 +414,22 @@ is not done, and must not be checked off, until all of these hold:
         and verified with the `m`/`m_lc`/`m_nv`/`m_arr`/`arr_m`/`m_empty`
         live-server fixture columns; encode runs green in the live INSERT
         test.
+- [x] `Int128`, `UInt128`, `Int256`, `UInt256` (decode and encode)
+      - Tier 2's first entry. Raw contiguous fixed-width `SerializationNumber<T>`
+        dump: 16 bytes (128-bit) / 32 bytes (256-bit), straight little-endian
+        two's-complement (signed for `Int128`/`Int256`, unsigned for
+        `UInt128`/`UInt256`), byte-identical to the integer body under
+        `Decimal128`/`Decimal256`. Decoded as a host-agnostic verbatim byte
+        passthrough into four distinct `Column` variants over the shared
+        `FixedBinaryColumn` (width 16 or 32); no native `i128`/`i256`. Legal
+        `Nullable` AND `LowCardinality` inners (added to the allowlist), unlike
+        `Decimal`/`Enum`. Exported as Arrow FixedSizeBinary `w:16`/`w:32`,
+        zero-copy; signedness rides the `ChType`/type-name channel, not the Arrow
+        format string. Type strings are the exact case-sensitive `Int128` etc.,
+        no params, no aliases. Confirmed against the server source
+        (`SerializationNumber`/`wide::integer`, v26.6.1.1193-stable) and verified
+        with the `i128`/`u128`/`i256`/`u256`/`ni128`/`lc_i256` live-server
+        fixture columns; encode runs green in the live INSERT test.
 
 ---
 
@@ -486,8 +527,13 @@ introduction), so record them per type only when determinable.
 
 ### Tier 2 - less common, still in scope
 
-- [ ] `Int128`, `UInt128`, `Int256`, `UInt256` - 16/32-byte little-endian
-      integers; decide host representation policy at the binding, not here.
+- [x] `Int128`, `UInt128`, `Int256`, `UInt256` - decode AND encode done.
+      16/32-byte little-endian `SerializationNumber<T>` dump (byte-identical to
+      the `Decimal128`/`Decimal256` integer body), host-agnostic verbatim
+      passthrough, legal `Nullable`/`LowCardinality` inners, Arrow FixedSizeBinary
+      `w:16`/`w:32`. Host representation is decided at the binding. See
+      "Implemented" and the `CODEC_CONTRACT.md` type section. Introduction version
+      undetermined from the shallow pin.
 - [ ] `Nested(...)` - sugar over `Array(Tuple(...))`; confirm whether the server
       ever emits the `Nested` type string on the wire or always the expanded
       form.

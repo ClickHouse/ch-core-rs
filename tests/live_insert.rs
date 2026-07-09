@@ -164,6 +164,12 @@ fn sample_batch() -> ColBatch {
                 bits: 256,
             },
         ),
+        ("i128", ChType::Int128),
+        ("u128", ChType::UInt128),
+        ("i256", ChType::Int256),
+        ("u256", ChType::UInt256),
+        ("ni128", ChType::Nullable(Box::new(ChType::Int128))),
+        ("lc_i256", ChType::LowCardinality(Box::new(ChType::Int256))),
         ("ni32", ChType::Nullable(Box::new(ChType::Int32))),
         ("ns", ChType::Nullable(Box::new(ChType::String))),
         ("nb", ChType::Nullable(Box::new(ChType::Bool))),
@@ -297,6 +303,35 @@ fn sample_batch() -> ColBatch {
     );
     ndec.validity = Some(validity());
 
+    // Wide integers: raw little-endian fixed-width bytes with sign/boundary
+    // coverage. Signed rows include the width MIN (MSB-only) and -1 (all 0xFF);
+    // unsigned rows include a high-bit-set value that must stay positive.
+    let w16 = |low: u8| {
+        let mut b = [0u8; 16];
+        b[0] = low;
+        b
+    };
+    let w32 = |low: u8| {
+        let mut b = [0u8; 32];
+        b[0] = low;
+        b
+    };
+    let mut i128_min = [0u8; 16];
+    i128_min[15] = 0x80;
+    let mut i128_max = [0xFFu8; 16];
+    i128_max[15] = 0x7F;
+    let mut u128_high = [0u8; 16];
+    u128_high[15] = 0x80;
+    let mut i256_min = [0u8; 32];
+    i256_min[31] = 0x80;
+    let mut i256_max = [0xFFu8; 32];
+    i256_max[31] = 0x7F;
+    let mut u256_high = [0u8; 32];
+    u256_high[31] = 0x80;
+    // Nullable(Int128): valid, null, valid, null. Null rows carry a placeholder.
+    let mut ni128 = fixed_binary_column(16, &[&w16(13), &[0u8; 16], &[0xFFu8; 16], &[0u8; 16]]);
+    ni128.validity = Some(validity());
+
     let columns = vec![
         Column::Int8(PrimitiveColumn::new(vec![i8::MIN, -13, 0, i8::MAX])),
         Column::Int16(PrimitiveColumn::new(vec![i16::MIN, -13, 0, i16::MAX])),
@@ -402,6 +437,34 @@ fn sample_batch() -> ColBatch {
             76,
             20,
             &[&dec256_neg, &dec256_zero, &dec256_pos, &dec256_one],
+        )),
+        // Wide integers: 16/32 raw bytes per row, verbatim little-endian
+        // passthrough. Distinct sign/boundary values per row so any reordering,
+        // byteswap, or sign misread would show up in the comparison.
+        Column::Int128(fixed_binary_column(
+            16,
+            &[&i128_min, &[0xFFu8; 16], &[0u8; 16], &i128_max],
+        )),
+        Column::UInt128(fixed_binary_column(
+            16,
+            &[&[0u8; 16], &w16(13), &u128_high, &[0xFFu8; 16]],
+        )),
+        Column::Int256(fixed_binary_column(
+            32,
+            &[&i256_min, &[0xFFu8; 32], &[0u8; 32], &i256_max],
+        )),
+        Column::UInt256(fixed_binary_column(
+            32,
+            &[&[0u8; 32], &w32(13), &u256_high, &[0xFFu8; 32]],
+        )),
+        Column::Int128(ni128),
+        // LowCardinality(Int256): slot 0 is the reserved default, real rows
+        // reference slots 1... The server reorders its own dictionary on
+        // readback, but `column_repr` resolves indices through the block-local
+        // dictionary, so the physical comparison stays stable.
+        Column::Dictionary(DictionaryColumn::new(
+            vec![1, 2, 1, 2],
+            Column::Int256(fixed_binary_column(32, &[&[0u8; 32], &w32(13), &w32(79)])),
         )),
         Column::Int32(PrimitiveColumn::new_nullable(
             vec![13, 0, 79, 0],
@@ -757,9 +820,17 @@ fn raw_column_repr(column: &Column) -> Vec<String> {
         // IPv4 is physically a u32; UUID and IPv6 are raw 16-byte rows, so
         // render the wire bytes verbatim (any reordering would show up here).
         Column::Ipv4(c) => c.values.iter().map(|v| v.to_string()).collect(),
-        Column::Uuid(c) | Column::Ipv6(c) | Column::FixedBinary(c) => {
-            (0..c.len()).map(|i| format!("{:?}", c.value(i))).collect()
-        }
+        // UUID, IPv6, the wide integers, and FixedString are all raw fixed-width
+        // rows; render the wire bytes verbatim (any reordering/byteswap shows up
+        // here). Signedness is type metadata, not per-row data, so the four
+        // wide-int variants render identically.
+        Column::Uuid(c)
+        | Column::Ipv6(c)
+        | Column::FixedBinary(c)
+        | Column::Int128(c)
+        | Column::UInt128(c)
+        | Column::Int256(c)
+        | Column::UInt256(c) => (0..c.len()).map(|i| format!("{:?}", c.value(i))).collect(),
         Column::Decimal(c) => (0..c.len()).map(|i| format!("{:?}", c.value(i))).collect(),
         Column::Dictionary(c) => {
             let values = raw_column_repr(c.values.as_ref());
@@ -859,6 +930,8 @@ fn insert_roundtrips_through_server() {
          e16 Enum16('off' = -1, 'idle' = 0, 'busy' = 79), \
          dec32 Decimal(9, 4), dec64 Decimal(18, 9), \
          dec128 Decimal(38, 10), dec256 Decimal(76, 20), \
+         i128 Int128, u128 UInt128, i256 Int256, u256 UInt256, \
+         ni128 Nullable(Int128), lc_i256 LowCardinality(Int256), \
          ni32 Nullable(Int32), ns Nullable(String), nb Nullable(Bool), \
          nu Nullable(UUID), ndec Nullable(Decimal(18, 9)), \
          arr_i32 Array(Int32), arr_ns Array(Nullable(String)), \
@@ -876,7 +949,10 @@ fn insert_roundtrips_through_server() {
          arr_m Array(Map(String, Int32)), \
          m_empty Map(String, Int32)) ENGINE = Memory"
         ),
-        "?enable_nullable_tuple_type=1",
+        // LowCardinality(Int256) is a suspicious LC inner (a numeric), gated at
+        // CREATE time by allow_suspicious_low_cardinality_types (a creation-time
+        // setting with no wire effect).
+        "?enable_nullable_tuple_type=1&allow_suspicious_low_cardinality_types=1",
     );
 
     // Encode at revision 0: HTTP INSERT parses the body with server_revision 0,
@@ -896,7 +972,9 @@ fn insert_roundtrips_through_server() {
     let native = server.select(&format!(
         "SELECT i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, s, lc, lcn, fs, b, \
          d, d32, dt, dt64, u, ip4, ip6, e8, e16, \
-         dec32, dec64, dec128, dec256, ni32, ns, nb, nu, ndec, \
+         dec32, dec64, dec128, dec256, \
+         i128, u128, i256, u256, ni128, lc_i256, \
+         ni32, ns, nb, nu, ndec, \
          arr_i32, arr_ns, arr_lc, arr_arr, arr_lc_empty, \
          tup, tup_named, arr_tup, ntup, \
          m, m_lc, m_nv, m_arr, arr_m, m_empty \

@@ -308,6 +308,15 @@ fn assert_all_types(batch: &ChunkedBatch) {
                 "m_empty",
                 ChType::Map(Box::new(ChType::String), Box::new(ChType::Int32)),
             ),
+            // Wide integers: the four exact spellings, plus a Nullable and a
+            // LowCardinality inner (the wide ints are legal LC inners, unlike
+            // Decimal/Enum). No parameters, no aliases.
+            Expected::Exact("i128", ChType::Int128),
+            Expected::Exact("u128", ChType::UInt128),
+            Expected::Exact("i256", ChType::Int256),
+            Expected::Exact("u256", ChType::UInt256),
+            Expected::Exact("ni128", ChType::Nullable(Box::new(ChType::Int128))),
+            Expected::Exact("lc_i256", ChType::LowCardinality(Box::new(ChType::Int256))),
         ],
     );
 
@@ -953,6 +962,98 @@ fn assert_all_types(batch: &ChunkedBatch) {
         let (keys, values) = map_entries(m);
         assert_eq!(keys.len(), 0);
         assert_eq!(values.len(), 0);
+    }
+
+    // Wide integers: raw little-endian fixed-width byte patterns, verbatim
+    // passthrough (no host byteswap, no native i128/i256). `w16`/`w32` build a
+    // little-endian buffer whose only nonzero byte is the least-significant.
+    let w16 = |low: u8| {
+        let mut b = [0u8; 16];
+        b[0] = low;
+        b
+    };
+    let w32 = |low: u8| {
+        let mut b = [0u8; 32];
+        b[0] = low;
+        b
+    };
+    // i128 (col 54): -1 (all 0xFF), 0, 79, i128::MAX (0xFF.. then 0x7F MSB).
+    match block.column(54) {
+        Column::Int128(c) => {
+            assert_eq!(c.width, 16);
+            assert_eq!(c.value(0), [0xFFu8; 16]);
+            assert_eq!(c.value(1), [0u8; 16]);
+            assert_eq!(c.value(2), w16(79));
+            let mut i128_max = [0xFFu8; 16];
+            i128_max[15] = 0x7F;
+            assert_eq!(c.value(3), i128_max);
+        }
+        other => panic!("expected Int128, got {other:?}"),
+    }
+    // u128 (col 55): 0, 13, 2^127 (high bit set, still positive), u128::MAX.
+    match block.column(55) {
+        Column::UInt128(c) => {
+            assert_eq!(c.value(0), [0u8; 16]);
+            assert_eq!(c.value(1), w16(13));
+            let mut two_pow_127 = [0u8; 16];
+            two_pow_127[15] = 0x80;
+            assert_eq!(c.value(2), two_pow_127);
+            assert_eq!(c.value(3), [0xFFu8; 16]);
+        }
+        other => panic!("expected UInt128, got {other:?}"),
+    }
+    // i256 (col 56): -1, 0, 79, i256::MAX.
+    match block.column(56) {
+        Column::Int256(c) => {
+            assert_eq!(c.width, 32);
+            assert_eq!(c.value(0), [0xFFu8; 32]);
+            assert_eq!(c.value(1), [0u8; 32]);
+            assert_eq!(c.value(2), w32(79));
+            let mut i256_max = [0xFFu8; 32];
+            i256_max[31] = 0x7F;
+            assert_eq!(c.value(3), i256_max);
+        }
+        other => panic!("expected Int256, got {other:?}"),
+    }
+    // u256 (col 57): 0, 13, 2^255 (high bit set), u256::MAX.
+    match block.column(57) {
+        Column::UInt256(c) => {
+            assert_eq!(c.value(0), [0u8; 32]);
+            assert_eq!(c.value(1), w32(13));
+            let mut two_pow_255 = [0u8; 32];
+            two_pow_255[31] = 0x80;
+            assert_eq!(c.value(2), two_pow_255);
+            assert_eq!(c.value(3), [0xFFu8; 32]);
+        }
+        other => panic!("expected UInt256, got {other:?}"),
+    }
+    // ni128 (col 58): Nullable(Int128), rows 13, NULL, -1, NULL. Null rows carry
+    // the server's placeholder; validity marks rows 1 and 3 null.
+    match block.column(58) {
+        Column::Int128(c) => {
+            assert_eq!(c.value(0), w16(13));
+            assert_eq!(c.value(2), [0xFFu8; 16]);
+        }
+        other => panic!("expected Int128, got {other:?}"),
+    }
+    assert_validity(block.column(58), &[true, false, true, false]);
+    // lc_i256 (col 59): LowCardinality(Int256), row values 13, 79, 13, 258 via a
+    // block-local dictionary. Resolve each row's index into the Int256 values.
+    match block.column(59) {
+        Column::Dictionary(dict) => match dict.values.as_ref() {
+            Column::Int256(vals) => {
+                let resolved = |row: usize| vals.value(dict.indices[row] as usize).to_vec();
+                let mut two_fifty_eight = [0u8; 32];
+                two_fifty_eight[0] = 0x02; // 258 = 0x0102, little-endian
+                two_fifty_eight[1] = 0x01;
+                assert_eq!(resolved(0), w32(13));
+                assert_eq!(resolved(1), w32(79));
+                assert_eq!(resolved(2), w32(13));
+                assert_eq!(resolved(3), two_fifty_eight.to_vec());
+            }
+            other => panic!("expected Int256 dictionary values, got {other:?}"),
+        },
+        other => panic!("expected Dictionary, got {other:?}"),
     }
 }
 

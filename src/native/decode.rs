@@ -392,6 +392,12 @@ fn parse_ch_type_depth(type_name: &str, depth: usize) -> Option<ChType> {
         "UInt64" => Some(ChType::UInt64),
         "Float32" => Some(ChType::Float32),
         "Float64" => Some(ChType::Float64),
+        // Wide integers. The server emits exactly these case-sensitive spellings
+        // (no parameters, no aliases) via `DataTypeNumber<T>::doGetName`.
+        "Int128" => Some(ChType::Int128),
+        "UInt128" => Some(ChType::UInt128),
+        "Int256" => Some(ChType::Int256),
+        "UInt256" => Some(ChType::UInt256),
         "Date" => Some(ChType::Date),
         "Date32" => Some(ChType::Date32),
         "DateTime" => Some(ChType::DateTime { timezone: None }),
@@ -897,7 +903,7 @@ fn decode_fixed_binary_data(
     let total = num_rows.checked_mul(width).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::UnexpectedEof,
-            "FixedString column byte length overflows usize",
+            "fixed-width column byte length overflows usize",
         )
     })?;
     Ok(reader.read_slice(total)?.to_vec())
@@ -1146,6 +1152,20 @@ pub(crate) fn is_low_cardinality_inner(dict_value_type: &ChType) -> bool {
             | ChType::UInt64
             | ChType::Float32
             | ChType::Float64
+            // The wide integers are `DataTypeNumberBase` subclasses whose
+            // `canBeInsideLowCardinality()` is final-true, so
+            // `LowCardinality(Int128)` etc. are legal on the wire (the server
+            // ships tests `02125_low_cardinality_int256` and
+            // `02459_low_cardinality_uint128_aggregator`). Unlike `Decimal`/
+            // `Enum` (forbidden inners), they belong in this allowlist. Their
+            // dictionary body is the plain fixed-width run (16/32 bytes per
+            // entry), decoded through the shared per-type body decoder. The
+            // `allow_suspicious_low_cardinality_types` setting gates CREATE only,
+            // not the wire.
+            | ChType::Int128
+            | ChType::UInt128
+            | ChType::Int256
+            | ChType::UInt256
             | ChType::String
             | ChType::FixedString(_)
             | ChType::Date
@@ -1769,6 +1789,44 @@ fn decode_column_body(
                 None => Column::Decimal(DecimalColumn::new(data, width, *precision, *scale)),
             }
         }
+        // Wide integers are a raw contiguous little-endian fixed-width integer
+        // per row (16 bytes for Int128/UInt128, 32 for Int256/UInt256), no
+        // per-row framing (`SerializationNumber<T>`, the same template as
+        // Int8..Int64; confirmed at v26.6.1.1193-stable, byte-identical to a
+        // Decimal128/256 integer body). Decode is a host-agnostic passthrough
+        // through the same fixed-binary single contiguous read as UUID/IPv6, so
+        // the core needs no native i128/i256 and the bytes stay correct on
+        // big-endian hosts; signedness lives in the ChType only. NOTE: this must
+        // NOT go through `decode_primitive!` (which byte-swaps into a native
+        // Vec<T> on big-endian hosts); the passthrough keeps the buffer verbatim.
+        ChType::Int128 => {
+            let data = decode_fixed_binary_data(reader, num_rows, 16)?;
+            match validity {
+                Some(bm) => Column::Int128(FixedBinaryColumn::new_nullable(data, 16, bm)),
+                None => Column::Int128(FixedBinaryColumn::new(data, 16)),
+            }
+        }
+        ChType::UInt128 => {
+            let data = decode_fixed_binary_data(reader, num_rows, 16)?;
+            match validity {
+                Some(bm) => Column::UInt128(FixedBinaryColumn::new_nullable(data, 16, bm)),
+                None => Column::UInt128(FixedBinaryColumn::new(data, 16)),
+            }
+        }
+        ChType::Int256 => {
+            let data = decode_fixed_binary_data(reader, num_rows, 32)?;
+            match validity {
+                Some(bm) => Column::Int256(FixedBinaryColumn::new_nullable(data, 32, bm)),
+                None => Column::Int256(FixedBinaryColumn::new(data, 32)),
+            }
+        }
+        ChType::UInt256 => {
+            let data = decode_fixed_binary_data(reader, num_rows, 32)?;
+            match validity {
+                Some(bm) => Column::UInt256(FixedBinaryColumn::new_nullable(data, 32, bm)),
+                None => Column::UInt256(FixedBinaryColumn::new(data, 32)),
+            }
+        }
         // Defense in depth: `parse_ch_type` rejects a wrapper nested where the
         // single-level unwrap in `decode_values` cannot handle it, and
         // `LowCardinality`, `Array`, and `Tuple` are dispatched by `decode_values`
@@ -1911,6 +1969,25 @@ fn empty_column(ch_type: &ChType) -> Column {
                 None => DecimalColumn::new(vec![], width, *precision, *scale),
             })
         }
+        // Wide-int empty columns are an empty width-16/32 fixed-binary buffer
+        // keeping the width (and the nullable empty validity bitmap), like the
+        // UUID/IPv6/FixedString empties.
+        ChType::Int128 => Column::Int128(match empty_validity {
+            Some(bm) => FixedBinaryColumn::new_nullable(vec![], 16, bm),
+            None => FixedBinaryColumn::new(vec![], 16),
+        }),
+        ChType::UInt128 => Column::UInt128(match empty_validity {
+            Some(bm) => FixedBinaryColumn::new_nullable(vec![], 16, bm),
+            None => FixedBinaryColumn::new(vec![], 16),
+        }),
+        ChType::Int256 => Column::Int256(match empty_validity {
+            Some(bm) => FixedBinaryColumn::new_nullable(vec![], 32, bm),
+            None => FixedBinaryColumn::new(vec![], 32),
+        }),
+        ChType::UInt256 => Column::UInt256(match empty_validity {
+            Some(bm) => FixedBinaryColumn::new_nullable(vec![], 32, bm),
+            None => FixedBinaryColumn::new(vec![], 32),
+        }),
         // A zero-row block reads no LowCardinality prefix or data (the server
         // gates `readData` on having rows), so the empty dictionary column has no
         // indices and an empty values dictionary. The values column is an empty
@@ -2452,6 +2529,10 @@ fn skip_column_body(
         ChType::Decimal { bits, .. } => {
             reader.skip(num_rows.saturating_mul((*bits / 8) as usize))?
         }
+        // Wide integers are 16 raw bytes per row for the 128-bit pair and 32 for
+        // the 256-bit pair, the same contiguous-buffer shape as FixedString.
+        ChType::Int128 | ChType::UInt128 => reader.skip(num_rows.saturating_mul(16))?,
+        ChType::Int256 | ChType::UInt256 => reader.skip(num_rows.saturating_mul(32))?,
         ChType::String => {
             for _ in 0..num_rows {
                 let len = varint_usize(reader.read_varint()?, "String value length")?;
@@ -2771,6 +2852,16 @@ mod tests {
                 self.buf.extend_from_slice(r);
             }
             self
+        }
+
+        /// Wide-integer column body: raw contiguous little-endian fixed-width
+        /// integers, `width` bytes per row (16 for Int128/UInt128, 32 for
+        /// Int256/UInt256), no per-row framing. Byte-identical to a
+        /// Decimal128/256 body, so it shares `decimal_data`'s shape; kept as its
+        /// own name for test readability. Each entry must be exactly `width`
+        /// bytes.
+        fn wide_int_data(self, rows: &[&[u8]], width: usize) -> Self {
+            self.decimal_data(rows, width)
         }
 
         fn null_map(mut self, nulls: &[bool]) -> Self {
@@ -3198,10 +3289,10 @@ mod tests {
     fn test_block_end_rejects_unsupported_type() {
         // An unsupported type inside an otherwise-complete block must surface as
         // a DecodeError from the scan, not be silently skipped or reported as
-        // incomplete. Int128 is not decoded yet, so it serves as the example.
+        // incomplete. `Nothing` is not decoded yet, so it serves as the example.
         let data = BlockBuilder::new()
             .header(1, 1)
-            .column_header("id", "Int128")
+            .column_header("id", "Nothing")
             .build();
         assert!(matches!(
             block_end(&data, &DecodeOptions::default()),
@@ -3217,11 +3308,11 @@ mod tests {
 
     #[test]
     fn test_unsupported_type() {
-        // Int128 is not decoded yet, so it serves as the unsupported example now
-        // that Decimal and UUID/IPv4/IPv6 are decoded.
+        // `Nothing` is not decoded yet, so it serves as the unsupported example
+        // now that the wide integers, Decimal, and UUID/IPv4/IPv6 are decoded.
         let data = BlockBuilder::new()
             .header(1, 1)
-            .column_header("id", "Int128")
+            .column_header("id", "Nothing")
             .build();
         assert!(matches!(
             decode_all_bytes(&data, &DecodeOptions::default()),
@@ -5895,6 +5986,405 @@ mod tests {
             decode_all_bytes(&data, &DecodeOptions::default()),
             Err(DecodeError::UnsupportedType { .. })
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Wide integers (Int128 / UInt128 / Int256 / UInt256)
+    // -----------------------------------------------------------------------
+
+    /// A 16-byte little-endian buffer with `b[0] = low`, the rest zero.
+    fn w16(low: u8) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[0] = low;
+        b
+    }
+
+    /// A 32-byte little-endian buffer with `b[0] = low`, the rest zero.
+    fn w32(low: u8) -> [u8; 32] {
+        let mut b = [0u8; 32];
+        b[0] = low;
+        b
+    }
+
+    #[test]
+    fn test_parse_ch_type_wide_int() {
+        // The four exact, case-sensitive spellings the server emits; no
+        // parameters, no aliases. Display round-trips each.
+        for (name, ty) in [
+            ("Int128", ChType::Int128),
+            ("UInt128", ChType::UInt128),
+            ("Int256", ChType::Int256),
+            ("UInt256", ChType::UInt256),
+        ] {
+            assert_eq!(parse_ch_type(name), Some(ty.clone()));
+            assert_eq!(ty.to_string(), name);
+            assert_eq!(parse_ch_type(&ty.to_string()), Some(ty));
+        }
+        // No case-folding or alias forms are accepted.
+        for bad in ["int128", "UINT128", "Int 128", "Int512", "UInt128(1)"] {
+            assert_eq!(parse_ch_type(bad), None, "{bad} must not parse");
+        }
+    }
+
+    #[test]
+    fn test_decode_int128_plain() {
+        // Int128 is a raw 16-byte LE two's-complement integer per row. The core
+        // has no native i128, so assert the raw byte pattern directly. Sign and
+        // boundary values: 13, -1 (all 0xFF), i128::MIN (only the MSB set:
+        // b[15] = 0x80), and i128::MAX (all 0xFF then b[15] = 0x7F).
+        let thirteen = w16(13);
+        let neg_one = [0xFFu8; 16];
+        let min = {
+            let mut b = [0u8; 16];
+            b[15] = 0x80;
+            b
+        };
+        let max = {
+            let mut b = [0xFFu8; 16];
+            b[15] = 0x7F;
+            b
+        };
+        let rows = [
+            thirteen.as_slice(),
+            neg_one.as_slice(),
+            min.as_slice(),
+            max.as_slice(),
+        ];
+        let data = BlockBuilder::new()
+            .header(1, 4)
+            .column_header("w", "Int128")
+            .wide_int_data(&rows, 16)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Int128(c) => {
+                assert_eq!(c.width, 16);
+                assert_eq!(c.len(), 4);
+                assert_eq!(c.value(0), thirteen);
+                assert_eq!(c.value(1), neg_one);
+                assert_eq!(c.value(2), min);
+                assert_eq!(c.value(3), max);
+                assert!(c.validity.is_none());
+            }
+            other => panic!("expected Int128, got {other:?}"),
+        }
+        assert_eq!(batch.schema.fields[0].ch_type, ChType::Int128);
+    }
+
+    #[test]
+    fn test_decode_uint128_plain() {
+        // UInt128 shares the 16-byte LE layout; the type is unsigned, so a
+        // high-bit-set value must survive verbatim (it is NOT a negative). Cover
+        // 79, 2^127 (b[15] = 0x80, the high bit), and u128::MAX (all 0xFF).
+        let seventy_nine = w16(79);
+        let two_pow_127 = {
+            let mut b = [0u8; 16];
+            b[15] = 0x80;
+            b
+        };
+        let max = [0xFFu8; 16];
+        let rows = [
+            seventy_nine.as_slice(),
+            two_pow_127.as_slice(),
+            max.as_slice(),
+        ];
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("w", "UInt128")
+            .wide_int_data(&rows, 16)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::UInt128(c) => {
+                assert_eq!(c.width, 16);
+                assert_eq!(c.value(0), seventy_nine);
+                assert_eq!(c.value(1), two_pow_127);
+                assert_eq!(c.value(2), max);
+            }
+            other => panic!("expected UInt128, got {other:?}"),
+        }
+        assert_eq!(batch.schema.fields[0].ch_type, ChType::UInt128);
+    }
+
+    #[test]
+    fn test_decode_int256_plain() {
+        // Int256 is a raw 32-byte LE two's-complement integer per row. Cover 13,
+        // -1 (all 0xFF), i256::MIN (b[31] = 0x80) and i256::MAX (all 0xFF then
+        // b[31] = 0x7F).
+        let thirteen = w32(13);
+        let neg_one = [0xFFu8; 32];
+        let min = {
+            let mut b = [0u8; 32];
+            b[31] = 0x80;
+            b
+        };
+        let max = {
+            let mut b = [0xFFu8; 32];
+            b[31] = 0x7F;
+            b
+        };
+        let rows = [
+            thirteen.as_slice(),
+            neg_one.as_slice(),
+            min.as_slice(),
+            max.as_slice(),
+        ];
+        let data = BlockBuilder::new()
+            .header(1, 4)
+            .column_header("w", "Int256")
+            .wide_int_data(&rows, 32)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Int256(c) => {
+                assert_eq!(c.width, 32);
+                assert_eq!(c.len(), 4);
+                assert_eq!(c.value(0), thirteen);
+                assert_eq!(c.value(1), neg_one);
+                assert_eq!(c.value(2), min);
+                assert_eq!(c.value(3), max);
+            }
+            other => panic!("expected Int256, got {other:?}"),
+        }
+        assert_eq!(batch.schema.fields[0].ch_type, ChType::Int256);
+    }
+
+    #[test]
+    fn test_decode_uint256_plain() {
+        // UInt256 is a raw 32-byte LE unsigned integer per row. A high-bit-set
+        // value (b[31] = 0x80 = 2^255) must survive verbatim as a positive value.
+        let seventy_nine = w32(79);
+        let two_pow_255 = {
+            let mut b = [0u8; 32];
+            b[31] = 0x80;
+            b
+        };
+        let max = [0xFFu8; 32];
+        let rows = [
+            seventy_nine.as_slice(),
+            two_pow_255.as_slice(),
+            max.as_slice(),
+        ];
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("w", "UInt256")
+            .wide_int_data(&rows, 32)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::UInt256(c) => {
+                assert_eq!(c.width, 32);
+                assert_eq!(c.value(1), two_pow_255);
+                assert_eq!(c.value(2), max);
+            }
+            other => panic!("expected UInt256, got {other:?}"),
+        }
+        assert_eq!(batch.schema.fields[0].ch_type, ChType::UInt256);
+    }
+
+    #[test]
+    fn test_decode_nullable_int128() {
+        // Nullable(Int128): the null map first, then the 16-byte body, exactly
+        // like Nullable(Decimal128). Null rows still carry a placeholder.
+        let rows = [
+            w16(13),
+            w16(0),
+            [0xFFu8; 16], // -1
+            w16(0),
+        ];
+        let row_refs: Vec<&[u8]> = rows.iter().map(|r| r.as_slice()).collect();
+        let data = BlockBuilder::new()
+            .header(1, 4)
+            .column_header("w", "Nullable(Int128)")
+            .null_map(&[false, true, false, true])
+            .wide_int_data(&row_refs, 16)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Int128(c) => {
+                assert_eq!(c.null_count(), 2);
+                assert_eq!(c.value(0), w16(13));
+                assert_eq!(c.value(2), [0xFFu8; 16]);
+            }
+            other => panic!("expected Int128, got {other:?}"),
+        }
+        assert!(batch.column(0).validity().unwrap().is_valid(0));
+        assert!(!batch.column(0).validity().unwrap().is_valid(1));
+        assert_eq!(
+            batch.schema.fields[0].ch_type,
+            ChType::Nullable(Box::new(ChType::Int128))
+        );
+    }
+
+    #[test]
+    fn test_decode_wide_int_zero_rows() {
+        // A zero-row block carrying every wide-int type contributes the schema
+        // but no chunks; the empty columns have length 0 and keep their width.
+        let data = BlockBuilder::new()
+            .header(4, 0)
+            .column_header("i128", "Int128")
+            .column_header("u128", "UInt128")
+            .column_header("i256", "Int256")
+            .column_header("u256", "UInt256")
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_rows(), 0);
+        assert_eq!(cb.num_chunks(), 0);
+        assert_eq!(cb.num_columns(), 4);
+        assert_eq!(cb.schema.fields[0].ch_type, ChType::Int128);
+        assert_eq!(cb.schema.fields[1].ch_type, ChType::UInt128);
+        assert_eq!(cb.schema.fields[2].ch_type, ChType::Int256);
+        assert_eq!(cb.schema.fields[3].ch_type, ChType::UInt256);
+    }
+
+    #[test]
+    fn test_multi_block_wide_int_kept_as_chunks() {
+        // Wide-int blocks stay separate chunks, never concatenated.
+        let a = [w32(13), [0xFFu8; 32]];
+        let b = [w32(79)];
+        let refs_a: Vec<&[u8]> = a.iter().map(|r| r.as_slice()).collect();
+        let refs_b: Vec<&[u8]> = b.iter().map(|r| r.as_slice()).collect();
+        let mut data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("w", "Int256")
+            .wide_int_data(&refs_a, 32)
+            .build();
+        data.extend(
+            BlockBuilder::new()
+                .header(1, 1)
+                .column_header("w", "Int256")
+                .wide_int_data(&refs_b, 32)
+                .build(),
+        );
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_chunks(), 2);
+        assert_eq!(cb.num_rows(), 3);
+        match cb.chunks[0].column(0) {
+            Column::Int256(c) => {
+                assert_eq!(c.len(), 2);
+                assert_eq!(c.value(1), [0xFFu8; 32]);
+            }
+            other => panic!("expected Int256, got {other:?}"),
+        }
+        match cb.chunks[1].column(0) {
+            Column::Int256(c) => {
+                assert_eq!(c.len(), 1);
+                assert_eq!(c.value(0), w32(79));
+            }
+            other => panic!("expected Int256, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_block_end_scans_wide_int_columns() {
+        // The completeness scan must walk both wide-int widths (16 and 32 bytes
+        // per row) to the exact block end, and report a one-byte-short buffer as
+        // "need more bytes".
+        let i128_rows = [w16(13), [0xFFu8; 16]];
+        let u256_rows = [w32(79), [0xFFu8; 32]];
+        let refs128: Vec<&[u8]> = i128_rows.iter().map(|r| r.as_slice()).collect();
+        let refs256: Vec<&[u8]> = u256_rows.iter().map(|r| r.as_slice()).collect();
+        let data = BlockBuilder::new()
+            .header(2, 2)
+            .column_header("i128", "Int128")
+            .wide_int_data(&refs128, 16)
+            .column_header("u256", "UInt256")
+            .wide_int_data(&refs256, 32)
+            .build();
+
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len())
+        );
+        let truncated = &data[..data.len() - 1];
+        let err = block_end(truncated, &DecodeOptions::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            DecodeError::Io(ref e) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[test]
+    fn test_decode_low_cardinality_int256() {
+        // LowCardinality(Int256) IS legal on the wire (a DataTypeNumberBase
+        // subclass, canBeInsideLowCardinality is true). The dictionary body is
+        // the plain 32-byte-per-entry Int256 run; indices resolve into it. This
+        // exercises the wide-int entry in the LC allowlist end to end.
+        let dict = [w32(13), [0xFFu8; 32]]; // entry 0 = 13, entry 1 = -1
+        let dict_refs: Vec<&[u8]> = dict.iter().map(|r| r.as_slice()).collect();
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("lc", "LowCardinality(Int256)")
+            .low_cardinality_fixed(&dict_refs, &[0, 1, 0], 1)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Dictionary(c) => {
+                assert_eq!(c.indices, vec![0, 1, 0]);
+                assert!(c.validity.is_none());
+                match c.values.as_ref() {
+                    Column::Int256(v) => {
+                        assert_eq!(v.width, 32);
+                        assert_eq!(v.len(), 2);
+                        assert_eq!(v.value(0), w32(13));
+                        assert_eq!(v.value(1), [0xFFu8; 32]);
+                    }
+                    other => panic!("expected Int256 dictionary values, got {other:?}"),
+                }
+            }
+            other => panic!("expected Dictionary, got {other:?}"),
+        }
+        assert_eq!(
+            batch.schema.fields[0].ch_type,
+            ChType::LowCardinality(Box::new(ChType::Int256))
+        );
+    }
+
+    #[test]
+    fn test_decode_low_cardinality_uint128() {
+        // LowCardinality(UInt128): unsigned, 16-byte dictionary entries. Include
+        // a high-bit-set entry to prove the dictionary body is a raw passthrough.
+        let high_bit = {
+            let mut b = [0u8; 16];
+            b[15] = 0x80;
+            b
+        };
+        let dict = [w16(79), high_bit];
+        let dict_refs: Vec<&[u8]> = dict.iter().map(|r| r.as_slice()).collect();
+        let data = BlockBuilder::new()
+            .header(1, 4)
+            .column_header("lc", "LowCardinality(UInt128)")
+            .low_cardinality_fixed(&dict_refs, &[0, 1, 1, 0], 1)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        match cb.chunks[0].column(0) {
+            Column::Dictionary(c) => {
+                assert_eq!(c.indices, vec![0, 1, 1, 0]);
+                match c.values.as_ref() {
+                    Column::UInt128(v) => {
+                        assert_eq!(v.value(0), w16(79));
+                        assert_eq!(v.value(1), high_bit);
+                    }
+                    other => panic!("expected UInt128 dictionary values, got {other:?}"),
+                }
+            }
+            other => panic!("expected Dictionary, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------

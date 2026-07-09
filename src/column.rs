@@ -542,6 +542,20 @@ pub enum Column {
     // shape as a FixedSizeBinary. precision/scale are metadata on the column;
     // host materialization is a binding concern.
     Decimal(DecimalColumn),
+    // Wide integers (Int128/UInt128/Int256/UInt256): a contiguous little-endian
+    // fixed-width integer buffer, 16 bytes/row for the 128-bit pair and 32
+    // bytes/row for the 256-bit pair, the same physical passthrough shape as a
+    // FixedSizeBinary (and UUID/IPv6), backed by a FixedBinaryColumn carrying the
+    // byte width. There are four distinct variants (one per ChType) even though
+    // the physical shape is shared, mirroring the Int8/UInt8/.. and UUID/IPv6
+    // precedent; signedness lives in the ChType/type-name channel, not in the
+    // buffer, so a binding reads the type name to recover the host value. Decode
+    // is a host-agnostic verbatim byte copy, so the core needs no native
+    // i128/i256 and the buffer stays correct on big-endian hosts.
+    Int128(FixedBinaryColumn),
+    UInt128(FixedBinaryColumn),
+    Int256(FixedBinaryColumn),
+    UInt256(FixedBinaryColumn),
     Dictionary(DictionaryColumn),
     // Array(T): Arrow list layout (offsets + a flattened element column). The
     // element column is itself a Column, so this is the first recursive variant.
@@ -580,6 +594,9 @@ impl Column {
             Column::Enum8(c) => c.len(),
             Column::Enum16(c) => c.len(),
             Column::Decimal(c) => c.len(),
+            Column::Int128(c) | Column::UInt128(c) | Column::Int256(c) | Column::UInt256(c) => {
+                c.len()
+            }
             Column::Dictionary(c) => c.len(),
             Column::Array(c) => c.len(),
             Column::Tuple(c) => c.len(),
@@ -616,6 +633,9 @@ impl Column {
             Column::Enum8(c) => c.null_count(),
             Column::Enum16(c) => c.null_count(),
             Column::Decimal(c) => c.null_count(),
+            Column::Int128(c) | Column::UInt128(c) | Column::Int256(c) | Column::UInt256(c) => {
+                c.null_count()
+            }
             Column::Dictionary(c) => c.null_count(),
             Column::Array(c) => c.null_count(),
             Column::Tuple(c) => c.null_count(),
@@ -648,6 +668,9 @@ impl Column {
             Column::Enum8(c) => c.validity.as_ref(),
             Column::Enum16(c) => c.validity.as_ref(),
             Column::Decimal(c) => c.validity.as_ref(),
+            Column::Int128(c) | Column::UInt128(c) | Column::Int256(c) | Column::UInt256(c) => {
+                c.validity.as_ref()
+            }
             Column::Dictionary(c) => c.validity.as_ref(),
             // Arrays are never nullable at the array level, so there is no
             // array validity bitmap; element nulls live on `values`.
