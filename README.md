@@ -132,13 +132,13 @@ Not implemented yet:
 - `Float32`, `Float64`
 - `String`
 - `FixedString(N)`
-- `Date`, `Date32`, `DateTime`, `DateTime64(P[, tz])`
+- `Date`, `Date32`, `DateTime`, `DateTime64(P[, tz])`, `Time`, `Time64(P)`
 - `Nullable(T)` where `T` is one of the supported inner types
 - `Decimal(P, S)`
 - `UUID`, `IPv4`, `IPv6`
 - `Enum8(...)`, `Enum16(...)`
 - `LowCardinality(T)` for the allowed inner types above, excluding server-forbidden
-  combinations such as `Decimal`, `DateTime64`, and `Enum`
+  combinations such as `Decimal`, `DateTime64`, `Time64`, and `Enum`
 
 Unsupported types raise a decode error rather than guessing.
 

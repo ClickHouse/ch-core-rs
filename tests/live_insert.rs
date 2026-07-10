@@ -73,7 +73,7 @@ fn decimal_column(width: usize, precision: u8, scale: u8, values: &[&[u8]]) -> D
 }
 
 /// The batch to insert: every encodable type over four rows (the ten fixed-width
-/// numerics, `String`, `FixedString(4)`, `Bool`, the four temporal types,
+/// numerics, `String`, `FixedString(4)`, `Bool`, the six temporal types,
 /// `UUID`, `IPv4`, `IPv6`, `Enum8`/`Enum16`, four Decimal widths, five
 /// `Nullable` columns, and four `Array` shapes covering a plain, `Nullable`,
 /// `LowCardinality`, and nested `Array` element, each with at least one empty
@@ -263,6 +263,14 @@ fn sample_batch() -> ColBatch {
             "m_empty",
             ChType::Map(Box::new(ChType::String), Box::new(ChType::Int32)),
         ),
+        ("t", ChType::Time),
+        ("t64", ChType::Time64 { precision: 6 }),
+        ("nt", ChType::Nullable(Box::new(ChType::Time))),
+        (
+            "nt64",
+            ChType::Nullable(Box::new(ChType::Time64 { precision: 6 })),
+        ),
+        ("lc_time", ChType::LowCardinality(Box::new(ChType::Time))),
     ]
     .into_iter()
     .map(|(name, ch_type)| Field {
@@ -621,6 +629,30 @@ fn sample_batch() -> ColBatch {
             Column::Utf8(utf8_column(&[])),
             Column::Int32(PrimitiveColumn::new(vec![])),
         )),
+        // Time and Time64 are raw signed seconds/ticks. Include the documented
+        // text extrema, negative fractional ticks, Nullable wrappers, and the
+        // one legal LC form (Time; the server forbids LowCardinality(Time64)).
+        Column::Time(PrimitiveColumn::new(vec![
+            -3_599_999, -3_600, 13, 3_599_999,
+        ])),
+        Column::Time64(PrimitiveColumn::new(vec![
+            -3_599_999_999_999,
+            -1,
+            13_000_079,
+            3_599_999_999_999,
+        ])),
+        Column::Time(PrimitiveColumn::new_nullable(
+            vec![-13, 0, 79, 0],
+            validity(),
+        )),
+        Column::Time64(PrimitiveColumn::new_nullable(
+            vec![-13, 0, 79, 0],
+            validity(),
+        )),
+        Column::Dictionary(DictionaryColumn::new(
+            vec![0, 1, 0, 2],
+            Column::Time(PrimitiveColumn::new(vec![-13, 79, 258])),
+        )),
     ];
 
     ColBatch::new(Schema::new(fields), columns, 4)
@@ -812,6 +844,8 @@ fn raw_column_repr(column: &Column) -> Vec<String> {
         Column::Date32(c) => c.values.iter().map(|v| v.to_string()).collect(),
         Column::DateTime(c) => c.values.iter().map(|v| v.to_string()).collect(),
         Column::DateTime64(c) => c.values.iter().map(|v| v.to_string()).collect(),
+        Column::Time(c) => c.values.iter().map(|v| v.to_string()).collect(),
+        Column::Time64(c) => c.values.iter().map(|v| v.to_string()).collect(),
         // Enum8/Enum16 are physically the underlying signed int; render the raw
         // value (the name->value map is type metadata, not per-row data).
         Column::Enum8(c) => c.values.iter().map(|v| v.to_string()).collect(),
@@ -947,12 +981,14 @@ fn insert_roundtrips_through_server() {
          m_nv Map(String, Nullable(String)), \
          m_arr Map(String, Array(Int32)), \
          arr_m Array(Map(String, Int32)), \
-         m_empty Map(String, Int32)) ENGINE = Memory"
+         m_empty Map(String, Int32), \
+         t Time, t64 Time64(6), nt Nullable(Time), \
+         nt64 Nullable(Time64(6)), lc_time LowCardinality(Time)) ENGINE = Memory"
         ),
         // LowCardinality(Int256) is a suspicious LC inner (a numeric), gated at
         // CREATE time by allow_suspicious_low_cardinality_types (a creation-time
         // setting with no wire effect).
-        "?enable_nullable_tuple_type=1&allow_suspicious_low_cardinality_types=1",
+        "?enable_nullable_tuple_type=1&allow_suspicious_low_cardinality_types=1&enable_time_time64_type=1",
     );
 
     // Encode at revision 0: HTTP INSERT parses the body with server_revision 0,
@@ -977,7 +1013,8 @@ fn insert_roundtrips_through_server() {
          ni32, ns, nb, nu, ndec, \
          arr_i32, arr_ns, arr_lc, arr_arr, arr_lc_empty, \
          tup, tup_named, arr_tup, ntup, \
-         m, m_lc, m_nv, m_arr, arr_m, m_empty \
+         m, m_lc, m_nv, m_arr, arr_m, m_empty, \
+         t, t64, nt, nt64, lc_time \
          FROM {TABLE} ORDER BY i32 FORMAT Native"
     ));
     let decoded = decode_all_bytes(

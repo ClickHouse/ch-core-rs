@@ -301,6 +301,23 @@ fn parse_ch_type_depth(type_name: &str, depth: usize) -> Option<ChType> {
         }
     }
 
+    // Time64(P). The server's canonical Native header always includes the
+    // precision and never carries a timezone. Although the type factory accepts
+    // a bare Time64 as an input shorthand for precision 3, it normalizes that
+    // input to Time64(3), so the wire parser accepts only the emitted form.
+    // P is one decimal digit because the supported range is exactly 0..=9.
+    if let Some(inner) = type_name.strip_prefix("Time64(") {
+        if let Some(inner) = inner.strip_suffix(')') {
+            let bytes = inner.as_bytes();
+            if bytes.len() == 1 && bytes[0].is_ascii_digit() {
+                return Some(ChType::Time64 {
+                    precision: bytes[0] - b'0',
+                });
+            }
+            return None;
+        }
+    }
+
     // DateTime64(P) and DateTime64(P, '<tz>'). Checked before the DateTime(
     // prefix so a DateTime64(...) string never falls into the DateTime arm.
     if let Some(inner) = type_name.strip_prefix("DateTime64(") {
@@ -401,6 +418,7 @@ fn parse_ch_type_depth(type_name: &str, depth: usize) -> Option<ChType> {
         "Date" => Some(ChType::Date),
         "Date32" => Some(ChType::Date32),
         "DateTime" => Some(ChType::DateTime { timezone: None }),
+        "Time" => Some(ChType::Time),
         "String" => Some(ChType::String),
         "UUID" => Some(ChType::Uuid),
         "IPv4" => Some(ChType::Ipv4),
@@ -1124,13 +1142,14 @@ fn decode_low_cardinality(
 /// `DataTypeLowCardinality` constructor after `removeNullable` (confirmed at
 /// v26.6.1.1193-stable). That predicate is true for `String`, `FixedString`, the
 /// fixed-width numerics, and the number-backed temporals `Date`/`Date32`/
-/// `DateTime` (`Bool` is a `UInt8`-backed number and also qualifies). It is false
-/// for `DateTime64` and every `Decimal`, which are `DataTypeDecimalBase`
-/// subclasses, so those are rejected here even though the crate decodes them as
-/// ordinary columns. `UUID`/`IPv4`/`IPv6` are permitted by the server and decoded
-/// by this crate, so they are in the allowlist: the dictionary body is the inner
-/// type's plain bulk form (4 raw bytes per entry for `IPv4`, 16 raw bytes per
-/// entry for `UUID`/`IPv6`), decoded through the shared per-type body decoder.
+/// `DateTime`/`Time` (`Bool` is a `UInt8`-backed number and also qualifies). It is
+/// false for `DateTime64`, `Time64`, and every `Decimal`, which are
+/// `DataTypeDecimalBase` subclasses, so those are rejected here even though the
+/// crate decodes them as ordinary columns. `UUID`/`IPv4`/`IPv6` are permitted by
+/// the server and decoded by this crate, so they are in the allowlist: the
+/// dictionary body is the inner type's plain bulk form (4 raw bytes per entry for
+/// `IPv4`, 16 raw bytes per entry for `UUID`/`IPv6`), decoded through the shared
+/// per-type body decoder.
 ///
 /// The fixed-width numeric and temporal inners require the server's
 /// `allow_suspicious_low_cardinality_types=1` at table-creation time; that is a
@@ -1171,6 +1190,7 @@ pub(crate) fn is_low_cardinality_inner(dict_value_type: &ChType) -> bool {
             | ChType::Date
             | ChType::Date32
             | ChType::DateTime { .. }
+            | ChType::Time
             | ChType::Uuid
             | ChType::Ipv4
             | ChType::Ipv6
@@ -1630,6 +1650,22 @@ fn read_array_offsets(
 ///
 /// `inner_type` is always a concrete type: `Nullable` and `LowCardinality` are
 /// unwrapped by the callers and only appear here as `unreachable!` arms.
+///
+/// At v26.6.1.1193-stable, `Time` is a contiguous raw signed Int32 seconds run:
+/// `DataTypeTime::doGetSerialization` in `src/DataTypes/DataTypeTime.h` and
+/// `src/DataTypes/DataTypeTime.cpp` selects `SerializationTime::create` in
+/// `src/DataTypes/Serializations/SerializationDateTime.h` and
+/// `src/DataTypes/Serializations/SerializationDateTime.cpp`, which uses the
+/// `SerializationNumber<Int32>` bulk methods in
+/// `src/DataTypes/Serializations/SerializationNumber.cpp`. `Time64(P)` is a
+/// contiguous raw signed Int64 tick run with no scale conversion:
+/// `DataTypeTime64` in `src/DataTypes/DataTypeTime64.h` and
+/// `src/DataTypes/DataTypeTime64.cpp` selects `SerializationTime64` in
+/// `src/DataTypes/Serializations/SerializationTime64.h` and
+/// `src/DataTypes/Serializations/SerializationTime64.cpp`, whose bulk path is
+/// `SerializationDecimalBase<Time64>` in
+/// `src/DataTypes/Serializations/SerializationDecimalBase.cpp`. Both are
+/// little-endian on the wire and use the primitive fast path below.
 fn decode_column_body(
     reader: &mut ByteReader,
     inner_type: &ChType,
@@ -1701,6 +1737,16 @@ fn decode_column_body(
         ChType::DateTime64 { .. } => {
             let values = decode_primitive!(reader, num_rows, i64);
             Column::DateTime64(PrimitiveColumn { values, validity })
+        }
+        // Time is signed Int32 seconds, with no date or timezone metadata.
+        ChType::Time => {
+            let values = decode_primitive!(reader, num_rows, i32);
+            Column::Time(PrimitiveColumn { values, validity })
+        }
+        // Time64(P) is signed Int64 ticks, with precision only in the ChType.
+        ChType::Time64 { .. } => {
+            let values = decode_primitive!(reader, num_rows, i64);
+            Column::Time64(PrimitiveColumn { values, validity })
         }
         ChType::String => {
             let (offsets, data) = decode_string_data(reader, num_rows)?;
@@ -1921,6 +1967,14 @@ fn empty_column(ch_type: &ChType) -> Column {
             validity: empty_validity,
         }),
         ChType::DateTime64 { .. } => Column::DateTime64(PrimitiveColumn {
+            values: vec![],
+            validity: empty_validity,
+        }),
+        ChType::Time => Column::Time(PrimitiveColumn {
+            values: vec![],
+            validity: empty_validity,
+        }),
+        ChType::Time64 { .. } => Column::Time64(PrimitiveColumn {
             values: vec![],
             validity: empty_validity,
         }),
@@ -2516,10 +2570,13 @@ fn skip_column_body(
         | ChType::Float32
         | ChType::Date32
         | ChType::DateTime { .. }
+        | ChType::Time
         | ChType::Ipv4 => reader.skip(num_rows.saturating_mul(4))?,
-        ChType::Int64 | ChType::UInt64 | ChType::Float64 | ChType::DateTime64 { .. } => {
-            reader.skip(num_rows.saturating_mul(8))?
-        }
+        ChType::Int64
+        | ChType::UInt64
+        | ChType::Float64
+        | ChType::DateTime64 { .. }
+        | ChType::Time64 { .. } => reader.skip(num_rows.saturating_mul(8))?,
         ChType::FixedString(width) => reader.skip(num_rows.saturating_mul(*width))?,
         // UUID and IPv6 are 16 raw bytes per row, the same body shape as
         // FixedString(16).
@@ -3721,10 +3778,11 @@ mod tests {
     #[test]
     fn test_decode_temporal_plain() {
         // Date is UInt16 days, Date32 is Int32 days (signed, can be pre-epoch),
-        // DateTime is UInt32 seconds, DateTime64(3) is Int64 ticks (ms here).
+        // DateTime is UInt32 seconds, DateTime64(3) is Int64 epoch ticks,
+        // Time is signed Int32 seconds, and Time64(3) is signed Int64 time ticks.
         // Timezone and precision are type metadata only, never in the bytes.
         let data = BlockBuilder::new()
-            .header(4, 4)
+            .header(6, 4)
             .column_header("d", "Date")
             .date_data(&[0, 19737, 49710, 65535])
             .column_header("d32", "Date32")
@@ -3733,6 +3791,10 @@ mod tests {
             .uint32_data(&[0, 1705322096, 961056000, 4294967295])
             .column_header("dt64", "DateTime64(3)")
             .int64_data(&[-877, 0, 1705322096789, 4102444799999])
+            .column_header("t", "Time")
+            .int32_data(&[-3_599_999, -13, 0, 3_599_999])
+            .column_header("t64", "Time64(3)")
+            .int64_data(&[-3_599_999_999, -13_000, 0, 3_599_999_999])
             .build();
 
         let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
@@ -3756,6 +3818,16 @@ mod tests {
                 assert_eq!(c.values, vec![-877i64, 0, 1705322096789, 4102444799999])
             }
             other => panic!("expected DateTime64, got {other:?}"),
+        }
+        match batch.column(4) {
+            Column::Time(c) => assert_eq!(c.values, vec![-3_599_999i32, -13, 0, 3_599_999]),
+            other => panic!("expected Time, got {other:?}"),
+        }
+        match batch.column(5) {
+            Column::Time64(c) => {
+                assert_eq!(c.values, vec![-3_599_999_999i64, -13_000, 0, 3_599_999_999])
+            }
+            other => panic!("expected Time64, got {other:?}"),
         }
     }
 
@@ -3784,24 +3856,58 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_nullable_time_types() {
+        let data = BlockBuilder::new()
+            .header(2, 4)
+            .column_header("t", "Nullable(Time)")
+            .null_map(&[false, true, false, true])
+            .int32_data(&[-13, 0, 79, 0])
+            .column_header("t64", "Nullable(Time64(6))")
+            .null_map(&[false, true, false, true])
+            .int64_data(&[-13_000_000, 0, 79_000_000, 0])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let batch = &cb.chunks[0];
+        match batch.column(0) {
+            Column::Time(c) => {
+                assert_eq!(c.values, vec![-13, 0, 79, 0]);
+                assert_eq!(c.null_count(), 2);
+            }
+            other => panic!("expected nullable Time, got {other:?}"),
+        }
+        match batch.column(1) {
+            Column::Time64(c) => {
+                assert_eq!(c.values, vec![-13_000_000, 0, 79_000_000, 0]);
+                assert_eq!(c.null_count(), 2);
+            }
+            other => panic!("expected nullable Time64, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_decode_temporal_zero_rows() {
-        // A zero-row block carrying a Date and a DateTime column contributes the
+        // A zero-row block carrying temporal columns contributes the
         // schema but no chunks, and the empty columns have length 0.
         let data = BlockBuilder::new()
-            .header(2, 0)
+            .header(4, 0)
             .column_header("d", "Date")
             .column_header("dt", "DateTime")
+            .column_header("t", "Time")
+            .column_header("t64", "Time64(3)")
             .build();
 
         let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
         assert_eq!(cb.num_rows(), 0);
         assert_eq!(cb.num_chunks(), 0);
-        assert_eq!(cb.num_columns(), 2);
+        assert_eq!(cb.num_columns(), 4);
         assert_eq!(cb.schema.fields[0].ch_type, ChType::Date);
         assert_eq!(
             cb.schema.fields[1].ch_type,
             ChType::DateTime { timezone: None }
         );
+        assert_eq!(cb.schema.fields[2].ch_type, ChType::Time);
+        assert_eq!(cb.schema.fields[3].ch_type, ChType::Time64 { precision: 3 });
     }
 
     #[test]
@@ -3831,6 +3937,57 @@ mod tests {
             Column::Date(c) => assert_eq!(c.values, vec![49710u16, 65535, 13]),
             other => panic!("expected Date, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_multi_block_time_types_kept_as_chunks() {
+        let mut data = BlockBuilder::new()
+            .header(2, 2)
+            .column_header("t", "Time")
+            .int32_data(&[-13, 0])
+            .column_header("t64", "Time64(3)")
+            .int64_data(&[-13_000, 0])
+            .build();
+        data.extend(
+            BlockBuilder::new()
+                .header(2, 2)
+                .column_header("t", "Time")
+                .int32_data(&[79, 3_599_999])
+                .column_header("t64", "Time64(3)")
+                .int64_data(&[79_000, 3_599_999_999])
+                .build(),
+        );
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_chunks(), 2);
+        match cb.chunks[0].column(0) {
+            Column::Time(c) => assert_eq!(c.values, vec![-13, 0]),
+            other => panic!("expected Time, got {other:?}"),
+        }
+        match cb.chunks[1].column(1) {
+            Column::Time64(c) => assert_eq!(c.values, vec![79_000, 3_599_999_999]),
+            other => panic!("expected Time64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_block_end_scans_time_types() {
+        let data = BlockBuilder::new()
+            .header(2, 2)
+            .column_header("t", "Time")
+            .int32_data(&[-13, 79])
+            .column_header("t64", "Time64(9)")
+            .int64_data(&[-13_000_000_000, 79_000_000_000])
+            .build();
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len())
+        );
+        let truncated = &data[..data.len() - 1];
+        assert!(matches!(
+            block_end(truncated, &DecodeOptions::default()),
+            Err(DecodeError::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
     }
 
     #[test]
@@ -3871,6 +4028,30 @@ mod tests {
         // Precision above the 0..=9 range is unsupported, surfaced as None so
         // the caller reports UnsupportedType.
         assert_eq!(parse_ch_type("DateTime64(10)"), None);
+        assert_eq!(parse_ch_type("Time"), Some(ChType::Time));
+        assert_eq!(
+            parse_ch_type("Time64(3)"),
+            Some(ChType::Time64 { precision: 3 })
+        );
+        assert_eq!(
+            parse_ch_type("Time64(9)"),
+            Some(ChType::Time64 { precision: 9 })
+        );
+        // Accept only canonical strings emitted in Native headers. Bare Time64
+        // is an input shorthand for Time64(3), not an emitted spelling.
+        for unsupported in [
+            "Time()",
+            "Time(3)",
+            "Time('UTC')",
+            "Time64",
+            "Time64()",
+            "Time64(03)",
+            "Time64(10)",
+            "Time64(3, 'UTC')",
+            "Time64(3, '')",
+        ] {
+            assert_eq!(parse_ch_type(unsupported), None, "accepted {unsupported}");
+        }
     }
 
     #[test]
@@ -3906,6 +4087,9 @@ mod tests {
                 precision: 9,
                 timezone: Some("Asia/Istanbul".to_string()),
             },
+            ChType::Time,
+            ChType::Time64 { precision: 0 },
+            ChType::Time64 { precision: 9 },
             ChType::Nullable(Box::new(ChType::String)),
             ChType::Nullable(Box::new(ChType::DateTime64 {
                 precision: 6,
@@ -4695,6 +4879,34 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_low_cardinality_time() {
+        // Time is Int32-number-backed and legal inside LowCardinality. The
+        // dictionary body is the same raw signed seconds run as a plain Time.
+        let dictionary = [0i32, -13, 79];
+        let dictionary_bytes: Vec<u8> = dictionary
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let data = BlockBuilder::new()
+            .header(1, 4)
+            .column_header("t", "LowCardinality(Time)")
+            .low_cardinality_block(3, &dictionary_bytes, &[1, 2, 1, 0], 1)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        match cb.chunks[0].column(0) {
+            Column::Dictionary(d) => {
+                assert_eq!(d.indices, vec![1, 2, 1, 0]);
+                match d.values.as_ref() {
+                    Column::Time(values) => assert_eq!(values.values, dictionary),
+                    other => panic!("expected Time dictionary values, got {other:?}"),
+                }
+            }
+            other => panic!("expected Dictionary, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_low_cardinality_rejects_datetime64_inner() {
         // DateTime64 is DataTypeDecimalBase, whose canBeInsideLowCardinality is
         // false, so the server never emits LowCardinality(DateTime64). The crate
@@ -4713,6 +4925,25 @@ mod tests {
         ));
         // The completeness scan must reject it identically, so block_end agrees
         // with decode on which columns are accepted.
+        assert!(matches!(
+            block_end(&data, &DecodeOptions::default()),
+            Err(DecodeError::UnsupportedType { .. })
+        ));
+    }
+
+    #[test]
+    fn test_low_cardinality_rejects_time64_inner() {
+        // Time64 is DecimalBase-backed, so canBeInsideLowCardinality is false.
+        // Decode and the completeness scan must reject the same header.
+        let data = BlockBuilder::new()
+            .header(1, 1)
+            .column_header("lc", "LowCardinality(Time64(3))")
+            .low_cardinality_block(1, &0i64.to_le_bytes(), &[0], 1)
+            .build();
+        assert!(matches!(
+            decode_all_bytes(&data, &DecodeOptions::default()),
+            Err(DecodeError::UnsupportedType { .. })
+        ));
         assert!(matches!(
             block_end(&data, &DecodeOptions::default()),
             Err(DecodeError::UnsupportedType { .. })

@@ -44,6 +44,14 @@ pub enum ChType {
         precision: u8,
         timezone: Option<String>,
     },
+    // Time is signed seconds without a date or timezone. Time64 carries signed
+    // fractional-second ticks at the declared precision, also without a date or
+    // timezone. Both are plain primitive buffers; the logical distinction lives
+    // in these tags.
+    Time,
+    Time64 {
+        precision: u8,
+    },
 
     // Decimal(P, S). The server always emits the canonical `Decimal(P, S)` form
     // on the wire (never `Decimal32(S)` etc.), so that is the only spelling
@@ -132,8 +140,8 @@ impl Schema {
 /// accepts. `Display` is the contract bindings use to report column types, so
 /// any value produced by the parser must round-trip through it. Values that
 /// are constructible but not parser-producible (e.g. `FixedString(0)` or a
-/// `DateTime64` precision above 9) still render, but `parse_ch_type` rejects
-/// them by design.
+/// `DateTime64`/`Time64` precision above 9) still render, but `parse_ch_type`
+/// rejects them by design.
 impl std::fmt::Display for ChType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -169,6 +177,8 @@ impl std::fmt::Display for ChType {
                 precision,
                 timezone: Some(tz),
             } => write!(f, "DateTime64({precision}, '{tz}')"),
+            ChType::Time => write!(f, "Time"),
+            ChType::Time64 { precision } => write!(f, "Time64({precision})"),
             // Render the canonical `Decimal(P, S)` the server emits, comma-space
             // separated, both fields always present, so it round-trips the wire
             // string. `bits` is derived from P and is not part of the name.

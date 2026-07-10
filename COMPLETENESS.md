@@ -47,89 +47,40 @@ point-in-time snapshot for the next agent, not a changelog. Keep it short. Alway
 include a "Recommended next" with a one-line reason, so the next agent has a
 default; the user may override it.
 
-- **Last updated:** 2026-07-09 (**wide integers `Int128`/`UInt128`/`Int256`/
-  `UInt256` decode AND encode** landed together, opening Tier 2 and keeping full
-  encode/decode parity. All four go through the server's generic
-  `SerializationNumber<T>`: a raw contiguous fixed-width dump, 16 bytes
-  (128-bit) / 32 bytes (256-bit), straight little-endian two's-complement,
-  byte-identical to the integer body under `Decimal128`/`Decimal256`. Decode is
-  a host-agnostic verbatim byte passthrough (the `Decimal`/`FixedBinary` path,
-  NOT the `decode_primitive!` host-byteswap path), so no native `i128`/`i256`
-  is used and the buffer stays correct on big-endian hosts. Unlike `Decimal`
-  and `Enum`, all four are legal `Nullable` AND `LowCardinality` inners
-  (`DataTypeNumberBase::canBeInsideLowCardinality()` is final/true), so they
-  were added to the `is_low_cardinality_inner` allowlist. Arrow export is
-  FixedSizeBinary `w:16`/`w:32` (never decimal: Arrow's precision-38/76 caps
-  cannot hold the full 128/256-bit range and would misread unsigned high-bit
-  values as negative); signedness rides the `ChType`/type-name channel, not the
-  Arrow format string (`w:16` is shared with `UUID`/`IPv6`). Adversarial review
-  (rust-reviewer + codex) found no correctness defects; two minor polish items
-  applied after (type-neutral fixed-width overflow message; `Array(Int128)` +
-  `Map(String, Int256)` container-element round-trips). Live INSERT and
-  recaptured fixtures green against 26.6.1.1193, including `lc_i256
-  LowCardinality(Int256)`.)
-- **Active track:** Tier 1 plus the wide integers are done; the rest of Tier 2
-  is the current growth, all cheap and needing no new framing: the
-  simple-integer-backed temporals `Time` (Int32) / `Time64(P)` (DateTime64
-  layout) and the 11 `Interval*` kinds (Int64), then `BFloat16` (2-byte),
-  `Nothing` (zero-width edge), `SimpleAggregateFunction` (parse-only, decodes as
-  the inner `T`), `Nested(...)` (sugar over the done `Array(Tuple(...))`), and
-  the geo aliases (`Point` = `Tuple(Float64, Float64)`, etc.). Tier 3
-  (`Variant`/`Dynamic`/`JSON` and the `Geometry`/`QBit` dependents) is the hard,
-  version-sensitive endgame. See "Type coverage".
-- **Pinned server tag (`.server-ref`):** v26.6.1.1193-stable, protocol revision
-  **54485**. The crate, the committed fixtures, and the `CODEC_CONTRACT.md`
-  citations are all aligned to this pin. The local `.server-src` checkout and the
-  running capture server are both 26.6.1.1193.
-- **Scope (current completeness bar):** "complete" means decoding `FORMAT Native`
-  delivered over **HTTP**, not TCP. The path **assumes uncompressed Native bytes**:
-  HTTP `FORMAT Native` does not enable native block-frame compression by default.
-  The LZ4/NONE + CityHash128 compressed-block framing in `src/compression/` is
-  built and tested but intentionally **unwired** (no caller). See "Out of scope".
-- **Last completed:** **wide integers `Int128`/`UInt128`/`Int256`/`UInt256`
-  decode and encode** (`src/schema.rs`, `src/column.rs`, `src/native/decode.rs`,
-  `src/native/encode.rs`, `src/ffi.rs`, plus fixture/integration/live-insert
-  coverage). Four distinct `ChType` variants and four distinct `Column`
-  variants, each backed by the existing `FixedBinaryColumn`
-  (`{ data: Vec<u8>, width, validity }`, width 16 or 32), mirroring the
-  UUID/IPv6-over-shared-fixed-binary precedent so `column_variant_matches`
-  catches an `Int128`-typed `UInt128` buffer (or a `UUID`/`IPv6`, all `w:16`).
-  `parse_ch_type` matches the four exact case-sensitive spellings (no params, no
-  aliases). Decode reuses `decode_fixed_binary_data` (raw `to_vec`, no
-  reinterpretation, `num_rows.checked_mul(width)` bounds the body); encode
-  reuses `encode_fixed_binary_data` (`extend_from_slice`); `validate_column`
-  rejects a width mismatch or a `data.len() != width * num_rows` body via
-  `checked_mul` before any bytes are written. `Nullable` composes via the
-  null-map wrapper and `LowCardinality` via the existing dictionary/index path
-  (both verified end to end, including a zero-length LC run).
-- **Build/test status:** Tree builds clean; `cargo test` green (386 unit + 3
-  integration, live-insert + doctest ignored); clippy clean
-  (`cargo clippy --all-targets -- -D warnings`); fmt clean. `all_types` now has
-  60 columns: the wide ints are covered by `i128`/`u128`/`i256`/`u256`, a
-  `ni128 Nullable(Int128)`, and `lc_i256 LowCardinality(Int256)` in the
-  committed fixtures (rev 0 and rev 54485, recaptured from the local 26.6.1.1193
-  server) and asserted in `tests/integration.rs`, plus the same columns in
-  `tests/live_insert.rs` (the `LowCardinality(Int256)` DDL uses
-  `allow_suspicious_low_cardinality_types=1`, a CREATE-time-only guard that does
-  not gate the wire). Encode is additionally covered by round-trip unit tests
-  (rev 0 and rev 54485), exact-byte framing pins, and the `Array(Int128)` /
-  `Map(String, Int256)` container round-trips. The `#[ignore]` live INSERT tests
-  run green against the local 26.6.1.1193 server. Note: in this environment
-  `localhost` is proxy-intercepted; capture scripts and live tests run against
-  `127.0.0.1` with `no_proxy` set.
-- **Recommended next:** continue the Tier 2 batch with the simple-integer-backed
-  temporals **`Time` + `Time64(P)`**: `Time` is a 4-byte LE `Int32` of seconds
-  (can be negative, no timezone), `Time64(P)` an 8-byte LE `Int64` wire-identical
-  to `DateTime64`, so both reuse the existing primitive/temporal machinery with
-  no new Column or Arrow concept (layouts already recorded in "Type coverage").
-  Then the 11 `Interval*` kinds (Int64), then `BFloat16`, `Nothing`, and
-  `SimpleAggregateFunction`. `Nested(...)` (first confirm via the server-reader
-  whether the server ever emits the `Nested` type string in a Native header or
-  always the expanded `Array(Tuple(...))`) and the geo aliases (`Point` =
-  `Tuple(Float64, Float64)` etc.) are cheap follow-ons on top of `Array` +
-  `Tuple`. Per the standing policy, land each new type's encode in the same
-  change. Sink-based encode and the (still unwired) compression framing remain
-  the other standing backlog items.
+- **Last updated:** 2026-07-09. **`Time` and `Time64(P)` decode AND encode**
+  landed together at full parity. At `v26.6.1.1193-stable`, `Time` is a raw
+  4-byte little-endian signed `Int32` of seconds and `Time64(P)` is a raw 8-byte
+  little-endian signed `Int64` of `10^-P`-second ticks, with no bulk rescaling,
+  timezone, or type-specific framing. The parser accepts only the canonical
+  Native header spellings `Time` and `Time64(P)`, `P in 0..=9`; input-only
+  server aliases such as bare `Time64` are deliberately outside the wire parser.
+- **Implementation shape:** distinct `ChType` and `Column::Time`/`Time64` tags
+  preserve exact type-buffer matching, while both columns reuse
+  `PrimitiveColumn<i32/i64>`, the primitive bulk fast path, null-map wrapper,
+  and fixed-width scanner. `Time` is legal inside `LowCardinality`; `Time64` is
+  not. Arrow export is raw `i`/`l`, not Arrow Time, because Arrow restricts Time
+  values to one nonnegative day while ClickHouse permits negative values and
+  magnitudes through 999 hours.
+- **Pinned server tag:** `v26.6.1.1193-stable`, protocol revision **54485**.
+  Confirmed server paths include `DataTypeTime.{h,cpp}`,
+  `Serializations/SerializationDateTime.{h,cpp}` (`SerializationTime`),
+  `DataTypeTime64.{h,cpp}`, `Serializations/SerializationTime64.{h,cpp}`, and
+  `Serializations/SerializationDecimalBase.cpp`. Local source, capture server,
+  fixtures, and contract citations are aligned to 26.6.1.1193.
+- **Scope:** completeness still means uncompressed HTTP `FORMAT Native`; TCP and
+  the currently unwired compression framing remain out of scope.
+- **Build/test status:** `cargo test` is green (396 unit + 3 integration;
+  live-insert and doctest ignored), clippy is clean with `-D warnings`, and fmt
+  is clean. The 65-column `all_types` fixtures at revisions 0 and 54485 now cover
+  plain/nullable `Time` and `Time64(6)` plus `LowCardinality(Time)`. Both ignored
+  live INSERT tests pass against ClickHouse 26.6.1.1193. Exact-byte, zero-row,
+  multi-block, nullable, LC allow/reject, invalid-precision, scanner, and Arrow
+  tests are included.
+- **Recommended next:** implement the 11 **`Interval*`** Tier 2 types together.
+  They are distinct logical types over the same raw little-endian `Int64` body,
+  so they should reuse this change's primitive-backed pattern while preserving
+  exact type tags and encode/decode parity. Then continue with `BFloat16`,
+  `Nothing`, and `SimpleAggregateFunction`.
 - **Active gotchas / context:**
   - A zero-length `LowCardinality` run (reachable when rows > 0 but every
     array or map is empty) has NO body bytes at all:
@@ -210,7 +161,7 @@ default; the user may override it.
     `UnsupportedType`. Do not add `Enum` to the LC allowlist.
   - Wide integers (`Int128`/`UInt128`/`Int256`/`UInt256`) ARE legal
     `LowCardinality` and `Nullable` inners, in contrast to
-    `Decimal`/`Enum`/`DateTime64` above: they are numerics, and
+    `Decimal`/`Enum`/`DateTime64`/`Time64` above: they are numerics, and
     `DataTypeNumberBase::canBeInsideLowCardinality()` is final/true, so
     `LowCardinality(Int128)` etc. appear on the wire and are IN the
     `is_low_cardinality_inner` allowlist (server tests `02125_low_cardinality_int256`
@@ -333,13 +284,14 @@ is not done, and must not be checked off, until all of these hold:
 - [x] `FixedString(N)`
 - [x] `UUID`, `IPv4`, `IPv6`
 - [x] `Date`, `Date32`, `DateTime`, `DateTime64(P[, tz])`
+- [x] `Time`, `Time64(P)`
 - [x] `Nullable(T)` over every supported inner type
 - [x] Per-column bulk-state prefix (generalized; `LowCardinality` is the first
       non-empty prefix)
 - [x] `LowCardinality(T)` for every allowed inner type this crate decodes:
       `String`, `FixedString(N)`, the fixed-width numerics, `Bool`, `Date`,
-      `Date32`, `DateTime`, `UUID`, `IPv4`, `IPv6`, each also in the inner
-      `Nullable` form. `DateTime64`, `Decimal`, and `Enum8`/`Enum16` are excluded:
+      `Date32`, `DateTime`, `Time`, `UUID`, `IPv4`, `IPv6`, each also in the inner
+      `Nullable` form. `DateTime64`, `Time64`, `Decimal`, and `Enum8`/`Enum16` are excluded:
       the server forbids all of them as LC inners (`canBeInsideLowCardinality()`
       is false), so they never appear in that position on the wire. This holds for
       `Enum` independent of decode support; the crate now decodes `Enum8`/`Enum16`
@@ -430,6 +382,20 @@ is not done, and must not be checked off, until all of these hold:
         (`SerializationNumber`/`wide::integer`, v26.6.1.1193-stable) and verified
         with the `i128`/`u128`/`i256`/`u256`/`ni128`/`lc_i256` live-server
         fixture columns; encode runs green in the live INSERT test.
+- [x] `Time`, `Time64(P)` (decode and encode)
+      - `Time` is a raw little-endian signed `Int32` of seconds;
+        `Time64(P)` is a raw little-endian signed `Int64` of `10^-P`-second ticks
+        with `P in 0..=9`. Both use distinct logical and `Column` tags over the
+        existing primitive buffers, with no new physical layout or copy.
+        `Nullable` composes for both. `Time` is a legal `LowCardinality` inner;
+        `Time64` inherits the server's false capability and is rejected there.
+        Arrow exports raw `i`/`l` because ClickHouse's negative and
+        beyond-one-day values cannot be represented by Arrow's one-day
+        nonnegative Time types.
+        Confirmed at `v26.6.1.1193-stable` against `DataTypeTime`,
+        `SerializationTime`, `DataTypeTime64`, `SerializationTime64`, and
+        `SerializationDecimalBase`; verified by the 65-column live fixtures,
+        unit round-trips/scanner tests, and the live INSERT test.
 
 ---
 
@@ -451,19 +417,19 @@ introduction), so record them per type only when determinable.
 - [x] `LowCardinality(T)` - dictionary + index framing; has a real bulk-state
       prefix. Decoded for every inner type this crate already decodes that
       ClickHouse permits inside `LowCardinality`: `String`, `FixedString(N)`, the
-      fixed-width numerics, `Bool`, `Date`, `Date32`, `DateTime`, each also in the
+      fixed-width numerics, `Bool`, `Date`, `Date32`, `DateTime`, `Time`, each also in the
       inner `Nullable` form. Exported as Arrow `dictionary(i32, V)` where `V` is
       the inner value type's format. The dictionary values defer to the shared
       per-type body decoder (`decode_column_body`), so the allowlist is just
       `IDataType::canBeInsideLowCardinality()` intersected with the decoded types.
-      `DateTime64`, `Decimal`, and `Enum8`/`Enum16` reject because the server
+      `DateTime64`, `Time64`, `Decimal`, and `Enum8`/`Enum16` reject because the server
       forbids them as LC inners (`canBeInsideLowCardinality()` is false), so they
       never appear in that position on the wire; this is independent of decode
-      support, and the crate decodes all three as ordinary columns while still
+      support, and the crate decodes all four as ordinary columns while still
       rejecting them as LC inners. `UUID`/`IPv4`/`IPv6` are decoded so their LC
       forms decode too. Confirmed against the server source and verified with
       live-server fixtures (`lc`, `lcn`, `lc_u32`, `lc_date`, `lcn_u32`,
-      `lc_uuid`).
+      `lc_uuid`, `lc_time`).
 - [x] `Enum8(...)`, `Enum16(...)` - raw `Int8`/`Int16` on the wire (the name
       list is in the type string only, never in per-row data). The core carries
       the name->value map in `ChType` (`variants`, in the server's emitted
@@ -555,17 +521,24 @@ introduction), so record them per type only when determinable.
       `SerializationNumber<BFloat16>` with no per-row framing. Confirmed registered
       and stable at v26.6.1.1193-stable (`registerDataTypeNumbers`; the
       `allow_experimental_bfloat16_type` gate is now an obsolete no-op).
-- [ ] `Time` - 4-byte little-endian signed `Int32` of seconds, can be negative
-      (range [-999:59:59, 999:59:59]); no timezone (the type rejects a tz arg).
+- [x] `Time` - decode AND encode done. 4-byte little-endian signed `Int32` of
+      seconds, can be negative (documented text range
+      [-999:59:59, 999:59:59], while Native accepts any i32 payload); no
+      timezone. The type rejects non-empty timezone arguments
+      but accepts and discards an empty timezone input alias; neither form is
+      emitted in a canonical Native header.
       `SerializationTime` extends `SerializationNumber<Int32>` with no binary-bulk
       override. Confirmed registered and stable at v26.6.1.1193-stable.
-- [ ] `Time64(P)` - 8-byte little-endian signed `Int64` of ticks scaled 10^-P,
-      P in 0..=9 (default 3); no timezone. Wire layout identical to `DateTime64`
+- [x] `Time64(P)` - decode AND encode done. 8-byte little-endian signed `Int64`
+      of ticks scaled 10^-P, P in 0..=9 (default 3); no timezone. Wire layout
+      identical to `DateTime64`
       (`SerializationTime64` extends `SerializationDecimalBase<Time64>`). Confirmed
-      registered and stable at v26.6.1.1193-stable. The `enable_time_time64_type`
-      setting (default true) gates only CREATE TABLE column creation, not
-      query-result Native streams, so a `Time`/`Time64` column can appear on the
-      wire regardless of the setting.
+      registered and stable at v26.6.1.1193-stable. The
+      `enable_time_time64_type` setting (default true) is a post-parse validation
+      gate for CREATE, ALTER, table-function structure declarations, and
+      user-facing CAST targets. It does not gate DataTypeFactory registration or
+      Native serialization, so a `Time`/`Time64` column can still appear in a
+      Native stream regardless of the setting.
 
 ### Tier 3 - advanced / newest type system; hardest, do last
 
@@ -698,6 +671,14 @@ bring encode to parity with what the decoder already supports.
       a `DateTime64` precision > 9 is constructible in memory and would render a
       type string the parser and server reject (pre-existing, encode input is
       trusted in-memory data, left out of scope).
+- [x] `Time` (i32 seconds) / `Time64(P)` (i64 ticks) through the same primitive
+      little-endian encoder, with distinct `Column::Time`/`Time64` tag matching.
+      Precision remains type-string metadata only. `Nullable` composes for both;
+      the shared dictionary path encodes `LowCardinality(Time)`, while
+      `LowCardinality(Time64)` remains `UnsupportedType` to match the server.
+      Verified at revisions 0 and 54485, including an exact signed-byte framing
+      pin, zero-row and multi-block round-trips, invalid precision rejection,
+      live fixture capture, and live INSERT against 26.6.1.1193.
 - [x] `UUID`/`IPv6` (raw 16-byte-per-row passthrough straight from the
       `FixedBinaryColumn` data buffer, one `extend_from_slice`, NO reordering:
       UUID stays in its wire UInt128 POD order, IPv6 in network byte order; the
@@ -756,7 +737,7 @@ bring encode to parity with what the decoder already supports.
       `0x600..0x603`, dictionary size, removeNullable inner body through the
       existing inner encoder, row count, and raw UInt8/16/32/64 indexes. Zero-row
       LC writes no prefix/body. Validation rejects forbidden inners
-      (`Decimal`, `DateTime64`, `Enum`), wrong dictionary value variants, negative
+      (`Decimal`, `DateTime64`, `Time64`, `Enum`), wrong dictionary value variants, negative
       or out-of-range indexes, non-empty dictionaries on zero-row blocks, and
       nullable-LC rows that violate the index-0 NULL sentinel rule. Covered by
       rev 0 / rev 54485 round-trips, exact-byte pins, zero-row and multi-block

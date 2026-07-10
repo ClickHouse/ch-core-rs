@@ -245,9 +245,22 @@ SELECT
     -- SETTINGS below; no wire effect). Values repeat (13, 79, 13, 258) so the
     -- per-block dictionary is smaller than the row count. The dictionary body is
     -- the plain 32-byte-per-entry Int256 run.
-    CAST(multiIf(n = 0, '13', n = 1, '79', n = 2, '13', '258'), 'LowCardinality(Int256)') AS lc_i256
+    CAST(multiIf(n = 0, '13', n = 1, '79', n = 2, '13', '258'), 'LowCardinality(Int256)') AS lc_i256,
+    -- Time: raw signed Int32 seconds, including both documented text extrema.
+    -- Unlike DateTime, this has no epoch or timezone.
+    CAST(multiIf(n = 0, toInt32(-3599999), n = 1, toInt32(-3600), n = 2, toInt32(13), toInt32(3599999)), 'Time') AS t,
+    -- Time64(6): raw signed Int64 microsecond ticks. The string forms pin exact
+    -- fractional values without a numeric cast rescaling seconds by 10^6.
+    CAST(multiIf(n = 0, '-999:59:59.999999', n = 1, '-00:00:00.000001', n = 2, '00:00:13.000079', '999:59:59.999999'), 'Time64(6)') AS t64,
+    -- Both Time types are legal Nullable inners. Null rows carry the server's
+    -- placeholder after the null map; only the valid rows are asserted.
+    CAST(multiIf(n = 1, NULL, n = 3, NULL, n = 0, toInt32(-13), toInt32(79)), 'Nullable(Time)') AS nt,
+    CAST(multiIf(n = 1, NULL, n = 3, NULL, n = 0, '-00:00:00.000013', '00:00:00.000079'), 'Nullable(Time64(6))') AS nt64,
+    -- Time is number-backed and legal inside LowCardinality (Time64 is not).
+    -- Repeats keep the per-block dictionary smaller than the row count.
+    CAST(multiIf(n = 0, toInt32(-13), n = 1, toInt32(79), n = 2, toInt32(-13), toInt32(258)), 'LowCardinality(Time)') AS lc_time
 FROM numbers(4)
-SETTINGS allow_suspicious_low_cardinality_types = 1, enable_nullable_tuple_type = 1
+SETTINGS allow_suspicious_low_cardinality_types = 1, enable_nullable_tuple_type = 1, enable_time_time64_type = 1
 FORMAT Native
 SQL
 )

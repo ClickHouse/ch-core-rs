@@ -269,6 +269,8 @@ than an error.
 | `Date32`          | `Date32`         | `Date32`          | `tdD`        | validity, values            | yes      |
 | `DateTime`, `DateTime('<tz>')` | `DateTime { timezone }` | `DateTime` | `I` | validity, values         | yes      |
 | `DateTime64(P)`, `DateTime64(P, '<tz>')` | `DateTime64 { precision, timezone }` | `DateTime64` | `ts{unit}:{tz}` for P in {0,3,6,9}, else `l` | validity, values | yes |
+| `Time`            | `Time`           | `Time`            | `i`          | validity, values            | yes      |
+| `Time64(P)`       | `Time64 { precision }` | `Time64`     | `l`          | validity, values            | yes      |
 | `Nullable(T)`     | `Nullable(T)`    | inner T's variant | inner's      | inner's, validity populated | n/a      |
 | `LowCardinality(T)` for an allowed inner `T` (see the type section) | `LowCardinality(Box<ChType>)` | `Dictionary` | `i` (index type; values type in the dictionary child) | validity, i32 indices (+ dictionary child) | via inner `Nullable` |
 | `Array(T)` for any supported element `T` | `Array(Box<ChType>)` | `Array` | `+L` (LargeList; element type in the item child) | validity, i64 offsets (+ item child) | no (array level); element nulls via `Array(Nullable(T))` |
@@ -737,9 +739,9 @@ Confirmed at `v26.6.1.1193-stable`.
 
 ### Temporal types
 
-This covers `Date`, `Date32`, `DateTime`, and `DateTime64`. All four are plain
-bulk integers on the wire, identical in layout to the corresponding
-`SerializationNumber<T>`. Timezone and precision are type metadata only and have
+This covers `Date`, `Date32`, `DateTime`, `DateTime64`, `Time`, and `Time64`.
+All six are plain bulk integers on the wire, identical in layout to the matching
+fixed-width primitive. Timezone and precision are type metadata only and have
 zero effect on the wire bytes.
 
 **Type string(s) and per-type details:**
@@ -750,11 +752,17 @@ zero effect on the wire bytes.
 | `Date32`                                 | `ChType::Date32`                      | `i32`        | `Date32`       | 4         |
 | `DateTime`, `DateTime('<tz>')`           | `ChType::DateTime { timezone }`       | `u32`        | `DateTime`     | 4         |
 | `DateTime64(P)`, `DateTime64(P, '<tz>')` | `ChType::DateTime64 { precision, timezone }` | `i64` | `DateTime64`   | 8         |
+| `Time`                                   | `ChType::Time`                        | `i32`        | `Time`         | 4         |
+| `Time64(P)`                              | `ChType::Time64 { precision }`        | `i64`        | `Time64`       | 8         |
 
 `parse_ch_type` reads the optional timezone as the single-quoted contents of the
 type string (`None` when absent), and the `DateTime64` precision `P` as the
 integer in `DateTime64(P[, '<tz>')`. A precision outside `0..=9` is rejected as
-`UnsupportedType`.
+`UnsupportedType`. `Time` has no parameter. `Time64(P)` carries a required
+canonical precision `P` in `0..=9` and has no timezone. Although the server's
+input parser accepts compatibility aliases such as bare `Time64` (defaulting to
+precision 3), it always emits `Time64(P)` in a Native header, so
+`parse_ch_type` accepts only that canonical wire spelling.
 
 **Logical meaning of the integer:**
 
@@ -765,6 +773,13 @@ integer in `DateTime64(P[, '<tz>')`. A precision outside `0..=9` is rejected as
 - `DateTime`: seconds since the Unix epoch, unsigned. Range 1970 .. 2106.
 - `DateTime64(P)`: ticks where one tick is `10^-P` seconds, signed (negative is
   before the epoch). For example `DateTime64(3)` ticks are milliseconds.
+- `Time`: signed whole seconds with no date, epoch, or timezone. Text parsing and
+  component extraction document `-999:59:59 .. 999:59:59`, but the Native bulk
+  path performs no range validation and decodes any `i32` payload verbatim.
+- `Time64(P)`: signed ticks where one tick is `10^-P` seconds, with precision
+  `P` in `0..=9` and no date, epoch, or timezone. Its text/component behavior
+  uses the same documented 999-hour range, but Native bulk decoding accepts any
+  `i64` payload verbatim.
 
 **Wire payload:** `num_rows * bytes_per_row` bytes, little-endian, contiguous,
 no per-row framing. Identical to the matching fixed-width numeric.
@@ -786,13 +801,25 @@ match, otherwise it exposes the raw integer:
   `DateTime64(9, 'America/New_York')` -> `tsn:America/New_York`. For any other
   precision it falls back to `l` (Arrow int64, raw ticks), for example
   `DateTime64(2)` -> `l`.
+- `Time` -> `i` (Arrow int32, raw seconds).
+- `Time64(P)` -> `l` (Arrow int64, raw ticks) for every precision.
+
+The two Time types deliberately do not use Arrow Time32/Time64 formats. Arrow
+Time values are restricted to one nonnegative 24-hour day, while ClickHouse
+`Time`/`Time64` allow negative values and values beyond 24 hours. Advertising
+the physical buffers as Arrow Time would therefore make valid ClickHouse values
+invalid Arrow arrays. Keeping the raw integers is zero-copy and preserves every
+wire value; `ChType::Time64` retains the tick precision.
 
 **Rust buffer:** `Column::Date(PrimitiveColumn<u16>)`,
 `Column::Date32(PrimitiveColumn<i32>)`,
 `Column::DateTime(PrimitiveColumn<u32>)`, and
-`Column::DateTime64(PrimitiveColumn<i64>)`. Each is `{ values, validity }` at the
-faithful native width. `values` has length `num_rows` and, on little-endian
-targets, is the wire bytes verbatim.
+`Column::DateTime64(PrimitiveColumn<i64>)`,
+`Column::Time(PrimitiveColumn<i32>)`, and
+`Column::Time64(PrimitiveColumn<i64>)`. Each is `{ values, validity }` at the
+faithful native width. The Time variants add only distinct logical tags, not a
+new physical column concept. `values` has length `num_rows` and, on
+little-endian targets, is the wire bytes verbatim.
 
 **Notes:** the Arrow export is zero-copy and never widens or rescales. `Date`
 exports as Arrow uint16 (raw days), `DateTime` as uint32 (raw seconds),
@@ -809,14 +836,28 @@ the server may drop the timezone and emit a bare `DateTime`, while at revision
 54485 it emits `DateTime('<tz>')`. The decoder trusts and reflects whatever type
 string the server actually wrote.
 
+`Time` and `Time64` always export their raw signed integer buffers because of
+the Arrow Time domain mismatch described above. Their precision and type
+identity remain available in `ChType`, and neither type carries timezone
+metadata.
+
 **Server reference:** `SerializationDate` (inherits `SerializationNumber<UInt16>`),
 `SerializationDate32` (inherits `SerializationNumber<Int32>`),
 `SerializationDateTime` (inherits `SerializationNumber<UInt32>`), and
 `SerializationDateTime64` (inherits `SerializationDecimalBase<DateTime64>`, native
-type `Int64`), in `src/DataTypes/Serializations/`. None override the binary bulk
-path, so each is exactly its underlying integer: a single bulk raw read on
-little-endian hosts, byte-swapped per element on big-endian hosts. Confirmed at
-`v26.6.1.1193-stable`.
+type `Int64`), plus `DataTypeTime`/`SerializationTime` and
+`DataTypeTime64`/`SerializationTime64`, in `src/DataTypes/` and
+`src/DataTypes/Serializations/`. `SerializationTime` inherits
+`SerializationNumber<Int32>`; `SerializationTime64` inherits
+`SerializationDecimalBase<Time64>`, whose native type is `Int64`. None override
+the binary bulk path, so each is exactly its underlying integer: a single bulk
+raw read on little-endian hosts, byte-swapped per element on big-endian hosts.
+Confirmed at `v26.6.1.1193-stable` from
+`src/DataTypes/DataTypeTime.{h,cpp}`,
+`src/DataTypes/Serializations/SerializationDateTime.{h,cpp}` for
+`SerializationTime`, `src/DataTypes/DataTypeTime64.{h,cpp}`,
+`src/DataTypes/Serializations/SerializationTime64.{h,cpp}`, and
+`src/DataTypes/Serializations/SerializationDecimalBase.cpp`.
 
 ### Nullable(T)
 
@@ -869,21 +910,24 @@ rejects any other inner as `UnsupportedType`.
 the fixed-width numerics (`Int8`/`Int16`/`Int32`/`Int64`,
 `UInt8`/`UInt16`/`UInt32`/`UInt64`, `Float32`/`Float64`), the wide integers
 (`Int128`/`UInt128`/`Int256`/`UInt256`), `Bool`, the number-backed temporals
-`Date`, `Date32`, and `DateTime`, and `UUID`/`IPv4`/`IPv6`. The dictionary values
-are that inner type serialized as a plain column body (varint-length strings for
-`String`, raw fixed-width bytes otherwise: 4 bytes per `IPv4` entry, 16 bytes per
-`UUID`/`IPv6`/`Int128`/`UInt128` entry, 32 bytes per `Int256`/`UInt256` entry), so
-support follows directly from the per-type body decoder.
+`Date`, `Date32`, `DateTime`, and `Time`, and `UUID`/`IPv4`/`IPv6`. The
+dictionary values are that inner type serialized as a plain column body:
+varint-length strings for `String`, raw fixed-width bytes otherwise (4 bytes per
+`IPv4` entry, 16 bytes per `UUID`/`IPv6`/`Int128`/`UInt128` entry, 32 bytes per
+`Int256`/`UInt256` entry). Support follows directly from the per-type body
+decoder.
 
 This allowlist is exactly `IDataType::canBeInsideLowCardinality()` intersected
 with the types this crate decodes, confirmed against the server source at
 `v26.6.1.1193-stable` (the `DataTypeLowCardinality` constructor checks it after
 `removeNullable`). Three consequences worth calling out:
 
-- `DateTime64` and every `Decimal` are **not** allowed: they are
+- `DateTime64`, `Time64`, and every `Decimal` are **not** allowed: they are
   `DataTypeDecimalBase` subclasses whose `canBeInsideLowCardinality()` is false,
-  so the server never emits `LowCardinality(DateTime64(...))`. The crate decodes
-  `DateTime64` as an ordinary column but rejects it as a `LowCardinality` inner.
+  so the server never emits `LowCardinality(DateTime64(...))` or
+  `LowCardinality(Time64(...))`. The crate decodes both as ordinary columns but
+  rejects them as `LowCardinality` inners. `Time`, by contrast, inherits the
+  number-backed true capability and is allowed.
 - `Enum8` and `Enum16` are **not** allowed either: `DataTypeEnum` does not
   inherit `DataTypeNumberBase`, so its `canBeInsideLowCardinality()` is false and
   the server throws `ILLEGAL_TYPE_OF_ARGUMENT` on `LowCardinality(Enum...)` at
@@ -1369,10 +1413,11 @@ defensive fall-through that validation already rules out.
 ### Coverage
 
 Encode coverage is kept a subset of decode coverage and grows the same
-one-type-at-a-time way; as of `Map(K, V)` landing, the two are at parity.
+one-type-at-a-time way; the two are currently at parity.
 Encodable today: `Bool`, the fixed-width numerics (`Int8`..`Int64`,
 `UInt8`..`UInt64`, `Float32`, `Float64`), the temporals (`Date`, `Date32`,
-`DateTime`, `DateTime64`), `UUID`, `IPv4`, `IPv6`, `String`, `FixedString(N)`,
+`DateTime`, `DateTime64`, `Time`, `Time64`), `UUID`, `IPv4`, `IPv6`, `String`,
+`FixedString(N)`,
 `Enum8`/`Enum16`, `Decimal(P, S)`, the wide integers
 (`Int128`/`UInt128`/`Int256`/`UInt256`, a verbatim fixed-width body byte-identical
 to a `Decimal128`/`256` body, the exact inverse of the decode passthrough),
@@ -1442,7 +1487,8 @@ would never produce.
 - **Type string round-trips.** `field.ch_type.to_string()` must parse back to the
   same `ChType` through `parse_ch_type`, so encode never writes a header the
   server or this crate's own decoder would reject: `FixedString(0)`, a
-  `DateTime64` precision above 9, an out-of-range `Decimal` precision, and so on.
+  `DateTime64` or `Time64` precision above 9, an out-of-range `Decimal`
+  precision, and so on.
   A `DateTime`/`DateTime64` timezone containing a single quote is rejected
   separately, since it renders a header that closes its quote early even though
   the crate's own lenient parser would recover it.
@@ -1642,11 +1688,12 @@ Not yet supported, tracked as planned phases in `src/schema.rs`:
 - `LowCardinality(T)` for an inner type outside the allowlist in the
   `LowCardinality(T)` section. The wrapper and its allowed inners (String,
   FixedString, the fixed-width numerics, the wide integers, Bool, Date, Date32,
-  DateTime, UUID/IPv4/IPv6, with or without an inner `Nullable`) are supported;
-  any other inner is rejected as `UnsupportedType`. This includes `DateTime64`,
-  every `Decimal`, and `Enum8`/`Enum16`, all of which the server itself forbids as
-  LC inners (`canBeInsideLowCardinality()` is false), so they never appear in that
-  position on the wire.
+  DateTime, Time, UUID/IPv4/IPv6, with or without an inner `Nullable`) are
+  supported; any other inner is rejected as `UnsupportedType`. This includes
+  `DateTime64`, `Time64`, every `Decimal`, and `Enum8`/`Enum16`, all of which the
+  server itself forbids as LC inners (`canBeInsideLowCardinality()` is false), so
+  they never appear in that position on the wire. Plain and nullable `Time64`
+  columns remain supported.
 
 The containers `Array(T)`, `Tuple(T1, ...)`, and `Map(K, V)` are all fully
 supported, decode and encode (see their type sections and the "Encoding"

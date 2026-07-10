@@ -224,6 +224,12 @@ fn arrow_format(ch_type: &ChType) -> String {
             let tz = timezone.as_deref().unwrap_or("");
             format!("ts{unit}:{tz}")
         }
+        // ClickHouse Time permits signed values outside Arrow Time's [0, 24h)
+        // domain, so exporting as an Arrow time type would misstate the logical
+        // range. Preserve the raw signed seconds/ticks at their native widths,
+        // with no validation, rescaling, or copy.
+        ChType::Time => "i".into(),
+        ChType::Time64 { .. } => "l".into(),
         ChType::String => "u".into(),
         ChType::FixedString(n) => format!("w:{n}"),
         // IPv4 is the standard UInt32 numeric value, exported as Arrow uint32
@@ -570,6 +576,8 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
         Column::Date32(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
         Column::DateTime(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
         Column::DateTime64(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
+        Column::Time(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
+        Column::Time64(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
         Column::Utf8(c) => {
             match &c.validity {
                 Some(bm) => buffers.push(bm.as_bytes().as_ptr() as *const c_void),
@@ -862,6 +870,7 @@ pub unsafe fn export_chunks_to_stream(
 mod tests {
     use super::*;
     use crate::batch::ColBatch;
+    use crate::bitmap::Bitmap;
     use crate::column::{Column, PrimitiveColumn, Utf8Column};
     use crate::schema::{ChType, Field, Schema};
     use std::ffi::CStr;
@@ -1437,6 +1446,113 @@ mod tests {
             }),
             "l"
         );
+        // ClickHouse times can be negative or exceed 24 hours, so every
+        // precision exports as the raw signed integer rather than Arrow Time.
+        assert_eq!(arrow_format(&ChType::Time), "i");
+        for precision in 0..=9 {
+            assert_eq!(arrow_format(&ChType::Time64 { precision }), "l");
+        }
+    }
+
+    #[test]
+    fn test_export_time_buffers() {
+        let schema = Schema::new(vec![
+            Field {
+                name: "t".into(),
+                ch_type: ChType::Time,
+            },
+            Field {
+                name: "t64".into(),
+                ch_type: ChType::Time64 { precision: 3 },
+            },
+        ]);
+        let batch = Arc::new(ColBatch::new(
+            schema,
+            vec![
+                Column::Time(PrimitiveColumn::new(vec![-3_599_999, 0, 3_599_999])),
+                Column::Time64(PrimitiveColumn::new(vec![-3_599_999_999, 0, 3_599_999_999])),
+            ],
+            3,
+        ));
+
+        // Safety: the zeroed FFI outputs are writable and the batch remains
+        // alive until each matching release callback is invoked below.
+        unsafe {
+            let mut schema_out: ArrowSchema = std::mem::zeroed();
+            export_schema(&batch.schema, &mut schema_out);
+            let t_schema = &**schema_out.children.add(0);
+            let t64_schema = &**schema_out.children.add(1);
+            assert_eq!(CStr::from_ptr(t_schema.format).to_str().unwrap(), "i");
+            assert_eq!(CStr::from_ptr(t64_schema.format).to_str().unwrap(), "l");
+            (schema_out.release.unwrap())(&mut schema_out);
+
+            let mut array: ArrowArray = std::mem::zeroed();
+            export_batch_array(&batch, &mut array);
+            let t = &**array.children.add(0);
+            let t64 = &**array.children.add(1);
+            assert_eq!(t.length, 3);
+            assert_eq!(t.n_buffers, 2);
+            assert!((*t.buffers.add(0)).is_null());
+            assert_eq!(*(*t.buffers.add(1) as *const i32), -3_599_999);
+            assert_eq!(t64.length, 3);
+            assert_eq!(t64.n_buffers, 2);
+            assert!((*t64.buffers.add(0)).is_null());
+            assert_eq!(*(*t64.buffers.add(1) as *const i64), -3_599_999_999);
+            (array.release.unwrap())(&mut array);
+        }
+    }
+
+    #[test]
+    fn test_export_nullable_time_buffers_zero_copy() {
+        let t_validity = Bitmap::from_ch_null_map(&[0, 1, 0]);
+        let t64_validity = Bitmap::from_ch_null_map(&[0, 1, 0]);
+        let t_values = vec![-13i32, 0, 79];
+        let t64_values = vec![-13_000_000i64, 0, 79_000_000];
+        let t_validity_ptr = t_validity.as_bytes().as_ptr() as *const c_void;
+        let t64_validity_ptr = t64_validity.as_bytes().as_ptr() as *const c_void;
+        let t_values_ptr = t_values.as_ptr() as *const c_void;
+        let t64_values_ptr = t64_values.as_ptr() as *const c_void;
+
+        let schema = Schema::new(vec![
+            Field {
+                name: "nt".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::Time)),
+            },
+            Field {
+                name: "nt64".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::Time64 { precision: 6 })),
+            },
+        ]);
+        let batch = Arc::new(ColBatch::new(
+            schema,
+            vec![
+                Column::Time(PrimitiveColumn::new_nullable(t_values, t_validity)),
+                Column::Time64(PrimitiveColumn::new_nullable(t64_values, t64_validity)),
+            ],
+            3,
+        ));
+
+        // Safety: the zeroed FFI outputs are writable and the batch remains
+        // alive until each matching release callback is invoked below.
+        unsafe {
+            let mut schema_out: ArrowSchema = std::mem::zeroed();
+            export_schema(&batch.schema, &mut schema_out);
+            assert_eq!((**schema_out.children.add(0)).flags, 2);
+            assert_eq!((**schema_out.children.add(1)).flags, 2);
+            (schema_out.release.unwrap())(&mut schema_out);
+
+            let mut array: ArrowArray = std::mem::zeroed();
+            export_batch_array(&batch, &mut array);
+            let t = &**array.children.add(0);
+            let t64 = &**array.children.add(1);
+            assert_eq!(t.null_count, 1);
+            assert_eq!(*t.buffers.add(0), t_validity_ptr);
+            assert_eq!(*t.buffers.add(1), t_values_ptr);
+            assert_eq!(t64.null_count, 1);
+            assert_eq!(*t64.buffers.add(0), t64_validity_ptr);
+            assert_eq!(*t64.buffers.add(1), t64_values_ptr);
+            (array.release.unwrap())(&mut array);
+        }
     }
 
     #[test]

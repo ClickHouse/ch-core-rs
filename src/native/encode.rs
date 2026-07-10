@@ -11,9 +11,9 @@
 //!
 //! Scope: this encodes `Bool`, the fixed-width numeric types (`Int8`..`Int64`,
 //! `UInt8`..`UInt64`, `Float32`, `Float64`), the temporal types (`Date`,
-//! `Date32`, `DateTime`, `DateTime64`), `UUID`, `IPv4`, `IPv6`, `String`,
-//! `FixedString(N)`, `Enum8`/`Enum16`, `Decimal(P, S)`, the wide integers
-//! (`Int128`/`UInt128`/`Int256`/`UInt256`), `LowCardinality(T)`
+//! `Date32`, `DateTime`, `DateTime64`, `Time`, `Time64`), `UUID`, `IPv4`,
+//! `IPv6`, `String`, `FixedString(N)`, `Enum8`/`Enum16`, `Decimal(P, S)`, the
+//! wide integers (`Int128`/`UInt128`/`Int256`/`UInt256`), `LowCardinality(T)`
 //! for the allowed inner types this crate decodes, `Array(T)` over any
 //! encodable element type (including nested arrays), `Tuple(T1, ...)`
 //! (named or unnamed, including the zero-element `Tuple()`) over encodable
@@ -231,13 +231,13 @@ fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<()
 
     // The rendered type string must round-trip through the decoder's parser. Some
     // `ChType`s are constructible that render a header this crate's own parser and
-    // the server reject (`FixedString(0)`, a `DateTime64` precision above 9, a
-    // timezone whose bytes break the type grammar); catching it here fails at the
-    // source rather than letting `decode(encode(x))` fail downstream. Reached only
-    // for an encodable, buffer-matched type, so any failure is a bad parameter on a
-    // supported type, which `InconsistentBatch` describes correctly. This validates
-    // the type inside a `Nullable` wrapper too, since `Display`/`parse` are total on
-    // the wrapper.
+    // the server reject (`FixedString(0)`, a `DateTime64`/`Time64` precision
+    // above 9, a timezone whose bytes break the type grammar); catching it here
+    // fails at the source rather than letting `decode(encode(x))` fail downstream.
+    // Reached only for an encodable, buffer-matched type, so any failure is a bad
+    // parameter on a supported type, which `InconsistentBatch` describes correctly.
+    // This validates the type inside a `Nullable` wrapper too, since
+    // `Display`/`parse` are total on the wrapper.
     let rendered = field.ch_type.to_string();
     if parse_ch_type(&rendered).as_ref() != Some(&field.ch_type) {
         return Err(EncodeError::InconsistentBatch {
@@ -944,6 +944,8 @@ fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
             | (ChType::Date32, Column::Date32(_))
             | (ChType::DateTime { .. }, Column::DateTime(_))
             | (ChType::DateTime64 { .. }, Column::DateTime64(_))
+            | (ChType::Time, Column::Time(_))
+            | (ChType::Time64 { .. }, Column::Time64(_))
             | (ChType::Uuid, Column::Uuid(_))
             | (ChType::Ipv4, Column::Ipv4(_))
             | (ChType::Ipv6, Column::Ipv6(_))
@@ -1457,6 +1459,10 @@ fn encode_column_body(
         (ChType::DateTime64 { .. }, Column::DateTime64(c)) => {
             encode_primitive!(buf, &c.values, i64)
         }
+        (ChType::Time, Column::Time(c)) => encode_primitive!(buf, &c.values, i32),
+        (ChType::Time64 { .. }, Column::Time64(c)) => {
+            encode_primitive!(buf, &c.values, i64)
+        }
         // Enum8/Enum16 are byte-identical to Int8/Int16 on the wire
         // (`SerializationEnum` inherits `SerializationNumber` and overrides no
         // bulk method); the name->value map lives only in the type string
@@ -1722,6 +1728,8 @@ fn is_encodable(ch_type: &ChType) -> bool {
         | ChType::Date32
         | ChType::DateTime { .. }
         | ChType::DateTime64 { .. }
+        | ChType::Time
+        | ChType::Time64 { .. }
         | ChType::Uuid
         | ChType::Ipv4
         | ChType::Ipv6
@@ -1927,12 +1935,9 @@ mod tests {
         ColBatch::new(Schema::new(fields), columns, 4)
     }
 
-    /// The four temporal columns over four rows. `DateTime` carries a timezone and
-    /// `DateTime64` carries precision plus a timezone so the type-string rendering
-    /// (which is where tz and precision live, never the per-row data) is exercised
-    /// on the wire. Values pick each width's boundaries plus neutral in-range days,
-    /// and `Date32`/`DateTime64` include a negative pre-epoch value to prove the
-    /// signed little-endian round-trip.
+    /// The six temporal columns over four rows. Date/time metadata is carried in
+    /// the type string only; the bodies are faithful primitive-width integers.
+    /// Signed types include negative values to prove little-endian round-trips.
     fn temporal_batch() -> ColBatch {
         let fields = vec![
             Field {
@@ -1956,6 +1961,14 @@ mod tests {
                     timezone: Some("UTC".into()),
                 },
             },
+            Field {
+                name: "t".into(),
+                ch_type: ChType::Time,
+            },
+            Field {
+                name: "t64".into(),
+                ch_type: ChType::Time64 { precision: 3 },
+            },
         ];
         let columns = vec![
             Column::Date(PrimitiveColumn::new(vec![0, 19000, 19001, u16::MAX])),
@@ -1972,27 +1985,52 @@ mod tests {
                 1_700_000_000_000,
                 i64::MAX,
             ])),
+            Column::Time(PrimitiveColumn::new(vec![-3_599_999, -13, 0, 3_599_999])),
+            Column::Time64(PrimitiveColumn::new(vec![
+                -3_599_999_999,
+                -13_000,
+                0,
+                3_599_999_999,
+            ])),
         ];
         ColBatch::new(Schema::new(fields), columns, 4)
     }
 
-    /// A `Nullable(DateTime64(3, 'UTC'))` column over four rows with the valid,
-    /// null, valid, null pattern, proving the `Nullable` wrapper composes with a
-    /// temporal inner: the null map precedes the inner i64 values.
+    /// Nullable DateTime64, Time, and Time64 columns over four rows with the
+    /// valid, null, valid, null pattern.
     fn nullable_temporal_batch() -> ColBatch {
-        // 0x00 = valid, 0x01 = null (ClickHouse null-map polarity).
-        let validity = Bitmap::from_ch_null_map(&[0, 1, 0, 1]);
-        let fields = vec![Field {
-            name: "ndt64".into(),
-            ch_type: ChType::Nullable(Box::new(ChType::DateTime64 {
-                precision: 3,
-                timezone: Some("UTC".into()),
-            })),
-        }];
-        let columns = vec![Column::DateTime64(PrimitiveColumn::new_nullable(
-            vec![1_700_000_000_000, 0, -1_000, 0],
-            validity,
-        ))];
+        let validity = || Bitmap::from_ch_null_map(&[0, 1, 0, 1]);
+        let fields = vec![
+            Field {
+                name: "ndt64".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::DateTime64 {
+                    precision: 3,
+                    timezone: Some("UTC".into()),
+                })),
+            },
+            Field {
+                name: "nt".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::Time)),
+            },
+            Field {
+                name: "nt64".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::Time64 { precision: 6 })),
+            },
+        ];
+        let columns = vec![
+            Column::DateTime64(PrimitiveColumn::new_nullable(
+                vec![1_700_000_000_000, 0, -1_000, 0],
+                validity(),
+            )),
+            Column::Time(PrimitiveColumn::new_nullable(
+                vec![-13, 0, 79, 0],
+                validity(),
+            )),
+            Column::Time64(PrimitiveColumn::new_nullable(
+                vec![-13_000_000, 0, 79_000_000, 0],
+                validity(),
+            )),
+        ];
         ColBatch::new(Schema::new(fields), columns, 4)
     }
 
@@ -2379,7 +2417,7 @@ mod tests {
         )
     }
 
-    /// A plain `LowCardinality(String)` and `LowCardinality(UInt32)` over four
+    /// Plain LowCardinality String, UInt32, and Time columns over four
     /// rows. The dictionary includes the server's reserved default slot 0 and
     /// rows reference real values in slots 1.., matching server-produced Native
     /// blocks while still exercising the dictionary/index writer.
@@ -2393,6 +2431,10 @@ mod tests {
                 name: "lc_u32".into(),
                 ch_type: ChType::LowCardinality(Box::new(ChType::UInt32)),
             },
+            Field {
+                name: "lc_time".into(),
+                ch_type: ChType::LowCardinality(Box::new(ChType::Time)),
+            },
         ];
         let columns = vec![
             Column::Dictionary(DictionaryColumn::new(
@@ -2402,6 +2444,10 @@ mod tests {
             Column::Dictionary(DictionaryColumn::new(
                 vec![1, 2, 1, 2],
                 Column::UInt32(PrimitiveColumn::new(vec![0, 13, 79])),
+            )),
+            Column::Dictionary(DictionaryColumn::new(
+                vec![1, 2, 1, 2],
+                Column::Time(PrimitiveColumn::new(vec![0, -13, 79])),
             )),
         ];
         ColBatch::new(Schema::new(fields), columns, 4)
@@ -2886,6 +2932,8 @@ mod tests {
             (Column::Date32(x), Column::Date32(y)) => eq!(x, y),
             (Column::DateTime(x), Column::DateTime(y)) => eq!(x, y),
             (Column::DateTime64(x), Column::DateTime64(y)) => eq!(x, y),
+            (Column::Time(x), Column::Time(y)) => eq!(x, y),
+            (Column::Time64(x), Column::Time64(y)) => eq!(x, y),
             (Column::Enum8(x), Column::Enum8(y)) => eq!(x, y),
             (Column::Enum16(x), Column::Enum16(y)) => eq!(x, y),
             (Column::Ipv4(x), Column::Ipv4(y)) => eq!(x, y),
@@ -3602,6 +3650,14 @@ mod tests {
                 )))),
             },
             Field {
+                name: "time".into(),
+                ch_type: ChType::Time,
+            },
+            Field {
+                name: "time64".into(),
+                ch_type: ChType::Time64 { precision: 3 },
+            },
+            Field {
                 name: "a".into(),
                 ch_type: ChType::Array(Box::new(ChType::Int32)),
             },
@@ -3643,6 +3699,8 @@ mod tests {
                 Column::Utf8(utf8_column(&[])),
                 Bitmap::from_ch_null_map(&[]),
             )),
+            Column::Time(PrimitiveColumn::new(vec![])),
+            Column::Time64(PrimitiveColumn::new(vec![])),
             // A zero-row Array carries only the leading-0 offset and writes no
             // data at all, not even the hoisted LC key version of an LC element.
             Column::Array(ArrayColumn::new(
@@ -3727,6 +3785,59 @@ mod tests {
             })
             .collect();
         assert_eq!(got, vec![vec![13, 14], vec![15, 16], vec![17]]);
+    }
+
+    #[test]
+    fn encode_chunked_roundtrips_time_blocks() {
+        let schema = Schema::new(vec![
+            Field {
+                name: "t".into(),
+                ch_type: ChType::Time,
+            },
+            Field {
+                name: "t64".into(),
+                ch_type: ChType::Time64 { precision: 3 },
+            },
+        ]);
+        let make_chunk = |time: Vec<i32>, time64: Vec<i64>| {
+            let rows = time.len();
+            assert_eq!(time64.len(), rows);
+            std::sync::Arc::new(ColBatch::new(
+                schema.clone(),
+                vec![
+                    Column::Time(PrimitiveColumn::new(time)),
+                    Column::Time64(PrimitiveColumn::new(time64)),
+                ],
+                rows,
+            ))
+        };
+        let batch = ChunkedBatch {
+            schema: schema.clone(),
+            chunks: vec![
+                make_chunk(vec![-13, 0], vec![-13_000, 0]),
+                make_chunk(vec![79, 3_599_999], vec![79_000, 3_599_999_999]),
+            ],
+        };
+        for revision in [0, DBMS_TCP_PROTOCOL_VERSION] {
+            let bytes = encode_chunked(
+                &batch,
+                &EncodeOptions {
+                    protocol_revision: revision,
+                },
+            )
+            .unwrap();
+            let decoded = decode_all_bytes(
+                &bytes,
+                &DecodeOptions {
+                    protocol_revision: revision,
+                },
+            )
+            .unwrap();
+            assert_eq!(decoded.num_chunks(), 2);
+            for (sent, got) in batch.chunks.iter().zip(&decoded.chunks) {
+                assert_batches_eq(sent, got);
+            }
+        }
     }
 
     #[test]
@@ -3955,6 +4066,39 @@ mod tests {
     }
 
     #[test]
+    fn rev0_frames_time_signed_little_endian_bytes() {
+        let batch = ColBatch::new(
+            Schema::new(vec![
+                Field {
+                    name: "t".into(),
+                    ch_type: ChType::Time,
+                },
+                Field {
+                    name: "t64".into(),
+                    ch_type: ChType::Time64 { precision: 3 },
+                },
+            ]),
+            vec![
+                Column::Time(PrimitiveColumn::new(vec![-13])),
+                Column::Time64(PrimitiveColumn::new(vec![-79_000])),
+            ],
+            1,
+        );
+        let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+        let expected = [
+            0x02, // num_cols = 2
+            0x01, // num_rows = 1
+            0x01, b't', // name "t"
+            0x04, b'T', b'i', b'm', b'e', // type "Time"
+            0xF3, 0xFF, 0xFF, 0xFF, // i32 -13 LE
+            0x03, b't', b'6', b'4', // name "t64"
+            0x09, b'T', b'i', b'm', b'e', b'6', b'4', b'(', b'3', b')', 0x68, 0xCB, 0xFE, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, // i64 -79000 LE
+        ];
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
     fn rev_tcp_frames_block_info_and_marker() {
         // At the TCP revision the block leads with the BlockInfo preamble and each
         // column header carries the default (0) custom-serialization marker.
@@ -4036,6 +4180,29 @@ mod tests {
             EncodeError::UnsupportedType { column, ch_type } => {
                 assert_eq!(column, "lc");
                 assert_eq!(ch_type, lc_decimal);
+            }
+            other => panic!("expected UnsupportedType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn low_cardinality_time64_is_unsupported() {
+        let lc_time64 = ChType::LowCardinality(Box::new(ChType::Time64 { precision: 3 }));
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "lc_t64".into(),
+                ch_type: lc_time64.clone(),
+            }]),
+            vec![Column::Dictionary(DictionaryColumn::new(
+                vec![0],
+                Column::Time64(PrimitiveColumn::new(vec![0])),
+            ))],
+            1,
+        );
+        match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::UnsupportedType { column, ch_type } => {
+                assert_eq!(column, "lc_t64");
+                assert_eq!(ch_type, lc_time64);
             }
             other => panic!("expected UnsupportedType, got {other:?}"),
         }
@@ -5489,8 +5656,8 @@ mod tests {
 
     #[test]
     fn unrepresentable_type_string_is_rejected() {
-        // A `DateTime64` precision above 9, invalid Decimal metadata, and a
-        // `FixedString(0)` are constructible `ChType`s whose rendered type string
+        // A DateTime64/Time64 precision above 9, invalid Decimal metadata, and
+        // FixedString(0) are constructible ChTypes whose rendered type string
         // this crate's parser and the server reject or normalize differently.
         // Encoding must fail at the source (InconsistentBatch) rather than emit a
         // header that fails to decode downstream, or worse, a Decimal header whose
@@ -5509,6 +5676,19 @@ mod tests {
         match encode_block(&dt64, &EncodeOptions::default()).unwrap_err() {
             EncodeError::InconsistentBatch { .. } => {}
             other => panic!("expected InconsistentBatch for DateTime64(200), got {other:?}"),
+        }
+
+        let time64 = ColBatch {
+            schema: Schema::new(vec![Field {
+                name: "t64".into(),
+                ch_type: ChType::Time64 { precision: 200 },
+            }]),
+            columns: vec![Column::Time64(PrimitiveColumn::new(vec![0]))],
+            num_rows: 1,
+        };
+        match encode_block(&time64, &EncodeOptions::default()).unwrap_err() {
+            EncodeError::InconsistentBatch { .. } => {}
+            other => panic!("expected InconsistentBatch for Time64(200), got {other:?}"),
         }
 
         let decimal_cases = [

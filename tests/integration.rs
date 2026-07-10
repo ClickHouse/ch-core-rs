@@ -317,6 +317,16 @@ fn assert_all_types(batch: &ChunkedBatch) {
             Expected::Exact("u256", ChType::UInt256),
             Expected::Exact("ni128", ChType::Nullable(Box::new(ChType::Int128))),
             Expected::Exact("lc_i256", ChType::LowCardinality(Box::new(ChType::Int256))),
+            // Time/Time64 are signed primitive-backed temporals with no timezone.
+            // Time is a legal LowCardinality inner; Time64 is not.
+            Expected::Exact("t", ChType::Time),
+            Expected::Exact("t64", ChType::Time64 { precision: 6 }),
+            Expected::Exact("nt", ChType::Nullable(Box::new(ChType::Time))),
+            Expected::Exact(
+                "nt64",
+                ChType::Nullable(Box::new(ChType::Time64 { precision: 6 })),
+            ),
+            Expected::Exact("lc_time", ChType::LowCardinality(Box::new(ChType::Time))),
         ],
     );
 
@@ -1052,6 +1062,60 @@ fn assert_all_types(batch: &ChunkedBatch) {
                 assert_eq!(resolved(3), two_fifty_eight.to_vec());
             }
             other => panic!("expected Int256 dictionary values, got {other:?}"),
+        },
+        other => panic!("expected Dictionary, got {other:?}"),
+    }
+
+    // Time (col 60): signed Int32 seconds, including the documented text
+    // extrema. Time64(6) (col 61): signed Int64 microsecond ticks. Neither has
+    // an epoch or timezone, and the wire carries no metadata beyond the type
+    // string.
+    match block.column(60) {
+        Column::Time(c) => {
+            assert_eq!(c.values.as_slice(), &[-3_599_999i32, -3_600, 13, 3_599_999]);
+        }
+        other => panic!("expected Time, got {other:?}"),
+    }
+    match block.column(61) {
+        Column::Time64(c) => assert_eq!(
+            c.values.as_slice(),
+            &[-3_599_999_999_999i64, -1, 13_000_079, 3_599_999_999_999]
+        ),
+        other => panic!("expected Time64, got {other:?}"),
+    }
+
+    // Nullable Time/Time64 (cols 62/63): valid, NULL, valid, NULL. The null-row
+    // primitive placeholders are deliberately not asserted.
+    match block.column(62) {
+        Column::Time(c) => {
+            assert_eq!(c.values[0], -13);
+            assert_eq!(c.values[2], 79);
+        }
+        other => panic!("expected nullable Time storage, got {other:?}"),
+    }
+    assert_validity(block.column(62), &[true, false, true, false]);
+    match block.column(63) {
+        Column::Time64(c) => {
+            assert_eq!(c.values[0], -13);
+            assert_eq!(c.values[2], 79);
+        }
+        other => panic!("expected nullable Time64 storage, got {other:?}"),
+    }
+    assert_validity(block.column(63), &[true, false, true, false]);
+
+    // LowCardinality(Time) (col 64): rows -13, 79, -13, 258 resolved through
+    // the block-local dictionary.
+    match block.column(64) {
+        Column::Dictionary(dict) => match dict.values.as_ref() {
+            Column::Time(values) => {
+                let resolved: Vec<i32> = dict
+                    .indices
+                    .iter()
+                    .map(|&index| values.values[index as usize])
+                    .collect();
+                assert_eq!(resolved, vec![-13, 79, -13, 258]);
+            }
+            other => panic!("expected Time dictionary values, got {other:?}"),
         },
         other => panic!("expected Dictionary, got {other:?}"),
     }
