@@ -258,9 +258,81 @@ SELECT
     CAST(multiIf(n = 1, NULL, n = 3, NULL, n = 0, '-00:00:00.000013', '00:00:00.000079'), 'Nullable(Time64(6))') AS nt64,
     -- Time is number-backed and legal inside LowCardinality (Time64 is not).
     -- Repeats keep the per-block dictionary smaller than the row count.
-    CAST(multiIf(n = 0, toInt32(-13), n = 1, toInt32(79), n = 2, toInt32(-13), toInt32(258)), 'LowCardinality(Time)') AS lc_time
+    CAST(multiIf(n = 0, toInt32(-13), n = 1, toInt32(79), n = 2, toInt32(-13), toInt32(258)), 'LowCardinality(Time)') AS lc_time,
+    -- SimpleAggregateFunction(func, T): pure name decoration over the inner type
+    -- T (DataTypeCustomSimpleAggregateFunction). The runtime object IS the inner
+    -- T instance with a custom name and a null serialization slot, so the wire
+    -- bytes, state prefix, and Arrow shape are byte-identical to T; the alias
+    -- spelling (never the expanded T) reaches the Native header. Decode delegates
+    -- to T, so no new Column variant appears. CAST(x AS SimpleAggregateFunction)
+    -- is expressible directly in a SELECT and the header keeps the alias, so no
+    -- temporary table is needed.
+    -- Over a scalar Float64: decodes as a plain Float64 buffer. Values -1.25, 0,
+    -- 13, 79.125 are all exactly representable.
+    CAST(multiIf(n = 0, -1.25, n = 1, 0., n = 2, 13., 79.125), 'SimpleAggregateFunction(sum, Float64)') AS saf_sum,
+    -- Over LowCardinality(Nullable(String)): decodes as a Dictionary, exactly the
+    -- inner LC. Rows resolve to user_1, NULL, user_2, NULL.
+    CAST(multiIf(n = 1, NULL, n = 3, NULL, n = 0, 'user_1', 'user_2'), 'SimpleAggregateFunction(anyLast, LowCardinality(Nullable(String)))') AS saf_lc,
+    -- Parametrized function name (groupArrayLastArray(5)) over Array(UInt64):
+    -- exercises the parenthesized-function-name parse path. The (5) is metadata
+    -- only; the stored value is a plain Array(UInt64). Rows [] / [13] / [79, 13] /
+    -- [1, 2, 3] -> offsets [0, 0, 1, 3, 6], flattened 13, 79, 13, 1, 2, 3.
+    CAST(multiIf(n = 0, [], n = 1, [13], n = 2, [79, 13], [1, 2, 3]), 'SimpleAggregateFunction(groupArrayLastArray(5), Array(UInt64))') AS saf_grp,
+    -- Geo aliases (DataTypeCustomGeo): a custom name over a fixed Tuple/Array-of-
+    -- Float64 nesting whose serialization slot is null, so wire bytes and Arrow
+    -- shape are byte-identical to that nesting and the bare alias spelling reaches
+    -- the header. CAST(... AS Point/Ring/MultiPolygon) is expressible in a SELECT.
+    -- Point = Tuple(Float64, Float64) (unnamed): decodes as a two-field Float64
+    -- Tuple. field0 (x) 13, -1.5, 0, 79.125; field1 (y) 79, 2.5, 0, -13.25.
+    CAST(multiIf(n = 0, (13., 79.), n = 1, (-1.5, 2.5), n = 2, (0., 0.), (79.125, -13.25)), 'Point') AS point,
+    -- Nullable(Point): Point is a Tuple, and DataTypeTuple::canBeInsideNullable()
+    -- is true, so Nullable(Point) is legal (enable_nullable_tuple_type gates only
+    -- CREATE, no wire effect). Decodes as a Tuple with a tuple-level null map;
+    -- null rows carry element placeholders. Valid rows 0 and 2 are (13, 79) and
+    -- (1.25, -2.5).
+    CAST(multiIf(n = 1, NULL, n = 3, NULL, n = 0, (13., 79.), (1.25, -2.5)), 'Nullable(Point)') AS npoint,
+    -- Ring = Array(Point) = Array(Tuple(Float64, Float64)): decodes as an Array of
+    -- a two-field Float64 Tuple. Rows [] / [(13, 79)] / [(1, 2), (3, 4)] /
+    -- [(-1.5, -2.5)] -> offsets [0, 0, 1, 3, 4], leaf x 13, 1, 3, -1.5, leaf y
+    -- 79, 2, 4, -2.5.
+    CAST(multiIf(n = 0, [], n = 1, [(13., 79.)], n = 2, [(1., 2.), (3., 4.)], [(-1.5, -2.5)]), 'Ring') AS ring,
+    -- MultiPolygon = Array(Array(Array(Point))): three Array levels over the leaf
+    -- Point tuple, the deepest geo nesting. Rows [] / [[[(13, 79)]]] /
+    -- [[[(1, 2), (3, 4)], [(5, 6)]]] / [[[(-1, -2)]], [[(7, 8)]]]. Outer offsets
+    -- [0, 0, 1, 2, 4], mid [0, 1, 3, 4, 5], inner [0, 1, 3, 4, 5, 6], leaf x
+    -- 13, 1, 3, 5, -1, 7, leaf y 79, 2, 4, 6, -2, 8.
+    CAST(multiIf(n = 0, [], n = 1, [[[(13., 79.)]]], n = 2, [[[(1., 2.), (3., 4.)], [(5., 6.)]]], [[[(-1., -2.)]], [[(7., 8.)]]]), 'MultiPolygon') AS mpoly,
+    -- Nested(x UInt32, y String): with the CAST form the alias reaches the header
+    -- regardless of flatten_nested (that setting flattens table DDL, not a SELECT
+    -- projection). The body is byte-identical to Array(Tuple(named x, y)), so it
+    -- decodes as an Array of a named two-field Tuple. Rows [] / [(13, user_1)] /
+    -- [(79, a), (1, user_2)] / [(2, x)] -> offsets [0, 0, 1, 3, 4], field x
+    -- 13, 79, 1, 2, field y user_1, a, user_2, x.
+    CAST(multiIf(n = 0, [], n = 1, [(13, 'user_1')], n = 2, [(79, 'a'), (1, 'user_2')], [(2, 'x')]), 'Nested(x UInt32, y String)') AS nst,
+    -- SimpleAggregateFunction inside wrappers. The server emits the alias
+    -- spelling VERBATIM inside the wrapper in the Native header (confirmed live at
+    -- v26.6.1.1193-stable via toTypeName + hexdump), and wrapper legality
+    -- delegates to the physical inner. These prove the decoder accepts the
+    -- server's real headers for the newly legal wrapper forms.
+    -- Nullable(SimpleAggregateFunction(sum, UInt64)): decodes exactly as
+    -- Nullable(UInt64), the null map then the UInt64 run. Rows 1 and 3 NULL,
+    -- rows 0 and 2 real (13, 79).
+    CAST(multiIf(n = 1, NULL, n = 3, NULL, n = 0, toUInt64(13), toUInt64(79)), 'Nullable(SimpleAggregateFunction(sum, UInt64))') AS nsaf,
+    -- LowCardinality(SimpleAggregateFunction(anyLast, String)): the LC body
+    -- delegates to the physical String inner. Values repeat so the per-block
+    -- dictionary is smaller than the row count. Rows user_1, user_2, user_1,
+    -- user_3 -> three distinct dictionary entries.
+    CAST(multiIf(n = 0, 'user_1', n = 1, 'user_2', n = 2, 'user_1', 'user_3'), 'LowCardinality(SimpleAggregateFunction(anyLast, String))') AS lc_saf,
+    -- LowCardinality(SimpleAggregateFunction(anyLast, Nullable(String))): the SAF
+    -- name decoration sits BETWEEN the LowCardinality and its removeNullable
+    -- Nullable, so nullability and the dictionary value type must be resolved
+    -- through the full SAF chain, not a single-level see-through. Confirmed a real
+    -- server header live at v26.6.1.1193-stable. Rows resolve to user_1, NULL,
+    -- user_2, NULL; index 0 is the NULL sentinel and the dictionary body is the
+    -- bare non-nullable String inner.
+    CAST(multiIf(n = 1, NULL, n = 3, NULL, n = 0, 'user_1', 'user_2'), 'LowCardinality(SimpleAggregateFunction(anyLast, Nullable(String)))') AS lc_nsaf
 FROM numbers(4)
-SETTINGS allow_suspicious_low_cardinality_types = 1, enable_nullable_tuple_type = 1, enable_time_time64_type = 1
+SETTINGS allow_suspicious_low_cardinality_types = 1, enable_nullable_tuple_type = 1, enable_time_time64_type = 1, flatten_nested = 0
 FORMAT Native
 SQL
 )

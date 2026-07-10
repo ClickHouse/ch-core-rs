@@ -111,6 +111,130 @@ pub enum ChType {
     // (`DataTypeMap::isValidKeyType`); the value type is unrestricted. The map
     // itself is never inside `Nullable` or `LowCardinality`.
     Map(Box<ChType>, Box<ChType>),
+
+    // Name-decoration aliases over existing machinery. Each of these three is a
+    // custom `getName()` attached to an underlying type instance whose
+    // serialization slot stays null (confirmed at v26.6.1.1193-stable), so the
+    // wire bytes, state prefix, and Arrow shape are byte-identical to the
+    // underlying type. Decode, encode, scan, and Arrow export all delegate to
+    // [`ChType::physical_delegate`]; no new `Column` variant is needed because
+    // the decoded buffer IS the underlying type's buffer.
+
+    // `SimpleAggregateFunction(func, T)`: the runtime object is the inner `T`
+    // instance with a custom name (`DataTypeCustomSimpleAggregateFunction`), so
+    // everything physical delegates to `inner`. `func` stores the rendered
+    // function spelling verbatim, INCLUDING any parenthesized literal params
+    // (e.g. "groupArrayLastArray(5)"), so `Display` round-trips exactly. The
+    // server whitelists a fixed set of functions (any, any_respect_nulls,
+    // anyLast, anyLast_respect_nulls, min, max, sum, sumWithOverflow,
+    // groupBitAnd, groupBitOr, groupBitXor, sumMap, minMap, maxMap,
+    // groupArrayArray, groupArrayLastArray, groupUniqArrayArray,
+    // groupUniqArrayArrayMap, sumMappedArrays, minMappedArrays, maxMappedArrays)
+    // but the decoder does NOT enforce it: a server-authored header is trusted
+    // and the list grows across versions. This is a top-level-only spelling; the
+    // parser rejects it inside any wrapper or container (the reversed nesting is
+    // unobserved on the wire, so shipping its inferred layout would be a guess).
+    SimpleAggregateFunction {
+        func: String,
+        inner: Box<ChType>,
+    },
+
+    // Geo aliases (`DataTypeCustomGeo`): `Point` = `Tuple(Float64, Float64)`
+    // (unnamed elements), `Ring`/`LineString` = `Array(Point)`,
+    // `Polygon`/`MultiLineString` = `Array(Array(Point))`, `MultiPolygon` =
+    // `Array(Array(Array(Point)))`. The Native header carries the bare alias
+    // spelling, never the expanded form, and the mapping is one-directional: a
+    // structural `Array(Tuple(Float64, Float64))` header stays spelled that way
+    // and decodes as a plain Array/Tuple. `Nullable(Point)` is legal (Tuple is
+    // nullable-able); `Nullable` of the five Array-based kinds and
+    // `LowCardinality` of all six are illegal.
+    Geo(GeoKind),
+
+    // `Nested(name1 T1, ...)` (`DataTypeNested`): with `flatten_nested = 0` the
+    // header carries the literal `Nested(a T, b U)` spelling and the body is
+    // byte-identical to `Array(Tuple(named elements))`. The runtime object is a
+    // `DataTypeArray` over a `DataTypeTuple` with a custom name; there is no
+    // `SerializationNested`. Element names are mandatory and follow the same
+    // `checkTupleNames` rules as a named `Tuple`. `Nullable(Nested)` and
+    // `LowCardinality(Nested)` are both illegal (it is an Array).
+    Nested(Vec<(String, ChType)>),
+}
+
+/// The six ClickHouse geo alias kinds. Each renders its bare alias name and
+/// expands to a fixed `Tuple`/`Array`-of-`Float64` nesting via
+/// [`GeoKind::underlying_type`]; the wire layout and Arrow shape are exactly
+/// that of the underlying nesting (confirmed at v26.6.1.1193-stable,
+/// `DataTypeCustomGeo.{h,cpp}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeoKind {
+    Point,
+    Ring,
+    LineString,
+    MultiLineString,
+    Polygon,
+    MultiPolygon,
+}
+
+impl GeoKind {
+    /// The bare alias spelling the server emits in a Native header.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            GeoKind::Point => "Point",
+            GeoKind::Ring => "Ring",
+            GeoKind::LineString => "LineString",
+            GeoKind::MultiLineString => "MultiLineString",
+            GeoKind::Polygon => "Polygon",
+            GeoKind::MultiPolygon => "MultiPolygon",
+        }
+    }
+
+    /// The physical nesting depth this geo alias expands to, the
+    /// `type_depth`/`parse_ch_type_depth` charge for the alias token. It equals
+    /// the depth of [`GeoKind::underlying_type`]: `Point` is a `Tuple` one level
+    /// deep (1), each `Array` level adds one, so `Ring`/`LineString` are 2,
+    /// `Polygon`/`MultiLineString` are 3, and `MultiPolygon` is 4. Both the
+    /// decoder's parse-time depth cap and the encoder's `type_depth` charge a geo
+    /// token this many levels so a geo-tipped type that decodes is always
+    /// re-encodable (the two sides agree on the physical depth).
+    pub(crate) fn expansion_depth(self) -> usize {
+        match self {
+            GeoKind::Point => 1,
+            GeoKind::Ring | GeoKind::LineString => 2,
+            GeoKind::Polygon | GeoKind::MultiLineString => 3,
+            GeoKind::MultiPolygon => 4,
+        }
+    }
+
+    /// The underlying physical `ChType` this alias decorates. `Point` is an
+    /// UNNAMED two-`Float64` tuple; each `Array` level wraps the level below.
+    pub(crate) fn underlying_type(self) -> ChType {
+        fn point() -> ChType {
+            ChType::Tuple(vec![(None, ChType::Float64), (None, ChType::Float64)])
+        }
+        match self {
+            GeoKind::Point => point(),
+            GeoKind::Ring | GeoKind::LineString => ChType::Array(Box::new(point())),
+            GeoKind::Polygon | GeoKind::MultiLineString => {
+                ChType::Array(Box::new(ChType::Array(Box::new(point()))))
+            }
+            GeoKind::MultiPolygon => ChType::Array(Box::new(ChType::Array(Box::new(
+                ChType::Array(Box::new(point())),
+            )))),
+        }
+    }
+}
+
+/// The underlying physical `ChType` a `Nested(...)` decorates: an
+/// `Array(Tuple(named elements))`. The Tuple carries the Nested field names, so
+/// the Arrow struct children are named exactly like the server's flattened
+/// `n.a Array(T)` sibling columns without the `n.` prefix.
+pub(crate) fn nested_underlying_type(fields: &[(String, ChType)]) -> ChType {
+    ChType::Array(Box::new(ChType::Tuple(
+        fields
+            .iter()
+            .map(|(name, ty)| (Some(name.clone()), ty.clone()))
+            .collect(),
+    )))
 }
 
 /// A named, typed column descriptor.
@@ -194,8 +318,34 @@ impl std::fmt::Display for ChType {
             // The canonical server form (`DataTypeMap::doGetName`): the two
             // type arguments only, comma-space separated, no element names.
             ChType::Map(key, value) => write!(f, "Map({key}, {value})"),
+            // `func` already carries any parenthesized params, so this renders
+            // the exact spelling the server emits and round-trips through the
+            // parser.
+            ChType::SimpleAggregateFunction { func, inner } => {
+                write!(f, "SimpleAggregateFunction({func}, {inner})")
+            }
+            // The bare alias spelling, never the expanded form.
+            ChType::Geo(kind) => write!(f, "{}", kind.name()),
+            ChType::Nested(fields) => write_nested(f, fields),
         }
     }
+}
+
+/// Render a `Nested(name1 T1, ...)` type string: the fields joined by `, `
+/// inside one pair of parentheses, each as `name type`. Names are mandatory and
+/// quoted by the same `backQuoteIfNeed` rules as named `Tuple` elements
+/// (confirmed at v26.6.1.1193-stable, `DataTypeNested.cpp` renders each name
+/// with `backQuoteIfNeed` exactly like `DataTypeTuple`).
+fn write_nested(f: &mut std::fmt::Formatter<'_>, fields: &[(String, ChType)]) -> std::fmt::Result {
+    write!(f, "Nested(")?;
+    for (i, (name, ch_type)) in fields.iter().enumerate() {
+        if i > 0 {
+            write!(f, ", ")?;
+        }
+        back_quote_if_need(f, name)?;
+        write!(f, " {ch_type}")?;
+    }
+    write!(f, ")")
 }
 
 /// Render a `Tuple(...)` type string: the elements joined by `, ` inside one
@@ -351,6 +501,28 @@ impl ChType {
         match self {
             ChType::Nullable(inner) => inner,
             other => other,
+        }
+    }
+
+    /// The underlying physical type a name-decoration alias delegates to, or
+    /// `None` for a type that is already physical.
+    ///
+    /// `SimpleAggregateFunction`, the geo aliases, and `Nested` all attach only
+    /// a custom name to an underlying type instance whose serialization slot is
+    /// null (confirmed at v26.6.1.1193-stable), so their wire bytes, state
+    /// prefix, and Arrow shape are byte-identical to the type returned here. The
+    /// decode, encode, scan, and Arrow-export paths call this at the top of
+    /// their per-type dispatch and recurse on the delegate, so a single
+    /// expansion point keeps all four directions consistent. Returns an owned
+    /// `ChType` because the geo and `Nested` expansions are synthesized rather
+    /// than stored; the clone is bounded by the parsed type depth and never runs
+    /// per row.
+    pub(crate) fn physical_delegate(&self) -> Option<ChType> {
+        match self {
+            ChType::SimpleAggregateFunction { inner, .. } => Some((**inner).clone()),
+            ChType::Geo(kind) => Some(kind.underlying_type()),
+            ChType::Nested(fields) => Some(nested_underlying_type(fields)),
+            _ => None,
         }
     }
 }

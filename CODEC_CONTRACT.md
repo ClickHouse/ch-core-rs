@@ -276,6 +276,10 @@ than an error.
 | `Array(T)` for any supported element `T`                                               | `Array(Box<ChType>)`                   | `Array`           | `+L` (LargeList; element type in the item child)                    | validity, i64 offsets (+ item child)       | no (array level); element nulls via `Array(Nullable(T))` |
 | `Tuple(T1, ...)` / `Tuple(name1 T1, ...)` for supported element types, incl. `Tuple()` | `Tuple(Vec<(Option<String>, ChType)>)` | `Tuple`           | `+s` (struct; element types in the children)                        | validity (one child per element)           | yes (`Nullable(Tuple(...))` is legal)                    |
 | `Map(K, V)` for a legal key type and supported `K`/`V`                                 | `Map(Box<ChType>, Box<ChType>)`        | `Map`             | `+L` (LargeList of an `entries` struct with `key`/`value` children) | validity, i64 offsets (+ entries child)    | no (map level); value nulls via `Map(K, Nullable(V))`    |
+| `SimpleAggregateFunction(func, T)` for a supported inner `T`                            | `SimpleAggregateFunction { func, inner }` | inner `T`'s    | inner `T`'s                                                         | inner `T`'s                                | via inner `Nullable` iff `Nullable(T)` is legal          |
+| `Point`                                                                                | `Geo(GeoKind::Point)`                  | `Tuple`           | `+s` (struct of two `g` Float64 children)                          | validity (two Float64 children)            | yes (`Nullable(Point)` is legal)                         |
+| `Ring`, `LineString`, `MultiLineString`, `Polygon`, `MultiPolygon`                     | `Geo(GeoKind::*)`                       | `Array`           | `+L` (LargeList chain over a Point `+s` struct)                     | validity, i64 offsets (+ item child)       | no (they expand to `Array`)                              |
+| `Nested(name1 T1, ...)` for supported field types                                      | `Nested(Vec<(String, ChType)>)`        | `Array`           | `+L` (LargeList of a `+s` struct with the field names)             | validity, i64 offsets (+ item struct child) | no (it is an `Array`)                                    |
 
 Any type not in this matrix is rejected. See "Unsupported types" below.
 
@@ -1003,6 +1007,17 @@ dictionary index 0 is the NULL sentinel and its on-wire value is the inner
 default (an empty string for `String`, a zero for the fixed-width inners). Rows
 whose index is 0 are NULL.
 
+A `SimpleAggregateFunction` name decoration may wrap the inner, including
+BETWEEN the `LowCardinality` and its `Nullable`: `LowCardinality(SAF(anyLast,
+Nullable(String)))` is a real server header (live-confirmed at
+`v26.6.1.1193-stable`), and chained SAF is legal. All `LowCardinality` sites
+resolve `(nullable, dict_value_type)` through one shared helper,
+`low_cardinality_dict_value_type` in `src/native/decode.rs`, which strips the
+full SAF chain, unwraps the optional `Nullable`, then strips any further SAF
+chain, so the aliased forms decode, encode, and export exactly as the
+equivalent plain `LowCardinality(Nullable(T))`. See the
+`SimpleAggregateFunction(func, T)` section.
+
 **Arrow export:** Arrow `dictionary(i32, V)` where `V` is the inner value type's
 Arrow format. The schema field's own format string is the index type `i` (int32)
 and the value type lives in the schema's `dictionary` child (`u` for a `String`
@@ -1362,6 +1377,195 @@ and the `Array(Tuple(keys, values))` bulk body) in
 
 ---
 
+### SimpleAggregateFunction(func, T)
+
+**Type string(s):** `SimpleAggregateFunction(func, T)` where `func` is an
+aggregate function name and `T` is any supported inner type. The function name
+may carry parenthesized literal parameters, so parametrized spellings such as
+`SimpleAggregateFunction(groupArrayLastArray(5), Array(UInt64))` appear VERBATIM
+in the Native header. Registration is case-sensitive with no aliases.
+`parse_ch_type` accepts the spelling at ANY nesting position, because the server
+emits it verbatim inside wrappers and containers: confirmed live at
+`v26.6.1.1193-stable` by CREATE plus a Native header hexdump for
+`Nullable(SimpleAggregateFunction(...))`,
+`LowCardinality(SimpleAggregateFunction(...))`,
+`Tuple(v SimpleAggregateFunction(...))`, `Array(SimpleAggregateFunction(...))`,
+and `Map(String, SimpleAggregateFunction(...))`, and corroborated by the server
+test `04329_tuple_element_aggregation_reject_nullable_tuple.sql`.
+
+**Logical type:**
+`ChType::SimpleAggregateFunction { func: String, inner: Box<ChType> }`.
+
+**Wire payload:** byte-identical to the inner `T`. `SimpleAggregateFunction` is
+pure name decoration (`DataTypeCustomSimpleAggregateFunction` attaches only a
+custom name and leaves the serialization slot null), so its state prefix
+(including a `LowCardinality` key version when `T` is `LowCardinality`), body
+bytes, and per-column custom-serialization marker are exactly `T`'s. There is no
+SAF-specific framing.
+
+**Arrow export:** exactly the inner `T`'s export, the same format string and
+buffers. There is no new Column variant: the decoded column IS the inner type's
+column, reached through `ChType::physical_delegate`.
+
+**Rust buffer:** the inner `T`'s `Column` variant, with no wrapper. `func` and
+the inner type live only in the schema's `ChType`, the same Column-vs-ChType
+split the temporals and `Decimal` use for their metadata.
+
+**Notes:**
+
+- Legal at any nesting position and to any chain depth; wrapper legality
+  delegates to `T`. `Nullable(SAF(T))` is legal iff `Nullable(T)` is, and
+  `is_low_cardinality_inner` / `is_valid_map_key_type` see through the alias to
+  the physical delegate, so a `LowCardinality(SAF(...))` or a
+  `Map(SAF(...), V)` key resolves as if the SAF were its inner.
+- Inside `LowCardinality`, the alias may sit BETWEEN the `LowCardinality` and its
+  removeNullable `Nullable`:
+  `LowCardinality(SimpleAggregateFunction(anyLast, Nullable(String)))` is a real
+  server header (live-confirmed at `v26.6.1.1193-stable`, fixture `lc_nsaf`).
+  Every `LowCardinality` site (decode, the completeness scan, the zero-row empty
+  column, header validation, encode validate/write, and the Arrow schema export)
+  resolves its inner through one shared helper, `low_cardinality_dict_value_type`
+  in `src/native/decode.rs`, which strips the full SAF chain, unwraps the optional
+  `Nullable`, then strips any further SAF chain beneath it, returning
+  `(nullable, dict_value_type)`. This is not a single-level see-through: chained
+  SAF (`SimpleAggregateFunction(anyLast, SimpleAggregateFunction(sum, UInt64))`,
+  and the same chain as a `LowCardinality` inner) resolves to its physical value
+  type the same way.
+- Decode is lenient on the function name. The server whitelists a fixed set (21
+  functions at this pin: `any`, `any_respect_nulls`, `anyLast`,
+  `anyLast_respect_nulls`, `min`, `max`, `sum`, `sumWithOverflow`, `groupBitAnd`,
+  `groupBitOr`, `groupBitXor`, `sumMap`, `minMap`, `maxMap`, `groupArrayArray`,
+  `groupArrayLastArray`, `groupUniqArrayArray`, `groupUniqArrayArrayMap`,
+  `sumMappedArrays`, `minMappedArrays`, `maxMappedArrays`), but the decoder does
+  NOT enforce it: a server-authored header is trusted and the list grows across
+  versions.
+- Multi-type-arg forms `SimpleAggregateFunction(f, T1, T2)` are rejected as
+  `UnsupportedType`. They are grammar-parseable server-side, but only `T1` is
+  physically load-bearing and the shape is unobserved in practice.
+- Depth accounting: each SAF level charges +1 on both the parse and encode sides,
+  so a hostile chain of nested SAFs stays bounded by `MAX_TYPE_DEPTH` and
+  decode-accept implies encode-accept at the cap.
+
+**Introduction version:** undetermined from the shallow `.server-src` checkout
+(its `CHANGELOG.md` only reaches 26.1). Stable at `v26.6.1.1193-stable`.
+
+**Server reference:** `DataTypeCustomSimpleAggregateFunction` in
+`src/DataTypes/DataTypeCustomSimpleAggregateFunction.{h,cpp}` (the custom-name
+attach with a null serialization slot). The wire layout, state prefix, and Arrow
+export are the inner type's; see that type's section. Confirmed at
+`v26.6.1.1193-stable`.
+
+### Geo types: Point, Ring, LineString, MultiLineString, Polygon, MultiPolygon
+
+**Type string(s):** the six bare alias spellings `Point`, `Ring`, `LineString`,
+`MultiLineString`, `Polygon`, and `MultiPolygon`, registered case-sensitive with
+no aliases (`DataTypeCustomGeo`). The Native header carries the bare alias, never
+the expanded form, and the mapping is one-directional: a structural
+`Array(Tuple(Float64, Float64))` header stays spelled that way and decodes as a
+plain `Array`/`Tuple`.
+
+**Logical type:** `ChType::Geo(GeoKind)` over the six `GeoKind` variants. Each
+expands to a fixed nesting over `Float64` (`GeoKind::underlying_type`):
+
+- `Point` = unnamed `Tuple(Float64, Float64)`
+- `Ring`, `LineString` = `Array(Point)`
+- `Polygon`, `MultiLineString` = `Array(Array(Point))`
+- `MultiPolygon` = `Array(Array(Array(Point)))`
+
+**Wire payload:** byte-identical to the underlying nesting. There is no custom
+geo serialization and no extra prefix, so decode, the state prefix, and the
+custom-serialization marker are exactly the underlying
+`Tuple`/`Array`-of-`Float64` column's.
+
+**Arrow export:** the underlying export. `Point` is a `+s` struct of two `g`
+(Float64) children; the five `Array`-based kinds are `+L` LargeList chains above
+that struct. Zero-copy, no new buffers.
+
+**Rust buffer:** the underlying `Tuple`/`Array` `Column`, reached through
+`ChType::physical_delegate`. `Point` is a two-field `TupleColumn` of `Float64`
+columns; the others are `ArrayColumn` chains over it. No new Column variant.
+
+**Notes:**
+
+- GA at `v26.6.1.1193-stable`; the `allow_experimental_geo_types` gate is an
+  obsolete no-op.
+- `Nullable(Point)` is legal (`DataTypeTuple::canBeInsideNullable()` is true).
+  `Nullable` of the five `Array`-based kinds is illegal, and `LowCardinality` is
+  illegal for all six. All six are legal as `Array`/`Tuple` elements and as `Map`
+  keys and values; the key case is accepted leniently, resolving through the
+  delegate to the underlying `Tuple`/`Array` (see FINDINGS.md).
+- Custom-serialization marker: the five `Array`-based kinds are always `0`.
+  `Point` could in principle carry a nonzero marker via the generic `Tuple`
+  sparse path, which the decoder rejects as `UnsupportedSerialization`
+  (pre-existing behavior) rather than misreads.
+- Depth accounting: each kind charges its physical expansion depth
+  (`GeoKind::expansion_depth`, `Point` 1 through `MultiPolygon` 4) on both the
+  parse and encode sides, so a geo-tipped header that decodes is always
+  re-encodable.
+
+**Introduction version:** undetermined from the shallow `.server-src` checkout.
+GA and stable at `v26.6.1.1193-stable`.
+
+**Server reference:** `DataTypeCustomGeo` in
+`src/DataTypes/DataTypeCustomGeo.{h,cpp}` (the custom-name attach over the
+`Tuple`/`Array`-of-`Float64` nesting). The wire layout and Arrow export are the
+underlying types'; see the `Tuple`, `Array`, and fixed-width numeric sections.
+Confirmed at `v26.6.1.1193-stable`.
+
+### Nested(name1 T1, ...)
+
+**Type string(s):** `Nested(name1 T1, name2 T2, ...)` with at least one field.
+Element names are MANDATORY (`Nested(UInt32)` is a server parse error) and follow
+the same `checkTupleNames` rules as a named `Tuple` (no empty name, no
+exact-lowercase `null`, no duplicates), quoted with `backQuoteIfNeed`. This
+spelling reaches the Native wire when a table is created with
+`flatten_nested = 0` (the default `flatten_nested = 1` expands `Nested` into
+sibling `n.a Array(T)` columns at CREATE time), AND in any SELECT projection that
+CASTs to `Nested` regardless of the setting (the setting governs table DDL, not
+projections; the fixture capture confirmed a plain `SELECT` CAST keeps the
+literal `Nested(...)` header).
+
+**Logical type:** `ChType::Nested(Vec<(String, ChType)>)`, expanding to
+`Array(Tuple(named fields))` (`nested_underlying_type`).
+
+**Wire payload:** byte-identical to `Array(Tuple(named fields))`: the element
+state prefixes recurse per field, then cumulative `UInt64` LE end-offsets, then
+the flattened field-major tuple body. There is no `SerializationNested`; the
+runtime object is a `DataTypeArray` over a `DataTypeTuple` with a custom name.
+
+**Arrow export:** `+L` LargeList of a `+s` struct whose children carry the
+declared field names verbatim (the same names the flattened `n.a` sibling columns
+would use, without the `n.` prefix). Reached through `ChType::physical_delegate`.
+
+**Rust buffer:** the underlying `ArrayColumn` over a two-or-more-field
+`TupleColumn`; no new Column variant. The field names live in the schema's
+`ChType::Nested`.
+
+**Notes:**
+
+- `Nullable(Nested)` and `LowCardinality(Nested)` are both illegal (it is an
+  `Array`).
+- `Nested` inside a container (`Array(Nested(...))`) is accepted leniently on
+  decode. That layout is INFERRED from the delegation architecture, not
+  test-confirmed against the server. Server-side flattening is not recursive, so
+  deep `Nested`-in-`Nested` under `flatten_nested = 0` is real.
+- Depth accounting: `Nested` charges +2 physical levels (`Array` + `Tuple`) on
+  both the parse and encode sides.
+- Binary-encoded type headers give `Nested` a distinct `0x2F` tag
+  (`DataTypesBinaryEncoding`); binary type headers remain out of scope (tracked
+  in FINDINGS.md).
+
+**Introduction version:** undetermined from the shallow `.server-src` checkout.
+Stable at `v26.6.1.1193-stable`.
+
+**Server reference:** `DataTypeNested` in
+`src/DataTypes/DataTypeNested.{h,cpp}` (`DataTypeNested.cpp` renders each field
+name with `backQuoteIfNeed` exactly like `DataTypeTuple`, and the runtime type is
+`Array(Tuple(...))`). The wire layout and Arrow export are the
+`Array(Tuple(...))` sections'. Confirmed at `v26.6.1.1193-stable`.
+
+---
+
 ## Encoding
 
 `src/native/encode.rs` is the inverse of the decode path: it turns a `ColBatch`
@@ -1428,8 +1632,15 @@ inner types decode accepts, `Array(T)` over any encodable element type
 zero-element `Tuple()` included, composing inside `Array` and inside
 `Nullable`), and `Map(K, V)` for a legal key type over encodable key/value
 types (composing inside `Array` and `Tuple`), the non-wrapper types and
-`Tuple` each optionally wrapped in `Nullable`. Any other type is
-`UnsupportedType`, at every row count including zero. This is deliberately
+`Tuple` each optionally wrapped in `Nullable`. The name-decoration aliases
+`SimpleAggregateFunction(func, T)` (encodable when its inner `T` is, at any
+nesting position), the six geo types (`Point`, `Ring`, `LineString`,
+`MultiLineString`, `Polygon`, `MultiPolygon`, always encodable since they
+expand to `Tuple`/`Array` of `Float64`), and `Nested(name1 T1, ...)`
+(encodable when every field type is) each encode as their physical delegate,
+with no new body writer: encode, like decode, recurses on
+`ChType::physical_delegate`. Any other type is `UnsupportedType`, at every row
+count including zero. This is deliberately
 stricter than decode, whose `empty_column` builds an empty column for any
 decodable type in a zero-row block: encode fails fast rather than write a header
 for a type it cannot write rows of.
@@ -1545,6 +1756,23 @@ would never produce.
   same classification as an illegal Map key, applied through nesting via the
   recursive validation. The decode parser deliberately round-trips these
   shapes, so the type-string round-trip check alone cannot catch them.
+- **Nested field names.** A `Nested(...)` renders its fields through the same
+  named-`Tuple` machinery, so its names get the same `checkTupleNames`
+  validation (all named, never empty, never the exact-lowercase reserved
+  `null`, never duplicated) applied through the `Tuple` delegation. Violations
+  are `UnsupportedType`, the type cannot exist on the server.
+- **SimpleAggregateFunction function name.** Every `SimpleAggregateFunction` in
+  the declared type (at any nesting position) must carry a SYNTACTICALLY valid
+  function spelling: an ASCII identifier optionally followed by one balanced
+  parenthesized literal-parameter suffix (`sum`, `anyLast`,
+  `groupArrayLastArray(5)`), checked by the exact predicate the decode parser
+  uses. This prevents a caller-constructed `func` from injecting extra type
+  tokens into the header's type-string channel (the same injection class the
+  Tuple element-name validation guards), and is reported as `UnsupportedType`.
+  The server's function whitelist is deliberately NOT enforced on encode either:
+  the list grows across versions and the server rejects an unknown function
+  loudly on INSERT, the same trusted-input boundary as a `DateTime64` precision
+  or an `Enum` value set. This is a syntactic guard, not a semantic one.
 - **Map key legality and entries.** The key type must satisfy the server's
   `DataTypeMap::isValidKeyType` (never `Nullable` or
   `LowCardinality(Nullable(...))`), reported as `UnsupportedType` since the
@@ -1700,6 +1928,16 @@ supported, decode and encode (see their type sections and the "Encoding"
 section). A `Map` header with an illegal key type (`Nullable` or
 `LowCardinality(Nullable(...))`) is rejected as `UnsupportedType`, matching
 the server's `DataTypeMap::isValidKeyType`.
+
+The name-decoration aliases `SimpleAggregateFunction(func, T)`, the six geo
+types, and `Nested(name1 T1, ...)` are all fully supported, decode and encode
+(see their type sections). They carry no new Column variant or body writer:
+every path resolves them to their physical delegate via
+`ChType::physical_delegate`. `Nullable`/`LowCardinality` of an alias is legal
+only when the physical delegate permits it: `Nullable(Point)` is legal (Point is
+a `Tuple`), while `Nullable(Ring)`, `Nullable(Nested(...))`, and
+`LowCardinality(Nested(...))` are rejected as `UnsupportedType` (they expand to
+`Array`).
 
 A malformed `LowCardinality` payload (a bad key version, the
 `NeedGlobalDictionaryBit` set, an index width tag outside `0..=3`, an out-of-range

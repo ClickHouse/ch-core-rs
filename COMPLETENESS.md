@@ -47,41 +47,111 @@ point-in-time snapshot for the next agent, not a changelog. Keep it short. Alway
 include a "Recommended next" with a one-line reason, so the next agent has a
 default; the user may override it.
 
-- **Last updated:** 2026-07-09. **`Time` and `Time64(P)` decode AND encode**
-  landed together at full parity. At `v26.6.1.1193-stable`, `Time` is a raw
-  4-byte little-endian signed `Int32` of seconds and `Time64(P)` is a raw 8-byte
-  little-endian signed `Int64` of `10^-P`-second ticks, with no bulk rescaling,
-  timezone, or type-specific framing. The parser accepts only the canonical
-  Native header spellings `Time` and `Time64(P)`, `P in 0..=9`; input-only
-  server aliases such as bare `Time64` are deliberately outside the wire parser.
-- **Implementation shape:** distinct `ChType` and `Column::Time`/`Time64` tags
-  preserve exact type-buffer matching, while both columns reuse
-  `PrimitiveColumn<i32/i64>`, the primitive bulk fast path, null-map wrapper,
-  and fixed-width scanner. `Time` is legal inside `LowCardinality`; `Time64` is
-  not. Arrow export is raw `i`/`l`, not Arrow Time, because Arrow restricts Time
-  values to one nonnegative day while ClickHouse permits negative values and
-  magnitudes through 999 hours.
+- **Last updated:** 2026-07-10. Follow-up fix pass on the `LowCardinality` /
+  `SimpleAggregateFunction` delegation: the alias may legally sit BETWEEN a
+  `LowCardinality` and its removeNullable `Nullable`
+  (`LowCardinality(SimpleAggregateFunction(anyLast, Nullable(String)))`, a
+  live-confirmed real server header at `v26.6.1.1193-stable`), and SAF chains are
+  legal to any depth. The per-site single-level SAF see-through was replaced with
+  one shared full-chain helper, `low_cardinality_dict_value_type`
+  (`src/native/decode.rs`), consulted by every `LowCardinality` site on both
+  paths and the Arrow export, so header validation, the nullability decision, and
+  the Arrow schema export can no longer disagree with the body paths. New fixture
+  column `lc_nsaf`, new unit/round-trip tests, and the live INSERT test extended.
+  Prior context: three name-decoration type groups (`SimpleAggregateFunction(func,
+  T)`, the six geo aliases, and `Nested(name1 T1, ...)`) landed together, decode
+  AND encode at full parity, all pure `getName()` decorations over an existing
+  physical type (SAF -> its inner `T`, geo -> a fixed `Tuple`/`Array`-of-`Float64`
+  nesting, Nested -> `Array(Tuple(named fields))`), so wire bytes, state prefix,
+  and Arrow shape are byte-identical to the underlying type.
+- **Implementation shape:** one delegation seam, `ChType::physical_delegate`
+  (`src/schema.rs`), returns the underlying physical `ChType` for each alias and
+  `None` for a plain type. Every dispatcher (`read_state_prefix`,
+  `decode_values`, `skip_values`, `empty_column`, `validate_header_type`, the
+  completeness scan, the encode paths, and the Arrow export) recurses on it at
+  the top, so there is NO new `Column` variant anywhere and cross-block schema
+  consistency keys on the alias `ChType` spelling (which `Display`/`parse`
+  round-trip exactly). `MAX_TYPE_DEPTH` now charges each alias its physical
+  expansion on BOTH the parse and encode sides (SAF +1, Nested +2, geo
+  `GeoKind::expansion_depth` 1..4), so decode-accept implies encode-accept at the
+  cap.
 - **Pinned server tag:** `v26.6.1.1193-stable`, protocol revision **54485**.
-  Confirmed server paths include `DataTypeTime.{h,cpp}`,
-  `Serializations/SerializationDateTime.{h,cpp}` (`SerializationTime`),
-  `DataTypeTime64.{h,cpp}`, `Serializations/SerializationTime64.{h,cpp}`, and
-  `Serializations/SerializationDecimalBase.cpp`. Local source, capture server,
-  fixtures, and contract citations are aligned to 26.6.1.1193.
+  Confirmed server paths: `DataTypeCustomSimpleAggregateFunction.{h,cpp}`,
+  `DataTypeCustomGeo.{h,cpp}`, and `DataTypeNested.{h,cpp}` (each a custom name
+  with a null serialization slot). Local source, capture server, fixtures, and
+  contract citations are aligned to 26.6.1.1193.
 - **Scope:** completeness still means uncompressed HTTP `FORMAT Native`; TCP and
   the currently unwired compression framing remain out of scope.
-- **Build/test status:** `cargo test` is green (396 unit + 3 integration;
+- **Build/test status:** `cargo test` is green (481 unit + 3 integration;
   live-insert and doctest ignored), clippy is clean with `-D warnings`, and fmt
-  is clean. The 65-column `all_types` fixtures at revisions 0 and 54485 now cover
-  plain/nullable `Time` and `Time64(6)` plus `LowCardinality(Time)`. Both ignored
-  live INSERT tests pass against ClickHouse 26.6.1.1193. Exact-byte, zero-row,
-  multi-block, nullable, LC allow/reject, invalid-precision, scanner, and Arrow
-  tests are included.
+  is clean. The `all_types` fixtures are recaptured at 76 columns (leading
+  varint `0x4c`) at revisions 0 and 54485, adding `saf_sum`
+  (`SimpleAggregateFunction(sum, Float64)`), `saf_lc`
+  (`SimpleAggregateFunction(anyLast, LowCardinality(Nullable(String)))`),
+  `saf_grp` (`SimpleAggregateFunction(groupArrayLastArray(5), Array(UInt64))`),
+  `nsaf` (`Nullable(SimpleAggregateFunction(sum, UInt64))` with NULLs), `lc_saf`
+  (`LowCardinality(SimpleAggregateFunction(anyLast, String))`), `lc_nsaf`
+  (`LowCardinality(SimpleAggregateFunction(anyLast, Nullable(String)))` with a
+  NULL), `point`, `npoint` (`Nullable(Point)`), `ring`, `mpoly`
+  (`MultiPolygon`), and `nst` (`Nested(x UInt32, y String)`); header spellings
+  are hexdump-verified verbatim. The live INSERT test
+  `geo_saf_nested_roundtrip_through_server` passes against 26.6.1.1193 (point,
+  npoint, ring, mpoly, saf_sum, saf_lc, nst on a `flatten_nested = 0` table, plus
+  `Nullable(SAF)`, `Tuple(v SAF)`, and
+  `LowCardinality(SAF(anyLast, Nullable(String)))` columns).
 - **Recommended next:** implement the 11 **`Interval*`** Tier 2 types together.
   They are distinct logical types over the same raw little-endian `Int64` body,
-  so they should reuse this change's primitive-backed pattern while preserving
-  exact type tags and encode/decode parity. Then continue with `BFloat16`,
-  `Nothing`, and `SimpleAggregateFunction`.
+  so they should reuse the primitive-backed pattern while preserving exact type
+  tags and encode/decode parity. Then continue with `BFloat16` and `Nothing`.
 - **Active gotchas / context:**
+  - `SimpleAggregateFunction`, the six geo aliases, and `Nested` are pure name
+    decorations resolved through `ChType::physical_delegate` (`src/schema.rs`),
+    the single seam every dispatcher recurses on. SAF is legal at ANY nesting
+    position and the server emits its spelling verbatim inside
+    wrappers/containers: `Nullable(SAF)`, `LowCardinality(SAF)`, `Tuple(v SAF)`,
+    `Array(SAF)`, and `Map(String, SAF)` were all confirmed live at 26.6.1.1193
+    (CREATE + Native header hexdump), corroborated by the server test
+    `04329_tuple_element_aggregation_reject_nullable_tuple.sql`. Wrapper legality
+    delegates to the inner: `Nullable(SAF(T))` is legal iff `Nullable(T)` is, and
+    `is_low_cardinality_inner`/`is_valid_map_key_type` see through the alias.
+    SAF chains are legal to any depth, and the alias may sit BETWEEN a
+    `LowCardinality` and its removeNullable `Nullable`:
+    `LowCardinality(SimpleAggregateFunction(anyLast, Nullable(String)))` is a real
+    server header (live-confirmed, fixture `lc_nsaf` with a NULL), and chained SAF
+    such as `SimpleAggregateFunction(anyLast, SimpleAggregateFunction(sum,
+    UInt64))` is live-constructible. Every `LowCardinality` site therefore
+    resolves its inner through ONE shared helper,
+    `low_cardinality_dict_value_type` (`src/native/decode.rs`), which strips the
+    full SAF chain, unwraps the optional `Nullable`, then strips any further SAF
+    chain beneath it, returning `(nullable, dict_value_type)`. Decode, the scan,
+    `empty_column`, header validation, encode validate/write,
+    `is_encodable`/`nullable_at_this_level`, and the Arrow schema export
+    (`dictionary_value_type`/`field_is_nullable` in `src/ffi.rs`) all call it, so
+    a single-level see-through gap ("one path resolves the alias, another does
+    not") cannot recur. A per-column single-level SAF unwrap must not be
+    reintroduced at any of these sites.
+  - A zero-row block with any alias header decodes via `empty_column`'s recursive
+    delegation. The FIRST implementation had an `unreachable!` panic here (an
+    alias inner reaching the panic arm on an untrusted 0-row header); review
+    caught it and it is fixed by recursing on `physical_delegate` at the very top
+    of `empty_column`, before the `Nullable` unwrap. Any new per-type dispatcher
+    must do the same delegate-first recursion or it will panic on a zero-row
+    alias column.
+  - `Nested` inside a container (`Array(Nested(...))`) is accepted leniently on
+    DECODE, but that layout is INFERRED from the delegation architecture, not
+    test-confirmed against the server. Server-side flattening is not recursive,
+    so deep `Nested`-in-`Nested` under `flatten_nested = 0` is real. Do not claim
+    the in-container case as confirmed without a live capture.
+  - Depth parity: `MAX_TYPE_DEPTH` charges each alias its PHYSICAL expansion on
+    both the parse and encode sides (SAF +1, Nested +2 for its Array+Tuple, geo
+    `GeoKind::expansion_depth` 1..4). This keeps decode-accept and encode-accept
+    in exact agreement at the cap, so an alias-tipped header that decodes is
+    always re-encodable. A future alias must charge the same depth on both sides.
+  - Map key legality resolves through the delegate: a `Point`/geo (or SAF) key
+    delegates to its underlying `Tuple`/`Array`, which passes the server's bare
+    `isValidKeyType` predicate, so `Map(Point, V)` is accepted leniently. This is
+    pre-existing delegation behavior, not separately confirmed against the server
+    for geo keys (see `FINDINGS.md`).
   - A zero-length `LowCardinality` run (reachable when rows > 0 but every
     array or map is empty) has NO body bytes at all:
     `SerializationLowCardinality::serializeBinaryBulkWithMultipleStreams`
@@ -394,8 +464,87 @@ is not done, and must not be checked off, until all of these hold:
         nonnegative Time types.
         Confirmed at `v26.6.1.1193-stable` against `DataTypeTime`,
         `SerializationTime`, `DataTypeTime64`, `SerializationTime64`, and
-        `SerializationDecimalBase`; verified by the 65-column live fixtures,
+        `SerializationDecimalBase`; verified by the live `all_types` fixtures,
         unit round-trips/scanner tests, and the live INSERT test.
+- [x] `SimpleAggregateFunction(func, T)` (decode and encode)
+      - Tier 2 name-decoration alias. Pure `getName()` decoration over the inner
+        `T` (`DataTypeCustomSimpleAggregateFunction` attaches only a custom name;
+        the serialization slot is null), so wire bytes, state prefix (including a
+        `LowCardinality` key version when `T` is LC), and Arrow export are exactly
+        `T`'s. No new `Column` variant: the decoded column IS the inner type's
+        column, reached through `ChType::physical_delegate`. The type string
+        appears VERBATIM in Native headers, including parametrized function
+        spellings like `SimpleAggregateFunction(groupArrayLastArray(5),
+        Array(UInt64))`; registration is case-sensitive with no aliases. Legal at
+        ANY nesting position, wrapper legality delegating to `T`: confirmed live
+        at 26.6.1.1193 (CREATE + Native header hexdump) for `Nullable(SAF)`,
+        `LowCardinality(SAF)`, `Tuple(v SAF)`, `Array(SAF)`, and
+        `Map(String, SAF)`, corroborated by server test
+        `04329_tuple_element_aggregation_reject_nullable_tuple`. Decode is lenient
+        on the function name (the server's 21-function whitelist is documented but
+        NOT enforced; a server-authored header is trusted and the list grows
+        across versions); encode validates the func string SYNTACTICALLY only
+        (identifier + optional balanced literal params) to prevent type-string
+        injection, and also does not enforce the whitelist (the same trusted-input
+        precedent as `DateTime64` precision and `Enum` values). Multi-type-arg
+        forms `SimpleAggregateFunction(f, T1, T2)` are rejected as
+        `UnsupportedType`. Each SAF level charges +1 depth on both the parse and
+        encode sides, and SAF chains are legal to any depth (live-constructible
+        `SimpleAggregateFunction(anyLast, SimpleAggregateFunction(sum, UInt64))`).
+        Inside `LowCardinality`, the alias may sit BETWEEN the LC and its
+        removeNullable `Nullable`; every LC site resolves the inner through one
+        shared full-chain helper `low_cardinality_dict_value_type`
+        (`src/native/decode.rs`) so header validation, the nullability decision,
+        the body paths, and the Arrow export cannot drift. Confirmed against the
+        server source (`DataTypeCustomSimpleAggregateFunction`,
+        v26.6.1.1193-stable) and verified with the
+        `saf_sum`/`saf_lc`/`saf_grp`/`nsaf`/`lc_saf`/`lc_nsaf` live-server fixture
+        columns; encode runs green in the live INSERT test.
+- [x] Geo types: `Point`, `Ring`, `LineString`, `MultiLineString`, `Polygon`,
+      `MultiPolygon` (decode and encode)
+      - Tier 2 name-decoration aliases (`DataTypeCustomGeo`), registered
+        case-sensitive with no aliases over: `Point` = unnamed
+        `Tuple(Float64, Float64)`; `Ring`/`LineString` = `Array(Point)`;
+        `Polygon`/`MultiLineString` = `Array(Array(Point))`; `MultiPolygon` =
+        `Array(Array(Array(Point)))`. Wire bytes are byte-identical to the
+        underlying nesting (no custom serialization, no extra prefix); the Native
+        header carries the bare alias spelling, and the mapping is
+        one-directional (a structural `Array(Tuple(Float64, Float64))` header
+        stays plain Array/Tuple). GA at v26.6.1.1193-stable (the
+        `allow_experimental_geo_types` gate is an obsolete no-op). `Nullable(Point)`
+        is legal (Tuple is nullable-able); `Nullable` of the five Array-based
+        kinds and `LowCardinality` of all six are illegal; all six are legal as
+        `Array`/`Tuple` elements and `Map` keys/values (the key case leniently,
+        through the delegate). Arrow export = the underlying export: `Point` as a
+        `+s` struct of two `g` (Float64) children, the others as `+L` LargeList
+        chains above it, zero-copy with no new buffers. Each kind charges its
+        physical expansion depth (`GeoKind::expansion_depth`, `Point` 1 through
+        `MultiPolygon` 4) on both sides. Confirmed against the server source
+        (`DataTypeCustomGeo`, v26.6.1.1193-stable) and verified with the
+        `point`/`npoint`/`ring`/`mpoly` live-server fixture columns; encode runs
+        green in the live INSERT test.
+- [x] `Nested(name1 T1, ...)` (decode and encode)
+      - Tier 2 name-decoration alias (`DataTypeNested`) over
+        `Array(Tuple(named fields))`; there is no `SerializationNested` and the
+        body is byte-identical to `Array(Tuple(...))` (element state prefixes
+        recurse per field, cumulative `UInt64` LE end-offsets, flattened
+        field-major tuple body). It reaches the wire when a table is created with
+        `flatten_nested = 0` (default `flatten_nested = 1` expands to sibling
+        `n.a Array(T)` columns at CREATE time), AND in any SELECT projection that
+        CASTs to `Nested` regardless of the setting (fixture-confirmed). Element
+        names are MANDATORY (`Nested(UInt32)` is a server parse error), validated
+        by the same `checkTupleNames` rules as a named `Tuple` (empty,
+        lowercase-`null`, duplicates) with `backQuoteIfNeed` quoting; encode
+        enforces these via the Tuple delegation. `Nullable(Nested)` and
+        `LowCardinality(Nested)` are illegal. `Nested` inside a container
+        (`Array(Nested(...))`) is accepted leniently on decode; that layout is
+        INFERRED from the delegation architecture, not test-confirmed. Arrow
+        export is `+L` LargeList of a `+s` struct with the declared field names.
+        Charges +2 physical levels (Array + Tuple) on both sides. Binary-encoded
+        type headers give `Nested` a distinct `0x2F` tag; binary type headers
+        remain out of scope. Confirmed against the server source (`DataTypeNested`,
+        v26.6.1.1193-stable) and verified with the `nst` live-server fixture
+        column; encode runs green in the live INSERT test.
 
 ---
 
@@ -500,19 +649,24 @@ introduction), so record them per type only when determinable.
       `w:16`/`w:32`. Host representation is decided at the binding. See
       "Implemented" and the `CODEC_CONTRACT.md` type section. Introduction version
       undetermined from the shallow pin.
-- [ ] `Nested(...)` - sugar over `Array(Tuple(...))`; confirm whether the server
-      ever emits the `Nested` type string on the wire or always the expanded
-      form.
-- [ ] `SimpleAggregateFunction(func, T)` - decodes as the inner `T` on the wire;
-      mostly a type-string parsing concern.
-- [ ] Geo types: `Point`, `Ring`, `LineString`, `MultiLineString`, `Polygon`,
-      `MultiPolygon` - custom-serialization aliases over `Tuple`/`Array` of
-      `Float64` (`Point` = `Tuple(Float64, Float64)`, the rest nest `Array` over
-      it); come almost for free once containers land, but need type-string parsing.
-      Confirmed registered and stable at v26.6.1.1193-stable (the
-      `allow_experimental_geo_types` gate is now an obsolete no-op). The umbrella
-      `Geometry` type (= `Variant(...)` of the six, alias `GEOMETRY`) is in Tier 3
-      because it depends on `Variant`.
+- [x] `Nested(...)` - decode AND encode done. A `DataTypeNested` name-decoration
+      alias over `Array(Tuple(named fields))`; the server DOES emit the literal
+      `Nested(...)` type string on the wire, under `flatten_nested = 0` and in any
+      SELECT that CASTs to `Nested`. See "Implemented" for the full summary; type
+      section in `CODEC_CONTRACT.md`.
+- [x] `SimpleAggregateFunction(func, T)` - decode AND encode done. Pure name
+      decoration; decodes/encodes as the inner `T`, legal at any nesting position,
+      the func string validated syntactically on encode but the whitelist not
+      enforced on either side. See "Implemented" for the full summary; type
+      section in `CODEC_CONTRACT.md`.
+- [x] Geo types: `Point`, `Ring`, `LineString`, `MultiLineString`, `Polygon`,
+      `MultiPolygon` - decode AND encode done. `DataTypeCustomGeo` name-decoration
+      aliases over `Tuple`/`Array` of `Float64` (`Point` = `Tuple(Float64,
+      Float64)`, the rest nest `Array` over it), GA and stable at
+      v26.6.1.1193-stable (the `allow_experimental_geo_types` gate is an obsolete
+      no-op). See "Implemented" for the full summary; type section in
+      `CODEC_CONTRACT.md`. The umbrella `Geometry` type (= `Variant(...)` of the
+      six, alias `GEOMETRY`) is in Tier 3 because it depends on `Variant`.
 - [ ] `Interval*` (`IntervalYear` ... `IntervalNanosecond`) - Int64 on the wire;
       11 distinct simple types, one per kind. Confirmed at v26.6.1.1193-stable.
 - [ ] `Nothing` - the type of a bare `NULL`; zero-width, edge case.
@@ -789,6 +943,30 @@ bring encode to parity with what the decoder already supports.
       Verified by round-trips at rev 0 and 54485, exact-byte pins (including
       the all-empty LC-key hoisted-prefix pin), rejection tests, and the live
       INSERT test.
+- [x] `SimpleAggregateFunction(func, T)` (encode as the inner `T` via
+      `ChType::physical_delegate`; no new body writer). `write_state_prefix`,
+      `encode_column_values`, and `is_encodable` all see through the alias, so a
+      SAF at any nesting position encodes as its inner. Pre-write validation runs
+      `validate_saf_func_spellings` over every SAF in the declared type (an
+      identifier plus an optional balanced literal-param suffix, the shared
+      `is_simple_aggregate_func_spelling`) so a caller-constructed `func` cannot
+      inject type-string tokens; the server whitelist is not enforced. Each SAF
+      level charges +1 in `type_depth`. Verified by round-trips (plain,
+      `Nullable(SAF)`, `Array(SAF)`, `LowCardinality(SAF)`, `Tuple(v SAF)`, and
+      the `groupArrayLastArray(5)` param form), exact-byte header pins,
+      func-spelling rejection tests, and the live INSERT test.
+- [x] Geo types (encode as the underlying `Tuple`/`Array`-of-`Float64` nesting via
+      `ChType::physical_delegate`; no new body writer). Always encodable (the
+      `Float64` nesting always is). Each kind charges its `expansion_depth` in
+      `type_depth`, so a geo-tipped type that decodes is re-encodable. Verified by
+      round-trips (`Point`, `Nullable(Point)`, `MultiPolygon`), exact-byte pins,
+      and the live INSERT test.
+- [x] `Nested(name1 T1, ...)` (encode as `Array(Tuple(named fields))` via
+      `ChType::physical_delegate`; no new body writer). Field names are validated
+      through the Tuple delegation (`checkTupleNames`: an empty name, the
+      exact-lowercase reserved `null`, or a duplicate -> `UnsupportedType`).
+      Charges +2 in `type_depth`. Verified by round-trips, an exact-byte
+      header/body pin, name-rejection tests, and the live INSERT test.
 - [x] Round-trip tests (encode then decode equals the original buffers) for the
       numerics, plus a live-server `INSERT` acceptance test
       (`tests/live_insert.rs`, `#[ignore]`, curl over HTTP). Extend both as each

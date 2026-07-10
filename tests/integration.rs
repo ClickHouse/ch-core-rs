@@ -1,7 +1,7 @@
 use ch_core_rs::batch::ChunkedBatch;
 use ch_core_rs::column::{Column, FixedBinaryColumn, Utf8Column};
 use ch_core_rs::native::decode::{decode_all_bytes, DecodeOptions, DBMS_TCP_PROTOCOL_VERSION};
-use ch_core_rs::schema::ChType;
+use ch_core_rs::schema::{ChType, GeoKind};
 
 /// Declare one `#[test]` per committed Native fixture. Each generated test
 /// decodes the fixture bytes through the public API and runs its asserter, so
@@ -327,6 +327,89 @@ fn assert_all_types(batch: &ChunkedBatch) {
                 ChType::Nullable(Box::new(ChType::Time64 { precision: 6 })),
             ),
             Expected::Exact("lc_time", ChType::LowCardinality(Box::new(ChType::Time))),
+            // SimpleAggregateFunction(func, T): a name-decoration alias over the
+            // inner type T. The header carries the alias spelling (never the
+            // expanded T), so the parsed ChType keeps func plus the inner type,
+            // and the decoded buffer IS T's buffer. func preserves any
+            // parenthesized literal params verbatim (groupArrayLastArray(5)).
+            Expected::Exact(
+                "saf_sum",
+                ChType::SimpleAggregateFunction {
+                    func: "sum".to_string(),
+                    inner: Box::new(ChType::Float64),
+                },
+            ),
+            Expected::Exact(
+                "saf_lc",
+                ChType::SimpleAggregateFunction {
+                    func: "anyLast".to_string(),
+                    inner: Box::new(ChType::LowCardinality(Box::new(ChType::Nullable(
+                        Box::new(ChType::String),
+                    )))),
+                },
+            ),
+            Expected::Exact(
+                "saf_grp",
+                ChType::SimpleAggregateFunction {
+                    func: "groupArrayLastArray(5)".to_string(),
+                    inner: Box::new(ChType::Array(Box::new(ChType::UInt64))),
+                },
+            ),
+            // Geo aliases: the bare alias spelling reaches the header and the
+            // parsed ChType is Geo(kind); the decoded buffer is the underlying
+            // Tuple/Array-of-Float64 nesting. Point = Tuple(Float64, Float64),
+            // Ring = Array(Point), MultiPolygon = Array(Array(Array(Point))).
+            // Nullable(Point) is legal (Point is a Tuple); the array-based kinds
+            // are not nullable, so npoint uses Point.
+            Expected::Exact("point", ChType::Geo(GeoKind::Point)),
+            Expected::Exact(
+                "npoint",
+                ChType::Nullable(Box::new(ChType::Geo(GeoKind::Point))),
+            ),
+            Expected::Exact("ring", ChType::Geo(GeoKind::Ring)),
+            Expected::Exact("mpoly", ChType::Geo(GeoKind::MultiPolygon)),
+            // Nested(x UInt32, y String): the literal Nested spelling reaches the
+            // header, and the body is byte-identical to Array(Tuple(named x, y)),
+            // so it decodes as an Array of a named two-field Tuple.
+            Expected::Exact(
+                "nst",
+                ChType::Nested(vec![
+                    ("x".to_string(), ChType::UInt32),
+                    ("y".to_string(), ChType::String),
+                ]),
+            ),
+            // SimpleAggregateFunction inside wrappers. The server emits the alias
+            // spelling verbatim inside the wrapper in the Native header (confirmed
+            // live at v26.6.1.1193-stable via toTypeName + hexdump), and the
+            // decoded buffer IS the physical delegate's. nsaf delegates to
+            // Nullable(UInt64); lc_saf delegates to LowCardinality(String).
+            Expected::Exact(
+                "nsaf",
+                ChType::Nullable(Box::new(ChType::SimpleAggregateFunction {
+                    func: "sum".to_string(),
+                    inner: Box::new(ChType::UInt64),
+                })),
+            ),
+            Expected::Exact(
+                "lc_saf",
+                ChType::LowCardinality(Box::new(ChType::SimpleAggregateFunction {
+                    func: "anyLast".to_string(),
+                    inner: Box::new(ChType::String),
+                })),
+            ),
+            // LowCardinality(SimpleAggregateFunction(anyLast, Nullable(String))):
+            // the SAF name decoration sits between the LowCardinality and its
+            // removeNullable Nullable. The decoder resolves the full SAF chain, so
+            // the column is nullable at the index level and its dictionary body is
+            // the bare String inner. Confirmed a real server header live at
+            // v26.6.1.1193-stable.
+            Expected::Exact(
+                "lc_nsaf",
+                ChType::LowCardinality(Box::new(ChType::SimpleAggregateFunction {
+                    func: "anyLast".to_string(),
+                    inner: Box::new(ChType::Nullable(Box::new(ChType::String))),
+                })),
+            ),
         ],
     );
 
@@ -1119,6 +1202,166 @@ fn assert_all_types(batch: &ChunkedBatch) {
         },
         other => panic!("expected Dictionary, got {other:?}"),
     }
+
+    // SimpleAggregateFunction(sum, Float64) (col 65): a name-decoration alias
+    // whose body is byte-identical to the inner Float64, so it decodes to a plain
+    // Float64 buffer with no extra framing. Values -1.25, 0, 13, 79.125.
+    match block.column(65) {
+        Column::Float64(c) => assert_eq!(c.values.as_slice(), &[-1.25, 0.0, 13.0, 79.125]),
+        other => panic!("expected Float64 (SimpleAggregateFunction delegate), got {other:?}"),
+    }
+    // SimpleAggregateFunction(anyLast, LowCardinality(Nullable(String))) (col 66):
+    // delegates to the LC inner, so it decodes to a Dictionary exactly like a bare
+    // LowCardinality(Nullable(String)). Rows resolve to user_1, NULL, user_2, NULL.
+    assert_dictionary_string_values(
+        block.column(66),
+        &[Some(b"user_1" as &[u8]), None, Some(b"user_2"), None],
+    );
+    assert_validity(block.column(66), &[true, false, true, false]);
+    // SimpleAggregateFunction(groupArrayLastArray(5), Array(UInt64)) (col 67):
+    // delegates to Array(UInt64). The parametrized function name is metadata only;
+    // the body is a plain array. Rows [] / [13] / [79, 13] / [1, 2, 3].
+    {
+        let arr = as_array(block.column(67));
+        assert_eq!(arr.offsets, vec![0i64, 0, 1, 3, 6]);
+        assert_eq!(arr.null_count(), 0);
+        match arr.values.as_ref() {
+            Column::UInt64(c) => assert_eq!(c.values.as_slice(), &[13, 79, 13, 1, 2, 3]),
+            other => panic!("expected UInt64 array elements, got {other:?}"),
+        }
+    }
+
+    // Point (col 68): Geo alias over Tuple(Float64, Float64) (unnamed), so it
+    // decodes to a two-field Float64 Tuple with no tuple-level validity. field 0
+    // is x, field 1 is y. Rows (13, 79), (-1.5, 2.5), (0, 0), (79.125, -13.25).
+    {
+        let t = as_tuple(block.column(68));
+        assert_eq!(t.len, 4);
+        assert!(t.validity.is_none());
+        match (&t.fields[0], &t.fields[1]) {
+            (Column::Float64(x), Column::Float64(y)) => {
+                assert_eq!(x.values.as_slice(), &[13.0, -1.5, 0.0, 79.125]);
+                assert_eq!(y.values.as_slice(), &[79.0, 2.5, 0.0, -13.25]);
+            }
+            other => panic!("expected (Float64, Float64) Point elements, got {other:?}"),
+        }
+    }
+    // Nullable(Point) (col 69): Point is a Tuple, so Nullable(Point) decodes to a
+    // Tuple with a tuple-level null map; null rows carry element placeholders that
+    // are deliberately not asserted. Valid rows 0 and 2 are (13, 79), (1.25, -2.5).
+    {
+        let t = as_tuple(block.column(69));
+        assert_eq!(t.len, 4);
+        assert_eq!(t.null_count(), 2);
+        let bm = t
+            .validity
+            .as_ref()
+            .expect("Nullable(Point) tuple-level validity");
+        let got: Vec<bool> = (0..4).map(|i| bm.is_valid(i)).collect();
+        assert_eq!(got, vec![true, false, true, false]);
+        match (&t.fields[0], &t.fields[1]) {
+            (Column::Float64(x), Column::Float64(y)) => {
+                assert_eq!(x.values[0], 13.0);
+                assert_eq!(y.values[0], 79.0);
+                assert_eq!(x.values[2], 1.25);
+                assert_eq!(y.values[2], -2.5);
+            }
+            other => panic!("expected (Float64, Float64) Point elements, got {other:?}"),
+        }
+    }
+    // Ring (col 70): Geo alias over Array(Point) = Array(Tuple(Float64, Float64)),
+    // so it decodes to an Array of a two-field Float64 Tuple. Rows [] / [(13, 79)] /
+    // [(1, 2), (3, 4)] / [(-1.5, -2.5)] -> offsets [0, 0, 1, 3, 4].
+    {
+        let arr = as_array(block.column(70));
+        assert_eq!(arr.offsets, vec![0i64, 0, 1, 3, 4]);
+        let t = as_tuple(arr.values.as_ref());
+        assert_eq!(t.len, 4);
+        match (&t.fields[0], &t.fields[1]) {
+            (Column::Float64(x), Column::Float64(y)) => {
+                assert_eq!(x.values.as_slice(), &[13.0, 1.0, 3.0, -1.5]);
+                assert_eq!(y.values.as_slice(), &[79.0, 2.0, 4.0, -2.5]);
+            }
+            other => panic!("expected (Float64, Float64) Ring point elements, got {other:?}"),
+        }
+    }
+    // MultiPolygon (col 71): Geo alias over Array(Array(Array(Point))), three
+    // Array levels above the leaf Point tuple. Rows [] / [[[(13, 79)]]] /
+    // [[[(1, 2), (3, 4)], [(5, 6)]]] / [[[(-1, -2)]], [[(7, 8)]]].
+    {
+        let outer = as_array(block.column(71));
+        assert_eq!(outer.offsets, vec![0i64, 0, 1, 2, 4]);
+        let mid = as_array(outer.values.as_ref());
+        assert_eq!(mid.offsets, vec![0i64, 1, 3, 4, 5]);
+        let inner = as_array(mid.values.as_ref());
+        assert_eq!(inner.offsets, vec![0i64, 1, 3, 4, 5, 6]);
+        let t = as_tuple(inner.values.as_ref());
+        assert_eq!(t.len, 6);
+        match (&t.fields[0], &t.fields[1]) {
+            (Column::Float64(x), Column::Float64(y)) => {
+                assert_eq!(x.values.as_slice(), &[13.0, 1.0, 3.0, 5.0, -1.0, 7.0]);
+                assert_eq!(y.values.as_slice(), &[79.0, 2.0, 4.0, 6.0, -2.0, 8.0]);
+            }
+            other => panic!("expected (Float64, Float64) MultiPolygon leaf, got {other:?}"),
+        }
+    }
+    // Nested(x UInt32, y String) (col 72): the body is byte-identical to
+    // Array(Tuple(named x, y)), so it decodes as an Array of a two-field Tuple.
+    // The field names live in the ChType (asserted above); the Column stores the
+    // element buffers by position. Rows [] / [(13, user_1)] / [(79, a), (1, user_2)]
+    // / [(2, x)] -> offsets [0, 0, 1, 3, 4].
+    {
+        let arr = as_array(block.column(72));
+        assert_eq!(arr.offsets, vec![0i64, 0, 1, 3, 4]);
+        let t = as_tuple(arr.values.as_ref());
+        assert_eq!(t.len, 4);
+        match &t.fields[0] {
+            Column::UInt32(c) => assert_eq!(c.values.as_slice(), &[13, 79, 1, 2]),
+            other => panic!("expected UInt32 Nested field, got {other:?}"),
+        }
+        match &t.fields[1] {
+            Column::Utf8(c) => assert_utf8_column(c, &[b"user_1" as &[u8], b"a", b"user_2", b"x"]),
+            other => panic!("expected Utf8 Nested field, got {other:?}"),
+        }
+    }
+
+    // Nullable(SimpleAggregateFunction(sum, UInt64)) (col 73): the alias is name
+    // decoration inside the Nullable, so the decoded buffer is a plain
+    // Nullable(UInt64): the null map then the UInt64 run. Rows 1 and 3 NULL,
+    // rows 0 and 2 real (13, 79); null rows carry the server's placeholder 0.
+    match block.column(73) {
+        Column::UInt64(c) => {
+            assert_eq!(c.values.as_slice(), &[13, 0, 79, 0]);
+            assert_eq!(c.null_count(), 2);
+        }
+        other => panic!("expected UInt64 SAF delegate, got {other:?}"),
+    }
+    assert_validity(block.column(73), &[true, false, true, false]);
+
+    // LowCardinality(SimpleAggregateFunction(anyLast, String)) (col 74): the LC
+    // body delegates to the physical String inner. Rows user_1, user_2, user_1,
+    // user_3 resolve through the per-block dictionary (three distinct entries).
+    assert_dictionary_string_values(
+        block.column(74),
+        &[
+            Some(b"user_1" as &[u8]),
+            Some(b"user_2"),
+            Some(b"user_1"),
+            Some(b"user_3"),
+        ],
+    );
+
+    // LowCardinality(SimpleAggregateFunction(anyLast, Nullable(String))) (col 75):
+    // the SAF name decoration sits between the LowCardinality and its
+    // removeNullable Nullable. The decoder resolves the full SAF chain, so this
+    // decodes exactly like LowCardinality(Nullable(String)): a nullable dictionary
+    // whose index 0 is the NULL sentinel and whose body is the bare String inner.
+    // Rows resolve to user_1, NULL, user_2, NULL.
+    assert_dictionary_string_values(
+        block.column(75),
+        &[Some(b"user_1" as &[u8]), None, Some(b"user_2"), None],
+    );
+    assert_validity(block.column(75), &[true, false, true, false]);
 }
 
 /// Borrow the inner `MapColumn` of a decoded `Map` column, panicking with a

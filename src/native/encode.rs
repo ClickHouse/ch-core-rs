@@ -31,7 +31,8 @@ use crate::column::{
 use crate::schema::{ChType, Field};
 
 use super::decode::{
-    decimal_bits_from_precision, is_low_cardinality_inner, is_valid_map_key_type, parse_ch_type,
+    decimal_bits_from_precision, is_low_cardinality_inner, is_simple_aggregate_func_spelling,
+    is_valid_map_key_type, low_cardinality_dict_value_type, parse_ch_type,
     DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION, DBMS_MIN_REVISION_WITH_OUT_OF_ORDER_BUCKETS,
     LC_HAS_ADDITIONAL_KEYS_BIT, LC_NEED_UPDATE_DICTIONARY_BIT, LOW_CARDINALITY_KEY_VERSION,
     MAX_TYPE_DEPTH,
@@ -204,6 +205,15 @@ fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<()
         });
     }
 
+    // Every `SimpleAggregateFunction` in the declared type must carry a
+    // syntactically valid function spelling before its header is rendered. A
+    // caller-constructed `func` is untrusted, and it is Displayed verbatim into
+    // the type-string channel, so a value like `"sum, UInt64), evil"` would inject
+    // extra type tokens into the header (the same bug class the Tuple element-name
+    // validation guards). Run once here, after the depth cap so the recursive walk
+    // is bounded, and before any bytes are written.
+    validate_saf_func_spellings(field, &field.ch_type)?;
+
     // Row count: the column must carry exactly the rows the block declares.
     if column.len() != num_rows {
         return Err(EncodeError::InconsistentBatch {
@@ -215,8 +225,24 @@ fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<()
         });
     }
 
-    // The concrete value type is the inner of a `Nullable`, else the type itself.
-    let value_type = field.ch_type.inner();
+    // Expand a name-decoration alias (SimpleAggregateFunction, geo, Nested) to
+    // the physical type it delegates to, for every STRUCTURAL check below. The
+    // header round-trip check further down stays on `field.ch_type` (the alias
+    // form), so the emitted header keeps the alias spelling. [`resolve_delegate`]
+    // follows the whole alias chain, not a fixed number of steps, mirroring the
+    // "recurse on the delegate" pattern the decoders use, so a nested alias like
+    // `Nullable(SimpleAggregateFunction(_, Point))` resolves all the way to the
+    // physical `Tuple` rather than stopping one level short.
+    let physical = resolve_delegate(&field.ch_type);
+    let physical_type = physical.as_ref().unwrap_or(&field.ch_type);
+
+    // The concrete value type is the inner of a `Nullable`, else the physical
+    // type itself; an alias under `Nullable` (`Nullable(Point)` -> `Tuple`,
+    // `Nullable(SAF(_, T))` -> physical `T`) is resolved through the whole chain
+    // here too.
+    let value_inner = physical_type.inner();
+    let value = resolve_delegate(value_inner);
+    let value_type = value.as_ref().unwrap_or(value_inner);
 
     // Supported, matching (type, buffer) pair. A not-yet-encodable type, or a
     // supported type under a mismatched buffer variant, is rejected here rather
@@ -295,8 +321,16 @@ fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<()
     // shape, a present bitmap must cover exactly `num_rows`. A non-nullable field
     // writes no nulls, so a null in its validity bitmap would be silently dropped
     // and the row's placeholder value encoded as real data; reject that.
-    let nullable_at_this_level = matches!(field.ch_type, ChType::Nullable(_))
-        || matches!(&field.ch_type, ChType::LowCardinality(inner) if matches!(inner.as_ref(), ChType::Nullable(_)));
+    // Nullability is read off the PHYSICAL type: a `SimpleAggregateFunction`
+    // over `LowCardinality(Nullable(T))` is nullable at the index level even
+    // though `field.ch_type` is the alias, so consult the delegate. For a
+    // `LowCardinality`, the null flag comes from the shared
+    // `low_cardinality_dict_value_type` helper, which sees through a SAF chain
+    // around the removeNullable `Nullable`, so
+    // `LowCardinality(SAF(anyLast, Nullable(String)))` is correctly nullable and a
+    // null row is not rejected as an `InconsistentBatch`.
+    let nullable_at_this_level = matches!(physical_type, ChType::Nullable(_))
+        || matches!(physical_type, ChType::LowCardinality(inner) if low_cardinality_dict_value_type(inner).0);
     if nullable_at_this_level {
         if let Some(validity) = column.validity() {
             if validity.len() != num_rows {
@@ -319,7 +353,7 @@ fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<()
         });
     }
 
-    if let (ChType::LowCardinality(inner), Column::Dictionary(c)) = (&field.ch_type, column) {
+    if let (ChType::LowCardinality(inner), Column::Dictionary(c)) = (physical_type, column) {
         validate_low_cardinality(field, inner, c, num_rows)?;
     }
 
@@ -395,6 +429,78 @@ fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<()
     Ok(())
 }
 
+/// Follow a name-decoration alias chain to its underlying physical type,
+/// returning `None` when `ch_type` is already physical (not an alias).
+///
+/// `SimpleAggregateFunction`, the geo aliases, and `Nested` each delegate to a
+/// physical type via [`ChType::physical_delegate`]; this resolves the whole
+/// chain (e.g. `SimpleAggregateFunction(_, Point)` -> `Geo(Point)` -> `Tuple`)
+/// rather than a fixed number of steps, so [`validate_column`] never stops one
+/// delegate short. The clone is bounded by the parsed/validated type depth and
+/// runs once per column validation, never per row.
+fn resolve_delegate(ch_type: &ChType) -> Option<ChType> {
+    let mut under = ch_type.physical_delegate()?;
+    while let Some(next) = under.physical_delegate() {
+        under = next;
+    }
+    Some(under)
+}
+
+/// Reject a `SimpleAggregateFunction` whose function-name spelling is not a bare
+/// identifier optionally followed by a single balanced parenthesized parameter
+/// suffix (`sum`, `anyLast`, `groupArrayLastArray(5)`), walking every wrapper and
+/// container so a nested SAF is checked too.
+///
+/// Two deliberate decisions, matching the crate's trusted-encode-input
+/// precedent:
+///
+/// - The `func` spelling IS validated (via the shared
+///   [`is_simple_aggregate_func_spelling`], the exact predicate the decode parser
+///   uses), because it is Displayed verbatim into the header's type-string
+///   channel. Without this, a caller-constructed `func` like
+///   `"sum, UInt64), evil"` would inject extra type tokens, the same injection
+///   class the Tuple element-name validation prevents.
+/// - The server's function whitelist is NOT enforced. The list grows across
+///   versions, the server rejects an unknown function loudly on INSERT, and this
+///   mirrors the same choice made for `DateTime64` precision and `Enum` values:
+///   the crate validates wire framing, not semantic legality the server owns.
+///
+/// Bounded by the [`MAX_TYPE_DEPTH`] check that runs before it in
+/// [`validate_column`], so the recursion cannot run away on a hostile type.
+fn validate_saf_func_spellings(field: &Field, ch_type: &ChType) -> Result<(), EncodeError> {
+    match ch_type {
+        ChType::SimpleAggregateFunction { func, inner } => {
+            if !is_simple_aggregate_func_spelling(func) {
+                return Err(EncodeError::UnsupportedType {
+                    column: field.name.clone(),
+                    ch_type: field.ch_type.clone(),
+                });
+            }
+            validate_saf_func_spellings(field, inner)
+        }
+        ChType::Nullable(inner) | ChType::LowCardinality(inner) | ChType::Array(inner) => {
+            validate_saf_func_spellings(field, inner)
+        }
+        ChType::Tuple(elements) => {
+            for (_, element_type) in elements {
+                validate_saf_func_spellings(field, element_type)?;
+            }
+            Ok(())
+        }
+        ChType::Nested(fields) => {
+            for (_, field_type) in fields {
+                validate_saf_func_spellings(field, field_type)?;
+            }
+            Ok(())
+        }
+        ChType::Map(key, value) => {
+            validate_saf_func_spellings(field, key)?;
+            validate_saf_func_spellings(field, value)
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Count the deepest wrapper/container nesting of `ch_type`, iteratively.
 ///
 /// Used by [`validate_column`] to reject a pathologically deep
@@ -420,6 +526,29 @@ fn type_depth(ch_type: &ChType) -> usize {
             ChType::Map(key, value) => {
                 work.push((key, depth + 1));
                 work.push((value, depth + 1));
+            }
+            // Name-decoration aliases contribute the depth of the physical type
+            // they delegate to, so a geo/Nested alias near the cap is not
+            // under-counted (a MultiPolygon expands to four Array/Tuple levels).
+            // `SimpleAggregateFunction` charges one level (parse it at `depth + 1`
+            // for its inner), matching the decode parser: SAF expands via one
+            // extra decode recursion frame, and charging it the same on both sides
+            // keeps decode-accept and encode-accept in exact agreement while
+            // bounding a hostile chain of nested SAFs. `Nested` expands to
+            // `Array(Tuple(fields))`, two wrapper levels above each field. Geo
+            // expands to a fixed constant nesting ([`GeoKind::expansion_depth`],
+            // the depth of `underlying_type`), so its token is charged that many
+            // levels directly, the same constant the decode parser charges.
+            ChType::SimpleAggregateFunction { inner, .. } => {
+                work.push((inner, depth + 1));
+            }
+            ChType::Nested(fields) => {
+                for (_, field_type) in fields {
+                    work.push((field_type, depth + 2));
+                }
+            }
+            ChType::Geo(kind) => {
+                max_depth = max_depth.max(depth + kind.expansion_depth());
             }
             _ => {}
         }
@@ -550,10 +679,11 @@ fn validate_low_cardinality(
     col: &DictionaryColumn,
     num_rows: usize,
 ) -> Result<(), EncodeError> {
-    let (nullable, dict_value_type) = match inner {
-        ChType::Nullable(t) => (true, t.as_ref()),
-        other => (false, other),
-    };
+    // Resolve the inner through the shared helper (full SAF chain + optional
+    // removeNullable Nullable + inner SAF chain), so the dictionary body and index
+    // nullability are those of the physical inner for both
+    // `LowCardinality(SAF(anyLast, Nullable(String)))` and a chained SAF.
+    let (nullable, dict_value_type) = low_cardinality_dict_value_type(inner);
 
     if !is_low_cardinality_inner(dict_value_type) || !is_encodable(dict_value_type) {
         return Err(EncodeError::UnsupportedType {
@@ -892,6 +1022,13 @@ fn validate_map(
 /// column before any bytes are written, which is what lets [`write_block_into`]
 /// treat the body match as structurally infallible.
 fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
+    // A name-decoration alias (SimpleAggregateFunction, geo, Nested) matches the
+    // column its physical delegate would, since decode produces the delegate's
+    // Column variant (no new variant). Expand and recurse before the pair checks
+    // below.
+    if let Some(under) = value_type.physical_delegate() {
+        return column_variant_matches(&under, column);
+    }
     // `Array(T)` matches only if the flattened element column matches the
     // element value type in turn, recursing the same way `decode_array` decodes
     // through `decode_values`. A `Nullable` element unwraps to its inner here
@@ -1089,6 +1226,13 @@ fn encode_column_data(
 /// UInt64 LE key version (`SharedDictionariesWithAdditionalKeys` = 1); every
 /// other supported type writes a zero-byte prefix.
 fn write_state_prefix(buf: &mut Vec<u8>, ch_type: &ChType) {
+    // A name-decoration alias (SimpleAggregateFunction, geo, Nested) writes the
+    // exact state prefix of the type it delegates to, so expand and recurse, the
+    // encode-side mirror of `decode::read_state_prefix`.
+    if let Some(under) = ch_type.physical_delegate() {
+        write_state_prefix(buf, &under);
+        return;
+    }
     match ch_type {
         ChType::LowCardinality(_) => {
             buf.extend_from_slice(&LOW_CARDINALITY_KEY_VERSION.to_le_bytes());
@@ -1137,6 +1281,14 @@ fn encode_column_values(
     ch_type: &ChType,
     column: &Column,
 ) -> Result<(), EncodeError> {
+    // A name-decoration alias (SimpleAggregateFunction, geo, Nested) encodes
+    // exactly as the physical type it delegates to, the encode-side mirror of
+    // `decode::decode_values`. Expand and recurse before the container dispatch
+    // so a geo/Nested alias that expands to an `Array` reaches the Array
+    // fast-path.
+    if let Some(under) = ch_type.physical_delegate() {
+        return encode_column_values(buf, field, &under, column);
+    }
     if let ChType::LowCardinality(inner) = ch_type {
         if let Column::Dictionary(c) = column {
             // A zero-length run writes no LowCardinality body at all: no index
@@ -1171,6 +1323,10 @@ fn encode_column_values(
     } else {
         ch_type
     };
+    // Expand a geo alias legal directly inside `Nullable` (only `Nullable(Point)`
+    // -> `Tuple`), so the Tuple arm below writes its body after the null map.
+    let delegate = value_type.physical_delegate();
+    let value_type = delegate.as_ref().unwrap_or(value_type);
     // Tuple after the Nullable unwrap, mirroring the decode side: a
     // `Nullable(Tuple(...))` writes its per-row null map above, then the tuple
     // body (element bodies still carry a placeholder value for null rows).
@@ -1277,10 +1433,13 @@ fn encode_low_cardinality_data(
     inner: &ChType,
     col: &DictionaryColumn,
 ) -> Result<(), EncodeError> {
-    let dict_value_type = match inner {
-        ChType::Nullable(t) => t.as_ref(),
-        other => other,
-    };
+    // Resolve the inner through the shared helper (the encode mirror of
+    // [`super::decode::decode_low_cardinality`]), so the dictionary body is
+    // written as its fully-stripped physical value type. Without the full SAF
+    // strip a chained SAF would leave an alias here and die in
+    // `encode_column_body`'s default arm as an `InconsistentBatch`.
+    // `validate_low_cardinality` already confirmed the inner is legal.
+    let (_, dict_value_type) = low_cardinality_dict_value_type(inner);
     let (index_width, width_tag) = low_cardinality_index_width(col.values.len());
 
     let index_word = width_tag | LC_HAS_ADDITIONAL_KEYS_BIT | LC_NEED_UPDATE_DICTIONARY_BIT;
@@ -1707,10 +1866,12 @@ fn column_error(field: &Field, ch_type: &ChType) -> EncodeError {
 fn is_encodable(ch_type: &ChType) -> bool {
     match ch_type {
         ChType::LowCardinality(inner) => {
-            let dict_value_type = match inner.as_ref() {
-                ChType::Nullable(t) => t.as_ref(),
-                other => other,
-            };
+            // Resolve through the shared helper (full SAF chain + optional
+            // Nullable + inner SAF chain) so a
+            // `LowCardinality(SAF(anyLast, Nullable(String)))` is not
+            // misclassified as unencodable: its physical dictionary value type is
+            // what must be an allowed and encodable LC inner.
+            let (_, dict_value_type) = low_cardinality_dict_value_type(inner);
             is_low_cardinality_inner(dict_value_type) && is_encodable(dict_value_type)
         }
         ChType::Bool
@@ -1763,6 +1924,17 @@ fn is_encodable(ch_type: &ChType) -> bool {
         ChType::Map(key, value) => {
             is_valid_map_key_type(key) && is_encodable(key) && is_encodable(value.inner())
         }
+        // Name-decoration aliases are encodable exactly when their physical
+        // delegate is: `SimpleAggregateFunction` over its inner, a geo alias over
+        // its Tuple/Array-of-Float64 nesting (always encodable), and `Nested`
+        // over its `Array(Tuple(fields))` (encodable when every field type is, a
+        // Nullable field unwrapping like the Tuple arm). The SAF inner unwraps a
+        // `Nullable` via `.inner()` exactly like the Array/Tuple/Nested arms, so
+        // `SimpleAggregateFunction(anyLast, Nullable(String))` is not misclassified
+        // as unencodable (a bare `is_encodable(Nullable(_))` is always false).
+        ChType::SimpleAggregateFunction { inner, .. } => is_encodable(inner.inner()),
+        ChType::Geo(kind) => is_encodable(&kind.underlying_type()),
+        ChType::Nested(fields) => fields.iter().all(|(_, t)| is_encodable(t.inner())),
         ChType::Nullable(_) => false,
     }
 }
@@ -1773,7 +1945,7 @@ mod tests {
     use crate::bitmap::Bitmap;
     use crate::column::{DecimalColumn, DictionaryColumn, PrimitiveColumn};
     use crate::native::decode::{decode_all_bytes, DecodeOptions, DBMS_TCP_PROTOCOL_VERSION};
-    use crate::schema::Schema;
+    use crate::schema::{GeoKind, Schema};
 
     /// Build a `Utf8Column` from raw byte values, computing the Arrow offsets the
     /// same way the decoder does (starting at 0, one entry past each value).
@@ -5892,5 +6064,906 @@ mod tests {
             EncodeError::InconsistentBatch { .. } => {}
             other => panic!("expected InconsistentBatch, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // SimpleAggregateFunction / geo aliases / Nested encode
+    // -----------------------------------------------------------------------
+
+    /// `SimpleAggregateFunction(sum, Float64)` over three rows; the column buffer
+    /// is the physical Float64 (no new Column variant).
+    fn simple_aggregate_function_scalar_batch() -> ColBatch {
+        let fields = vec![Field {
+            name: "s".into(),
+            ch_type: ChType::SimpleAggregateFunction {
+                func: "sum".into(),
+                inner: Box::new(ChType::Float64),
+            },
+        }];
+        let columns = vec![Column::Float64(PrimitiveColumn::new(vec![3.5, -7.25, 0.0]))];
+        ColBatch::new(Schema::new(fields), columns, 3)
+    }
+
+    /// `SimpleAggregateFunction(anyLast, Nullable(String))` over three rows: the
+    /// alias sits over `Nullable(String)`, so nullability is read off the
+    /// delegate and the null map precedes the string body.
+    fn simple_aggregate_function_nullable_batch() -> ColBatch {
+        let mut col = utf8_column(&[b"user_1", b"", b"user_2"]);
+        col.validity = Some(Bitmap::from_ch_null_map(&[0, 1, 0]));
+        let fields = vec![Field {
+            name: "s".into(),
+            ch_type: ChType::SimpleAggregateFunction {
+                func: "anyLast".into(),
+                inner: Box::new(ChType::Nullable(Box::new(ChType::String))),
+            },
+        }];
+        ColBatch::new(Schema::new(fields), vec![Column::Utf8(col)], 3)
+    }
+
+    /// `SimpleAggregateFunction(anyLast, LowCardinality(Nullable(String)))` over
+    /// four rows (valid, null, valid, null): the shared LC gate under a SAF
+    /// alias, nullable at the index level.
+    fn simple_aggregate_function_low_cardinality_batch() -> ColBatch {
+        let fields = vec![Field {
+            name: "s".into(),
+            ch_type: ChType::SimpleAggregateFunction {
+                func: "anyLast".into(),
+                inner: Box::new(ChType::LowCardinality(Box::new(ChType::Nullable(
+                    Box::new(ChType::String),
+                )))),
+            },
+        }];
+        let columns = vec![Column::Dictionary(DictionaryColumn::new_nullable(
+            vec![1, 0, 2, 0],
+            Column::Utf8(utf8_column(&[b"", b"user_1", b"user_2"])),
+            Bitmap::from_ch_null_map(&[0, 1, 0, 1]),
+        ))];
+        ColBatch::new(Schema::new(fields), columns, 4)
+    }
+
+    /// `LowCardinality(SimpleAggregateFunction(anyLast, Nullable(String)))` over
+    /// four rows (valid, null, valid, null). This is the previously-failing
+    /// shape: the SAF sits between the `LowCardinality` and its removeNullable
+    /// `Nullable`, so nullability and the dictionary value type must be resolved
+    /// through the full SAF chain, not a single-level see-through. Index 0 is the
+    /// NULL sentinel. Confirmed a real server header live at v26.6.1.1193-stable.
+    fn low_cardinality_saf_nullable_string_batch() -> ColBatch {
+        let fields = vec![Field {
+            name: "lc_nsaf".into(),
+            ch_type: ChType::LowCardinality(Box::new(ChType::SimpleAggregateFunction {
+                func: "anyLast".into(),
+                inner: Box::new(ChType::Nullable(Box::new(ChType::String))),
+            })),
+        }];
+        let columns = vec![Column::Dictionary(DictionaryColumn::new_nullable(
+            vec![1, 0, 2, 0],
+            Column::Utf8(utf8_column(&[b"", b"user_1", b"user_2"])),
+            Bitmap::from_ch_null_map(&[0, 1, 0, 1]),
+        ))];
+        ColBatch::new(Schema::new(fields), columns, 4)
+    }
+
+    /// The same `LowCardinality(SimpleAggregateFunction(anyLast,
+    /// Nullable(String)))` type over three all-valid rows (no index-0 references),
+    /// still nullable at the type level.
+    fn low_cardinality_saf_nullable_string_all_valid_batch() -> ColBatch {
+        let fields = vec![Field {
+            name: "lc_nsaf".into(),
+            ch_type: ChType::LowCardinality(Box::new(ChType::SimpleAggregateFunction {
+                func: "anyLast".into(),
+                inner: Box::new(ChType::Nullable(Box::new(ChType::String))),
+            })),
+        }];
+        let columns = vec![Column::Dictionary(DictionaryColumn::new_nullable(
+            vec![1, 2, 1],
+            Column::Utf8(utf8_column(&[b"", b"user_3", b"user_4"])),
+            Bitmap::from_ch_null_map(&[0, 0, 0]),
+        ))];
+        ColBatch::new(Schema::new(fields), columns, 3)
+    }
+
+    /// A chained `SimpleAggregateFunction` as a `LowCardinality` inner:
+    /// `LowCardinality(SimpleAggregateFunction(anyLast,
+    /// SimpleAggregateFunction(sum, UInt64)))`. The full SAF chain resolves to a
+    /// plain non-nullable `UInt64` dictionary body; a single-level see-through
+    /// would leave an alias and die at write. The chain is live-constructible at
+    /// v26.6.1.1193-stable.
+    fn low_cardinality_chained_saf_batch() -> ColBatch {
+        let fields = vec![Field {
+            name: "lc_saf2".into(),
+            ch_type: ChType::LowCardinality(Box::new(ChType::SimpleAggregateFunction {
+                func: "anyLast".into(),
+                inner: Box::new(ChType::SimpleAggregateFunction {
+                    func: "sum".into(),
+                    inner: Box::new(ChType::UInt64),
+                }),
+            })),
+        }];
+        let columns = vec![Column::Dictionary(DictionaryColumn::new(
+            vec![1, 2, 1],
+            Column::UInt64(PrimitiveColumn::new(vec![0, 13, 79])),
+        ))];
+        ColBatch::new(Schema::new(fields), columns, 3)
+    }
+
+    /// A standalone chained `SimpleAggregateFunction(anyLast,
+    /// SimpleAggregateFunction(sum, UInt64))` over three rows: the buffer is the
+    /// physical `UInt64` and the whole chain resolves through the delegate.
+    fn chained_simple_aggregate_function_batch() -> ColBatch {
+        let fields = vec![Field {
+            name: "saf2".into(),
+            ch_type: ChType::SimpleAggregateFunction {
+                func: "anyLast".into(),
+                inner: Box::new(ChType::SimpleAggregateFunction {
+                    func: "sum".into(),
+                    inner: Box::new(ChType::UInt64),
+                }),
+            },
+        }];
+        let columns = vec![Column::UInt64(PrimitiveColumn::new(vec![
+            13,
+            79,
+            8_589_934_592,
+        ]))];
+        ColBatch::new(Schema::new(fields), columns, 3)
+    }
+
+    /// `Point` over two rows: the column buffer is a two-field `Tuple(Float64,
+    /// Float64)` (unnamed), field-major on the wire.
+    fn point_batch() -> ColBatch {
+        let fields = vec![Field {
+            name: "p".into(),
+            ch_type: ChType::Geo(GeoKind::Point),
+        }];
+        let columns = vec![Column::Tuple(TupleColumn::new(
+            vec![
+                Column::Float64(PrimitiveColumn::new(vec![1.0, 3.0])),
+                Column::Float64(PrimitiveColumn::new(vec![2.0, 4.0])),
+            ],
+            2,
+        ))];
+        ColBatch::new(Schema::new(fields), columns, 2)
+    }
+
+    /// `Nullable(Point)` over two rows (valid, null): the tuple-level validity
+    /// bitmap plus a null-row placeholder point, the ordinary `Nullable(Tuple)`
+    /// framing.
+    fn nullable_point_batch() -> ColBatch {
+        let fields = vec![Field {
+            name: "p".into(),
+            ch_type: ChType::Nullable(Box::new(ChType::Geo(GeoKind::Point))),
+        }];
+        let columns = vec![Column::Tuple(TupleColumn::new_nullable(
+            vec![
+                Column::Float64(PrimitiveColumn::new(vec![1.0, 0.0])),
+                Column::Float64(PrimitiveColumn::new(vec![2.0, 0.0])),
+            ],
+            2,
+            Bitmap::from_ch_null_map(&[0, 1]),
+        ))];
+        ColBatch::new(Schema::new(fields), columns, 2)
+    }
+
+    /// `MultiPolygon` over two rows, exercising all four expanded Array/Tuple
+    /// levels. Row 0 holds one polygon of one ring of two points; row 1 is empty.
+    fn multi_polygon_batch() -> ColBatch {
+        let point = Column::Tuple(TupleColumn::new(
+            vec![
+                Column::Float64(PrimitiveColumn::new(vec![1.0, 3.0])),
+                Column::Float64(PrimitiveColumn::new(vec![2.0, 4.0])),
+            ],
+            2,
+        ));
+        let ring = Column::Array(ArrayColumn::new(vec![0, 2], point)); // one ring, two points
+        let polygon = Column::Array(ArrayColumn::new(vec![0, 1], ring)); // one ring
+        let multi = Column::Array(ArrayColumn::new(vec![0, 1, 1], polygon)); // row0: 1 polygon, row1: empty
+        let fields = vec![Field {
+            name: "mp".into(),
+            ch_type: ChType::Geo(GeoKind::MultiPolygon),
+        }];
+        ColBatch::new(Schema::new(fields), vec![multi], 2)
+    }
+
+    /// `Nested(a UInt32, b String)` over two rows: delegates to
+    /// `Array(Tuple(a UInt32, b String))`. Row 0 has two elements, row 1 has one.
+    fn nested_batch() -> ColBatch {
+        let entries = Column::Tuple(TupleColumn::new(
+            vec![
+                Column::UInt32(PrimitiveColumn::new(vec![10, 20, 30])),
+                Column::Utf8(utf8_column(&[b"x", b"y", b"z"])),
+            ],
+            3,
+        ));
+        let fields = vec![Field {
+            name: "n".into(),
+            ch_type: ChType::Nested(vec![
+                ("a".into(), ChType::UInt32),
+                ("b".into(), ChType::String),
+            ]),
+        }];
+        let columns = vec![Column::Array(ArrayColumn::new(vec![0, 2, 3], entries))];
+        ColBatch::new(Schema::new(fields), columns, 2)
+    }
+
+    /// `Nested(a LowCardinality(String))` over two rows: the shared LC gate, so
+    /// the LC key version is hoisted to the front of the whole column, ahead of
+    /// the Array offsets.
+    fn nested_low_cardinality_batch() -> ColBatch {
+        let entries = Column::Tuple(TupleColumn::new(
+            vec![Column::Dictionary(DictionaryColumn::new(
+                vec![1, 2, 1],
+                Column::Utf8(utf8_column(&[b"", b"user_1", b"user_2"])),
+            ))],
+            3,
+        ));
+        let fields = vec![Field {
+            name: "n".into(),
+            ch_type: ChType::Nested(vec![(
+                "a".into(),
+                ChType::LowCardinality(Box::new(ChType::String)),
+            )]),
+        }];
+        let columns = vec![Column::Array(ArrayColumn::new(vec![0, 2, 3], entries))];
+        ColBatch::new(Schema::new(fields), columns, 2)
+    }
+
+    #[test]
+    fn roundtrip_simple_aggregate_function_scalar_rev0() {
+        roundtrip(&simple_aggregate_function_scalar_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_simple_aggregate_function_scalar_tcp_revision() {
+        roundtrip(
+            &simple_aggregate_function_scalar_batch(),
+            DBMS_TCP_PROTOCOL_VERSION,
+        );
+    }
+
+    #[test]
+    fn roundtrip_simple_aggregate_function_nullable_rev0() {
+        roundtrip(&simple_aggregate_function_nullable_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_simple_aggregate_function_nullable_tcp_revision() {
+        roundtrip(
+            &simple_aggregate_function_nullable_batch(),
+            DBMS_TCP_PROTOCOL_VERSION,
+        );
+    }
+
+    #[test]
+    fn roundtrip_simple_aggregate_function_low_cardinality_rev0() {
+        roundtrip(&simple_aggregate_function_low_cardinality_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_simple_aggregate_function_low_cardinality_tcp_revision() {
+        roundtrip(
+            &simple_aggregate_function_low_cardinality_batch(),
+            DBMS_TCP_PROTOCOL_VERSION,
+        );
+    }
+
+    // LowCardinality with a SimpleAggregateFunction between the LC and its
+    // removeNullable Nullable, plus chained SAF. Both were rejected before the
+    // shared `low_cardinality_dict_value_type` resolution; the null-row case in
+    // particular used to fail with a misleading InconsistentBatch on encode.
+
+    #[test]
+    fn roundtrip_low_cardinality_saf_nullable_string_rev0() {
+        roundtrip(&low_cardinality_saf_nullable_string_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_low_cardinality_saf_nullable_string_tcp_revision() {
+        roundtrip(
+            &low_cardinality_saf_nullable_string_batch(),
+            DBMS_TCP_PROTOCOL_VERSION,
+        );
+    }
+
+    #[test]
+    fn roundtrip_low_cardinality_saf_nullable_string_all_valid_rev0() {
+        roundtrip(&low_cardinality_saf_nullable_string_all_valid_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_low_cardinality_saf_nullable_string_all_valid_tcp_revision() {
+        roundtrip(
+            &low_cardinality_saf_nullable_string_all_valid_batch(),
+            DBMS_TCP_PROTOCOL_VERSION,
+        );
+    }
+
+    #[test]
+    fn roundtrip_low_cardinality_chained_saf_rev0() {
+        roundtrip(&low_cardinality_chained_saf_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_low_cardinality_chained_saf_tcp_revision() {
+        roundtrip(
+            &low_cardinality_chained_saf_batch(),
+            DBMS_TCP_PROTOCOL_VERSION,
+        );
+    }
+
+    #[test]
+    fn roundtrip_chained_simple_aggregate_function_rev0() {
+        roundtrip(&chained_simple_aggregate_function_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_chained_simple_aggregate_function_tcp_revision() {
+        roundtrip(
+            &chained_simple_aggregate_function_batch(),
+            DBMS_TCP_PROTOCOL_VERSION,
+        );
+    }
+
+    #[test]
+    fn encode_low_cardinality_saf_nullable_null_row_succeeds() {
+        // The previously-failing shape: encoding a null row of
+        // LowCardinality(SAF(anyLast, Nullable(String))) used to be rejected as an
+        // InconsistentBatch because nullability was read one SAF level too shallow.
+        // It must now encode, and the encoder's own output must decode back.
+        let batch = low_cardinality_saf_nullable_string_batch();
+        let bytes = encode_block(&batch, &EncodeOptions::default())
+            .expect("encoding a null row of LC(SAF(Nullable(String))) must succeed");
+        let decoded = decode_all_bytes(&bytes, &DecodeOptions::default())
+            .expect("decoding the encoder's own LC(SAF(Nullable)) output must succeed");
+        assert_eq!(decoded.num_chunks(), 1);
+        assert_batches_eq(&batch, &decoded.chunks[0]);
+    }
+
+    #[test]
+    fn encode_zero_row_low_cardinality_saf_nullable_block() {
+        // A zero-row LC(SAF(anyLast, Nullable(String))) block encodes (no column
+        // data is written for a zero-row block) and decodes back to just the
+        // schema with no chunks, exercising the empty_column delegate path.
+        let fields = vec![Field {
+            name: "lc_nsaf".into(),
+            ch_type: ChType::LowCardinality(Box::new(ChType::SimpleAggregateFunction {
+                func: "anyLast".into(),
+                inner: Box::new(ChType::Nullable(Box::new(ChType::String))),
+            })),
+        }];
+        let columns = vec![Column::Dictionary(DictionaryColumn::new_nullable(
+            vec![],
+            Column::Utf8(utf8_column(&[])),
+            Bitmap::from_ch_null_map(&[]),
+        ))];
+        let batch = ColBatch::new(Schema::new(fields.clone()), columns, 0);
+        let bytes = encode_block(&batch, &EncodeOptions::default())
+            .expect("encoding a zero-row LC(SAF(Nullable)) block must succeed");
+        let decoded = decode_all_bytes(&bytes, &DecodeOptions::default())
+            .expect("decoding a zero-row LC(SAF(Nullable)) block must succeed");
+        assert_eq!(decoded.num_chunks(), 0);
+        assert_eq!(decoded.schema.fields[0].ch_type, fields[0].ch_type);
+    }
+
+    // SimpleAggregateFunction INSIDE wrappers/containers (confirmed legal live at
+    // v26.6.1.1193-stable). The buffer is the physical delegate's, so encode
+    // delegates through and the header keeps the verbatim SAF spelling.
+
+    /// `Nullable(SimpleAggregateFunction(sum, UInt64))` over three rows (valid,
+    /// null, valid): the null map precedes the UInt64 run, nullability read off
+    /// the delegate.
+    fn nullable_simple_aggregate_function_batch() -> ColBatch {
+        let fields = vec![Field {
+            name: "s".into(),
+            ch_type: ChType::Nullable(Box::new(ChType::SimpleAggregateFunction {
+                func: "sum".into(),
+                inner: Box::new(ChType::UInt64),
+            })),
+        }];
+        let columns = vec![Column::UInt64(PrimitiveColumn {
+            values: vec![13, 0, 79],
+            validity: Some(Bitmap::from_ch_null_map(&[0, 1, 0])),
+        })];
+        ColBatch::new(Schema::new(fields), columns, 3)
+    }
+
+    /// `Array(SimpleAggregateFunction(sum, UInt64))` over two rows: `[13, 79]`,
+    /// `[5]`. Offsets then the flattened UInt64 run.
+    fn array_simple_aggregate_function_batch() -> ColBatch {
+        let fields = vec![Field {
+            name: "a".into(),
+            ch_type: ChType::Array(Box::new(ChType::SimpleAggregateFunction {
+                func: "sum".into(),
+                inner: Box::new(ChType::UInt64),
+            })),
+        }];
+        let columns = vec![Column::Array(ArrayColumn::new(
+            vec![0, 2, 3],
+            Column::UInt64(PrimitiveColumn::new(vec![13, 79, 5])),
+        ))];
+        ColBatch::new(Schema::new(fields), columns, 2)
+    }
+
+    /// `LowCardinality(SimpleAggregateFunction(anyLast, String))` over three rows:
+    /// the LC body decodes/encodes as its physical `String` inner.
+    fn low_cardinality_simple_aggregate_function_batch() -> ColBatch {
+        let fields = vec![Field {
+            name: "s".into(),
+            ch_type: ChType::LowCardinality(Box::new(ChType::SimpleAggregateFunction {
+                func: "anyLast".into(),
+                inner: Box::new(ChType::String),
+            })),
+        }];
+        let columns = vec![Column::Dictionary(DictionaryColumn::new(
+            vec![1, 2, 1],
+            Column::Utf8(utf8_column(&[b"", b"user_1", b"user_2"])),
+        ))];
+        ColBatch::new(Schema::new(fields), columns, 3)
+    }
+
+    /// `Tuple(v SimpleAggregateFunction(sum, UInt64))` over two rows: one field
+    /// column of the physical UInt64.
+    fn tuple_simple_aggregate_function_batch() -> ColBatch {
+        let fields = vec![Field {
+            name: "t".into(),
+            ch_type: ChType::Tuple(vec![(
+                Some("v".into()),
+                ChType::SimpleAggregateFunction {
+                    func: "sum".into(),
+                    inner: Box::new(ChType::UInt64),
+                },
+            )]),
+        }];
+        let columns = vec![Column::Tuple(TupleColumn::new(
+            vec![Column::UInt64(PrimitiveColumn::new(vec![13, 79]))],
+            2,
+        ))];
+        ColBatch::new(Schema::new(fields), columns, 2)
+    }
+
+    /// `SimpleAggregateFunction(groupArrayLastArray(5), Array(UInt64))` over two
+    /// rows: a parametrized function name whose balanced `(5)` suffix must survive
+    /// the header round-trip.
+    fn simple_aggregate_function_parametrized_batch() -> ColBatch {
+        let fields = vec![Field {
+            name: "s".into(),
+            ch_type: ChType::SimpleAggregateFunction {
+                func: "groupArrayLastArray(5)".into(),
+                inner: Box::new(ChType::Array(Box::new(ChType::UInt64))),
+            },
+        }];
+        let columns = vec![Column::Array(ArrayColumn::new(
+            vec![0, 2, 3],
+            Column::UInt64(PrimitiveColumn::new(vec![13, 79, 5])),
+        ))];
+        ColBatch::new(Schema::new(fields), columns, 2)
+    }
+
+    #[test]
+    fn roundtrip_nullable_simple_aggregate_function_rev0() {
+        roundtrip(&nullable_simple_aggregate_function_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_nullable_simple_aggregate_function_tcp_revision() {
+        roundtrip(
+            &nullable_simple_aggregate_function_batch(),
+            DBMS_TCP_PROTOCOL_VERSION,
+        );
+    }
+
+    #[test]
+    fn roundtrip_array_simple_aggregate_function_rev0() {
+        roundtrip(&array_simple_aggregate_function_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_array_simple_aggregate_function_tcp_revision() {
+        roundtrip(
+            &array_simple_aggregate_function_batch(),
+            DBMS_TCP_PROTOCOL_VERSION,
+        );
+    }
+
+    #[test]
+    fn roundtrip_low_cardinality_simple_aggregate_function_rev0() {
+        roundtrip(&low_cardinality_simple_aggregate_function_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_low_cardinality_simple_aggregate_function_tcp_revision() {
+        roundtrip(
+            &low_cardinality_simple_aggregate_function_batch(),
+            DBMS_TCP_PROTOCOL_VERSION,
+        );
+    }
+
+    #[test]
+    fn roundtrip_tuple_simple_aggregate_function_rev0() {
+        roundtrip(&tuple_simple_aggregate_function_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_tuple_simple_aggregate_function_tcp_revision() {
+        roundtrip(
+            &tuple_simple_aggregate_function_batch(),
+            DBMS_TCP_PROTOCOL_VERSION,
+        );
+    }
+
+    #[test]
+    fn roundtrip_simple_aggregate_function_parametrized_func() {
+        // Fix 3 correctness check: encode-then-decode equality for a parametrized
+        // function name, proving Display(parse(...)) holds through the header.
+        roundtrip(&simple_aggregate_function_parametrized_batch(), 0);
+        roundtrip(
+            &simple_aggregate_function_parametrized_batch(),
+            DBMS_TCP_PROTOCOL_VERSION,
+        );
+    }
+
+    #[test]
+    fn encode_rejects_malformed_simple_aggregate_function_func() {
+        // A caller-constructed SAF `func` is untrusted and Displayed into the
+        // header's type-string channel, so a malformed spelling is rejected as
+        // UnsupportedType before any bytes are written (injection guard). The
+        // server's function whitelist is deliberately NOT enforced here.
+        for bad_func in [
+            "sum, UInt64), evil", // a top-level comma would inject extra type tokens
+            "sum(",               // unbalanced open paren
+            "sum)",               // stray close paren
+            "sum(a))",            // paren imbalance in the params suffix
+            "",                   // empty
+            "1sum",               // leading digit
+            "sum bar",            // embedded space
+        ] {
+            let batch = ColBatch::new(
+                Schema::new(vec![Field {
+                    name: "s".into(),
+                    ch_type: ChType::SimpleAggregateFunction {
+                        func: bad_func.into(),
+                        inner: Box::new(ChType::UInt64),
+                    },
+                }]),
+                vec![Column::UInt64(PrimitiveColumn::new(vec![13]))],
+                1,
+            );
+            assert!(
+                matches!(
+                    encode_block(&batch, &EncodeOptions::default()),
+                    Err(EncodeError::UnsupportedType { .. })
+                ),
+                "func {bad_func:?} should be rejected as UnsupportedType"
+            );
+        }
+
+        // A malformed SAF func nested inside a container is caught too: the walk
+        // descends every wrapper/container.
+        let nested_bad = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "a".into(),
+                ch_type: ChType::Array(Box::new(ChType::SimpleAggregateFunction {
+                    func: "sum, evil".into(),
+                    inner: Box::new(ChType::UInt64),
+                })),
+            }]),
+            vec![Column::Array(ArrayColumn::new(
+                vec![0, 1],
+                Column::UInt64(PrimitiveColumn::new(vec![13])),
+            ))],
+            1,
+        );
+        assert!(matches!(
+            encode_block(&nested_bad, &EncodeOptions::default()),
+            Err(EncodeError::UnsupportedType { .. })
+        ));
+    }
+
+    #[test]
+    fn roundtrip_point_rev0() {
+        roundtrip(&point_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_point_tcp_revision() {
+        roundtrip(&point_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_nullable_point_rev0() {
+        roundtrip(&nullable_point_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_nullable_point_tcp_revision() {
+        roundtrip(&nullable_point_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_multi_polygon_rev0() {
+        roundtrip(&multi_polygon_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_multi_polygon_tcp_revision() {
+        roundtrip(&multi_polygon_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_nested_rev0() {
+        roundtrip(&nested_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_nested_tcp_revision() {
+        roundtrip(&nested_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_nested_low_cardinality_rev0() {
+        roundtrip(&nested_low_cardinality_batch(), 0);
+    }
+
+    #[test]
+    fn roundtrip_nested_low_cardinality_tcp_revision() {
+        roundtrip(&nested_low_cardinality_batch(), DBMS_TCP_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn multi_block_name_decoration_roundtrips() {
+        // Two blocks of the same schema stay separate chunks through encode ->
+        // decode.
+        let batch = ChunkedBatch {
+            schema: point_batch().schema.clone(),
+            chunks: vec![
+                std::sync::Arc::new(point_batch()),
+                std::sync::Arc::new(point_batch()),
+            ],
+        };
+        let bytes = encode_chunked(&batch, &EncodeOptions::default()).unwrap();
+        let decoded = decode_all_bytes(&bytes, &DecodeOptions::default()).unwrap();
+        assert_eq!(decoded.num_chunks(), 2);
+        assert_batches_eq(&point_batch(), &decoded.chunks[0]);
+        assert_batches_eq(&point_batch(), &decoded.chunks[1]);
+    }
+
+    #[test]
+    fn rev0_frames_simple_aggregate_function_bytes() {
+        // The header carries the VERBATIM alias spelling and the body is
+        // byte-identical to the bare inner Float64.
+        let bytes = encode_block(
+            &simple_aggregate_function_scalar_batch(),
+            &EncodeOptions::default(),
+        )
+        .unwrap();
+        let mut expected = vec![
+            0x01, // num_cols = 1
+            0x03, // num_rows = 3
+            0x01, b's', // name "s"
+            0x25, // type string length = 37
+        ];
+        expected.extend_from_slice(b"SimpleAggregateFunction(sum, Float64)");
+        expected.extend_from_slice(&3.5f64.to_le_bytes());
+        expected.extend_from_slice(&(-7.25f64).to_le_bytes());
+        expected.extend_from_slice(&0.0f64.to_le_bytes());
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn rev0_frames_point_bytes() {
+        // Point body is the field-major Tuple(Float64, Float64): all X then all Y,
+        // no offsets, no tuple-level framing.
+        let bytes = encode_block(&point_batch(), &EncodeOptions::default()).unwrap();
+        let mut expected = vec![
+            0x01, // num_cols = 1
+            0x02, // num_rows = 2
+            0x01, b'p', // name "p"
+            0x05, b'P', b'o', b'i', b'n', b't', // type "Point"
+        ];
+        expected.extend_from_slice(&1.0f64.to_le_bytes()); // X row 0
+        expected.extend_from_slice(&3.0f64.to_le_bytes()); // X row 1
+        expected.extend_from_slice(&2.0f64.to_le_bytes()); // Y row 0
+        expected.extend_from_slice(&4.0f64.to_le_bytes()); // Y row 1
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn rev0_frames_nested_bytes() {
+        // Nested body is the Array(Tuple(a, b)) shape: offsets[1..] as raw LE u64,
+        // then the flattened tuple body field-major (all a's then all b's).
+        let bytes = encode_block(&nested_batch(), &EncodeOptions::default()).unwrap();
+        let mut expected = vec![
+            0x01, // num_cols = 1
+            0x02, // num_rows = 2
+            0x01, b'n', // name "n"
+            0x1A, // type string length = 26
+        ];
+        expected.extend_from_slice(b"Nested(a UInt32, b String)");
+        // Offsets [2, 3] as raw LE u64 (no leading zero).
+        expected.extend_from_slice(&2u64.to_le_bytes());
+        expected.extend_from_slice(&3u64.to_le_bytes());
+        // Field a: UInt32 [10, 20, 30].
+        expected.extend_from_slice(&10u32.to_le_bytes());
+        expected.extend_from_slice(&20u32.to_le_bytes());
+        expected.extend_from_slice(&30u32.to_le_bytes());
+        // Field b: String [x, y, z] as varint len + bytes.
+        expected.extend_from_slice(&[0x01, b'x', 0x01, b'y', 0x01, b'z']);
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn encode_rejects_nested_duplicate_names() {
+        // Duplicate element names fail `checkTupleNames` through the Tuple
+        // delegation, reported as `UnsupportedType`.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "n".into(),
+                ch_type: ChType::Nested(vec![
+                    ("a".into(), ChType::UInt32),
+                    ("a".into(), ChType::String),
+                ]),
+            }]),
+            vec![Column::Array(ArrayColumn::new(
+                vec![0, 1],
+                Column::Tuple(TupleColumn::new(
+                    vec![
+                        Column::UInt32(PrimitiveColumn::new(vec![10])),
+                        Column::Utf8(utf8_column(&[b"x"])),
+                    ],
+                    1,
+                )),
+            ))],
+            1,
+        );
+        assert!(matches!(
+            encode_block(&batch, &EncodeOptions::default()),
+            Err(EncodeError::UnsupportedType { .. })
+        ));
+    }
+
+    #[test]
+    fn encode_rejects_nested_empty_name() {
+        // An empty element name is unconstructible on the server, rejected via the
+        // Tuple delegation.
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "n".into(),
+                ch_type: ChType::Nested(vec![("".into(), ChType::UInt32)]),
+            }]),
+            vec![Column::Array(ArrayColumn::new(
+                vec![0, 1],
+                Column::Tuple(TupleColumn::new(
+                    vec![Column::UInt32(PrimitiveColumn::new(vec![10]))],
+                    1,
+                )),
+            ))],
+            1,
+        );
+        assert!(matches!(
+            encode_block(&batch, &EncodeOptions::default()),
+            Err(EncodeError::UnsupportedType { .. })
+        ));
+    }
+
+    #[test]
+    fn type_depth_of_alias_matches_physical_delegate() {
+        // The encoder's depth cap must count a name-decoration alias at its
+        // physical depth so a geo/Nested type near the cap is not under-counted,
+        // and it must count it the SAME as the decode parser so a type that
+        // decodes is always re-encodable.
+        //
+        // Geo and Nested are charged exactly their physical expansion depth.
+        for kind in [
+            GeoKind::Point,
+            GeoKind::Ring,
+            GeoKind::LineString,
+            GeoKind::MultiLineString,
+            GeoKind::Polygon,
+            GeoKind::MultiPolygon,
+        ] {
+            let alias = ChType::Geo(kind);
+            assert_eq!(
+                type_depth(&alias),
+                type_depth(&kind.underlying_type()),
+                "geo {kind:?} depth mismatch"
+            );
+            // And the geo token's own charge equals its expansion_depth constant.
+            assert_eq!(type_depth(&alias), kind.expansion_depth());
+        }
+        let nested = ChType::Nested(vec![
+            ("a".into(), ChType::UInt32),
+            ("b".into(), ChType::Array(Box::new(ChType::String))),
+        ]);
+        assert_eq!(
+            type_depth(&nested),
+            type_depth(&nested.physical_delegate().unwrap())
+        );
+        // SimpleAggregateFunction charges ONE level over its inner (not zero): it
+        // expands via one extra decode recursion frame, so both the parser and
+        // type_depth charge +1 to bound a hostile chain of nested SAFs and keep
+        // the two directions aligned.
+        let saf = ChType::SimpleAggregateFunction {
+            func: "sum".into(),
+            inner: Box::new(ChType::Array(Box::new(ChType::Float64))),
+        };
+        assert_eq!(
+            type_depth(&saf),
+            type_depth(&saf.physical_delegate().unwrap()) + 1
+        );
+    }
+
+    #[test]
+    fn decode_accept_implies_encode_accept_at_the_cap() {
+        // Fix 4 boundary: any type the decode parser accepts must pass the
+        // encoder's type_depth cap, and vice versa, for a geo-tipped and a
+        // Nested-tipped chain. Walk Array nesting from just under to just over the
+        // point where the alias expansion crosses MAX_TYPE_DEPTH and confirm the
+        // two sides flip together.
+        for (label, tip, expansion) in [
+            ("geo", ChType::Geo(GeoKind::MultiPolygon), 4usize),
+            (
+                "nested",
+                ChType::Nested(vec![("a".into(), ChType::UInt32)]),
+                2usize,
+            ),
+        ] {
+            // arrays + expansion must be <= MAX_TYPE_DEPTH to be accepted, so the
+            // last accepted array count is MAX_TYPE_DEPTH - expansion.
+            let last_ok = MAX_TYPE_DEPTH - expansion;
+            for arrays in [last_ok, last_ok + 1] {
+                let mut ty = tip.clone();
+                for _ in 0..arrays {
+                    ty = ChType::Array(Box::new(ty));
+                }
+                let parse_ok = parse_ch_type(&ty.to_string()).is_some();
+                let encode_ok = type_depth(&ty) <= MAX_TYPE_DEPTH;
+                assert_eq!(
+                    parse_ok, encode_ok,
+                    "{label} chain with {arrays} arrays: decode-accept {parse_ok} but encode-accept {encode_ok}"
+                );
+                // At exactly last_ok both accept; one deeper both reject.
+                assert_eq!(parse_ok, arrays == last_ok, "{label} {arrays} arrays");
+            }
+        }
+    }
+
+    #[test]
+    fn encode_rejects_geo_type_over_the_depth_cap() {
+        // A geo type wrapped in enough Arrays that its physical expansion exceeds
+        // MAX_TYPE_DEPTH is rejected as InconsistentBatch (the same iterative cap
+        // as any deep caller-constructed type). MultiPolygon adds four physical
+        // levels, so wrapping it in MAX_TYPE_DEPTH Arrays pushes it over.
+        let mut ty = ChType::Geo(GeoKind::MultiPolygon);
+        for _ in 0..MAX_TYPE_DEPTH {
+            ty = ChType::Array(Box::new(ty));
+        }
+        assert!(type_depth(&ty) > MAX_TYPE_DEPTH);
+        // The decode parser now charges the geo expansion too, so it rejects the
+        // very same over-deep header: the two sides agree instead of the encoder
+        // rejecting a type the decoder would have accepted (the old asymmetry).
+        assert_eq!(parse_ch_type(&ty.to_string()), None);
+        // A one-row batch whose column buffer is irrelevant: the depth check runs
+        // first. Use a zero-row batch to avoid building the deep nesting buffer.
+        let batch = ColBatch {
+            schema: Schema::new(vec![Field {
+                name: "g".into(),
+                ch_type: ty,
+            }]),
+            columns: vec![Column::Array(ArrayColumn::new(vec![0], empty_deep_array()))],
+            num_rows: 0,
+        };
+        assert!(matches!(
+            encode_block(&batch, &EncodeOptions::default()),
+            Err(EncodeError::InconsistentBatch { .. })
+        ));
+    }
+
+    /// A throwaway element column for the depth-cap rejection test; the depth
+    /// check fires before the buffer is inspected, so its exact shape does not
+    /// matter.
+    fn empty_deep_array() -> Column {
+        Column::Array(ArrayColumn::new(
+            vec![0],
+            Column::Float64(PrimitiveColumn::new(vec![])),
+        ))
     }
 }

@@ -8,7 +8,7 @@ use crate::column::{
     PrimitiveColumn, TupleColumn, Utf8Column,
 };
 use crate::native::varint::ByteReader;
-use crate::schema::{ChType, Field, Schema};
+use crate::schema::{ChType, Field, GeoKind, Schema};
 
 /// Errors that can occur during Native format decoding.
 #[derive(Debug)]
@@ -216,13 +216,16 @@ fn parse_ch_type_depth(type_name: &str, depth: usize) -> Option<ChType> {
     if let Some(inner) = type_name.strip_prefix("Nullable(") {
         if let Some(inner) = inner.strip_suffix(')') {
             let inner_type = parse_ch_type_depth(inner, depth + 1)?;
-            if matches!(
-                inner_type,
-                ChType::Nullable(_)
-                    | ChType::LowCardinality(_)
-                    | ChType::Array(_)
-                    | ChType::Map(..)
-            ) {
+            // `Nested` is an `Array` and the array-based geo kinds
+            // (`Ring`/`LineString`/`Polygon`/`MultiLineString`/`MultiPolygon`)
+            // expand to `Array`, so `Nullable` over any of them is as illegal as
+            // `Nullable(Array(T))` (`DataTypeArray::canBeInsideNullable()` is
+            // false). `Nullable(Point)` IS legal (Point is a `Tuple`, and
+            // `DataTypeTuple::canBeInsideNullable()` is true). A
+            // `SimpleAggregateFunction` inner delegates to its physical type, so
+            // `Nullable(SAF(T))` is legal iff `Nullable(T)` is:
+            // [`can_be_inside_nullable`] resolves the alias before deciding.
+            if !can_be_inside_nullable(&inner_type) {
                 return None;
             }
             return Some(ChType::Nullable(Box::new(inner_type)));
@@ -264,6 +267,76 @@ fn parse_ch_type_depth(type_name: &str, depth: usize) -> Option<ChType> {
     if let Some(inner) = type_name.strip_prefix("Tuple(") {
         if let Some(inner) = inner.strip_suffix(')') {
             return parse_tuple_elements(inner, depth).map(ChType::Tuple);
+        }
+    }
+
+    // Nested(name1 T1, ...). With `flatten_nested = 0` the server writes this
+    // literal spelling and the body is byte-identical to
+    // `Array(Tuple(named elements))` (confirmed at v26.6.1.1193-stable,
+    // `DataTypeNested.cpp`). Element names are MANDATORY (the server rejects an
+    // unnamed element such as `Nested(UInt32)` at parse time), so a field
+    // without a name makes the whole header unsupported. Nested-in-container
+    // (`Array(Nested(...))`) is grammar-permitted but only INFERRED legal, never
+    // test-confirmed; decode is lenient here and accepts it, delegating to the
+    // underlying `Array(Tuple(...))` layout (see the type doc). Each element
+    // recurses at depth + 1 so the MAX_TYPE_DEPTH cap bounds a hostile
+    // deeply-nested header exactly like the Tuple arm.
+    if let Some(inner) = type_name.strip_prefix("Nested(") {
+        if let Some(inner) = inner.strip_suffix(')') {
+            // A `Nested(...)` expands to `Array(Tuple(fields))`, two physical
+            // levels above each field, so charge the fields `depth + 2` to match
+            // the encoder's `type_depth`. `parse_nested_elements` -> its
+            // `parse_tuple_element` adds one more level, so pass `depth + 1` here
+            // for the fields to land at `depth + 2` and stay inside the same
+            // `MAX_TYPE_DEPTH` bound the physical decode recursion respects.
+            return parse_nested_elements(inner, depth + 1).map(ChType::Nested);
+        }
+    }
+
+    // SimpleAggregateFunction(func[, T]). Pure name decoration over the inner
+    // type T (confirmed at v26.6.1.1193-stable,
+    // `DataTypeCustomSimpleAggregateFunction.cpp`): the wire bytes are exactly
+    // T's. Grammar is `func[(litParams)], T`, where the function-name token may
+    // itself contain parentheses (its literal params), so the split is on the
+    // FIRST top-level comma after balancing parens, done by the same
+    // paren/quote-aware `split_top_level_commas` the Tuple/Map arms use. The
+    // function name is validated only for identifier-with-optional-params shape;
+    // its params are NOT semantically checked, and the server's function
+    // whitelist is deliberately NOT enforced (a server-authored header is
+    // trusted and the list grows across versions).
+    //
+    // Parsed at ANY nesting depth: `SimpleAggregateFunction` is legal inside
+    // wrappers and containers, and the server emits the SAF spelling verbatim
+    // inside them. Confirmed live at v26.6.1.1193-stable: a Native header for
+    // `Tuple(v SimpleAggregateFunction(sum, UInt64))`, `Array(SAF(...))`,
+    // `Nullable(SAF(...))`, `LowCardinality(SAF(anyLast, String))`, and
+    // `Map(String, SAF(...))` all carry the SAF spelling (hexdump-verified), and
+    // the server test `04329_tuple_element_aggregation_reject_nullable_tuple`
+    // corroborates it. Wrapper legality delegates to the inner type through
+    // `physical_delegate`: `Nullable(SAF(T))` is legal iff `Nullable(T)` is (see
+    // `can_be_inside_nullable`), and `LowCardinality`/`Map`-key validity resolve
+    // through the delegate the same way. Each SAF level charges one depth (parse
+    // inner at `depth + 1`), matching the encoder's `type_depth`, so a hostile
+    // chain of SAFs is still bounded by `MAX_TYPE_DEPTH`. Multi-type-arg forms
+    // (`SimpleAggregateFunction(f, T1, T2)`) parse server-side but only T1 is
+    // physically load-bearing and they are unobserved in practice, so they are
+    // rejected.
+    if let Some(inner) = type_name.strip_prefix("SimpleAggregateFunction(") {
+        if let Some(inner) = inner.strip_suffix(')') {
+            let parts = split_top_level_commas(inner.trim_matches(' '))?;
+            // Exactly a function name plus one type argument.
+            if parts.len() != 2 {
+                return None;
+            }
+            let func = parts[0].trim_matches(' ');
+            if !is_simple_aggregate_func_spelling(func) {
+                return None;
+            }
+            let inner_type = parse_ch_type_depth(parts[1].trim_matches(' '), depth + 1)?;
+            return Some(ChType::SimpleAggregateFunction {
+                func: func.to_string(),
+                inner: Box::new(inner_type),
+            });
         }
     }
 
@@ -423,8 +496,144 @@ fn parse_ch_type_depth(type_name: &str, depth: usize) -> Option<ChType> {
         "UUID" => Some(ChType::Uuid),
         "IPv4" => Some(ChType::Ipv4),
         "IPv6" => Some(ChType::Ipv6),
+        // Geo aliases. The server registers these case-sensitive with no
+        // aliases and emits the bare spelling in the header (never the expanded
+        // `Array(Tuple(...))` form); a wrong-case `point` is not a geo type and
+        // falls through to `None` (`DataTypeCustomGeo`, confirmed at
+        // v26.6.1.1193-stable). A geo token is a leaf here but expands to a fixed
+        // `Tuple`/`Array`-of-`Float64` nesting, so `geo_within_depth` charges its
+        // expansion depth against `MAX_TYPE_DEPTH`, keeping the decode cap aligned
+        // with the encoder's `type_depth` (a geo-tipped header that decodes is
+        // always re-encodable).
+        "Point" => geo_within_depth(GeoKind::Point, depth),
+        "Ring" => geo_within_depth(GeoKind::Ring, depth),
+        "LineString" => geo_within_depth(GeoKind::LineString, depth),
+        "MultiLineString" => geo_within_depth(GeoKind::MultiLineString, depth),
+        "Polygon" => geo_within_depth(GeoKind::Polygon, depth),
+        "MultiPolygon" => geo_within_depth(GeoKind::MultiPolygon, depth),
         _ => None,
     }
+}
+
+/// Accept a geo alias only if its physical expansion, added to the current
+/// nesting `depth`, stays within [`MAX_TYPE_DEPTH`].
+///
+/// A geo token is a leaf in the parser, but it expands to a fixed
+/// `Tuple`/`Array`-of-`Float64` nesting ([`GeoKind::expansion_depth`]) that the
+/// physical decode recurses through and that the encoder's `type_depth` counts.
+/// Charging that expansion here keeps decode-accept and encode-accept in exact
+/// agreement at the cap: a geo-tipped chain the decoder accepts is always
+/// re-encodable, and one it rejects the encoder rejects too.
+fn geo_within_depth(kind: GeoKind, depth: usize) -> Option<ChType> {
+    if depth + kind.expansion_depth() > MAX_TYPE_DEPTH {
+        return None;
+    }
+    Some(ChType::Geo(kind))
+}
+
+/// Whether `inner` may sit directly inside `Nullable`, the server's
+/// `IDataType::canBeInsideNullable()` (confirmed at v26.6.1.1193-stable): a
+/// `Nullable`, `LowCardinality`, `Array`, or `Map` cannot, while a `Tuple` and
+/// the scalars can.
+///
+/// Name-decoration aliases resolve through [`ChType::physical_delegate`] so the
+/// physical type that actually governs is checked: `Nullable(SimpleAggregateFunction(T))`
+/// is legal iff `Nullable(T)` is, `Nullable(Point)` is legal (Point is a Tuple),
+/// and `Nullable(Ring)`/`Nullable(Nested(...))` are not (both expand to an
+/// Array). The recursion is bounded by the parsed type depth, so it cannot run
+/// away on untrusted input.
+fn can_be_inside_nullable(inner: &ChType) -> bool {
+    if let Some(under) = inner.physical_delegate() {
+        return can_be_inside_nullable(&under);
+    }
+    !matches!(
+        inner,
+        ChType::Nullable(_) | ChType::LowCardinality(_) | ChType::Array(_) | ChType::Map(..)
+    )
+}
+
+/// Parse the element list of a `Nested(...)` type string into `(name, type)`
+/// pairs, preserving declaration order.
+///
+/// Names are mandatory, so an unnamed element (`Nested(UInt32)`) or an empty
+/// list (`Nested()`) returns `None` (-> `UnsupportedType`); the server rejects
+/// both at parse time. The list is split on top-level commas with the same
+/// paren/quote-aware splitter the Tuple arm uses, and each element is parsed by
+/// [`parse_tuple_element`] at `depth + 1`. Decode is otherwise lenient: an empty
+/// name, the reserved lowercase `null`, or duplicate names are accepted as
+/// written and round-trip through `Display`, mirroring the Tuple decode leniency
+/// (the encoder mirrors `checkTupleNames` and rejects those shapes on the way
+/// back out, via the Tuple delegation).
+fn parse_nested_elements(inner: &str, depth: usize) -> Option<Vec<(String, ChType)>> {
+    let trimmed = inner.trim_matches(' ');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parts = split_top_level_commas(trimmed)?;
+    let mut fields = Vec::with_capacity(parts.len());
+    for part in parts {
+        let (name, ch_type) = parse_tuple_element(part.trim_matches(' '), depth)?;
+        // Nested elements must be named; an unnamed one is a parse error.
+        let name = name?;
+        fields.push((name, ch_type));
+    }
+    Some(fields)
+}
+
+/// Whether `func` is a valid `SimpleAggregateFunction` function-name spelling:
+/// an ASCII identifier (`[A-Za-z_][A-Za-z0-9_]*`) optionally followed by a
+/// balanced parenthesized parameter list running to the end of the token
+/// (e.g. `sum`, `anyLast`, `groupArrayLastArray(5)`).
+///
+/// The parameter contents are NOT semantically validated (the server renders
+/// them via `FieldVisitorToString`, mostly numbers, and this crate does not
+/// re-derive that grammar); only identifier shape and paren balance are checked
+/// so a malformed header surfaces as `UnsupportedType` rather than a wrong
+/// decode. The whitelist of allowed function names is deliberately not enforced.
+///
+/// Shared with `native::encode`, which runs the same check on a
+/// caller-constructed `SimpleAggregateFunction` before rendering its header, so
+/// a malformed `func` cannot inject extra type-string tokens on the encode side.
+pub(crate) fn is_simple_aggregate_func_spelling(func: &str) -> bool {
+    let bytes = func.as_bytes();
+    // Identifier prefix.
+    match bytes.first() {
+        Some(b) if b.is_ascii_alphabetic() || *b == b'_' => {}
+        _ => return false,
+    }
+    let mut i = 1usize;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    // Bare identifier: no parameter list.
+    if i == bytes.len() {
+        return true;
+    }
+    // Otherwise the remainder must be a balanced `(...)` running to the end. The
+    // index math is in-bounds: `i < bytes.len()` here (the bare-identifier return
+    // above handled `i == bytes.len()`), so `bytes.len() - 1` is a valid index.
+    if bytes[i] != b'(' || bytes[bytes.len() - 1] != b')' {
+        return false;
+    }
+    // `depth` counts open parens with an unsigned counter. It cannot overflow: at
+    // most one increment happens per byte, so it stays bounded by the token
+    // length, a valid `usize`. Decrementing only after a nonzero check makes the
+    // walk obviously total, so a stray closing paren returns false rather than
+    // wrapping below zero.
+    let mut depth = 0usize;
+    for &b in &bytes[i..] {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                if depth == 0 {
+                    return false;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 /// Derive a `Decimal`'s on-wire byte width (as a bit count) from its precision.
@@ -949,6 +1158,14 @@ fn read_state_prefix(
     ch_type: &ChType,
     column: &str,
 ) -> Result<Option<u64>, DecodeError> {
+    // A name-decoration alias (SimpleAggregateFunction, geo, Nested) has the
+    // exact state prefix of the type it delegates to, so expand and recurse. For
+    // Nested(a LowCardinality(String)) this reaches the leaf LowCardinality's
+    // 8-byte key version through the delegated Array(Tuple(...)) chain, hoisting
+    // it to the very front of the whole column, before the offsets.
+    if let Some(under) = ch_type.physical_delegate() {
+        return read_state_prefix(reader, &under, column);
+    }
     match ch_type {
         ChType::LowCardinality(_) => {
             let key_version = reader.read_u64_le()?;
@@ -1059,12 +1276,13 @@ fn decode_low_cardinality(
     num_rows: usize,
     column: &str,
 ) -> Result<Column, DecodeError> {
-    // Unwrap an inner Nullable. ClickHouse always nests Nullable inside
-    // LowCardinality, never the reverse, so this is the only nullable form.
-    let (nullable, dict_value_type) = match inner {
-        ChType::Nullable(t) => (true, t.as_ref()),
-        other => (false, other),
-    };
+    // Resolve the inner through the shared helper: it strips the full
+    // `SimpleAggregateFunction` chain (the only alias legal inside
+    // LowCardinality, confirmed live at v26.6.1.1193-stable), unwraps the
+    // removeNullable `Nullable`, and strips any further SAF chain beneath it, so
+    // the dictionary body and null handling are those of the physical type for
+    // both `LowCardinality(SAF(anyLast, Nullable(String)))` and a chained SAF.
+    let (nullable, dict_value_type) = low_cardinality_dict_value_type(inner);
 
     // Index type word. Native must not request a global dictionary, and must
     // request additional keys (the per-block dictionary). The low two bits are
@@ -1158,6 +1376,15 @@ fn decode_low_cardinality(
 /// `FixedString`) is allowed unconditionally; `IPv4`/`IPv6` need the suspicious
 /// setting at creation, again with no wire effect.
 pub(crate) fn is_low_cardinality_inner(dict_value_type: &ChType) -> bool {
+    // A name-decoration alias is legal inside `LowCardinality` exactly when the
+    // physical type it delegates to is, so `is_low_cardinality_inner(SAF(T))` ==
+    // `is_low_cardinality_inner(T)`. Confirmed live at v26.6.1.1193-stable:
+    // `LowCardinality(SimpleAggregateFunction(anyLast, String))` is a legal
+    // header. A geo/`Nested` alias resolves to a `Tuple`/`Array`, which is not in
+    // the allowlist, so those stay rejected.
+    if let Some(under) = dict_value_type.physical_delegate() {
+        return is_low_cardinality_inner(&under);
+    }
     matches!(
         dict_value_type,
         ChType::Bool
@@ -1195,6 +1422,42 @@ pub(crate) fn is_low_cardinality_inner(dict_value_type: &ChType) -> bool {
             | ChType::Ipv4
             | ChType::Ipv6
     )
+}
+
+/// Resolve a `LowCardinality` inner type to `(nullable, dict_value_type)`, the
+/// single source of truth every `LowCardinality` site consults so they cannot
+/// disagree on nullability or the dictionary value type.
+///
+/// `inner` is the type spelled inside `LowCardinality(...)`. On the wire it may
+/// be wrapped in any number of `SimpleAggregateFunction` name decorations
+/// (the only alias legal inside `LowCardinality`) around at most one `Nullable`,
+/// with further `SimpleAggregateFunction` decorations under that `Nullable`.
+/// ClickHouse always nests `Nullable` inside `LowCardinality`, never the reverse,
+/// so at most one `Nullable` is reachable. This strips the full outer SAF chain,
+/// unwraps an optional `Nullable`, then strips any further SAF chain beneath it,
+/// returning whether the dictionary is nullable together with the physical value
+/// type its per-block dictionary body is serialized as.
+///
+/// Confirmed live at v26.6.1.1193-stable:
+/// `LowCardinality(SimpleAggregateFunction(anyLast, Nullable(String)))` is a real
+/// server header (hexdump-verified), and a chained SAF such as
+/// `SimpleAggregateFunction(anyLast, SimpleAggregateFunction(sum, UInt64))` is
+/// constructible, so a single-level see-through is not enough. `SimpleAggregateFunction`
+/// is a pure name decoration whose inner is a `Box<ChType>` we can borrow, so this
+/// returns a borrow rather than an owned type; the geo/`Nested` aliases are never
+/// legal here and resolve (through `is_low_cardinality_inner`) to a rejected
+/// `Tuple`/`Array` anyway.
+pub(crate) fn low_cardinality_dict_value_type(inner: &ChType) -> (bool, &ChType) {
+    fn strip_saf(mut t: &ChType) -> &ChType {
+        while let ChType::SimpleAggregateFunction { inner, .. } = t {
+            t = inner.as_ref();
+        }
+        t
+    }
+    match strip_saf(inner) {
+        ChType::Nullable(t) => (true, strip_saf(t.as_ref())),
+        other => (false, other),
+    }
 }
 
 /// Decode the per-block dictionary values for a `LowCardinality(T)` column.
@@ -1331,6 +1594,15 @@ fn decode_values(
     num_rows: usize,
     column: &str,
 ) -> Result<Column, DecodeError> {
+    // A name-decoration alias (SimpleAggregateFunction, geo, Nested) decodes
+    // exactly as the physical type it delegates to, producing the underlying
+    // Column variant (no new variant). Expand and recurse before the container
+    // dispatch below so a geo/Nested alias that expands to an `Array` reaches the
+    // Array fast-path, and a SimpleAggregateFunction over any inner delegates to
+    // that inner.
+    if let Some(under) = ch_type.physical_delegate() {
+        return decode_values(reader, &under, num_rows, column);
+    }
     // LowCardinality carries its own dictionary, indexes, and (for a Nullable
     // inner type) null handling, so it is decoded as a unit rather than going
     // through the Nullable null-map unwrap below.
@@ -1375,6 +1647,13 @@ fn decode_values(
     } else {
         None
     };
+
+    // A geo alias legal directly inside `Nullable` is only `Nullable(Point)`
+    // (the array-based kinds and `Nested` are rejected by the parser); expand it
+    // to its `Tuple` so the Tuple arm below handles the body after the null map,
+    // the ordinary `Nullable(Tuple(...))` framing.
+    let delegate = inner.physical_delegate();
+    let inner = delegate.as_ref().unwrap_or(inner);
 
     // Tuple is a container of element columns decoded as a unit (each element
     // recurses back through this function), dispatched after the Nullable
@@ -1877,15 +2156,20 @@ fn decode_column_body(
         // single-level unwrap in `decode_values` cannot handle it, and
         // `LowCardinality`, `Array`, and `Tuple` are dispatched by `decode_values`
         // before reaching here (a `Nullable` is unwrapped there too), so these arms
-        // cannot occur for any type this decoder produces. None of them is a legal
-        // inner of a `LowCardinality` dictionary either, the other caller. Return
-        // an error rather than panic so a future regression degrades to a clean
-        // decode error instead of undefined behavior at an FFI boundary.
+        // cannot occur for any type this decoder produces. The name-decoration
+        // aliases (`SimpleAggregateFunction`, geo, `Nested`) are expanded to their
+        // physical delegate by `decode_values` before reaching here too. None of
+        // these is a legal inner of a `LowCardinality` dictionary either, the other
+        // caller. Return an error rather than panic so a future regression degrades
+        // to a clean decode error instead of undefined behavior at an FFI boundary.
         ChType::Nullable(_)
         | ChType::LowCardinality(_)
         | ChType::Array(_)
         | ChType::Tuple(_)
-        | ChType::Map(..) => {
+        | ChType::Map(..)
+        | ChType::SimpleAggregateFunction { .. }
+        | ChType::Geo(_)
+        | ChType::Nested(_) => {
             return Err(DecodeError::UnsupportedType {
                 column: String::new(),
                 type_name: inner_type.to_string(),
@@ -1898,6 +2182,17 @@ fn decode_column_body(
 
 /// Build an empty column for a given ChType (used for zero-row blocks).
 fn empty_column(ch_type: &ChType) -> Column {
+    // A name-decoration alias (SimpleAggregateFunction, geo, Nested) builds the
+    // empty column its physical delegate would, so recurse on the delegate at the
+    // very top, matching every other per-type dispatcher (`decode_values`,
+    // `skip_values`, `validate_header_type`). Doing this before the `Nullable`
+    // unwrap is what keeps a zero-row header like
+    // `SimpleAggregateFunction(anyLast, Nullable(String))`, `SAF` over a geo/
+    // `Nested` inner, or `SAF(_, Nullable(Point))` from reaching the `unreachable!`
+    // arm below and panicking on untrusted wire input.
+    if let Some(under) = ch_type.physical_delegate() {
+        return empty_column(&under);
+    }
     let (nullable, inner) = match ch_type {
         ChType::Nullable(inner) => (true, inner.as_ref()),
         other => (false, other),
@@ -1907,6 +2202,21 @@ fn empty_column(ch_type: &ChType) -> Column {
     } else {
         None
     };
+
+    // Fully resolve any name-decoration alias remaining after the `Nullable`
+    // unwrap, following the delegate chain to a physical type. A top-level alias
+    // was already handled by the recursion at the top of this function, so this
+    // covers an alias legal directly inside `Nullable`: `Nullable(Point)`
+    // (`Geo(Point)` -> `Tuple`) and `Nullable(SimpleAggregateFunction(_, T))`
+    // (SAF -> its inner), including a chain like `Nullable(SAF(_, Point))`
+    // (SAF -> `Geo(Point)` -> `Tuple`). `empty_validity` is Some in these cases,
+    // so the Tuple/primitive arm builds the matching nullable empty column, and
+    // the `unreachable!` arm can never see an alias.
+    let mut resolved = inner.physical_delegate();
+    while let Some(under) = resolved.as_ref().and_then(|t| t.physical_delegate()) {
+        resolved = Some(under);
+    }
+    let inner = resolved.as_ref().unwrap_or(inner);
 
     match inner {
         ChType::Bool => Column::Bool(if nullable {
@@ -2049,11 +2359,15 @@ fn empty_column(ch_type: &ChType) -> Column {
         // nullable inner type carries an empty index validity bitmap, matching the
         // other nullable empties.
         ChType::LowCardinality(lc_inner) => {
-            let empty_values = match lc_inner.as_ref() {
-                ChType::Nullable(t) => empty_column(t),
-                other => empty_column(other),
-            };
-            let nullable_inner = matches!(lc_inner.as_ref(), ChType::Nullable(_));
+            // Resolve the inner through the shared helper so the empty dictionary
+            // matches what the non-empty decode would build: a non-nullable
+            // dictionary values column of the physical value type, plus an empty
+            // index validity bitmap when the inner is nullable. This mirrors
+            // `decode_low_cardinality`, so a zero-row
+            // `LowCardinality(SAF(anyLast, Nullable(String)))` column decodes the
+            // same shape as a populated one.
+            let (nullable_inner, dict_value_type) = low_cardinality_dict_value_type(lc_inner);
+            let empty_values = empty_column(dict_value_type);
             Column::Dictionary(if nullable_inner {
                 DictionaryColumn::new_nullable(vec![], empty_values, Bitmap::from_ch_null_map(&[]))
             } else {
@@ -2083,13 +2397,17 @@ fn empty_column(ch_type: &ChType) -> Column {
             vec![0i64],
             build_tuple_column(vec![empty_column(key), empty_column(value)], 0, None),
         )),
-        // The outer `Nullable` was unwrapped above, and `parse_ch_type` never
-        // produces a `Nullable` directly inside a `Nullable`, so `inner` is never
-        // `Nullable` here. Unlike the decode and scan paths this constructor is
-        // infallible (it returns a `Column`, not a `Result`), so the invariant is
-        // asserted rather than surfaced as an error.
-        ChType::Nullable(_) => {
-            unreachable!("Nullable inner already unwrapped; parse_ch_type rejects nested Nullable")
+        // The outer `Nullable` was unwrapped above, `parse_ch_type` never
+        // produces a `Nullable` directly inside a `Nullable`, and any
+        // name-decoration alias was expanded to its physical delegate above, so
+        // `inner` is never a `Nullable` or an alias here. Unlike the decode and
+        // scan paths this constructor is infallible (it returns a `Column`, not a
+        // `Result`), so the invariant is asserted rather than surfaced as an error.
+        ChType::Nullable(_)
+        | ChType::SimpleAggregateFunction { .. }
+        | ChType::Geo(_)
+        | ChType::Nested(_) => {
+            unreachable!("Nullable inner unwrapped and aliases expanded; parse_ch_type rejects nested Nullable")
         }
     }
 }
@@ -2245,12 +2563,22 @@ fn read_column_header(
 /// disagree without this recursion. The recursion is bounded: it runs only after
 /// [`parse_ch_type`] succeeds, and that parser caps nesting at [`MAX_TYPE_DEPTH`].
 fn validate_header_type(col_name: &str, ch_type: &ChType) -> Result<(), DecodeError> {
+    // A name-decoration alias (SimpleAggregateFunction, geo, Nested) is legal
+    // exactly when the physical type it delegates to is, so validate the
+    // delegate. This catches a forbidden `LowCardinality` inner nested inside a
+    // `Nested` element (e.g. `Nested(a LowCardinality(Decimal(9, 4)))`) on every
+    // path, at header time, regardless of row count.
+    if let Some(under) = ch_type.physical_delegate() {
+        return validate_header_type(col_name, &under);
+    }
     match ch_type {
         ChType::LowCardinality(inner) => {
-            let dict_value_type = match inner.as_ref() {
-                ChType::Nullable(t) => t.as_ref(),
-                other => other,
-            };
+            // Resolve through the shared helper (full SAF chain + optional
+            // Nullable + inner SAF chain) so an aliased inner like
+            // `SimpleAggregateFunction(anyLast, Nullable(String))` is validated on
+            // its physical dictionary value type, not rejected because the raw
+            // inner is not itself an allowed LC inner.
+            let (_, dict_value_type) = low_cardinality_dict_value_type(inner);
             if !is_low_cardinality_inner(dict_value_type) {
                 return Err(DecodeError::UnsupportedType {
                     column: col_name.to_string(),
@@ -2296,7 +2624,15 @@ fn validate_header_type(col_name: &str, ch_type: &ChType) -> Result<(), DecodeEr
 /// `LowCardinality(Nullable(K))` keys are forbidden; a plain
 /// `LowCardinality(K)` key is legal. `pub(crate)` so the encoder's validation
 /// enforces the same constraint on caller-constructed types.
+///
+/// A name-decoration alias key resolves through [`ChType::physical_delegate`],
+/// so a `SimpleAggregateFunction(sum, UInt64)` key is legal (it delegates to a
+/// plain `UInt64`) while a `SimpleAggregateFunction(anyLast, Nullable(String))`
+/// key is not (it delegates to `Nullable(String)`).
 pub(crate) fn is_valid_map_key_type(key: &ChType) -> bool {
+    if let Some(under) = key.physical_delegate() {
+        return is_valid_map_key_type(&under);
+    }
     match key {
         ChType::Nullable(_) => false,
         ChType::LowCardinality(inner) => !matches!(inner.as_ref(), ChType::Nullable(_)),
@@ -2450,6 +2786,12 @@ fn skip_values(
     num_rows: usize,
     column: &str,
 ) -> Result<(), DecodeError> {
+    // Expand a name-decoration alias to its physical delegate, the scan-side
+    // mirror of `decode_values`, so a geo/Nested alias reaches the Array
+    // fast-path and a SimpleAggregateFunction walks its inner.
+    if let Some(under) = ch_type.physical_delegate() {
+        return skip_values(reader, &under, num_rows, column);
+    }
     if let ChType::LowCardinality(inner) = ch_type {
         // A zero-length run has no LowCardinality body bytes at all (see the
         // matching gate in `decode_values`), so there is nothing to walk.
@@ -2476,6 +2818,11 @@ fn skip_values(
         }
         other => other,
     };
+
+    // Expand a geo alias legal directly inside `Nullable` (only `Nullable(Point)`
+    // -> `Tuple`), the scan-side mirror of `decode_values`.
+    let delegate = inner.physical_delegate();
+    let inner = delegate.as_ref().unwrap_or(inner);
 
     // Tuple after the Nullable unwrap, mirroring `decode_values`: a
     // `Nullable(Tuple(...))` walks its per-row null map above, then the tuple
@@ -2598,17 +2945,22 @@ fn skip_column_body(
         }
         // `read_column_header` already rejected unsupported types, Nullable is
         // unwrapped by the callers, and LowCardinality, Array, Tuple, and Map
-        // are dispatched by `skip_values` above. Defense in depth:
-        // `parse_ch_type` also rejects a wrapper nested where the callers'
-        // single-level unwrap cannot reach it, so these arms cannot occur.
-        // Return an error rather than panic to keep the streaming scan
-        // panic-free even if that guarantee ever regresses (a panic here is
-        // undefined behavior across FFI).
+        // are dispatched by `skip_values` above. The name-decoration aliases
+        // (`SimpleAggregateFunction`, geo, `Nested`) are expanded to their
+        // physical delegate by `skip_values` before reaching here too. Defense in
+        // depth: `parse_ch_type` also rejects a wrapper nested where the callers'
+        // single-level unwrap cannot reach it, so these arms cannot occur. Return
+        // an error rather than panic to keep the streaming scan panic-free even if
+        // that guarantee ever regresses (a panic here is undefined behavior across
+        // FFI).
         ChType::Nullable(_)
         | ChType::LowCardinality(_)
         | ChType::Array(_)
         | ChType::Tuple(_)
-        | ChType::Map(..) => {
+        | ChType::Map(..)
+        | ChType::SimpleAggregateFunction { .. }
+        | ChType::Geo(_)
+        | ChType::Nested(_) => {
             return Err(DecodeError::UnsupportedType {
                 column: String::new(),
                 type_name: inner_type.to_string(),
@@ -2629,10 +2981,12 @@ fn skip_low_cardinality_data(
     num_rows: usize,
     column: &str,
 ) -> Result<(), DecodeError> {
-    let dict_value_type = match inner {
-        ChType::Nullable(t) => t.as_ref(),
-        other => other,
-    };
+    // Resolve the inner through the shared helper, the scan-side mirror of
+    // [`decode_low_cardinality`], so the dictionary body walk matches the decode
+    // for `LowCardinality(SAF(anyLast, Nullable(String)))` and chained SAF alike.
+    // The scan does not need the nullability flag: nulls are index-0 sentinels in
+    // the same raw index array it skips regardless.
+    let (_, dict_value_type) = low_cardinality_dict_value_type(inner);
 
     // Index type word. Mirror the decode-side rejections
     // ([`decode_low_cardinality`]) exactly, not just the index width: a hostile
@@ -4300,6 +4654,166 @@ mod tests {
             lc_value(batch.column(0), 4).as_deref(),
             Some(b"user_1" as &[u8])
         );
+    }
+
+    #[test]
+    fn test_decode_low_cardinality_saf_nullable_string() {
+        // `LowCardinality(SimpleAggregateFunction(anyLast, Nullable(String)))` is
+        // a real server header, hexdump-confirmed live at v26.6.1.1193-stable. The
+        // SAF is a pure name decoration, so the wire body is byte-identical to
+        // `LowCardinality(Nullable(String))`: a per-block dictionary whose slot 0
+        // is the NULL sentinel, then per-row indexes. Decode must see through the
+        // SAF chain and treat the column as nullable. Exercised at a bare stream
+        // (rev 0) and full modern framing (rev 54485), with one nulls block and
+        // one all-valid block in the same stream.
+        let type_name = "LowCardinality(SimpleAggregateFunction(anyLast, Nullable(String)))";
+        let expected_type = ChType::LowCardinality(Box::new(ChType::SimpleAggregateFunction {
+            func: "anyLast".to_string(),
+            inner: Box::new(ChType::Nullable(Box::new(ChType::String))),
+        }));
+
+        for revision in [0u64, DBMS_TCP_PROTOCOL_VERSION] {
+            // Block 1: rows with nulls. Index 0 is the NULL sentinel.
+            let nulls_dict = ["", "user_1", "user_2"];
+            let nulls_indices = [1u64, 0, 2, 0, 1];
+            let mut data = BlockBuilder::new()
+                .revision(revision)
+                .header(1, nulls_indices.len())
+                .column_header("lc_nsaf", type_name)
+                .low_cardinality_string(&nulls_dict, &nulls_indices, 1)
+                .build();
+            // Block 2: all valid, no index-0 references, still nullable at the type
+            // level.
+            let valid_dict = ["", "user_3", "user_4"];
+            let valid_indices = [1u64, 2, 1];
+            data.extend(
+                BlockBuilder::new()
+                    .revision(revision)
+                    .header(1, valid_indices.len())
+                    .column_header("lc_nsaf", type_name)
+                    .low_cardinality_string(&valid_dict, &valid_indices, 1)
+                    .build(),
+            );
+
+            let options = DecodeOptions {
+                protocol_revision: revision,
+            };
+            let cb = decode_all_bytes(&data, &options).unwrap();
+            assert_eq!(cb.schema.fields[0].ch_type, expected_type);
+            assert_eq!(cb.num_chunks(), 2);
+
+            let nulls = &cb.chunks[0];
+            match nulls.column(0) {
+                Column::Dictionary(d) => {
+                    assert_eq!(d.len(), 5);
+                    assert_eq!(d.null_count(), 2);
+                    assert!(d.validity.is_some());
+                }
+                other => panic!("expected Dictionary, got {other:?}"),
+            }
+            let want: [Option<&[u8]>; 5] = [
+                Some(b"user_1"),
+                None,
+                Some(b"user_2"),
+                None,
+                Some(b"user_1"),
+            ];
+            for (row, w) in want.iter().enumerate() {
+                assert_eq!(lc_value(nulls.column(0), row).as_deref(), *w);
+            }
+
+            let valid = &cb.chunks[1];
+            match valid.column(0) {
+                Column::Dictionary(d) => {
+                    assert_eq!(d.len(), 3);
+                    assert_eq!(d.null_count(), 0);
+                }
+                other => panic!("expected Dictionary, got {other:?}"),
+            }
+            let want_valid: [&[u8]; 3] = [b"user_3", b"user_4", b"user_3"];
+            for (row, w) in want_valid.iter().enumerate() {
+                assert_eq!(lc_value(valid.column(0), row).as_deref(), Some(*w));
+            }
+        }
+    }
+
+    #[test]
+    fn test_decode_low_cardinality_saf_nullable_string_zero_rows() {
+        // A zero-row block with the SAF-aliased LC header must build the same
+        // empty column shape as `LowCardinality(Nullable(String))` (an empty
+        // nullable dictionary), exercising the `empty_column` delegate path that
+        // resolves the SAF chain through `low_cardinality_dict_value_type`.
+        let type_name = "LowCardinality(SimpleAggregateFunction(anyLast, Nullable(String)))";
+        let data = BlockBuilder::new()
+            .header(1, 0)
+            .column_header("lc_nsaf", type_name)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_rows(), 0);
+        assert_eq!(cb.num_chunks(), 0);
+        assert_eq!(
+            cb.schema.fields[0].ch_type,
+            ChType::LowCardinality(Box::new(ChType::SimpleAggregateFunction {
+                func: "anyLast".to_string(),
+                inner: Box::new(ChType::Nullable(Box::new(ChType::String))),
+            }))
+        );
+        // The empty column is a nullable dictionary of non-nullable String values,
+        // matching what the populated blocks decode.
+        let empty = empty_column(&cb.schema.fields[0].ch_type);
+        match empty {
+            Column::Dictionary(d) => {
+                assert_eq!(d.len(), 0);
+                assert!(d.validity.is_some());
+                assert!(matches!(d.values.as_ref(), Column::Utf8(_)));
+            }
+            other => panic!("expected Dictionary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_chained_simple_aggregate_function() {
+        // A chained SAF resolves through the full delegate chain to its physical
+        // inner. `SimpleAggregateFunction(anyLast, SimpleAggregateFunction(sum,
+        // UInt64))` is constructible live at v26.6.1.1193-stable; its wire body is
+        // a plain UInt64 column. Both the standalone chain and the same chain as a
+        // LowCardinality inner must decode.
+        let chain = ChType::SimpleAggregateFunction {
+            func: "anyLast".to_string(),
+            inner: Box::new(ChType::SimpleAggregateFunction {
+                func: "sum".to_string(),
+                inner: Box::new(ChType::UInt64),
+            }),
+        };
+        assert_eq!(
+            parse_ch_type("SimpleAggregateFunction(anyLast, SimpleAggregateFunction(sum, UInt64))"),
+            Some(chain.clone())
+        );
+
+        // Standalone chained SAF: decodes as a UInt64 primitive body.
+        let values = [13u64, 79, 8_589_934_592];
+        let data = BlockBuilder::new()
+            .header(1, values.len())
+            .column_header("saf_chain", &chain.to_string())
+            .uint64_data(&values)
+            .build();
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.schema.fields[0].ch_type, chain);
+        match cb.chunks[0].column(0) {
+            Column::UInt64(c) => assert_eq!(c.values, values.to_vec()),
+            other => panic!("expected UInt64, got {other:?}"),
+        }
+
+        // Same chain as a LowCardinality inner: the dictionary body is a plain
+        // UInt64 run and the column is non-nullable.
+        let lc_chain = ChType::LowCardinality(Box::new(chain));
+        let (nullable, dict_value_type) = match &lc_chain {
+            ChType::LowCardinality(inner) => low_cardinality_dict_value_type(inner),
+            _ => unreachable!(),
+        };
+        assert!(!nullable);
+        assert_eq!(dict_value_type, &ChType::UInt64);
     }
 
     #[test]
@@ -8131,6 +8645,786 @@ mod tests {
             let data = BlockBuilder::new()
                 .header(1, num_rows)
                 .column_header("lc", "LowCardinality(Tuple(Int32, String))")
+                .build();
+            assert!(matches!(
+                decode_all_bytes(&data, &DecodeOptions::default()),
+                Err(DecodeError::UnsupportedType { .. })
+            ));
+            assert!(matches!(
+                block_end(&data, &DecodeOptions::default()),
+                Err(DecodeError::UnsupportedType { .. })
+            ));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // SimpleAggregateFunction / geo aliases / Nested (name-decoration types)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_ch_type_simple_aggregate_function() {
+        // Plain scalar inner.
+        assert_eq!(
+            parse_ch_type("SimpleAggregateFunction(sum, Float64)"),
+            Some(ChType::SimpleAggregateFunction {
+                func: "sum".to_string(),
+                inner: Box::new(ChType::Float64),
+            })
+        );
+        // Function name with parenthesized literal params: the split is on the
+        // FIRST top-level comma, so the params stay with the function name.
+        assert_eq!(
+            parse_ch_type("SimpleAggregateFunction(groupArrayLastArray(5), Array(UInt64))"),
+            Some(ChType::SimpleAggregateFunction {
+                func: "groupArrayLastArray(5)".to_string(),
+                inner: Box::new(ChType::Array(Box::new(ChType::UInt64))),
+            })
+        );
+        // Inner Tuple whose own commas sit inside parentheses.
+        assert_eq!(
+            parse_ch_type("SimpleAggregateFunction(sumMap, Tuple(Array(Int32), Array(Int64)))"),
+            Some(ChType::SimpleAggregateFunction {
+                func: "sumMap".to_string(),
+                inner: Box::new(ChType::Tuple(vec![
+                    (None, ChType::Array(Box::new(ChType::Int32))),
+                    (None, ChType::Array(Box::new(ChType::Int64))),
+                ])),
+            })
+        );
+        // A whitelisted underscore-bearing function name.
+        assert_eq!(
+            parse_ch_type("SimpleAggregateFunction(anyLast_respect_nulls, String)"),
+            Some(ChType::SimpleAggregateFunction {
+                func: "anyLast_respect_nulls".to_string(),
+                inner: Box::new(ChType::String),
+            })
+        );
+    }
+
+    #[test]
+    fn test_simple_aggregate_function_display_round_trips() {
+        for spelling in [
+            "SimpleAggregateFunction(sum, Float64)",
+            "SimpleAggregateFunction(anyLast, LowCardinality(Nullable(String)))",
+            "SimpleAggregateFunction(groupArrayLastArray(5), Array(UInt64))",
+            "SimpleAggregateFunction(sumMap, Tuple(Array(Int32), Array(Int64)))",
+        ] {
+            let parsed = parse_ch_type(spelling).expect("parses");
+            assert_eq!(parsed.to_string(), spelling, "round-trip for {spelling}");
+        }
+    }
+
+    #[test]
+    fn test_parse_simple_aggregate_function_rejections() {
+        // Multi-type-arg form: only T1 is load-bearing and it is unobserved, so
+        // reject rather than decode a guess.
+        assert_eq!(
+            parse_ch_type("SimpleAggregateFunction(sum, Int32, Int64)"),
+            None
+        );
+        // Missing the type argument.
+        assert_eq!(parse_ch_type("SimpleAggregateFunction(sum)"), None);
+        // A non-identifier-shaped function name.
+        assert_eq!(parse_ch_type("SimpleAggregateFunction(1sum, Int32)"), None);
+    }
+
+    #[test]
+    fn test_parse_simple_aggregate_function_inside_wrappers() {
+        // SAF parses at any nesting position: the server emits the SAF spelling
+        // verbatim inside wrappers and containers (confirmed live at
+        // v26.6.1.1193-stable via CREATE + SELECT ... FORMAT Native hexdump for
+        // each of these shapes).
+        assert_eq!(
+            parse_ch_type("Nullable(SimpleAggregateFunction(sum, UInt64))"),
+            Some(ChType::Nullable(Box::new(
+                ChType::SimpleAggregateFunction {
+                    func: "sum".to_string(),
+                    inner: Box::new(ChType::UInt64),
+                }
+            )))
+        );
+        assert_eq!(
+            parse_ch_type("Array(SimpleAggregateFunction(sum, UInt64))"),
+            Some(ChType::Array(Box::new(ChType::SimpleAggregateFunction {
+                func: "sum".to_string(),
+                inner: Box::new(ChType::UInt64),
+            })))
+        );
+        assert_eq!(
+            parse_ch_type("LowCardinality(SimpleAggregateFunction(anyLast, String))"),
+            Some(ChType::LowCardinality(Box::new(
+                ChType::SimpleAggregateFunction {
+                    func: "anyLast".to_string(),
+                    inner: Box::new(ChType::String),
+                }
+            )))
+        );
+        assert_eq!(
+            parse_ch_type("Tuple(v SimpleAggregateFunction(sum, UInt64))"),
+            Some(ChType::Tuple(vec![(
+                Some("v".to_string()),
+                ChType::SimpleAggregateFunction {
+                    func: "sum".to_string(),
+                    inner: Box::new(ChType::UInt64),
+                }
+            )]))
+        );
+        assert_eq!(
+            parse_ch_type("Map(String, SimpleAggregateFunction(sum, UInt64))"),
+            Some(ChType::Map(
+                Box::new(ChType::String),
+                Box::new(ChType::SimpleAggregateFunction {
+                    func: "sum".to_string(),
+                    inner: Box::new(ChType::UInt64),
+                })
+            ))
+        );
+        // Wrapper legality delegates to the inner: Nullable(SAF(Array(...))) is
+        // illegal because Nullable(Array(...)) is (the delegate is an Array), and a
+        // SAF whose delegate is a Nullable cannot sit inside another Nullable.
+        assert_eq!(
+            parse_ch_type("Nullable(SimpleAggregateFunction(groupArrayArray, Array(UInt64)))"),
+            None
+        );
+        assert_eq!(
+            parse_ch_type("Nullable(SimpleAggregateFunction(anyLast, Nullable(String)))"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_ch_type_geo() {
+        assert_eq!(parse_ch_type("Point"), Some(ChType::Geo(GeoKind::Point)));
+        assert_eq!(parse_ch_type("Ring"), Some(ChType::Geo(GeoKind::Ring)));
+        assert_eq!(
+            parse_ch_type("LineString"),
+            Some(ChType::Geo(GeoKind::LineString))
+        );
+        assert_eq!(
+            parse_ch_type("MultiLineString"),
+            Some(ChType::Geo(GeoKind::MultiLineString))
+        );
+        assert_eq!(
+            parse_ch_type("Polygon"),
+            Some(ChType::Geo(GeoKind::Polygon))
+        );
+        assert_eq!(
+            parse_ch_type("MultiPolygon"),
+            Some(ChType::Geo(GeoKind::MultiPolygon))
+        );
+    }
+
+    #[test]
+    fn test_geo_display_round_trips() {
+        for spelling in [
+            "Point",
+            "Ring",
+            "LineString",
+            "MultiLineString",
+            "Polygon",
+            "MultiPolygon",
+        ] {
+            assert_eq!(parse_ch_type(spelling).unwrap().to_string(), spelling);
+        }
+        // A geo type composes inside containers and renders the bare alias.
+        assert_eq!(
+            parse_ch_type("Array(Point)").unwrap().to_string(),
+            "Array(Point)"
+        );
+        assert_eq!(
+            parse_ch_type("Map(Point, MultiPolygon)")
+                .unwrap()
+                .to_string(),
+            "Map(Point, MultiPolygon)"
+        );
+    }
+
+    #[test]
+    fn test_parse_geo_rejects_bad_casing() {
+        // Registration is case-sensitive with no aliases.
+        assert_eq!(parse_ch_type("point"), None);
+        assert_eq!(parse_ch_type("ring"), None);
+        assert_eq!(parse_ch_type("POLYGON"), None);
+        assert_eq!(parse_ch_type("multipolygon"), None);
+    }
+
+    #[test]
+    fn test_geo_underlying_type_expansion() {
+        // The one-directional structural mapping, confirmed against
+        // DataTypeCustomGeo.
+        let point = ChType::Tuple(vec![(None, ChType::Float64), (None, ChType::Float64)]);
+        assert_eq!(GeoKind::Point.underlying_type(), point);
+        assert_eq!(
+            GeoKind::Ring.underlying_type(),
+            ChType::Array(Box::new(point.clone()))
+        );
+        assert_eq!(
+            GeoKind::LineString.underlying_type(),
+            ChType::Array(Box::new(point.clone()))
+        );
+        assert_eq!(
+            GeoKind::Polygon.underlying_type(),
+            ChType::Array(Box::new(ChType::Array(Box::new(point.clone()))))
+        );
+        assert_eq!(
+            GeoKind::MultiLineString.underlying_type(),
+            ChType::Array(Box::new(ChType::Array(Box::new(point.clone()))))
+        );
+        assert_eq!(
+            GeoKind::MultiPolygon.underlying_type(),
+            ChType::Array(Box::new(ChType::Array(Box::new(ChType::Array(Box::new(
+                point
+            ))))))
+        );
+    }
+
+    #[test]
+    fn test_parse_ch_type_nested() {
+        assert_eq!(
+            parse_ch_type("Nested(a UInt32, b String)"),
+            Some(ChType::Nested(vec![
+                ("a".to_string(), ChType::UInt32),
+                ("b".to_string(), ChType::String),
+            ]))
+        );
+        // A backtick-quoted name and a nested type argument.
+        assert_eq!(
+            parse_ch_type("Nested(`a b` UInt32, c Array(Nullable(String)))"),
+            Some(ChType::Nested(vec![
+                ("a b".to_string(), ChType::UInt32),
+                (
+                    "c".to_string(),
+                    ChType::Array(Box::new(ChType::Nullable(Box::new(ChType::String)))),
+                ),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_nested_display_round_trips() {
+        for spelling in [
+            "Nested(a UInt32, b String)",
+            "Nested(`a b` UInt32, c Array(Nullable(String)))",
+            "Nested(inner Nested(x Int32, y Int32))",
+        ] {
+            assert_eq!(parse_ch_type(spelling).unwrap().to_string(), spelling);
+        }
+    }
+
+    #[test]
+    fn test_parse_nested_rejections() {
+        // Element names are mandatory.
+        assert_eq!(parse_ch_type("Nested(UInt32)"), None);
+        assert_eq!(parse_ch_type("Nested(a UInt32, String)"), None);
+        // An empty field list is a parse error.
+        assert_eq!(parse_ch_type("Nested()"), None);
+    }
+
+    #[test]
+    fn test_parse_nullable_geo_legality() {
+        // Nullable(Point) is legal (Point is a Tuple, canBeInsideNullable true).
+        assert_eq!(
+            parse_ch_type("Nullable(Point)"),
+            Some(ChType::Nullable(Box::new(ChType::Geo(GeoKind::Point))))
+        );
+        // Nullable of the five Array-based geo kinds is illegal (Array is not
+        // nullable-able).
+        assert_eq!(parse_ch_type("Nullable(Ring)"), None);
+        assert_eq!(parse_ch_type("Nullable(LineString)"), None);
+        assert_eq!(parse_ch_type("Nullable(Polygon)"), None);
+        assert_eq!(parse_ch_type("Nullable(MultiLineString)"), None);
+        assert_eq!(parse_ch_type("Nullable(MultiPolygon)"), None);
+        // Nullable(Nested) is illegal (it is an Array).
+        assert_eq!(parse_ch_type("Nullable(Nested(a UInt32))"), None);
+    }
+
+    #[test]
+    fn test_decode_simple_aggregate_function_scalar() {
+        // Wire bytes are byte-identical to the bare inner Float64.
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("s", "SimpleAggregateFunction(sum, Float64)")
+            .float64_data(&[3.5, -7.25, 0.0])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(
+            cb.schema.fields[0].ch_type,
+            ChType::SimpleAggregateFunction {
+                func: "sum".to_string(),
+                inner: Box::new(ChType::Float64),
+            }
+        );
+        match cb.chunks[0].column(0) {
+            Column::Float64(c) => assert_eq!(c.values, vec![3.5, -7.25, 0.0]),
+            other => panic!("expected Float64 delegate column, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_simple_aggregate_function_nullable_string() {
+        // SAF(anyLast, Nullable(String)) decodes exactly as Nullable(String):
+        // the per-row null map then the string run.
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("s", "SimpleAggregateFunction(anyLast, Nullable(String))")
+            .null_map(&[false, true, false])
+            .string_data(&["user_1", "", "user_2"])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        match cb.chunks[0].column(0) {
+            Column::Utf8(c) => {
+                assert_eq!(c.value(0), b"user_1");
+                assert_eq!(c.value(2), b"user_2");
+                assert_eq!(c.null_count(), 1);
+                let bm = c.validity.as_ref().expect("nullable validity");
+                assert!(bm.is_valid(0) && !bm.is_valid(1) && bm.is_valid(2));
+            }
+            other => panic!("expected Utf8 delegate column, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_simple_aggregate_function_over_low_cardinality() {
+        // Shared gate: SAF over LowCardinality(String) hoists the LC 8-byte key
+        // version to the front through the delegate, then the LC body.
+        let dictionary = ["", "user_1", "user_2"];
+        let indices = [1u64, 2, 1];
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header(
+                "s",
+                "SimpleAggregateFunction(anyLast, LowCardinality(String))",
+            )
+            .low_cardinality_string(&dictionary, &indices, 1)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        match cb.chunks[0].column(0) {
+            Column::Dictionary(d) => {
+                assert_eq!(d.indices, vec![1, 2, 1]);
+                assert_eq!(
+                    lc_value(cb.chunks[0].column(0), 0).as_deref(),
+                    Some(&b"user_1"[..])
+                );
+            }
+            other => panic!("expected Dictionary delegate column, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_point_plain() {
+        // Point = Tuple(Float64, Float64), field-major: all X then all Y.
+        let data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("p", "Point")
+            .float64_data(&[1.0, 3.0]) // X coordinates
+            .float64_data(&[2.0, 4.0]) // Y coordinates
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.schema.fields[0].ch_type, ChType::Geo(GeoKind::Point));
+        let t = as_tuple(cb.chunks[0].column(0));
+        assert_eq!(t.fields.len(), 2);
+        match (&t.fields[0], &t.fields[1]) {
+            (Column::Float64(x), Column::Float64(y)) => {
+                assert_eq!(x.values, vec![1.0, 3.0]);
+                assert_eq!(y.values, vec![2.0, 4.0]);
+            }
+            other => panic!("expected two Float64 tuple fields, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_nullable_point() {
+        // Nullable(Point): null map then the Tuple(Float64, Float64) body.
+        let data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("p", "Nullable(Point)")
+            .null_map(&[false, true])
+            .float64_data(&[1.0, 0.0])
+            .float64_data(&[2.0, 0.0])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let t = as_tuple(cb.chunks[0].column(0));
+        assert_eq!(t.len(), 2);
+        let bm = t.validity.as_ref().expect("tuple-level validity");
+        assert!(bm.is_valid(0) && !bm.is_valid(1));
+    }
+
+    #[test]
+    fn test_decode_ring() {
+        // Ring = Array(Point): offsets then the flattened Point body (field-major
+        // over all points).
+        let data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("r", "Ring")
+            .array_offsets(&[2, 3]) // row 0 has 2 points, row 1 has 1 point
+            .float64_data(&[1.0, 3.0, 5.0]) // X for all 3 points
+            .float64_data(&[2.0, 4.0, 6.0]) // Y for all 3 points
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let arr = as_array(cb.chunks[0].column(0));
+        assert_eq!(arr.offsets, vec![0i64, 2, 3]);
+        let t = as_tuple(arr.values.as_ref());
+        match (&t.fields[0], &t.fields[1]) {
+            (Column::Float64(x), Column::Float64(y)) => {
+                assert_eq!(x.values, vec![1.0, 3.0, 5.0]);
+                assert_eq!(y.values, vec![2.0, 4.0, 6.0]);
+            }
+            other => panic!("expected Point tuple fields, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_multi_polygon() {
+        // MultiPolygon = Array(Array(Array(Point))): three offset levels then the
+        // Point body. One row holding one polygon of one ring of two points.
+        let data = BlockBuilder::new()
+            .header(1, 1)
+            .column_header("mp", "MultiPolygon")
+            .array_offsets(&[1]) // 1 polygon in the row
+            .array_offsets(&[1]) // 1 ring in the polygon
+            .array_offsets(&[2]) // 2 points in the ring
+            .float64_data(&[1.0, 3.0])
+            .float64_data(&[2.0, 4.0])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let l0 = as_array(cb.chunks[0].column(0));
+        assert_eq!(l0.offsets, vec![0i64, 1]);
+        let l1 = as_array(l0.values.as_ref());
+        assert_eq!(l1.offsets, vec![0i64, 1]);
+        let l2 = as_array(l1.values.as_ref());
+        assert_eq!(l2.offsets, vec![0i64, 2]);
+        let t = as_tuple(l2.values.as_ref());
+        match (&t.fields[0], &t.fields[1]) {
+            (Column::Float64(x), Column::Float64(y)) => {
+                assert_eq!(x.values, vec![1.0, 3.0]);
+                assert_eq!(y.values, vec![2.0, 4.0]);
+            }
+            other => panic!("expected Point tuple fields, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_nested_plain() {
+        // Nested(a UInt32, b String) = Array(Tuple(a UInt32, b String)): offsets,
+        // then the flattened tuple body (all a's then all b's), field-major.
+        let data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("n", "Nested(a UInt32, b String)")
+            .array_offsets(&[2, 3]) // row 0 has 2 elements, row 1 has 1
+            .uint32_data(&[10, 20, 30])
+            .string_data(&["x", "y", "z"])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(
+            cb.schema.fields[0].ch_type,
+            ChType::Nested(vec![
+                ("a".to_string(), ChType::UInt32),
+                ("b".to_string(), ChType::String),
+            ])
+        );
+        let arr = as_array(cb.chunks[0].column(0));
+        assert_eq!(arr.offsets, vec![0i64, 2, 3]);
+        let t = as_tuple(arr.values.as_ref());
+        match (&t.fields[0], &t.fields[1]) {
+            (Column::UInt32(a), Column::Utf8(b)) => {
+                assert_eq!(a.values, vec![10, 20, 30]);
+                assert_eq!(b.value(0), b"x");
+                assert_eq!(b.value(2), b"z");
+            }
+            other => panic!("expected (UInt32, Utf8) tuple fields, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_nested_with_low_cardinality_hoists_key_version() {
+        // Shared gate: Nested(a LowCardinality(String)) delegates to
+        // Array(Tuple(a LowCardinality(String))). The state prefix recurses
+        // Array -> Tuple -> LowCardinality, so the LC 8-byte key version is
+        // hoisted to the very front of the column, before the offsets, then the
+        // LC body follows the offsets.
+        let dictionary = ["", "user_1", "user_2"];
+        let element_indices = [1u64, 2, 1];
+        let lc_full = BlockBuilder::new()
+            .low_cardinality_string(&dictionary, &element_indices, 1)
+            .build();
+        let (key_version, lc_body) = lc_full.split_at(8);
+
+        let data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("n", "Nested(a LowCardinality(String))")
+            .raw_bytes(key_version) // hoisted LC key version, ahead of the offsets
+            .array_offsets(&[2, 3])
+            .raw_bytes(lc_body)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let arr = as_array(cb.chunks[0].column(0));
+        assert_eq!(arr.offsets, vec![0i64, 2, 3]);
+        let t = as_tuple(arr.values.as_ref());
+        match &t.fields[0] {
+            Column::Dictionary(d) => assert_eq!(d.indices, vec![1, 2, 1]),
+            other => panic!("expected LC dictionary element, got {other:?}"),
+        }
+        // The scan agrees on the framing (including the hoisted prefix).
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len())
+        );
+    }
+
+    #[test]
+    fn test_decode_name_decoration_zero_rows() {
+        // A zero-row block carrying the three alias groups contributes the schema
+        // but no chunks; the empty columns delegate to the physical layout.
+        let data = BlockBuilder::new()
+            .header(3, 0)
+            .column_header("s", "SimpleAggregateFunction(sum, Float64)")
+            .column_header("p", "Point")
+            .column_header("n", "Nested(a UInt32, b String)")
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_rows(), 0);
+        assert_eq!(cb.num_chunks(), 0);
+        assert_eq!(cb.num_columns(), 3);
+        assert_eq!(cb.schema.fields[1].ch_type, ChType::Geo(GeoKind::Point));
+    }
+
+    #[test]
+    fn test_decode_alias_over_wrapper_zero_rows() {
+        // A zero-row block whose header is a name-decoration alias OVER a
+        // Nullable/geo/Nested inner must build an empty column via the physical
+        // delegate, never reach the `empty_column` `unreachable!` arm. Before the
+        // Fix, `SimpleAggregateFunction(anyLast, Nullable(String))` (and the SAF
+        // over Point/Nested shapes) panicked on this untrusted 0-row header.
+        let data = BlockBuilder::new()
+            .header(4, 0)
+            // SAF over a Nullable inner: delegate is Nullable(String).
+            .column_header("s", "SimpleAggregateFunction(anyLast, Nullable(String))")
+            // SAF over a geo inner: delegate is Geo(Point) -> Tuple(Float64, Float64).
+            .column_header("g", "SimpleAggregateFunction(anyLast, Point)")
+            // A Nested field group.
+            .column_header("n", "Nested(a UInt32, b String)")
+            // Alias legal directly inside Nullable, expanded post-unwrap.
+            .column_header("np", "Nullable(Point)")
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_rows(), 0);
+        assert_eq!(cb.num_chunks(), 0);
+        assert_eq!(cb.num_columns(), 4);
+        assert_eq!(
+            cb.schema.fields[0].ch_type,
+            ChType::SimpleAggregateFunction {
+                func: "anyLast".to_string(),
+                inner: Box::new(ChType::Nullable(Box::new(ChType::String))),
+            }
+        );
+        // The block_end completeness scan agrees the zero-row block is complete.
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len())
+        );
+    }
+
+    #[test]
+    fn test_multi_block_point_kept_as_chunks() {
+        // Geo blocks stay separate chunks, never concatenated.
+        let mut data = BlockBuilder::new()
+            .header(1, 1)
+            .column_header("p", "Point")
+            .float64_data(&[1.0])
+            .float64_data(&[2.0])
+            .build();
+        data.extend(
+            BlockBuilder::new()
+                .header(1, 2)
+                .column_header("p", "Point")
+                .float64_data(&[3.0, 5.0])
+                .float64_data(&[4.0, 6.0])
+                .build(),
+        );
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_chunks(), 2);
+        assert_eq!(as_tuple(cb.chunks[0].column(0)).len(), 1);
+        assert_eq!(as_tuple(cb.chunks[1].column(0)).len(), 2);
+    }
+
+    #[test]
+    fn test_block_end_scans_name_decoration_types() {
+        // The completeness scan walks the same bytes the decoders consume for all
+        // three alias groups, ending exactly at the block boundary.
+        let dictionary = ["", "user_1"];
+        let lc_full = BlockBuilder::new()
+            .low_cardinality_string(&dictionary, &[1u64], 1)
+            .build();
+        let (key_version, lc_body) = lc_full.split_at(8);
+        let data = BlockBuilder::new()
+            .header(3, 1)
+            // Column 0: SAF body is one Float64 (each header is immediately
+            // followed by its own data, per the Native per-column framing).
+            .column_header("s", "SimpleAggregateFunction(sum, Float64)")
+            .float64_data(&[3.5])
+            // Column 1: MultiPolygon, three offset levels then one Point.
+            .column_header("mp", "MultiPolygon")
+            .array_offsets(&[1])
+            .array_offsets(&[1])
+            .array_offsets(&[1])
+            .float64_data(&[1.0])
+            .float64_data(&[2.0])
+            // Column 2: Nested, hoisted LC key version, offsets, LC body.
+            .column_header("n", "Nested(a LowCardinality(String))")
+            .raw_bytes(key_version)
+            .array_offsets(&[1])
+            .raw_bytes(lc_body)
+            .build();
+
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len())
+        );
+        // And a full decode consumes it without error.
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(cb.num_columns(), 3);
+    }
+
+    #[test]
+    fn test_decode_rejects_low_cardinality_geo() {
+        // LowCardinality is illegal for all six geo kinds (no canBeInsideLowCardinality
+        // override), rejected at header time regardless of row count.
+        for num_rows in [0usize, 1] {
+            let data = BlockBuilder::new()
+                .header(1, num_rows)
+                .column_header("lc", "LowCardinality(Point)")
+                .build();
+            assert!(matches!(
+                decode_all_bytes(&data, &DecodeOptions::default()),
+                Err(DecodeError::UnsupportedType { .. })
+            ));
+            assert!(matches!(
+                block_end(&data, &DecodeOptions::default()),
+                Err(DecodeError::UnsupportedType { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn test_decode_nullable_simple_aggregate_function() {
+        // Nullable(SAF(sum, UInt64)) decodes exactly as Nullable(UInt64): the
+        // per-row null map then the UInt64 run. The SAF is name decoration inside
+        // the Nullable (confirmed legal live at v26.6.1.1193-stable).
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header("s", "Nullable(SimpleAggregateFunction(sum, UInt64))")
+            .null_map(&[false, true, false])
+            .uint64_data(&[13, 0, 79])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(
+            cb.schema.fields[0].ch_type,
+            ChType::Nullable(Box::new(ChType::SimpleAggregateFunction {
+                func: "sum".to_string(),
+                inner: Box::new(ChType::UInt64),
+            }))
+        );
+        match cb.chunks[0].column(0) {
+            Column::UInt64(c) => {
+                assert_eq!(c.values, vec![13, 0, 79]);
+                let bm = c.validity.as_ref().expect("nullable validity");
+                assert!(bm.is_valid(0) && !bm.is_valid(1) && bm.is_valid(2));
+            }
+            other => panic!("expected UInt64 delegate column, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_array_simple_aggregate_function() {
+        // Array(SAF(sum, UInt64)) decodes exactly as Array(UInt64): offsets then
+        // the flattened UInt64 element run.
+        let data = BlockBuilder::new()
+            .header(1, 2)
+            .column_header("a", "Array(SimpleAggregateFunction(sum, UInt64))")
+            .array_offsets(&[2, 3]) // row 0 has 2 elements, row 1 has 1
+            .uint64_data(&[13, 79, 5])
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        let arr = as_array(cb.chunks[0].column(0));
+        assert_eq!(arr.offsets, vec![0i64, 2, 3]);
+        match arr.values.as_ref() {
+            Column::UInt64(c) => assert_eq!(c.values, vec![13, 79, 5]),
+            other => panic!("expected UInt64 element column, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_low_cardinality_simple_aggregate_function() {
+        // LowCardinality(SAF(anyLast, String)) decodes exactly as
+        // LowCardinality(String): the key version prefix (in the helper), the
+        // per-block dictionary, and the indexes.
+        let dictionary = ["", "user_1", "user_2"];
+        let indices = [1u64, 2, 1];
+        let data = BlockBuilder::new()
+            .header(1, 3)
+            .column_header(
+                "s",
+                "LowCardinality(SimpleAggregateFunction(anyLast, String))",
+            )
+            .low_cardinality_string(&dictionary, &indices, 1)
+            .build();
+
+        let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        assert_eq!(
+            cb.schema.fields[0].ch_type,
+            ChType::LowCardinality(Box::new(ChType::SimpleAggregateFunction {
+                func: "anyLast".to_string(),
+                inner: Box::new(ChType::String),
+            }))
+        );
+        match cb.chunks[0].column(0) {
+            Column::Dictionary(d) => {
+                assert_eq!(d.indices, vec![1, 2, 1]);
+                assert_eq!(
+                    lc_value(cb.chunks[0].column(0), 0).as_deref(),
+                    Some(&b"user_1"[..])
+                );
+            }
+            other => panic!("expected Dictionary delegate column, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_rejects_unnamed_nested_element_header() {
+        // An unnamed Nested element makes the whole header unsupported.
+        let data = BlockBuilder::new()
+            .header(1, 1)
+            .column_header("n", "Nested(UInt32)")
+            .build();
+        assert!(matches!(
+            decode_all_bytes(&data, &DecodeOptions::default()),
+            Err(DecodeError::UnsupportedType { .. })
+        ));
+    }
+
+    #[test]
+    fn test_decode_rejects_nested_low_cardinality_bad_inner() {
+        // A forbidden LowCardinality inner nested inside a Nested field is
+        // rejected at header time on both paths, at every row count, because
+        // validate_header_type expands the Nested delegate and recurses.
+        for num_rows in [0usize, 1] {
+            let data = BlockBuilder::new()
+                .header(1, num_rows)
+                .column_header("n", "Nested(a LowCardinality(Decimal(9, 4)))")
                 .build();
             assert!(matches!(
                 decode_all_bytes(&data, &DecodeOptions::default()),

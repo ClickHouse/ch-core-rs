@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::batch::ColBatch;
 use crate::column::Column;
+use crate::native::decode::low_cardinality_dict_value_type;
 use crate::schema::{ChType, Schema};
 
 // ---------------------------------------------------------------------------
@@ -323,6 +324,17 @@ fn arrow_format(ch_type: &ChType) -> String {
         // the offset width, so bindings can cast cheaply.
         // `ARROW_FLAG_MAP_KEYS_SORTED` is never set (it is `+m`-only).
         ChType::Map(..) => "+L".into(),
+        // Name-decoration aliases export with the Arrow shape of the physical
+        // type they delegate to (`SimpleAggregateFunction` -> its inner, a geo
+        // alias -> its Tuple/Array nesting, `Nested` -> the LargeList over an
+        // `Array(Tuple(...))`). The child schemas are emitted by
+        // `write_field_schema`, which expands the same delegate.
+        ChType::SimpleAggregateFunction { inner, .. } => arrow_format(inner),
+        ChType::Geo(kind) => arrow_format(&kind.underlying_type()),
+        // `Nested` is always an `Array(Tuple(...))`, so its top format is the
+        // LargeList `+L` regardless of the field types (which appear in the
+        // `item` struct child), matching the `Array`/`Map` arms above.
+        ChType::Nested(_) => "+L".into(),
     }
 }
 
@@ -336,13 +348,14 @@ fn is_dictionary(ch_type: &ChType) -> bool {
 /// The Arrow value type of a `LowCardinality(T)` dictionary, i.e. the type of
 /// the entries in the dictionary `values` column. The inner `Nullable` is
 /// transparent here: nulls live in the index validity, so the dictionary value
-/// type is always the non-nullable inner type.
+/// type is always the non-nullable inner type. The shared
+/// `low_cardinality_dict_value_type` helper sees through any
+/// `SimpleAggregateFunction` chain around the removeNullable `Nullable`, so
+/// `LowCardinality(SAF(anyLast, Nullable(String)))` exports the `String` value
+/// type rather than a stray alias/`Nullable`.
 fn dictionary_value_type(ch_type: &ChType) -> &ChType {
     match ch_type {
-        ChType::LowCardinality(inner) => match inner.as_ref() {
-            ChType::Nullable(t) => t,
-            other => other,
-        },
+        ChType::LowCardinality(inner) => low_cardinality_dict_value_type(inner).1,
         other => other,
     }
 }
@@ -350,11 +363,13 @@ fn dictionary_value_type(ch_type: &ChType) -> &ChType {
 /// Whether a column exports with the Arrow nullable flag set. A bare
 /// `Nullable(T)` is nullable, and a `LowCardinality(Nullable(T))` is nullable
 /// at the index level (nulls live in the index validity bitmap). A plain
-/// `LowCardinality(T)` is not nullable.
+/// `LowCardinality(T)` is not nullable. The `LowCardinality` case resolves the
+/// null flag through the shared `low_cardinality_dict_value_type` helper, so a
+/// `LowCardinality(SAF(anyLast, Nullable(String)))` is correctly nullable.
 fn field_is_nullable(ch_type: &ChType) -> bool {
     match ch_type {
         ChType::Nullable(_) => true,
-        ChType::LowCardinality(inner) => matches!(inner.as_ref(), ChType::Nullable(_)),
+        ChType::LowCardinality(inner) => low_cardinality_dict_value_type(inner).0,
         _ => false,
     }
 }
@@ -385,6 +400,16 @@ fn cstring_lossy(s: &str) -> CString {
 // ---------------------------------------------------------------------------
 
 unsafe fn write_field_schema(out: *mut ArrowSchema, name: &str, ch_type: &ChType) {
+    // A top-level name-decoration alias (SimpleAggregateFunction, geo, Nested)
+    // exports exactly as the physical type it delegates to, so expand and recurse
+    // once here. A `Nullable(Point)` is NOT caught here (Nullable has no
+    // delegate); its inner geo alias is expanded in the children match below,
+    // while `arrow_format` and `field_is_nullable` handle the Nullable wrapper.
+    if let Some(under) = ch_type.physical_delegate() {
+        write_field_schema(out, name, &under);
+        return;
+    }
+
     let format = cstring_lossy(&arrow_format(ch_type));
     let name_cstr = cstring_lossy(name);
 
@@ -414,7 +439,13 @@ unsafe fn write_field_schema(out: *mut ArrowSchema, name: &str, ch_type: &ChType
     // emits its element children (an `Array` is never inside a `Nullable`, so
     // its arm is unaffected by the unwrap).
     let mut children: Vec<*mut ArrowSchema> = Vec::new();
-    match ch_type.inner() {
+    // Expand a name-decoration alias sitting directly inside a `Nullable`
+    // (`Nullable(Point)` -> `Tuple`) so its element children are emitted. A
+    // top-level alias was already expanded and recursed above, so this only
+    // matters for the one alias legal under `Nullable`, `Point`.
+    let inner_delegate = ch_type.inner().physical_delegate();
+    let inner_type = inner_delegate.as_ref().unwrap_or_else(|| ch_type.inner());
+    match inner_type {
         // An `Array(T)` LargeList field: one conventionally-named `item` child.
         ChType::Array(inner) => {
             // Safety: an all-zero `ArrowSchema` is a valid initial value, the same
@@ -871,8 +902,10 @@ mod tests {
     use super::*;
     use crate::batch::ColBatch;
     use crate::bitmap::Bitmap;
-    use crate::column::{Column, PrimitiveColumn, Utf8Column};
-    use crate::schema::{ChType, Field, Schema};
+    use crate::column::{
+        ArrayColumn, Column, DictionaryColumn, PrimitiveColumn, TupleColumn, Utf8Column,
+    };
+    use crate::schema::{ChType, Field, GeoKind, Schema};
     use std::ffi::CStr;
 
     fn make_test_batch() -> Arc<ColBatch> {
@@ -1099,6 +1132,53 @@ mod tests {
             )))),
             "i"
         );
+    }
+
+    #[test]
+    fn test_export_low_cardinality_saf_nullable_string_schema() {
+        use crate::column::DictionaryColumn;
+
+        // LowCardinality(SimpleAggregateFunction(anyLast, Nullable(String))) must
+        // export exactly like LowCardinality(Nullable(String)): field format `i`,
+        // the index-level nullable flag set (nulls live in the index validity),
+        // and a non-nullable `u` (String) dictionary child. The SAF chain between
+        // the LC and its removeNullable Nullable is resolved through the shared
+        // `low_cardinality_dict_value_type` helper.
+        let schema = Schema::new(vec![Field {
+            name: "lc_nsaf".into(),
+            ch_type: ChType::LowCardinality(Box::new(ChType::SimpleAggregateFunction {
+                func: "anyLast".into(),
+                inner: Box::new(ChType::Nullable(Box::new(ChType::String))),
+            })),
+        }]);
+        let values = Column::Utf8(crate::column::Utf8Column::new(vec![0], vec![]));
+        let dict = DictionaryColumn::new_nullable(
+            vec![],
+            values,
+            crate::bitmap::Bitmap::from_ch_null_map(&[]),
+        );
+        let batch = Arc::new(ColBatch::new(schema, vec![Column::Dictionary(dict)], 0));
+
+        unsafe {
+            let mut schema_out: ArrowSchema = std::mem::zeroed();
+            export_schema(&batch.schema, &mut schema_out);
+            let c0 = &**schema_out.children.add(0);
+            assert_eq!(CStr::from_ptr(c0.format).to_str().unwrap(), "i");
+            assert_eq!(
+                c0.flags & 2,
+                2,
+                "nullable flag set for LC(SAF(_, Nullable(String)))"
+            );
+            assert!(!c0.dictionary.is_null(), "dictionary child present");
+            let dict_schema = &*c0.dictionary;
+            assert_eq!(CStr::from_ptr(dict_schema.format).to_str().unwrap(), "u");
+            assert_eq!(
+                dict_schema.flags & 2,
+                0,
+                "dictionary values are non-nullable; nulls live in the index validity"
+            );
+            (schema_out.release.unwrap())(&mut schema_out);
+        }
     }
 
     #[test]
@@ -2390,6 +2470,179 @@ mod tests {
             assert_eq!(*vals.add(2), 2);
 
             (array.release.unwrap())(&mut array);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // SimpleAggregateFunction / geo aliases / Nested Arrow export
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_arrow_format_name_decoration_delegates() {
+        // Each alias reports the Arrow format of the physical type it delegates to.
+        assert_eq!(
+            arrow_format(&ChType::SimpleAggregateFunction {
+                func: "sum".into(),
+                inner: Box::new(ChType::Float64),
+            }),
+            "g"
+        );
+        assert_eq!(
+            arrow_format(&ChType::SimpleAggregateFunction {
+                func: "anyLast".into(),
+                inner: Box::new(ChType::LowCardinality(Box::new(ChType::String))),
+            }),
+            "i" // dictionary index type
+        );
+        assert_eq!(arrow_format(&ChType::Geo(GeoKind::Point)), "+s");
+        assert_eq!(arrow_format(&ChType::Geo(GeoKind::Ring)), "+L");
+        assert_eq!(arrow_format(&ChType::Geo(GeoKind::MultiPolygon)), "+L");
+        assert_eq!(
+            arrow_format(&ChType::Nested(vec![("a".into(), ChType::UInt32)])),
+            "+L"
+        );
+    }
+
+    #[test]
+    fn test_export_point_schema_and_array() {
+        // Point exports as an Arrow struct of two float64 children (unnamed tuple
+        // elements are named by 1-based position).
+        let schema = Schema::new(vec![Field {
+            name: "p".into(),
+            ch_type: ChType::Geo(GeoKind::Point),
+        }]);
+        let columns = vec![Column::Tuple(TupleColumn::new(
+            vec![
+                Column::Float64(PrimitiveColumn::new(vec![1.0, 3.0])),
+                Column::Float64(PrimitiveColumn::new(vec![2.0, 4.0])),
+            ],
+            2,
+        ))];
+        let batch = Arc::new(ColBatch::new(schema, columns, 2));
+        unsafe {
+            let mut schema_out: ArrowSchema = std::mem::zeroed();
+            export_schema(&batch.schema, &mut schema_out);
+            let p = &**schema_out.children.add(0);
+            assert_eq!(CStr::from_ptr(p.format).to_str().unwrap(), "+s");
+            assert_eq!(p.n_children, 2);
+            let x = &**p.children.add(0);
+            let y = &**p.children.add(1);
+            assert_eq!(CStr::from_ptr(x.format).to_str().unwrap(), "g");
+            assert_eq!(CStr::from_ptr(y.format).to_str().unwrap(), "g");
+            assert_eq!(CStr::from_ptr(x.name).to_str().unwrap(), "1");
+            assert_eq!(CStr::from_ptr(y.name).to_str().unwrap(), "2");
+            (schema_out.release.unwrap())(&mut schema_out);
+
+            let mut array: ArrowArray = std::mem::zeroed();
+            export_batch_array(&batch, &mut array);
+            let p = &**array.children.add(0);
+            assert_eq!(p.length, 2);
+            assert_eq!(p.n_children, 2);
+            (array.release.unwrap())(&mut array);
+        }
+    }
+
+    #[test]
+    fn test_export_nullable_point_schema() {
+        // Nullable(Point) sets the struct's nullable flag while still emitting its
+        // two element children.
+        let schema = Schema::new(vec![Field {
+            name: "p".into(),
+            ch_type: ChType::Nullable(Box::new(ChType::Geo(GeoKind::Point))),
+        }]);
+        let columns = vec![Column::Tuple(TupleColumn::new_nullable(
+            vec![
+                Column::Float64(PrimitiveColumn::new(vec![1.0, 0.0])),
+                Column::Float64(PrimitiveColumn::new(vec![2.0, 0.0])),
+            ],
+            2,
+            Bitmap::from_ch_null_map(&[0, 1]),
+        ))];
+        let batch = Arc::new(ColBatch::new(schema, columns, 2));
+        unsafe {
+            let mut schema_out: ArrowSchema = std::mem::zeroed();
+            export_schema(&batch.schema, &mut schema_out);
+            let p = &**schema_out.children.add(0);
+            assert_eq!(CStr::from_ptr(p.format).to_str().unwrap(), "+s");
+            assert_eq!(p.flags & 2, 2, "nullable flag set for Nullable(Point)");
+            assert_eq!(p.n_children, 2);
+            (schema_out.release.unwrap())(&mut schema_out);
+        }
+    }
+
+    #[test]
+    fn test_export_nested_schema() {
+        // Nested exports as a LargeList of a struct whose children carry the
+        // Nested field names verbatim.
+        let schema = Schema::new(vec![Field {
+            name: "n".into(),
+            ch_type: ChType::Nested(vec![
+                ("a".into(), ChType::UInt32),
+                ("b".into(), ChType::String),
+            ]),
+        }]);
+        let entries = Column::Tuple(TupleColumn::new(
+            vec![
+                Column::UInt32(PrimitiveColumn::new(vec![10, 20])),
+                Column::Utf8(Utf8Column::new(vec![0, 1, 2], b"xy".to_vec())),
+            ],
+            2,
+        ));
+        let columns = vec![Column::Array(ArrayColumn::new(vec![0, 2], entries))];
+        let batch = Arc::new(ColBatch::new(schema, columns, 1));
+        unsafe {
+            let mut schema_out: ArrowSchema = std::mem::zeroed();
+            export_schema(&batch.schema, &mut schema_out);
+            let n = &**schema_out.children.add(0);
+            assert_eq!(CStr::from_ptr(n.format).to_str().unwrap(), "+L");
+            assert_eq!(n.n_children, 1);
+            let item = &**n.children.add(0);
+            assert_eq!(CStr::from_ptr(item.format).to_str().unwrap(), "+s");
+            assert_eq!(CStr::from_ptr(item.name).to_str().unwrap(), "item");
+            assert_eq!(item.n_children, 2);
+            let a = &**item.children.add(0);
+            let b = &**item.children.add(1);
+            assert_eq!(CStr::from_ptr(a.name).to_str().unwrap(), "a");
+            assert_eq!(CStr::from_ptr(a.format).to_str().unwrap(), "I");
+            assert_eq!(CStr::from_ptr(b.name).to_str().unwrap(), "b");
+            assert_eq!(CStr::from_ptr(b.format).to_str().unwrap(), "u");
+            (schema_out.release.unwrap())(&mut schema_out);
+        }
+    }
+
+    #[test]
+    fn test_export_simple_aggregate_function_over_low_cardinality_schema() {
+        // SAF over LowCardinality(Nullable(String)) exports as a dictionary field
+        // (index format `i`, a `u` dictionary child, the nullable flag set).
+        let schema = Schema::new(vec![Field {
+            name: "s".into(),
+            ch_type: ChType::SimpleAggregateFunction {
+                func: "anyLast".into(),
+                inner: Box::new(ChType::LowCardinality(Box::new(ChType::Nullable(
+                    Box::new(ChType::String),
+                )))),
+            },
+        }]);
+        let columns = vec![Column::Dictionary(DictionaryColumn::new_nullable(
+            vec![1, 0],
+            Column::Utf8(Utf8Column::new(vec![0, 0, 6], b"user_1".to_vec())),
+            Bitmap::from_ch_null_map(&[0, 1]),
+        ))];
+        let batch = Arc::new(ColBatch::new(schema, columns, 2));
+        unsafe {
+            let mut schema_out: ArrowSchema = std::mem::zeroed();
+            export_schema(&batch.schema, &mut schema_out);
+            let s = &**schema_out.children.add(0);
+            assert_eq!(CStr::from_ptr(s.format).to_str().unwrap(), "i");
+            assert_eq!(
+                s.flags & 2,
+                2,
+                "nullable flag set for SAF over LC(Nullable)"
+            );
+            assert!(!s.dictionary.is_null(), "dictionary child present");
+            let dict = &*s.dictionary;
+            assert_eq!(CStr::from_ptr(dict.format).to_str().unwrap(), "u");
+            (schema_out.release.unwrap())(&mut schema_out);
         }
     }
 }

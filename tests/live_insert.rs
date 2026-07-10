@@ -34,10 +34,11 @@ use ch_core_rs::column::{
 };
 use ch_core_rs::native::decode::{decode_all_bytes, DecodeOptions};
 use ch_core_rs::native::encode::{encode_block, EncodeOptions};
-use ch_core_rs::schema::{ChType, Field, Schema};
+use ch_core_rs::schema::{ChType, Field, GeoKind, Schema};
 
 const TABLE: &str = "ch_core_rs_encode_test";
 const LC_U16_TABLE: &str = "ch_core_rs_encode_lc_u16_test";
+const GSN_TABLE: &str = "ch_core_rs_encode_gsn_test";
 
 /// Build a `Utf8Column` from raw byte values, computing Arrow offsets the same
 /// way the decoder does.
@@ -700,6 +701,205 @@ fn lc_fixed_string_u16_batch() -> ColBatch {
     ColBatch::new(Schema::new(fields), columns, 260)
 }
 
+/// A focused batch of the name-decoration alias types:
+/// `SimpleAggregateFunction`, the geo aliases, and `Nested`. Each is a custom
+/// name over a physical type whose serialization slot is null, so the encoder
+/// writes the alias spelling in the header and the underlying type's body; the
+/// physical `Column` shape here is exactly that underlying type. `i32` is
+/// strictly ascending so `ORDER BY i32` on readback matches insertion order.
+fn geo_saf_nested_batch() -> ColBatch {
+    // 0x00 = valid, 0x01 = null: valid, null, valid, null.
+    let validity = || Bitmap::from_ch_null_map(&[0, 1, 0, 1]);
+
+    let fields = vec![
+        Field {
+            name: "i32".into(),
+            ch_type: ChType::Int32,
+        },
+        // SimpleAggregateFunction over a scalar: delegates to Float64.
+        Field {
+            name: "saf_sum".into(),
+            ch_type: ChType::SimpleAggregateFunction {
+                func: "sum".into(),
+                inner: Box::new(ChType::Float64),
+            },
+        },
+        // SimpleAggregateFunction over LowCardinality(Nullable(String)):
+        // delegates to the LC dictionary, exactly a bare LC on the wire.
+        Field {
+            name: "saf_lc".into(),
+            ch_type: ChType::SimpleAggregateFunction {
+                func: "anyLast".into(),
+                inner: Box::new(ChType::LowCardinality(Box::new(ChType::Nullable(
+                    Box::new(ChType::String),
+                )))),
+            },
+        },
+        // Point = Tuple(Float64, Float64).
+        Field {
+            name: "point".into(),
+            ch_type: ChType::Geo(GeoKind::Point),
+        },
+        // Nullable(Point): a Nullable over the Point tuple.
+        Field {
+            name: "npoint".into(),
+            ch_type: ChType::Nullable(Box::new(ChType::Geo(GeoKind::Point))),
+        },
+        // Ring = Array(Point).
+        Field {
+            name: "ring".into(),
+            ch_type: ChType::Geo(GeoKind::Ring),
+        },
+        // MultiPolygon = Array(Array(Array(Point))), three Array levels.
+        Field {
+            name: "mpoly".into(),
+            ch_type: ChType::Geo(GeoKind::MultiPolygon),
+        },
+        // Nested(x UInt32, y String) = Array(Tuple(named x, y)).
+        Field {
+            name: "nst".into(),
+            ch_type: ChType::Nested(vec![
+                ("x".into(), ChType::UInt32),
+                ("y".into(), ChType::String),
+            ]),
+        },
+        // Nullable(SimpleAggregateFunction(sum, UInt64)): the SAF is name
+        // decoration inside the Nullable, delegating to Nullable(UInt64).
+        Field {
+            name: "nsaf".into(),
+            ch_type: ChType::Nullable(Box::new(ChType::SimpleAggregateFunction {
+                func: "sum".into(),
+                inner: Box::new(ChType::UInt64),
+            })),
+        },
+        // Tuple(v SimpleAggregateFunction(sum, UInt64)): the SAF sits in a named
+        // Tuple element, delegating to a one-field UInt64 tuple.
+        Field {
+            name: "tsaf".into(),
+            ch_type: ChType::Tuple(vec![(
+                Some("v".into()),
+                ChType::SimpleAggregateFunction {
+                    func: "sum".into(),
+                    inner: Box::new(ChType::UInt64),
+                },
+            )]),
+        },
+        // LowCardinality(SimpleAggregateFunction(anyLast, Nullable(String))): the
+        // SAF name decoration sits BETWEEN the LowCardinality and its
+        // removeNullable Nullable, so encode must resolve the full SAF chain to
+        // treat the column as nullable and write the bare String dictionary body.
+        // This is a real server header confirmed live at v26.6.1.1193-stable.
+        Field {
+            name: "lc_nsaf".into(),
+            ch_type: ChType::LowCardinality(Box::new(ChType::SimpleAggregateFunction {
+                func: "anyLast".into(),
+                inner: Box::new(ChType::Nullable(Box::new(ChType::String))),
+            })),
+        },
+    ];
+
+    let columns = vec![
+        Column::Int32(PrimitiveColumn::new(vec![0, 1, 2, 3])),
+        // saf_sum -> Float64 buffer.
+        Column::Float64(PrimitiveColumn::new(vec![-1.25, 0.0, 13.0, 79.125])),
+        // saf_lc -> nullable dictionary: rows resolve user_1, NULL, user_2, NULL.
+        // Slot 0 is the null sentinel; validity marks rows 1 and 3 null.
+        Column::Dictionary(DictionaryColumn::new_nullable(
+            vec![1, 0, 2, 0],
+            Column::Utf8(utf8_column(&[b"", b"user_1", b"user_2"])),
+            validity(),
+        )),
+        // point -> Tuple(Float64 x, Float64 y). Rows (13, 79), (-1.5, 2.5),
+        // (0, 0), (79.125, -13.25).
+        Column::Tuple(TupleColumn::new(
+            vec![
+                Column::Float64(PrimitiveColumn::new(vec![13.0, -1.5, 0.0, 79.125])),
+                Column::Float64(PrimitiveColumn::new(vec![79.0, 2.5, 0.0, -13.25])),
+            ],
+            4,
+        )),
+        // npoint -> Tuple with a tuple-level null map; null rows carry element
+        // placeholders. Valid rows 0 and 2 are (13, 79) and (1.25, -2.5).
+        Column::Tuple(TupleColumn::new_nullable(
+            vec![
+                Column::Float64(PrimitiveColumn::new(vec![13.0, 0.0, 1.25, 0.0])),
+                Column::Float64(PrimitiveColumn::new(vec![79.0, 0.0, -2.5, 0.0])),
+            ],
+            4,
+            validity(),
+        )),
+        // ring -> Array(Tuple). Rows [(13, 79)] / [] / [(1, 2), (3, 4)] /
+        // [(-1.5, -2.5)] -> offsets [0, 1, 1, 3, 4].
+        Column::Array(ArrayColumn::new(
+            vec![0, 1, 1, 3, 4],
+            Column::Tuple(TupleColumn::new(
+                vec![
+                    Column::Float64(PrimitiveColumn::new(vec![13.0, 1.0, 3.0, -1.5])),
+                    Column::Float64(PrimitiveColumn::new(vec![79.0, 2.0, 4.0, -2.5])),
+                ],
+                4,
+            )),
+        )),
+        // mpoly -> Array(Array(Array(Tuple))). Rows [[[(13, 79)]]] / [] /
+        // [[[(1, 2), (3, 4)], [(5, 6)]]] / [[[(-1, -2)]], [[(7, 8)]]]. Outer
+        // offsets [0, 1, 1, 2, 4], mid [0, 1, 3, 4, 5], inner [0, 1, 3, 4, 5, 6].
+        Column::Array(ArrayColumn::new(
+            vec![0, 1, 1, 2, 4],
+            Column::Array(ArrayColumn::new(
+                vec![0, 1, 3, 4, 5],
+                Column::Array(ArrayColumn::new(
+                    vec![0, 1, 3, 4, 5, 6],
+                    Column::Tuple(TupleColumn::new(
+                        vec![
+                            Column::Float64(PrimitiveColumn::new(vec![
+                                13.0, 1.0, 3.0, 5.0, -1.0, 7.0,
+                            ])),
+                            Column::Float64(PrimitiveColumn::new(vec![
+                                79.0, 2.0, 4.0, 6.0, -2.0, 8.0,
+                            ])),
+                        ],
+                        6,
+                    )),
+                )),
+            )),
+        )),
+        // nst -> Array(Tuple(UInt32, String)). Rows [(13, user_1)] / [] /
+        // [(79, a), (1, user_2)] / [(2, x)] -> offsets [0, 1, 1, 3, 4].
+        Column::Array(ArrayColumn::new(
+            vec![0, 1, 1, 3, 4],
+            Column::Tuple(TupleColumn::new(
+                vec![
+                    Column::UInt32(PrimitiveColumn::new(vec![13, 79, 1, 2])),
+                    Column::Utf8(utf8_column(&[b"user_1", b"a", b"user_2", b"x"])),
+                ],
+                4,
+            )),
+        )),
+        // nsaf -> nullable UInt64: valid, null, valid, null -> [13, 0, 79, 0];
+        // null rows carry the server's placeholder 0 after the null map.
+        Column::UInt64(PrimitiveColumn {
+            values: vec![13, 0, 79, 0],
+            validity: Some(validity()),
+        }),
+        // tsaf -> one-field UInt64 tuple. Values 13, 26, 39, 52.
+        Column::Tuple(TupleColumn::new(
+            vec![Column::UInt64(PrimitiveColumn::new(vec![13, 26, 39, 52]))],
+            4,
+        )),
+        // lc_nsaf -> nullable dictionary: rows resolve user_1, NULL, user_2, NULL.
+        // Slot 0 is the null sentinel; validity marks rows 1 and 3 null. Identical
+        // wire body to a bare LowCardinality(Nullable(String)) once the SAF chain
+        // is resolved.
+        Column::Dictionary(DictionaryColumn::new_nullable(
+            vec![1, 0, 2, 0],
+            Column::Utf8(utf8_column(&[b"", b"user_1", b"user_2"])),
+            validity(),
+        )),
+    ];
+
+    ColBatch::new(Schema::new(fields), columns, 4)
+}
+
 struct Server {
     base_url: String,
     user: String,
@@ -1081,6 +1281,74 @@ fn low_cardinality_fixed_string_u16_dictionary_roundtrips_through_server() {
     .expect("decode server Native response");
 
     server.ddl(&format!("DROP TABLE IF EXISTS {LC_U16_TABLE}"));
+
+    assert_eq!(decoded.num_rows(), batch.num_rows, "row count from server");
+    assert_eq!(
+        decoded.num_columns(),
+        batch.num_columns(),
+        "column count from server"
+    );
+
+    let sent = single_block(&batch);
+    for col in 0..batch.num_columns() {
+        assert_eq!(
+            column_repr(&decoded, col),
+            column_repr(&sent, col),
+            "column {col} ({}) differs after server round-trip",
+            batch.schema.fields[col].name
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a live ClickHouse server matching .server-ref; run with --ignored"]
+fn geo_saf_nested_roundtrip_through_server() {
+    let server = Server::from_env();
+    let batch = geo_saf_nested_batch();
+
+    server.ddl(&format!("DROP TABLE IF EXISTS {GSN_TABLE}"));
+    // The Nested column needs flatten_nested = 0 so the literal Nested type is the
+    // column type (not flattened into nst.x / nst.y siblings); Nullable(Point)
+    // needs enable_nullable_tuple_type. Both are creation-time gates with no wire
+    // effect. allow_suspicious_low_cardinality_types is harmless here (the LC
+    // inner is a plain String) and kept for symmetry with the other tests.
+    server.ddl_with_params(
+        &format!(
+            "CREATE TABLE {GSN_TABLE} (\
+         i32 Int32, \
+         saf_sum SimpleAggregateFunction(sum, Float64), \
+         saf_lc SimpleAggregateFunction(anyLast, LowCardinality(Nullable(String))), \
+         point Point, npoint Nullable(Point), ring Ring, mpoly MultiPolygon, \
+         nst Nested(x UInt32, y String), \
+         nsaf Nullable(SimpleAggregateFunction(sum, UInt64)), \
+         tsaf Tuple(v SimpleAggregateFunction(sum, UInt64)), \
+         lc_nsaf LowCardinality(SimpleAggregateFunction(anyLast, Nullable(String)))) ENGINE = Memory"
+        ),
+        "?flatten_nested=0&enable_nullable_tuple_type=1&allow_suspicious_low_cardinality_types=1",
+    );
+
+    let bytes = encode_block(
+        &batch,
+        &EncodeOptions {
+            protocol_revision: 0,
+        },
+    )
+    .expect("encode geo/SAF/Nested batch");
+    server.insert_native_into(GSN_TABLE, &bytes);
+
+    let native = server.select(&format!(
+        "SELECT i32, saf_sum, saf_lc, point, npoint, ring, mpoly, nst, nsaf, tsaf, lc_nsaf \
+         FROM {GSN_TABLE} ORDER BY i32 FORMAT Native"
+    ));
+    let decoded = decode_all_bytes(
+        &native,
+        &DecodeOptions {
+            protocol_revision: 0,
+        },
+    )
+    .expect("decode server Native response");
+
+    server.ddl(&format!("DROP TABLE IF EXISTS {GSN_TABLE}"));
 
     assert_eq!(decoded.num_rows(), batch.num_rows, "row count from server");
     assert_eq!(
