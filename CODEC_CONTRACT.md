@@ -240,42 +240,42 @@ than an error.
 
 ## Supported types matrix
 
-| ClickHouse type   | ChType           | Column variant    | Arrow format | Arrow buffers (in order)    | Nullable |
-|-------------------|------------------|-------------------|--------------|-----------------------------|----------|
-| `Bool`, `Boolean` | `Bool`           | `Bool`            | `b`          | validity, data bits         | yes      |
-| `Int8`            | `Int8`           | `Int8`            | `c`          | validity, values            | yes      |
-| `Int16`           | `Int16`          | `Int16`           | `s`          | validity, values            | yes      |
-| `Int32`           | `Int32`          | `Int32`           | `i`          | validity, values            | yes      |
-| `Int64`           | `Int64`          | `Int64`           | `l`          | validity, values            | yes      |
-| `UInt8`           | `UInt8`          | `UInt8`           | `C`          | validity, values            | yes      |
-| `UInt16`          | `UInt16`         | `UInt16`          | `S`          | validity, values            | yes      |
-| `UInt32`          | `UInt32`         | `UInt32`          | `I`          | validity, values            | yes      |
-| `UInt64`          | `UInt64`         | `UInt64`          | `L`          | validity, values            | yes      |
-| `Float32`         | `Float32`        | `Float32`         | `f`          | validity, values            | yes      |
-| `Float64`         | `Float64`        | `Float64`         | `g`          | validity, values            | yes      |
-| `String`          | `String`         | `Utf8`            | `u`          | validity, offsets, data     | yes      |
-| `FixedString(N)`  | `FixedString(N)` | `FixedBinary`     | `w:N`        | validity, data              | yes      |
-| `UUID`            | `Uuid`           | `Uuid`            | `w:16`       | validity, data              | yes      |
-| `IPv4`            | `Ipv4`           | `Ipv4`            | `I`          | validity, values            | yes      |
-| `IPv6`            | `Ipv6`           | `Ipv6`            | `w:16`       | validity, data              | yes      |
-| `Enum8(...)`      | `Enum8 { variants }`  | `Enum8`      | `c`          | validity, values            | yes      |
-| `Enum16(...)`     | `Enum16 { variants }` | `Enum16`     | `s`          | validity, values            | yes      |
-| `Decimal(P, S)`   | `Decimal { precision, scale, bits }` | `Decimal` | `d:P,S` (128-bit) or `d:P,S,bits` (32/64/256-bit) | validity, data | yes |
-| `Int128`          | `Int128`         | `Int128`          | `w:16`       | validity, data              | yes      |
-| `UInt128`         | `UInt128`        | `UInt128`         | `w:16`       | validity, data              | yes      |
-| `Int256`          | `Int256`         | `Int256`          | `w:32`       | validity, data              | yes      |
-| `UInt256`         | `UInt256`        | `UInt256`         | `w:32`       | validity, data              | yes      |
-| `Date`            | `Date`           | `Date`            | `S`          | validity, values            | yes      |
-| `Date32`          | `Date32`         | `Date32`          | `tdD`        | validity, values            | yes      |
-| `DateTime`, `DateTime('<tz>')` | `DateTime { timezone }` | `DateTime` | `I` | validity, values         | yes      |
-| `DateTime64(P)`, `DateTime64(P, '<tz>')` | `DateTime64 { precision, timezone }` | `DateTime64` | `ts{unit}:{tz}` for P in {0,3,6,9}, else `l` | validity, values | yes |
-| `Time`            | `Time`           | `Time`            | `i`          | validity, values            | yes      |
-| `Time64(P)`       | `Time64 { precision }` | `Time64`     | `l`          | validity, values            | yes      |
-| `Nullable(T)`     | `Nullable(T)`    | inner T's variant | inner's      | inner's, validity populated | n/a      |
-| `LowCardinality(T)` for an allowed inner `T` (see the type section) | `LowCardinality(Box<ChType>)` | `Dictionary` | `i` (index type; values type in the dictionary child) | validity, i32 indices (+ dictionary child) | via inner `Nullable` |
-| `Array(T)` for any supported element `T` | `Array(Box<ChType>)` | `Array` | `+L` (LargeList; element type in the item child) | validity, i64 offsets (+ item child) | no (array level); element nulls via `Array(Nullable(T))` |
-| `Tuple(T1, ...)` / `Tuple(name1 T1, ...)` for supported element types, incl. `Tuple()` | `Tuple(Vec<(Option<String>, ChType)>)` | `Tuple` | `+s` (struct; element types in the children) | validity (one child per element) | yes (`Nullable(Tuple(...))` is legal) |
-| `Map(K, V)` for a legal key type and supported `K`/`V` | `Map(Box<ChType>, Box<ChType>)` | `Map` | `+L` (LargeList of an `entries` struct with `key`/`value` children) | validity, i64 offsets (+ entries child) | no (map level); value nulls via `Map(K, Nullable(V))` |
+| ClickHouse type                                                                        | ChType                                 | Column variant    | Arrow format                                                        | Arrow buffers (in order)                   | Nullable                                                 |
+|----------------------------------------------------------------------------------------|----------------------------------------|-------------------|---------------------------------------------------------------------|--------------------------------------------|----------------------------------------------------------|
+| `Bool`, `Boolean`                                                                      | `Bool`                                 | `Bool`            | `b`                                                                 | validity, data bits                        | yes                                                      |
+| `Int8`                                                                                 | `Int8`                                 | `Int8`            | `c`                                                                 | validity, values                           | yes                                                      |
+| `Int16`                                                                                | `Int16`                                | `Int16`           | `s`                                                                 | validity, values                           | yes                                                      |
+| `Int32`                                                                                | `Int32`                                | `Int32`           | `i`                                                                 | validity, values                           | yes                                                      |
+| `Int64`                                                                                | `Int64`                                | `Int64`           | `l`                                                                 | validity, values                           | yes                                                      |
+| `UInt8`                                                                                | `UInt8`                                | `UInt8`           | `C`                                                                 | validity, values                           | yes                                                      |
+| `UInt16`                                                                               | `UInt16`                               | `UInt16`          | `S`                                                                 | validity, values                           | yes                                                      |
+| `UInt32`                                                                               | `UInt32`                               | `UInt32`          | `I`                                                                 | validity, values                           | yes                                                      |
+| `UInt64`                                                                               | `UInt64`                               | `UInt64`          | `L`                                                                 | validity, values                           | yes                                                      |
+| `Float32`                                                                              | `Float32`                              | `Float32`         | `f`                                                                 | validity, values                           | yes                                                      |
+| `Float64`                                                                              | `Float64`                              | `Float64`         | `g`                                                                 | validity, values                           | yes                                                      |
+| `String`                                                                               | `String`                               | `Utf8`            | `u`                                                                 | validity, offsets, data                    | yes                                                      |
+| `FixedString(N)`                                                                       | `FixedString(N)`                       | `FixedBinary`     | `w:N`                                                               | validity, data                             | yes                                                      |
+| `UUID`                                                                                 | `Uuid`                                 | `Uuid`            | `w:16`                                                              | validity, data                             | yes                                                      |
+| `IPv4`                                                                                 | `Ipv4`                                 | `Ipv4`            | `I`                                                                 | validity, values                           | yes                                                      |
+| `IPv6`                                                                                 | `Ipv6`                                 | `Ipv6`            | `w:16`                                                              | validity, data                             | yes                                                      |
+| `Enum8(...)`                                                                           | `Enum8 { variants }`                   | `Enum8`           | `c`                                                                 | validity, values                           | yes                                                      |
+| `Enum16(...)`                                                                          | `Enum16 { variants }`                  | `Enum16`          | `s`                                                                 | validity, values                           | yes                                                      |
+| `Decimal(P, S)`                                                                        | `Decimal { precision, scale, bits }`   | `Decimal`         | `d:P,S` (128-bit) or `d:P,S,bits` (32/64/256-bit)                   | validity, data                             | yes                                                      |
+| `Int128`                                                                               | `Int128`                               | `Int128`          | `w:16`                                                              | validity, data                             | yes                                                      |
+| `UInt128`                                                                              | `UInt128`                              | `UInt128`         | `w:16`                                                              | validity, data                             | yes                                                      |
+| `Int256`                                                                               | `Int256`                               | `Int256`          | `w:32`                                                              | validity, data                             | yes                                                      |
+| `UInt256`                                                                              | `UInt256`                              | `UInt256`         | `w:32`                                                              | validity, data                             | yes                                                      |
+| `Date`                                                                                 | `Date`                                 | `Date`            | `S`                                                                 | validity, values                           | yes                                                      |
+| `Date32`                                                                               | `Date32`                               | `Date32`          | `tdD`                                                               | validity, values                           | yes                                                      |
+| `DateTime`, `DateTime('<tz>')`                                                         | `DateTime { timezone }`                | `DateTime`        | `I`                                                                 | validity, values                           | yes                                                      |
+| `DateTime64(P)`, `DateTime64(P, '<tz>')`                                               | `DateTime64 { precision, timezone }`   | `DateTime64`      | `ts{unit}:{tz}` for P in {0,3,6,9}, else `l`                        | validity, values                           | yes                                                      |
+| `Time`                                                                                 | `Time`                                 | `Time`            | `i`                                                                 | validity, values                           | yes                                                      |
+| `Time64(P)`                                                                            | `Time64 { precision }`                 | `Time64`          | `l`                                                                 | validity, values                           | yes                                                      |
+| `Nullable(T)`                                                                          | `Nullable(T)`                          | inner T's variant | inner's                                                             | inner's, validity populated                | n/a                                                      |
+| `LowCardinality(T)` for an allowed inner `T` (see the type section)                    | `LowCardinality(Box<ChType>)`          | `Dictionary`      | `i` (index type; values type in the dictionary child)               | validity, i32 indices (+ dictionary child) | via inner `Nullable`                                     |
+| `Array(T)` for any supported element `T`                                               | `Array(Box<ChType>)`                   | `Array`           | `+L` (LargeList; element type in the item child)                    | validity, i64 offsets (+ item child)       | no (array level); element nulls via `Array(Nullable(T))` |
+| `Tuple(T1, ...)` / `Tuple(name1 T1, ...)` for supported element types, incl. `Tuple()` | `Tuple(Vec<(Option<String>, ChType)>)` | `Tuple`           | `+s` (struct; element types in the children)                        | validity (one child per element)           | yes (`Nullable(Tuple(...))` is legal)                    |
+| `Map(K, V)` for a legal key type and supported `K`/`V`                                 | `Map(Box<ChType>, Box<ChType>)`        | `Map`             | `+L` (LargeList of an `entries` struct with `key`/`value` children) | validity, i64 offsets (+ entries child)    | no (map level); value nulls via `Map(K, Nullable(V))`    |
 
 Any type not in this matrix is rejected. See "Unsupported types" below.
 
@@ -746,14 +746,14 @@ zero effect on the wire bytes.
 
 **Type string(s) and per-type details:**
 
-| Type string                              | Logical type                          | Wire element | Column variant | Bytes/row |
-|------------------------------------------|---------------------------------------|--------------|----------------|-----------|
-| `Date`                                   | `ChType::Date`                        | `u16`        | `Date`         | 2         |
-| `Date32`                                 | `ChType::Date32`                      | `i32`        | `Date32`       | 4         |
-| `DateTime`, `DateTime('<tz>')`           | `ChType::DateTime { timezone }`       | `u32`        | `DateTime`     | 4         |
-| `DateTime64(P)`, `DateTime64(P, '<tz>')` | `ChType::DateTime64 { precision, timezone }` | `i64` | `DateTime64`   | 8         |
-| `Time`                                   | `ChType::Time`                        | `i32`        | `Time`         | 4         |
-| `Time64(P)`                              | `ChType::Time64 { precision }`        | `i64`        | `Time64`       | 8         |
+| Type string                              | Logical type                                 | Wire element | Column variant | Bytes/row |
+|------------------------------------------|----------------------------------------------|--------------|----------------|-----------|
+| `Date`                                   | `ChType::Date`                               | `u16`        | `Date`         | 2         |
+| `Date32`                                 | `ChType::Date32`                             | `i32`        | `Date32`       | 4         |
+| `DateTime`, `DateTime('<tz>')`           | `ChType::DateTime { timezone }`              | `u32`        | `DateTime`     | 4         |
+| `DateTime64(P)`, `DateTime64(P, '<tz>')` | `ChType::DateTime64 { precision, timezone }` | `i64`        | `DateTime64`   | 8         |
+| `Time`                                   | `ChType::Time`                               | `i32`        | `Time`         | 4         |
+| `Time64(P)`                              | `ChType::Time64 { precision }`               | `i64`        | `Time64`       | 8         |
 
 `parse_ch_type` reads the optional timezone as the single-quoted contents of the
 type string (`None` when absent), and the `DateTime64` precision `P` as the
