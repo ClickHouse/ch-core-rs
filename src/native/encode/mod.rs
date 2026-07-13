@@ -30,12 +30,14 @@ use crate::column::{
 };
 use crate::schema::{ChType, Field};
 
-use super::decode::{
-    decimal_bits_from_precision, is_low_cardinality_inner, is_simple_aggregate_func_spelling,
-    is_valid_map_key_type, low_cardinality_dict_value_type, parse_ch_type,
+use super::protocol::{
     DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION, DBMS_MIN_REVISION_WITH_OUT_OF_ORDER_BUCKETS,
     LC_HAS_ADDITIONAL_KEYS_BIT, LC_NEED_UPDATE_DICTIONARY_BIT, LOW_CARDINALITY_KEY_VERSION,
     MAX_TYPE_DEPTH,
+};
+use super::type_parser::{
+    decimal_bits_from_precision, is_low_cardinality_inner, is_simple_aggregate_func_spelling,
+    is_valid_map_key_type, low_cardinality_dict_value_type, parse_ch_type,
 };
 use super::varint::write_varint;
 
