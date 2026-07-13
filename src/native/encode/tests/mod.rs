@@ -2,6 +2,9 @@ use super::*;
 use crate::bitmap::Bitmap;
 use crate::column::{DecimalColumn, DictionaryColumn, PrimitiveColumn};
 use crate::native::decode::{decode_all_bytes, DecodeOptions, DBMS_TCP_PROTOCOL_VERSION};
+use crate::native::encode::validate::type_depth;
+use crate::native::protocol::MAX_TYPE_DEPTH;
+use crate::native::type_parser::parse_ch_type;
 use crate::schema::{GeoKind, Schema};
 
 mod bool;
