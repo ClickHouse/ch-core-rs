@@ -11,8 +11,9 @@
 //!
 //! Scope: this encodes `Bool`, the fixed-width numeric types (`Int8`..`Int64`,
 //! `UInt8`..`UInt64`, `Float32`, `Float64`), the temporal types (`Date`,
-//! `Date32`, `DateTime`, `DateTime64`, `Time`, `Time64`), `UUID`, `IPv4`,
-//! `IPv6`, `String`, `FixedString(N)`, `Enum8`/`Enum16`, `Decimal(P, S)`, the
+//! `Date32`, `DateTime`, `DateTime64`, `Time`, `Time64`, and all 11
+//! `Interval*` kinds), `UUID`, `IPv4`, `IPv6`, `String`, `FixedString(N)`,
+//! `Enum8`/`Enum16`, `Decimal(P, S)`, the
 //! wide integers (`Int128`/`UInt128`/`Int256`/`UInt256`), `LowCardinality(T)`
 //! for the allowed inner types this crate decodes, `Array(T)` over any
 //! encodable element type (including nested arrays), `Tuple(T1, ...)`
@@ -683,6 +684,11 @@ fn encode_column_body(
         (ChType::Time64 { .. }, Column::Time64(c)) => {
             encode_primitive!(buf, &c.values, i64)
         }
+        // SerializationInterval writes the same contiguous signed Int64 body
+        // for every IntervalKind; the exact unit is carried by the type string.
+        (ChType::Interval(_), Column::Interval(c)) => {
+            encode_primitive!(buf, &c.values, i64)
+        }
         // Enum8/Enum16 are byte-identical to Int8/Int16 on the wire
         // (`SerializationEnum` inherits `SerializationNumber` and overrides no
         // bulk method); the name->value map lives only in the type string
@@ -875,6 +881,7 @@ fn is_encodable(ch_type: &ChType) -> bool {
         | ChType::DateTime64 { .. }
         | ChType::Time
         | ChType::Time64 { .. }
+        | ChType::Interval(_)
         | ChType::Uuid
         | ChType::Ipv4
         | ChType::Ipv6

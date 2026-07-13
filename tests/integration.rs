@@ -1,7 +1,7 @@
 use ch_core_rs::batch::ChunkedBatch;
 use ch_core_rs::column::{Column, FixedBinaryColumn, Utf8Column};
 use ch_core_rs::native::decode::{decode_all_bytes, DecodeOptions, DBMS_TCP_PROTOCOL_VERSION};
-use ch_core_rs::schema::{ChType, GeoKind};
+use ch_core_rs::schema::{ChType, GeoKind, IntervalKind};
 
 /// Declare one `#[test]` per committed Native fixture. Each generated test
 /// decodes the fixture bytes through the public API and runs its asserter, so
@@ -409,6 +409,35 @@ fn assert_all_types(batch: &ChunkedBatch) {
                     func: "anyLast".to_string(),
                     inner: Box::new(ChType::Nullable(Box::new(ChType::String))),
                 })),
+            ),
+            // The 11 Interval* types preserve their exact logical unit over one
+            // shared signed Int64 physical body. Nullable and LowCardinality
+            // representatives exercise the two legal wrappers.
+            Expected::Exact("iy", ChType::Interval(IntervalKind::Year)),
+            Expected::Exact("iq", ChType::Interval(IntervalKind::Quarter)),
+            Expected::Exact("imo", ChType::Interval(IntervalKind::Month)),
+            Expected::Exact("iw", ChType::Interval(IntervalKind::Week)),
+            Expected::Exact("id", ChType::Interval(IntervalKind::Day)),
+            Expected::Exact("ih", ChType::Interval(IntervalKind::Hour)),
+            Expected::Exact("imi", ChType::Interval(IntervalKind::Minute)),
+            Expected::Exact("isecond", ChType::Interval(IntervalKind::Second)),
+            Expected::Exact("ims", ChType::Interval(IntervalKind::Millisecond)),
+            Expected::Exact("ius", ChType::Interval(IntervalKind::Microsecond)),
+            Expected::Exact("ins", ChType::Interval(IntervalKind::Nanosecond)),
+            Expected::Exact(
+                "nid",
+                ChType::Nullable(Box::new(ChType::Interval(IntervalKind::Day))),
+            ),
+            Expected::Exact(
+                "lc_ih",
+                ChType::LowCardinality(Box::new(ChType::Interval(IntervalKind::Hour))),
+            ),
+            Expected::Exact(
+                "m_id",
+                ChType::Map(
+                    Box::new(ChType::Interval(IntervalKind::Day)),
+                    Box::new(ChType::String),
+                ),
             ),
         ],
     );
@@ -1362,6 +1391,61 @@ fn assert_all_types(batch: &ChunkedBatch) {
         &[Some(b"user_1" as &[u8]), None, Some(b"user_2"), None],
     );
     assert_validity(block.column(75), &[true, false, true, false]);
+
+    // Interval* (cols 76..86): all kinds carry the same raw signed Int64 count
+    // shape. The exact logical kinds are pinned in the schema assertions above.
+    for col in 76..=86 {
+        match block.column(col) {
+            Column::Interval(c) => assert_eq!(c.values.as_slice(), &[-13, 0, 79, 258]),
+            other => panic!("expected Interval at column {col}, got {other:?}"),
+        }
+    }
+
+    // Nullable(IntervalDay) (col 87): valid, NULL, valid, NULL. Placeholder
+    // values for NULL rows are not semantically meaningful.
+    match block.column(87) {
+        Column::Interval(c) => {
+            assert_eq!(c.values[0], 13);
+            assert_eq!(c.values[2], 79);
+            assert_eq!(c.null_count(), 2);
+        }
+        other => panic!("expected nullable Interval, got {other:?}"),
+    }
+    assert_validity(block.column(87), &[true, false, true, false]);
+
+    // LowCardinality(IntervalHour) (col 88): rows 13, 79, 13, 258 resolve
+    // through an Interval-valued per-block dictionary.
+    match block.column(88) {
+        Column::Dictionary(d) => {
+            let values = match d.values.as_ref() {
+                Column::Interval(values) => values,
+                other => panic!("expected Interval dictionary values, got {other:?}"),
+            };
+            let resolved: Vec<i64> = d
+                .indices
+                .iter()
+                .map(|index| values.values[*index as usize])
+                .collect();
+            assert_eq!(resolved, vec![13, 79, 13, 258]);
+        }
+        other => panic!("expected Interval dictionary, got {other:?}"),
+    }
+
+    // Map(IntervalDay, String) (col 89): rows {} / {13: user_1} /
+    // {-79: a, 13: user_2} / {258: x}. The flattened key run must retain the
+    // Interval physical tag rather than collapsing to a plain Int64 column.
+    {
+        let m = as_map(block.column(89));
+        assert_eq!(m.offsets, vec![0i64, 0, 1, 3, 4]);
+        let (keys, values) = map_entries(m);
+        match (keys, values) {
+            (Column::Interval(k), Column::Utf8(v)) => {
+                assert_eq!(k.values.as_slice(), &[13, -79, 13, 258]);
+                assert_utf8_column(v, &[b"user_1" as &[u8], b"a", b"user_2", b"x"]);
+            }
+            other => panic!("expected (Interval, Utf8) entries, got {other:?}"),
+        }
+    }
 }
 
 /// Borrow the inner `MapColumn` of a decoded `Map` column, panicking with a

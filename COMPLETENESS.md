@@ -47,63 +47,54 @@ point-in-time snapshot for the next agent, not a changelog. Keep it short. Alway
 include a "Recommended next" with a one-line reason, so the next agent has a
 default; the user may override it.
 
-- **Last updated:** 2026-07-10. Follow-up fix pass on the `LowCardinality` /
-  `SimpleAggregateFunction` delegation: the alias may legally sit BETWEEN a
-  `LowCardinality` and its removeNullable `Nullable`
-  (`LowCardinality(SimpleAggregateFunction(anyLast, Nullable(String)))`, a
-  live-confirmed real server header at `v26.6.1.1193-stable`), and SAF chains are
-  legal to any depth. The per-site single-level SAF see-through was replaced with
-  one shared full-chain helper, `low_cardinality_dict_value_type`
-  (`src/native/type_parser.rs`), consulted by every `LowCardinality` site on both
-  paths and the Arrow export, so header validation, the nullability decision, and
-  the Arrow schema export can no longer disagree with the body paths. New fixture
-  column `lc_nsaf`, new unit/round-trip tests, and the live INSERT test extended.
-  Prior context: three name-decoration type groups (`SimpleAggregateFunction(func,
-  T)`, the six geo aliases, and `Nested(name1 T1, ...)`) landed together, decode
-  AND encode at full parity, all pure `getName()` decorations over an existing
-  physical type (SAF -> its inner `T`, geo -> a fixed `Tuple`/`Array`-of-`Float64`
-  nesting, Nested -> `Array(Tuple(named fields))`), so wire bytes, state prefix,
-  and Arrow shape are byte-identical to the underlying type.
-- **Implementation shape:** one delegation seam, `ChType::physical_delegate`
-  (`src/schema.rs`), returns the underlying physical `ChType` for each alias and
-  `None` for a plain type. Every dispatcher (`read_state_prefix`,
-  `decode_values`, `skip_values`, `empty_column`, `validate_header_type`, the
-  completeness scan, the encode paths, and the Arrow export) recurses on it at
-  the top, so there is NO new `Column` variant anywhere and cross-block schema
-  consistency keys on the alias `ChType` spelling (which `Display`/`parse`
-  round-trip exactly). `MAX_TYPE_DEPTH` now charges each alias its physical
-  expansion on BOTH the parse and encode sides (SAF +1, Nested +2, geo
-  `GeoKind::expansion_depth` 1..4), so decode-accept implies encode-accept at the
-  cap.
+- **Last updated:** 2026-07-13. Implemented all 11 `Interval*` logical types at
+  decode/encode parity, including parser, scanner, zero-row handling,
+  `Nullable`, `LowCardinality`, Arrow export, synthetic tests, live INSERT
+  coverage, and the shared `all_types` fixture query/assertions. Both committed
+  fixtures were recaptured from ClickHouse 26.6.1.1193 and the full integration
+  and live INSERT gates pass. Fixture coverage includes plain, Nullable,
+  LowCardinality, and `Map(IntervalDay, String)` columns.
+- **Implementation shape:** `ChType::Interval(IntervalKind)` preserves the exact
+  logical unit while every kind shares one `Column::Interval(PrimitiveColumn<i64>)`
+  physical buffer. Decode uses the existing direct primitive `Int64` hot path,
+  encode writes its inverse, and the scanner skips exactly 8 bytes per value.
+  Arrow exports Second/Millisecond/Microsecond/Nanosecond as `tDs`/`tDm`/`tDu`/
+  `tDn`; the seven non-fixed or unsupported-duration units remain raw signed
+  `Int64` (`l`) without copying.
 - **Pinned server tag:** `v26.6.1.1193-stable`, protocol revision **54485**.
-  Confirmed server paths: `DataTypeCustomSimpleAggregateFunction.{h,cpp}`,
-  `DataTypeCustomGeo.{h,cpp}`, and `DataTypeNested.{h,cpp}` (each a custom name
-  with a null serialization slot). Local source, capture server, fixtures, and
+  Confirmed server paths for this item: `DataTypeInterval.{h,cpp}`
+  (`DataTypeInterval::doGetName`/`doGetSerialization` and
+  `registerDataTypeInterval`), `Common/IntervalKind.{h,cpp}`,
+  `Serializations/SerializationInterval.h`, and
+  `Serializations/SerializationNumber.cpp` (binary bulk read/write). Nullable,
+  LowCardinality, and Map-key legality were confirmed in
+  `DataTypeNullable.cpp`, `DataTypeNumberBase.h` /
+  `DataTypeLowCardinality.cpp`, and `DataTypeMap.cpp`. All interval findings are
+  confirmed; none are inferred. Local source, capture server, fixtures, and
   contract citations are aligned to 26.6.1.1193.
 - **Scope:** completeness still means uncompressed HTTP `FORMAT Native`; TCP and
   the currently unwired compression framing remain out of scope.
-- **Build/test status:** `cargo test` is green (481 unit + 3 integration;
-  live-insert and doctest ignored), clippy is clean with `-D warnings`, and fmt
-  is clean. The `all_types` fixtures are recaptured at 76 columns (leading
-  varint `0x4c`) at revisions 0 and 54485, adding `saf_sum`
-  (`SimpleAggregateFunction(sum, Float64)`), `saf_lc`
-  (`SimpleAggregateFunction(anyLast, LowCardinality(Nullable(String)))`),
-  `saf_grp` (`SimpleAggregateFunction(groupArrayLastArray(5), Array(UInt64))`),
-  `nsaf` (`Nullable(SimpleAggregateFunction(sum, UInt64))` with NULLs), `lc_saf`
-  (`LowCardinality(SimpleAggregateFunction(anyLast, String))`), `lc_nsaf`
-  (`LowCardinality(SimpleAggregateFunction(anyLast, Nullable(String)))` with a
-  NULL), `point`, `npoint` (`Nullable(Point)`), `ring`, `mpoly`
-  (`MultiPolygon`), and `nst` (`Nested(x UInt32, y String)`); header spellings
-  are hexdump-verified verbatim. The live INSERT test
-  `geo_saf_nested_roundtrip_through_server` passes against 26.6.1.1193 (point,
-  npoint, ring, mpoly, saf_sum, saf_lc, nst on a `flatten_nested = 0` table, plus
-  `Nullable(SAF)`, `Tuple(v SAF)`, and
-  `LowCardinality(SAF(anyLast, Nullable(String)))` columns).
-- **Recommended next:** implement the 11 **`Interval*`** Tier 2 types together.
-  They are distinct logical types over the same raw little-endian `Int64` body,
-  so they should reuse the primitive-backed pattern while preserving exact type
-  tags and encode/decode parity. Then continue with `BFloat16` and `Nothing`.
+- **Build/test status:** `cargo test` is green (496 unit + 3 integration;
+  unrelated live tests and the doctest remain ignored), clippy is clean with
+  `-D warnings`, and fmt is clean. The two `all_types` fixtures were recaptured
+  at 90 columns (leading varint `0x5a`) for revisions 0 and 54485. The live
+  `insert_roundtrips_through_server` test passes against ClickHouse
+  26.6.1.1193 with all 11 plain Interval kinds plus Nullable and
+  LowCardinality representatives.
+- **Recommended next:** implement **`BFloat16`**. It is the next compact scalar
+  type and can reuse the fixed-width primitive path; `Nothing` can follow.
 - **Active gotchas / context:**
+  - All 11 interval names are distinct case-sensitive logical type tags, even
+    though their body is the same signed little-endian `Int64` count. Do not
+    collapse them into `Int64` or a physical delegate. `Nullable` and
+    `LowCardinality` are legal for every interval kind, and bare or plain-LC
+    interval Map keys are legal. Persisted LC-Interval schema declarations and
+    explicit CAST targets still require
+    `allow_suspicious_low_cardinality_types = 1`; this is the generic
+    fixed-width numeric guard, not an Interval-specific restriction. Server
+    expressions can return LC-Interval results without it, and the gate does not
+    affect the wire. Only the four fixed Arrow duration units use `tD*`;
+    calendar and non-Arrow-duration units intentionally export as `l`.
   - `SimpleAggregateFunction`, the six geo aliases, and `Nested` are pure name
     decorations resolved through `ChType::physical_delegate` (`src/schema.rs`),
     the single seam every dispatcher recurses on. SAF is legal at ANY nesting
@@ -242,9 +233,10 @@ default; the user may override it.
     `ChType`: the Arrow format string does not, and `w:16` is shared with
     `UUID`/`IPv6`. A binding recovers the integer by reading the 16/32 bytes as a
     little-endian value of that width, two's-complement signed for
-    `Int128`/`Int256`. `allow_suspicious_low_cardinality_types` is a CREATE-time
-    guard only and does not gate the wire. Introduction version undetermined from
-    the shallow pin.
+    `Int128`/`Int256`. `allow_suspicious_low_cardinality_types` is a server-side
+    type-use guard on persisted schema declarations and explicit `CAST` targets.
+    It does not gate wire results or decoding. Introduction version undetermined
+    from the shallow pin.
   - V1 done (v26.6.1.1193-stable): the Tier lists are authoritative against
     `DataTypeFactory`. `Geometry` and `QBit(T, N)` are registered and GA in Tier 3;
     `QBit`'s `SerializationQBit` wire layout is still unexamined - read it via the
@@ -256,12 +248,15 @@ default; the user may override it.
     determinable from the source; do not guess from memory.
   - `LowCardinality` inner support is gated by `is_low_cardinality_inner`
     (`src/native/type_parser.rs`), the `canBeInsideLowCardinality()` allowlist
-    intersected with decoded types. It now includes `UUID`/`IPv4`/`IPv6`. Both
+    intersected with decoded types. It includes `UUID`/`IPv4`/`IPv6` and every
+    `Interval*` kind. Both
     `decode_low_cardinality_dictionary` and the scan's `skip_low_cardinality_data`
     consult it, so decode and `block_end` agree on which columns are accepted. The
-    `allow_suspicious_low_cardinality_types` setting is a server-side creation
-    guard only (needed at creation for the numerics, temporals, and `IPv4`/`IPv6`,
-    not for `UUID`) and does not affect decoding.
+    `allow_suspicious_low_cardinality_types` setting is a generic server-side
+    type-use guard for persisted schema declarations and explicit `CAST` targets.
+    It is needed for numerics, temporals, intervals, and `IPv4`/`IPv6`, but not
+    for `UUID`. Server expressions can still return these `LowCardinality` types
+    without the setting, and it does not affect wire results or decoding.
   - The per-column bulk-state prefix is generalized (`read_state_prefix`).
     `LowCardinality` reads its 8-byte key version through it; the containers
     (`Array`, `Tuple`, `Map`) and `Nullable` write nothing of their own and
@@ -355,13 +350,17 @@ is not done, and must not be checked off, until all of these hold:
 - [x] `UUID`, `IPv4`, `IPv6`
 - [x] `Date`, `Date32`, `DateTime`, `DateTime64(P[, tz])`
 - [x] `Time`, `Time64(P)`
+- [x] `IntervalYear`, `IntervalQuarter`, `IntervalMonth`, `IntervalWeek`,
+      `IntervalDay`, `IntervalHour`, `IntervalMinute`, `IntervalSecond`,
+      `IntervalMillisecond`, `IntervalMicrosecond`, `IntervalNanosecond`
 - [x] `Nullable(T)` over every supported inner type
 - [x] Per-column bulk-state prefix (generalized; `LowCardinality` is the first
       non-empty prefix)
 - [x] `LowCardinality(T)` for every allowed inner type this crate decodes:
       `String`, `FixedString(N)`, the fixed-width numerics, `Bool`, `Date`,
-      `Date32`, `DateTime`, `Time`, `UUID`, `IPv4`, `IPv6`, each also in the inner
-      `Nullable` form. `DateTime64`, `Time64`, `Decimal`, and `Enum8`/`Enum16` are excluded:
+      `Date32`, `DateTime`, `Time`, every `Interval*`, `UUID`, `IPv4`, `IPv6`,
+      each also in the inner `Nullable` form. `DateTime64`, `Time64`, `Decimal`,
+      and `Enum8`/`Enum16` are excluded:
       the server forbids all of them as LC inners (`canBeInsideLowCardinality()`
       is false), so they never appear in that position on the wire. This holds for
       `Enum` independent of decode support; the crate now decodes `Enum8`/`Enum16`
@@ -466,6 +465,23 @@ is not done, and must not be checked off, until all of these hold:
         `SerializationTime`, `DataTypeTime64`, `SerializationTime64`, and
         `SerializationDecimalBase`; verified by the live `all_types` fixtures,
         unit round-trips/scanner tests, and the live INSERT test.
+- [x] `IntervalYear` through `IntervalNanosecond` (decode and encode)
+      - The 11 exact case-sensitive logical types share one
+        `ChType::Interval(IntervalKind)` family and one
+        `Column::Interval(PrimitiveColumn<i64>)` physical buffer. Every body is a
+        contiguous little-endian signed Int64 count, so decode/encode reuse the
+        primitive bulk hot path with no new allocation, copy, or per-row work.
+        All kinds compose with `Nullable` and `LowCardinality`; bare and plain-LC
+        forms are legal Map keys. Arrow exports Second/Millisecond/Microsecond/
+        Nanosecond as the exact zero-copy Duration formats `tDs`/`tDm`/`tDu`/
+        `tDn`; the other seven kinds stay raw `l` because Arrow's calendar
+        interval layout is physically incompatible. Confirmed, not inferred, at
+        `v26.6.1.1193-stable` against `DataTypeInterval`, `IntervalKind`,
+        `SerializationInterval`, and `SerializationNumber<Int64>`. Unit coverage
+        includes all 11 names, plain extrema, Nullable, LowCardinality, zero-row,
+        multi-block, exact bytes, encode round-trips, and Arrow zero-copy export;
+        the all-types fixture query/assertions and live INSERT gate include all 11
+        plus Nullable/LowCardinality representatives.
 - [x] `SimpleAggregateFunction(func, T)` (decode and encode)
       - Tier 2 name-decoration alias. Pure `getName()` decoration over the inner
         `T` (`DataTypeCustomSimpleAggregateFunction` attaches only a custom name;
@@ -667,8 +683,10 @@ introduction), so record them per type only when determinable.
       no-op). See "Implemented" for the full summary; type section in
       `CODEC_CONTRACT.md`. The umbrella `Geometry` type (= `Variant(...)` of the
       six, alias `GEOMETRY`) is in Tier 3 because it depends on `Variant`.
-- [ ] `Interval*` (`IntervalYear` ... `IntervalNanosecond`) - Int64 on the wire;
-      11 distinct simple types, one per kind. Confirmed at v26.6.1.1193-stable.
+- [x] `Interval*` (`IntervalYear` ... `IntervalNanosecond`) - decode AND encode
+      done. One signed Int64 body per row, with exact logical unit preservation;
+      legal Nullable/LowCardinality inners and Map keys. See "Implemented" and
+      the `CODEC_CONTRACT.md` type section.
 - [ ] `Nothing` - the type of a bare `NULL`; zero-width, edge case.
 - [ ] `BFloat16` - 2-byte float, the top 16 bits of an IEEE-754 `Float32` (sign +
       8-bit exponent + 7-bit truncated mantissa), serialized raw little-endian via
@@ -833,6 +851,13 @@ bring encode to parity with what the decoder already supports.
       Verified at revisions 0 and 54485, including an exact signed-byte framing
       pin, zero-row and multi-block round-trips, invalid precision rejection,
       live fixture capture, and live INSERT against 26.6.1.1193.
+- [x] All 11 `Interval*` types through one signed-i64 primitive encoder arm over
+      `Column::Interval`, the exact inverse of the decoder. The unit stays in
+      `ChType::Interval(IntervalKind)` and the type string. `Nullable` and the
+      shared `LowCardinality` writer compose without Interval-specific framing.
+      Covered at revisions 0 and 54485, including all kinds, exact signed bytes,
+      zero-row, multi-block, Nullable, LowCardinality, all-types fixtures, and
+      the live INSERT batch.
 - [x] `UUID`/`IPv6` (raw 16-byte-per-row passthrough straight from the
       `FixedBinaryColumn` data buffer, one `extend_from_slice`, NO reordering:
       UUID stays in its wire UInt128 POD order, IPv6 in network byte order; the

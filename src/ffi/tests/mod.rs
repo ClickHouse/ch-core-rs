@@ -4,7 +4,7 @@ use crate::bitmap::Bitmap;
 use crate::column::{
     ArrayColumn, Column, DictionaryColumn, PrimitiveColumn, TupleColumn, Utf8Column,
 };
-use crate::schema::{ChType, Field, GeoKind, Schema};
+use crate::schema::{ChType, Field, GeoKind, IntervalKind, Schema};
 use std::ffi::CStr;
 
 mod containers;

@@ -2,11 +2,12 @@ use super::*;
 use crate::native::protocol::{DBMS_MIN_REVISION_WITH_OUT_OF_ORDER_BUCKETS, MAX_TYPE_DEPTH};
 use crate::native::type_parser::decimal_bits_from_precision;
 use crate::native::varint::write_varint;
-use crate::schema::GeoKind;
+use crate::schema::{GeoKind, IntervalKind};
 
 mod containers;
 mod decimal;
 mod framing;
+mod interval;
 mod low_cardinality;
 mod numeric;
 mod parser;

@@ -523,6 +523,9 @@ pub enum Column {
     DateTime64(PrimitiveColumn<i64>),
     Time(PrimitiveColumn<i32>),
     Time64(PrimitiveColumn<i64>),
+    // All 11 ClickHouse Interval* types are signed Int64 counts. The unit stays
+    // in the schema's ChType::Interval tag, mirroring Time64 precision metadata.
+    Interval(PrimitiveColumn<i64>),
     Utf8(Utf8Column),
     FixedBinary(FixedBinaryColumn),
     // IPv4 is a UInt32 on the wire (the standard IPv4 numeric form), decoded at
@@ -590,6 +593,7 @@ impl Column {
             Column::DateTime64(c) => c.len(),
             Column::Time(c) => c.len(),
             Column::Time64(c) => c.len(),
+            Column::Interval(c) => c.len(),
             Column::Utf8(c) => c.len(),
             Column::FixedBinary(c) => c.len(),
             Column::Ipv4(c) => c.len(),
@@ -631,6 +635,7 @@ impl Column {
             Column::DateTime64(c) => c.null_count(),
             Column::Time(c) => c.null_count(),
             Column::Time64(c) => c.null_count(),
+            Column::Interval(c) => c.null_count(),
             Column::Utf8(c) => c.null_count(),
             Column::FixedBinary(c) => c.null_count(),
             Column::Ipv4(c) => c.null_count(),
@@ -668,6 +673,7 @@ impl Column {
             Column::DateTime64(c) => c.validity.as_ref(),
             Column::Time(c) => c.validity.as_ref(),
             Column::Time64(c) => c.validity.as_ref(),
+            Column::Interval(c) => c.validity.as_ref(),
             Column::Utf8(c) => c.validity.as_ref(),
             Column::FixedBinary(c) => c.validity.as_ref(),
             Column::Ipv4(c) => c.validity.as_ref(),

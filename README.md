@@ -133,6 +133,9 @@ Not implemented yet:
 - `String`
 - `FixedString(N)`
 - `Date`, `Date32`, `DateTime`, `DateTime64(P[, tz])`, `Time`, `Time64(P)`
+- `IntervalYear`, `IntervalQuarter`, `IntervalMonth`, `IntervalWeek`,
+  `IntervalDay`, `IntervalHour`, `IntervalMinute`, `IntervalSecond`,
+  `IntervalMillisecond`, `IntervalMicrosecond`, `IntervalNanosecond`
 - `Nullable(T)` where `T` is one of the supported inner types
 - `Decimal(P, S)`
 - `UUID`, `IPv4`, `IPv6`

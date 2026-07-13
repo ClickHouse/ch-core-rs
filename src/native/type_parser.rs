@@ -5,7 +5,7 @@
 //! `Option<ChType>`, so it is self-contained.
 
 use crate::native::protocol::MAX_TYPE_DEPTH;
-use crate::schema::{ChType, GeoKind};
+use crate::schema::{ChType, GeoKind, IntervalKind};
 
 // ---------------------------------------------------------------------------
 // Type name parsing
@@ -332,6 +332,19 @@ fn parse_ch_type_depth(type_name: &str, depth: usize) -> Option<ChType> {
         "Date32" => Some(ChType::Date32),
         "DateTime" => Some(ChType::DateTime { timezone: None }),
         "Time" => Some(ChType::Time),
+        // DataTypeInterval::doGetName emits these 11 exact case-sensitive
+        // spellings, one per IntervalKind. There are no parameters or aliases.
+        "IntervalYear" => Some(ChType::Interval(IntervalKind::Year)),
+        "IntervalQuarter" => Some(ChType::Interval(IntervalKind::Quarter)),
+        "IntervalMonth" => Some(ChType::Interval(IntervalKind::Month)),
+        "IntervalWeek" => Some(ChType::Interval(IntervalKind::Week)),
+        "IntervalDay" => Some(ChType::Interval(IntervalKind::Day)),
+        "IntervalHour" => Some(ChType::Interval(IntervalKind::Hour)),
+        "IntervalMinute" => Some(ChType::Interval(IntervalKind::Minute)),
+        "IntervalSecond" => Some(ChType::Interval(IntervalKind::Second)),
+        "IntervalMillisecond" => Some(ChType::Interval(IntervalKind::Millisecond)),
+        "IntervalMicrosecond" => Some(ChType::Interval(IntervalKind::Microsecond)),
+        "IntervalNanosecond" => Some(ChType::Interval(IntervalKind::Nanosecond)),
         "String" => Some(ChType::String),
         "UUID" => Some(ChType::Uuid),
         "IPv4" => Some(ChType::Ipv4),
@@ -841,7 +854,8 @@ fn hex_digit(b: u8) -> Option<u8> {
 /// `DataTypeLowCardinality` constructor after `removeNullable` (confirmed at
 /// v26.6.1.1193-stable). That predicate is true for `String`, `FixedString`, the
 /// fixed-width numerics, and the number-backed temporals `Date`/`Date32`/
-/// `DateTime`/`Time` (`Bool` is a `UInt8`-backed number and also qualifies). It is
+/// `DateTime`/`Time`, and every `Interval*` (`Bool` is a `UInt8`-backed number
+/// and also qualifies). It is
 /// false for `DateTime64`, `Time64`, and every `Decimal`, which are
 /// `DataTypeDecimalBase` subclasses, so those are rejected here even though the
 /// crate decodes them as ordinary columns. `UUID`/`IPv4`/`IPv6` are permitted by
@@ -850,12 +864,13 @@ fn hex_digit(b: u8) -> Option<u8> {
 /// `IPv4`, 16 raw bytes per entry for `UUID`/`IPv6`), decoded through the shared
 /// per-type body decoder.
 ///
-/// The fixed-width numeric and temporal inners require the server's
-/// `allow_suspicious_low_cardinality_types=1` at table-creation time; that is a
-/// server-side creation guard only and has no effect on the wire bytes or on
-/// decoding a column the server already produced. `UUID` (like `String` and
-/// `FixedString`) is allowed unconditionally; `IPv4`/`IPv6` need the suspicious
-/// setting at creation, again with no wire effect.
+/// The fixed-width numeric, temporal, and Interval inners require the server's
+/// `allow_suspicious_low_cardinality_types=1` for persisted schema declarations
+/// and explicit `CAST` targets. That is a server-side type-use guard only and
+/// has no effect on the wire bytes or on decoding a column the server already
+/// produced. `UUID` (like `String` and `FixedString`) is allowed
+/// unconditionally; `IPv4`/`IPv6` need the suspicious setting at those same
+/// boundaries, again with no wire effect.
 pub(crate) fn is_low_cardinality_inner(dict_value_type: &ChType) -> bool {
     // A name-decoration alias is legal inside `LowCardinality` exactly when the
     // physical type it delegates to is, so `is_low_cardinality_inner(SAF(T))` ==
@@ -899,6 +914,7 @@ pub(crate) fn is_low_cardinality_inner(dict_value_type: &ChType) -> bool {
             | ChType::Date32
             | ChType::DateTime { .. }
             | ChType::Time
+            | ChType::Interval(_)
             | ChType::Uuid
             | ChType::Ipv4
             | ChType::Ipv6

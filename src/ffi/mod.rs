@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::batch::ColBatch;
 use crate::column::Column;
 use crate::native::decode::low_cardinality_dict_value_type;
-use crate::schema::{ChType, Schema};
+use crate::schema::{ChType, IntervalKind, Schema};
 
 // ---------------------------------------------------------------------------
 // Arrow C Data Interface structs (repr(C) per spec)
@@ -231,6 +231,25 @@ fn arrow_format(ch_type: &ChType) -> String {
         // with no validation, rescaling, or copy.
         ChType::Time => "i".into(),
         ChType::Time64 { .. } => "l".into(),
+        // Arrow Duration is physically i64 and exactly matches the four units
+        // it supports: seconds, milliseconds, microseconds, and nanoseconds.
+        // Minute/Hour/Day/Week are fixed counts too, but Arrow has no Duration
+        // units for them. Month/Quarter/Year are calendar-variable, and Arrow's
+        // calendar interval layouts are physically different. Preserve both
+        // groups as raw i64 rather than rescaling or copying.
+        ChType::Interval(kind) => match kind {
+            IntervalKind::Second => "tDs".into(),
+            IntervalKind::Millisecond => "tDm".into(),
+            IntervalKind::Microsecond => "tDu".into(),
+            IntervalKind::Nanosecond => "tDn".into(),
+            IntervalKind::Year
+            | IntervalKind::Quarter
+            | IntervalKind::Month
+            | IntervalKind::Week
+            | IntervalKind::Day
+            | IntervalKind::Hour
+            | IntervalKind::Minute => "l".into(),
+        },
         ChType::String => "u".into(),
         ChType::FixedString(n) => format!("w:{n}"),
         // IPv4 is the standard UInt32 numeric value, exported as Arrow uint32
@@ -609,6 +628,7 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
         Column::DateTime64(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
         Column::Time(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
         Column::Time64(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
+        Column::Interval(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
         Column::Utf8(c) => {
             match &c.validity {
                 Some(bm) => buffers.push(bm.as_bytes().as_ptr() as *const c_void),

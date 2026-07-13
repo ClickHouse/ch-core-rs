@@ -34,7 +34,7 @@ use ch_core_rs::column::{
 };
 use ch_core_rs::native::decode::{decode_all_bytes, DecodeOptions};
 use ch_core_rs::native::encode::{encode_block, EncodeOptions};
-use ch_core_rs::schema::{ChType, Field, GeoKind, Schema};
+use ch_core_rs::schema::{ChType, Field, GeoKind, IntervalKind, Schema};
 
 const TABLE: &str = "ch_core_rs_encode_test";
 const LC_U16_TABLE: &str = "ch_core_rs_encode_lc_u16_test";
@@ -272,6 +272,25 @@ fn sample_batch() -> ColBatch {
             ChType::Nullable(Box::new(ChType::Time64 { precision: 6 })),
         ),
         ("lc_time", ChType::LowCardinality(Box::new(ChType::Time))),
+        ("iy", ChType::Interval(IntervalKind::Year)),
+        ("iq", ChType::Interval(IntervalKind::Quarter)),
+        ("imo", ChType::Interval(IntervalKind::Month)),
+        ("iw", ChType::Interval(IntervalKind::Week)),
+        ("id", ChType::Interval(IntervalKind::Day)),
+        ("ih", ChType::Interval(IntervalKind::Hour)),
+        ("imi", ChType::Interval(IntervalKind::Minute)),
+        ("isecond", ChType::Interval(IntervalKind::Second)),
+        ("ims", ChType::Interval(IntervalKind::Millisecond)),
+        ("ius", ChType::Interval(IntervalKind::Microsecond)),
+        ("ins", ChType::Interval(IntervalKind::Nanosecond)),
+        (
+            "nid",
+            ChType::Nullable(Box::new(ChType::Interval(IntervalKind::Day))),
+        ),
+        (
+            "lc_ih",
+            ChType::LowCardinality(Box::new(ChType::Interval(IntervalKind::Hour))),
+        ),
     ]
     .into_iter()
     .map(|(name, ch_type)| Field {
@@ -653,6 +672,28 @@ fn sample_batch() -> ColBatch {
         Column::Dictionary(DictionaryColumn::new(
             vec![0, 1, 0, 2],
             Column::Time(PrimitiveColumn::new(vec![-13, 79, 258])),
+        )),
+        // Every Interval* is the same signed Int64 count body with a distinct
+        // logical unit in the type string. Wrapper representatives prove the
+        // Nullable null map and LowCardinality dictionary paths compose.
+        Column::Interval(PrimitiveColumn::new(vec![-13, 0, 79, 258])),
+        Column::Interval(PrimitiveColumn::new(vec![-13, 0, 79, 258])),
+        Column::Interval(PrimitiveColumn::new(vec![-13, 0, 79, 258])),
+        Column::Interval(PrimitiveColumn::new(vec![-13, 0, 79, 258])),
+        Column::Interval(PrimitiveColumn::new(vec![-13, 0, 79, 258])),
+        Column::Interval(PrimitiveColumn::new(vec![-13, 0, 79, 258])),
+        Column::Interval(PrimitiveColumn::new(vec![-13, 0, 79, 258])),
+        Column::Interval(PrimitiveColumn::new(vec![-13, 0, 79, 258])),
+        Column::Interval(PrimitiveColumn::new(vec![-13, 0, 79, 258])),
+        Column::Interval(PrimitiveColumn::new(vec![-13, 0, 79, 258])),
+        Column::Interval(PrimitiveColumn::new(vec![-13, 0, 79, 258])),
+        Column::Interval(PrimitiveColumn::new_nullable(
+            vec![13, 0, 79, 0],
+            validity(),
+        )),
+        Column::Dictionary(DictionaryColumn::new(
+            vec![1, 2, 1, 3],
+            Column::Interval(PrimitiveColumn::new(vec![0, 13, 79, 258])),
         )),
     ];
 
@@ -1046,6 +1087,7 @@ fn raw_column_repr(column: &Column) -> Vec<String> {
         Column::DateTime64(c) => c.values.iter().map(|v| v.to_string()).collect(),
         Column::Time(c) => c.values.iter().map(|v| v.to_string()).collect(),
         Column::Time64(c) => c.values.iter().map(|v| v.to_string()).collect(),
+        Column::Interval(c) => c.values.iter().map(|v| v.to_string()).collect(),
         // Enum8/Enum16 are physically the underlying signed int; render the raw
         // value (the name->value map is type metadata, not per-row data).
         Column::Enum8(c) => c.values.iter().map(|v| v.to_string()).collect(),
@@ -1183,7 +1225,11 @@ fn insert_roundtrips_through_server() {
          arr_m Array(Map(String, Int32)), \
          m_empty Map(String, Int32), \
          t Time, t64 Time64(6), nt Nullable(Time), \
-         nt64 Nullable(Time64(6)), lc_time LowCardinality(Time)) ENGINE = Memory"
+         nt64 Nullable(Time64(6)), lc_time LowCardinality(Time), \
+         iy IntervalYear, iq IntervalQuarter, imo IntervalMonth, iw IntervalWeek, \
+         id IntervalDay, ih IntervalHour, imi IntervalMinute, isecond IntervalSecond, \
+         ims IntervalMillisecond, ius IntervalMicrosecond, ins IntervalNanosecond, \
+         nid Nullable(IntervalDay), lc_ih LowCardinality(IntervalHour)) ENGINE = Memory"
         ),
         // LowCardinality(Int256) is a suspicious LC inner (a numeric), gated at
         // CREATE time by allow_suspicious_low_cardinality_types (a creation-time
@@ -1214,7 +1260,8 @@ fn insert_roundtrips_through_server() {
          arr_i32, arr_ns, arr_lc, arr_arr, arr_lc_empty, \
          tup, tup_named, arr_tup, ntup, \
          m, m_lc, m_nv, m_arr, arr_m, m_empty, \
-         t, t64, nt, nt64, lc_time \
+         t, t64, nt, nt64, lc_time, \
+         iy, iq, imo, iw, id, ih, imi, isecond, ims, ius, ins, nid, lc_ih \
          FROM {TABLE} ORDER BY i32 FORMAT Native"
     ));
     let decoded = decode_all_bytes(

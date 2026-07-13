@@ -942,6 +942,7 @@ fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
             | (ChType::DateTime64 { .. }, Column::DateTime64(_))
             | (ChType::Time, Column::Time(_))
             | (ChType::Time64 { .. }, Column::Time64(_))
+            | (ChType::Interval(_), Column::Interval(_))
             | (ChType::Uuid, Column::Uuid(_))
             | (ChType::Ipv4, Column::Ipv4(_))
             | (ChType::Ipv6, Column::Ipv6(_))

@@ -340,6 +340,138 @@ fn test_arrow_format_temporal() {
 }
 
 #[test]
+fn test_arrow_format_intervals() {
+    for kind in [
+        IntervalKind::Year,
+        IntervalKind::Quarter,
+        IntervalKind::Month,
+        IntervalKind::Week,
+        IntervalKind::Day,
+        IntervalKind::Hour,
+        IntervalKind::Minute,
+    ] {
+        assert_eq!(arrow_format(&ChType::Interval(kind)), "l");
+    }
+    assert_eq!(arrow_format(&ChType::Interval(IntervalKind::Second)), "tDs");
+    assert_eq!(
+        arrow_format(&ChType::Interval(IntervalKind::Millisecond)),
+        "tDm"
+    );
+    assert_eq!(
+        arrow_format(&ChType::Interval(IntervalKind::Microsecond)),
+        "tDu"
+    );
+    assert_eq!(
+        arrow_format(&ChType::Interval(IntervalKind::Nanosecond)),
+        "tDn"
+    );
+}
+
+#[test]
+fn test_export_interval_buffers_zero_copy() {
+    let raw_values = vec![-79i64, 13, i64::MAX];
+    let validity = Bitmap::from_ch_null_map(&[0, 1, 0]);
+    let values = vec![-13i64, 0, 79];
+    let raw_values_ptr = raw_values.as_ptr() as *const c_void;
+    let validity_ptr = validity.as_bytes().as_ptr() as *const c_void;
+    let values_ptr = values.as_ptr() as *const c_void;
+    let batch = Arc::new(ColBatch::new(
+        Schema::new(vec![
+            Field {
+                name: "raw".into(),
+                ch_type: ChType::Interval(IntervalKind::Month),
+            },
+            Field {
+                name: "duration".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::Interval(IntervalKind::Second))),
+            },
+        ]),
+        vec![
+            Column::Interval(PrimitiveColumn::new(raw_values)),
+            Column::Interval(PrimitiveColumn::new_nullable(values, validity)),
+        ],
+        3,
+    ));
+
+    // Safety: the zeroed FFI outputs are writable and the batch remains alive
+    // until each matching release callback is invoked below.
+    unsafe {
+        let mut schema_out: ArrowSchema = std::mem::zeroed();
+        export_schema(&batch.schema, &mut schema_out);
+        let raw_schema = &**schema_out.children.add(0);
+        assert_eq!(CStr::from_ptr(raw_schema.format).to_str().unwrap(), "l");
+        assert_eq!(raw_schema.flags, 0);
+        let duration_schema = &**schema_out.children.add(1);
+        assert_eq!(
+            CStr::from_ptr(duration_schema.format).to_str().unwrap(),
+            "tDs"
+        );
+        assert_eq!(duration_schema.flags, 2);
+        (schema_out.release.unwrap())(&mut schema_out);
+
+        let mut array: ArrowArray = std::mem::zeroed();
+        export_batch_array(&batch, &mut array);
+        let raw = &**array.children.add(0);
+        assert_eq!(raw.length, 3);
+        assert_eq!(raw.null_count, 0);
+        assert_eq!(raw.n_buffers, 2);
+        assert!((*raw.buffers.add(0)).is_null());
+        assert_eq!(*raw.buffers.add(1), raw_values_ptr);
+        assert_eq!(raw.n_children, 0);
+        assert!(raw.dictionary.is_null());
+
+        let duration = &**array.children.add(1);
+        assert_eq!(duration.length, 3);
+        assert_eq!(duration.null_count, 1);
+        assert_eq!(duration.n_buffers, 2);
+        assert_eq!(*duration.buffers.add(0), validity_ptr);
+        assert_eq!(*duration.buffers.add(1), values_ptr);
+        assert_eq!(duration.n_children, 0);
+        assert!(duration.dictionary.is_null());
+        (array.release.unwrap())(&mut array);
+    }
+}
+
+#[test]
+fn test_export_zero_row_interval() {
+    let values = Vec::<i64>::new();
+    let values_ptr = values.as_ptr() as *const c_void;
+    let batch = Arc::new(ColBatch::new(
+        Schema::new(vec![Field {
+            name: "i".into(),
+            ch_type: ChType::Interval(IntervalKind::Nanosecond),
+        }]),
+        vec![Column::Interval(PrimitiveColumn::new(values))],
+        0,
+    ));
+
+    // Safety: the zeroed FFI outputs are writable and the batch remains alive
+    // until each matching release callback is invoked below. The length-zero
+    // values pointer is compared but never dereferenced.
+    unsafe {
+        let mut schema_out: ArrowSchema = std::mem::zeroed();
+        export_schema(&batch.schema, &mut schema_out);
+        let child = &**schema_out.children.add(0);
+        assert_eq!(CStr::from_ptr(child.format).to_str().unwrap(), "tDn");
+        assert_eq!(child.flags, 0);
+        (schema_out.release.unwrap())(&mut schema_out);
+
+        let mut array: ArrowArray = std::mem::zeroed();
+        export_batch_array(&batch, &mut array);
+        let child = &**array.children.add(0);
+        assert_eq!(child.length, 0);
+        assert_eq!(child.null_count, 0);
+        assert_eq!(child.n_buffers, 2);
+        assert!((*child.buffers.add(0)).is_null());
+        assert_eq!(*child.buffers.add(1), values_ptr);
+        assert_eq!(child.n_children, 0);
+        assert!(child.children.is_null());
+        assert!(child.dictionary.is_null());
+        (array.release.unwrap())(&mut array);
+    }
+}
+
+#[test]
 fn test_export_time_buffers() {
     let schema = Schema::new(vec![
         Field {

@@ -967,6 +967,13 @@ fn read_array_offsets(
 /// `SerializationDecimalBase<Time64>` in
 /// `src/DataTypes/Serializations/SerializationDecimalBase.cpp`. Both are
 /// little-endian on the wire and use the primitive fast path below.
+///
+/// At the same tag, every `Interval*` type selects `SerializationInterval`
+/// through `DataTypeInterval::doGetSerialization`; its bulk path is the same
+/// contiguous signed `Int64` run as `SerializationNumber<Int64>`, with no unit
+/// metadata in the body. See `src/DataTypes/DataTypeInterval.{h,cpp}`,
+/// `src/DataTypes/Serializations/SerializationInterval.h`, and
+/// `src/DataTypes/Serializations/SerializationNumber.cpp`.
 fn decode_column_body(
     reader: &mut ByteReader,
     inner_type: &ChType,
@@ -1048,6 +1055,13 @@ fn decode_column_body(
         ChType::Time64 { .. } => {
             let values = decode_primitive!(reader, num_rows, i64);
             Column::Time64(PrimitiveColumn { values, validity })
+        }
+        // All 11 Interval* kinds are signed Int64 counts. The kind is schema
+        // metadata only, so every one shares this primitive hot path and one
+        // distinct Column tag.
+        ChType::Interval(_) => {
+            let values = decode_primitive!(reader, num_rows, i64);
+            Column::Interval(PrimitiveColumn { values, validity })
         }
         ChType::String => {
             let (offsets, data) = decode_string_data(reader, num_rows)?;
@@ -1307,6 +1321,10 @@ fn empty_column(ch_type: &ChType) -> Column {
             validity: empty_validity,
         }),
         ChType::Time64 { .. } => Column::Time64(PrimitiveColumn {
+            values: vec![],
+            validity: empty_validity,
+        }),
+        ChType::Interval(_) => Column::Interval(PrimitiveColumn {
             values: vec![],
             validity: empty_validity,
         }),
@@ -1924,7 +1942,8 @@ fn skip_column_body(
         | ChType::UInt64
         | ChType::Float64
         | ChType::DateTime64 { .. }
-        | ChType::Time64 { .. } => reader.skip(num_rows.saturating_mul(8))?,
+        | ChType::Time64 { .. }
+        | ChType::Interval(_) => reader.skip(num_rows.saturating_mul(8))?,
         ChType::FixedString(width) => reader.skip(num_rows.saturating_mul(*width))?,
         // UUID and IPv6 are 16 raw bytes per row, the same body shape as
         // FixedString(16).

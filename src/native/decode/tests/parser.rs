@@ -141,6 +141,40 @@ fn test_parse_ch_type_temporal() {
 }
 
 #[test]
+fn test_parse_ch_type_intervals() {
+    let cases = [
+        ("IntervalYear", IntervalKind::Year),
+        ("IntervalQuarter", IntervalKind::Quarter),
+        ("IntervalMonth", IntervalKind::Month),
+        ("IntervalWeek", IntervalKind::Week),
+        ("IntervalDay", IntervalKind::Day),
+        ("IntervalHour", IntervalKind::Hour),
+        ("IntervalMinute", IntervalKind::Minute),
+        ("IntervalSecond", IntervalKind::Second),
+        ("IntervalMillisecond", IntervalKind::Millisecond),
+        ("IntervalMicrosecond", IntervalKind::Microsecond),
+        ("IntervalNanosecond", IntervalKind::Nanosecond),
+    ];
+    for (name, kind) in cases {
+        let ch_type = ChType::Interval(kind);
+        assert_eq!(parse_ch_type(name), Some(ch_type.clone()));
+        assert_eq!(ch_type.to_string(), name);
+        assert_eq!(parse_ch_type(&ch_type.to_string()), Some(ch_type));
+    }
+
+    // Native headers use only the canonical, case-sensitive full names.
+    for unsupported in [
+        "Interval",
+        "IntervalDay()",
+        "intervalDay",
+        "IntervalDays",
+        "Intervalsecond",
+    ] {
+        assert_eq!(parse_ch_type(unsupported), None, "accepted {unsupported}");
+    }
+}
+
+#[test]
 fn test_ch_type_display_round_trips_through_parser() {
     // Display renders the canonical ClickHouse type name, which is the
     // string bindings hand to users. Every representative variant must

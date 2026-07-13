@@ -201,6 +201,107 @@ fn test_export_low_cardinality_uint32() {
 }
 
 #[test]
+fn test_export_low_cardinality_interval_formats_and_buffers() {
+    let second_values = vec![0i64, 13, 79];
+    let second_indices = vec![1i32, 2, 1];
+    let month_values = vec![0i64, -13, 79];
+    let month_indices = vec![1i32, 0, 2];
+    let month_validity = Bitmap::from_ch_null_map(&[0, 1, 0]);
+
+    let second_values_ptr = second_values.as_ptr() as *const c_void;
+    let second_indices_ptr = second_indices.as_ptr() as *const c_void;
+    let month_values_ptr = month_values.as_ptr() as *const c_void;
+    let month_indices_ptr = month_indices.as_ptr() as *const c_void;
+    let month_validity_ptr = month_validity.as_bytes().as_ptr() as *const c_void;
+
+    let schema = Schema::new(vec![
+        Field {
+            name: "lc_second".into(),
+            ch_type: ChType::LowCardinality(Box::new(ChType::Interval(IntervalKind::Second))),
+        },
+        Field {
+            name: "lc_month".into(),
+            ch_type: ChType::LowCardinality(Box::new(ChType::Nullable(Box::new(
+                ChType::Interval(IntervalKind::Month),
+            )))),
+        },
+    ]);
+    let columns = vec![
+        Column::Dictionary(DictionaryColumn::new(
+            second_indices,
+            Column::Interval(PrimitiveColumn::new(second_values)),
+        )),
+        Column::Dictionary(DictionaryColumn::new_nullable(
+            month_indices,
+            Column::Interval(PrimitiveColumn::new(month_values)),
+            month_validity,
+        )),
+    ];
+    let batch = Arc::new(ColBatch::new(schema, columns, 3));
+
+    // Safety: the zeroed FFI outputs are writable and the batch remains alive
+    // until each matching release callback is invoked below.
+    unsafe {
+        let mut schema_out: ArrowSchema = std::mem::zeroed();
+        export_schema(&batch.schema, &mut schema_out);
+
+        let second_schema = &**schema_out.children.add(0);
+        assert_eq!(CStr::from_ptr(second_schema.format).to_str().unwrap(), "i");
+        assert_eq!(second_schema.flags, 0);
+        assert!(!second_schema.dictionary.is_null());
+        let second_dict_schema = &*second_schema.dictionary;
+        assert_eq!(
+            CStr::from_ptr(second_dict_schema.format).to_str().unwrap(),
+            "tDs"
+        );
+        assert_eq!(second_dict_schema.flags, 0);
+
+        let month_schema = &**schema_out.children.add(1);
+        assert_eq!(CStr::from_ptr(month_schema.format).to_str().unwrap(), "i");
+        assert_eq!(month_schema.flags, 2);
+        assert!(!month_schema.dictionary.is_null());
+        let month_dict_schema = &*month_schema.dictionary;
+        assert_eq!(
+            CStr::from_ptr(month_dict_schema.format).to_str().unwrap(),
+            "l"
+        );
+        assert_eq!(month_dict_schema.flags, 0);
+        (schema_out.release.unwrap())(&mut schema_out);
+
+        let mut array: ArrowArray = std::mem::zeroed();
+        export_batch_array(&batch, &mut array);
+
+        let second = &**array.children.add(0);
+        assert_eq!(second.length, 3);
+        assert_eq!(second.null_count, 0);
+        assert_eq!(second.n_buffers, 2);
+        assert!((*second.buffers.add(0)).is_null());
+        assert_eq!(*second.buffers.add(1), second_indices_ptr);
+        assert!(!second.dictionary.is_null());
+        let second_dict = &*second.dictionary;
+        assert_eq!(second_dict.length, 3);
+        assert_eq!(second_dict.n_buffers, 2);
+        assert!((*second_dict.buffers.add(0)).is_null());
+        assert_eq!(*second_dict.buffers.add(1), second_values_ptr);
+
+        let month = &**array.children.add(1);
+        assert_eq!(month.length, 3);
+        assert_eq!(month.null_count, 1);
+        assert_eq!(month.n_buffers, 2);
+        assert_eq!(*month.buffers.add(0), month_validity_ptr);
+        assert_eq!(*month.buffers.add(1), month_indices_ptr);
+        assert!(!month.dictionary.is_null());
+        let month_dict = &*month.dictionary;
+        assert_eq!(month_dict.length, 3);
+        assert_eq!(month_dict.n_buffers, 2);
+        assert!((*month_dict.buffers.add(0)).is_null());
+        assert_eq!(*month_dict.buffers.add(1), month_values_ptr);
+
+        (array.release.unwrap())(&mut array);
+    }
+}
+
+#[test]
 fn test_export_low_cardinality_uuid_child_format() {
     use crate::column::{DictionaryColumn, FixedBinaryColumn};
 

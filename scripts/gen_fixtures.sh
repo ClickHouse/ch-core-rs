@@ -330,7 +330,30 @@ SELECT
     -- server header live at v26.6.1.1193-stable. Rows resolve to user_1, NULL,
     -- user_2, NULL; index 0 is the NULL sentinel and the dictionary body is the
     -- bare non-nullable String inner.
-    CAST(multiIf(n = 1, NULL, n = 3, NULL, n = 0, 'user_1', 'user_2'), 'LowCardinality(SimpleAggregateFunction(anyLast, Nullable(String)))') AS lc_nsaf
+    CAST(multiIf(n = 1, NULL, n = 3, NULL, n = 0, 'user_1', 'user_2'), 'LowCardinality(SimpleAggregateFunction(anyLast, Nullable(String)))') AS lc_nsaf,
+    -- The 11 Interval* types are distinct logical units over the same raw signed
+    -- Int64 body. Small signed counts keep the SQL conversion safely in range
+    -- while pinning negative, zero, and positive wire values for every kind.
+    CAST(multiIf(n = 0, toInt64(-13), n = 1, toInt64(0), n = 2, toInt64(79), toInt64(258)), 'IntervalYear') AS iy,
+    CAST(multiIf(n = 0, toInt64(-13), n = 1, toInt64(0), n = 2, toInt64(79), toInt64(258)), 'IntervalQuarter') AS iq,
+    CAST(multiIf(n = 0, toInt64(-13), n = 1, toInt64(0), n = 2, toInt64(79), toInt64(258)), 'IntervalMonth') AS imo,
+    CAST(multiIf(n = 0, toInt64(-13), n = 1, toInt64(0), n = 2, toInt64(79), toInt64(258)), 'IntervalWeek') AS iw,
+    CAST(multiIf(n = 0, toInt64(-13), n = 1, toInt64(0), n = 2, toInt64(79), toInt64(258)), 'IntervalDay') AS id,
+    CAST(multiIf(n = 0, toInt64(-13), n = 1, toInt64(0), n = 2, toInt64(79), toInt64(258)), 'IntervalHour') AS ih,
+    CAST(multiIf(n = 0, toInt64(-13), n = 1, toInt64(0), n = 2, toInt64(79), toInt64(258)), 'IntervalMinute') AS imi,
+    CAST(multiIf(n = 0, toInt64(-13), n = 1, toInt64(0), n = 2, toInt64(79), toInt64(258)), 'IntervalSecond') AS isecond,
+    CAST(multiIf(n = 0, toInt64(-13), n = 1, toInt64(0), n = 2, toInt64(79), toInt64(258)), 'IntervalMillisecond') AS ims,
+    CAST(multiIf(n = 0, toInt64(-13), n = 1, toInt64(0), n = 2, toInt64(79), toInt64(258)), 'IntervalMicrosecond') AS ius,
+    CAST(multiIf(n = 0, toInt64(-13), n = 1, toInt64(0), n = 2, toInt64(79), toInt64(258)), 'IntervalNanosecond') AS ins,
+    -- Wrapper representatives: both Nullable and LowCardinality are legal for
+    -- every Interval kind. The LC values repeat so a real dictionary body and
+    -- indexes are captured.
+    CAST(multiIf(n = 1, NULL, n = 3, NULL, n = 0, toInt64(13), toInt64(79)), 'Nullable(IntervalDay)') AS nid,
+    CAST(multiIf(n = 0, toInt64(13), n = 1, toInt64(79), n = 2, toInt64(13), toInt64(258)), 'LowCardinality(IntervalHour)') AS lc_ih,
+    -- Map(IntervalDay, String): bare Interval keys are legal. This captures the
+    -- ordinary Array(Tuple(keys, values)) Map body with an Interval-backed key
+    -- run, including an empty row and multiple entries in one row.
+    CAST(multiIf(n = 0, map(), n = 1, map(toIntervalDay(13), 'user_1'), n = 2, map(toIntervalDay(-79), 'a', toIntervalDay(13), 'user_2'), map(toIntervalDay(258), 'x')), 'Map(IntervalDay, String)') AS m_id
 FROM numbers(4)
 SETTINGS allow_suspicious_low_cardinality_types = 1, enable_nullable_tuple_type = 1, enable_time_time64_type = 1, flatten_nested = 0
 FORMAT Native

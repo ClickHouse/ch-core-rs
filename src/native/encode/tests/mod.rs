@@ -5,11 +5,12 @@ use crate::native::decode::{decode_all_bytes, DecodeOptions, DBMS_TCP_PROTOCOL_V
 use crate::native::encode::validate::type_depth;
 use crate::native::protocol::MAX_TYPE_DEPTH;
 use crate::native::type_parser::parse_ch_type;
-use crate::schema::{GeoKind, Schema};
+use crate::schema::{GeoKind, IntervalKind, Schema};
 
 mod bool;
 mod containers;
 mod decimal;
+mod interval;
 mod low_cardinality;
 mod nullable;
 mod numeric;
@@ -107,6 +108,7 @@ fn assert_columns_eq(left: &Column, right: &Column, label: &str) {
         (Column::DateTime64(x), Column::DateTime64(y)) => eq!(x, y),
         (Column::Time(x), Column::Time(y)) => eq!(x, y),
         (Column::Time64(x), Column::Time64(y)) => eq!(x, y),
+        (Column::Interval(x), Column::Interval(y)) => eq!(x, y),
         (Column::Enum8(x), Column::Enum8(y)) => eq!(x, y),
         (Column::Enum16(x), Column::Enum16(y)) => eq!(x, y),
         (Column::Ipv4(x), Column::Ipv4(y)) => eq!(x, y),

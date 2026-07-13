@@ -52,6 +52,10 @@ pub enum ChType {
     Time64 {
         precision: u8,
     },
+    // ClickHouse's 11 Interval* logical types all store one signed Int64 count
+    // of the declared unit. The unit lives only in the logical type tag; the
+    // Native body is the same contiguous i64 buffer for every kind.
+    Interval(IntervalKind),
 
     // Decimal(P, S). The server always emits the canonical `Decimal(P, S)` form
     // on the wire (never `Decimal32(S)` etc.), so that is the only spelling
@@ -252,6 +256,45 @@ pub struct Schema {
     pub fields: Vec<Field>,
 }
 
+/// The unit carried by one of ClickHouse's 11 `Interval*` logical types.
+///
+/// Every kind has the same signed `Int64` Native body. Keeping the unit in a
+/// compact enum preserves the exact ClickHouse type while allowing all kinds
+/// to share one physical [`crate::column::Column::Interval`] buffer variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntervalKind {
+    Year,
+    Quarter,
+    Month,
+    Week,
+    Day,
+    Hour,
+    Minute,
+    Second,
+    Millisecond,
+    Microsecond,
+    Nanosecond,
+}
+
+impl IntervalKind {
+    /// The canonical, case-sensitive type name emitted in Native headers.
+    pub(crate) fn type_name(self) -> &'static str {
+        match self {
+            IntervalKind::Year => "IntervalYear",
+            IntervalKind::Quarter => "IntervalQuarter",
+            IntervalKind::Month => "IntervalMonth",
+            IntervalKind::Week => "IntervalWeek",
+            IntervalKind::Day => "IntervalDay",
+            IntervalKind::Hour => "IntervalHour",
+            IntervalKind::Minute => "IntervalMinute",
+            IntervalKind::Second => "IntervalSecond",
+            IntervalKind::Millisecond => "IntervalMillisecond",
+            IntervalKind::Microsecond => "IntervalMicrosecond",
+            IntervalKind::Nanosecond => "IntervalNanosecond",
+        }
+    }
+}
+
 impl Schema {
     pub fn new(fields: Vec<Field>) -> Self {
         Self { fields }
@@ -305,6 +348,7 @@ impl std::fmt::Display for ChType {
             } => write!(f, "DateTime64({precision}, '{tz}')"),
             ChType::Time => write!(f, "Time"),
             ChType::Time64 { precision } => write!(f, "Time64({precision})"),
+            ChType::Interval(kind) => f.write_str(kind.type_name()),
             // Render the canonical `Decimal(P, S)` the server emits, comma-space
             // separated, both fields always present, so it round-trips the wire
             // string. `bits` is derived from P and is not part of the name.

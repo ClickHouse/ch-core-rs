@@ -271,6 +271,7 @@ than an error.
 | `DateTime64(P)`, `DateTime64(P, '<tz>')`                                               | `DateTime64 { precision, timezone }`   | `DateTime64`      | `ts{unit}:{tz}` for P in {0,3,6,9}, else `l`                        | validity, values                           | yes                                                      |
 | `Time`                                                                                 | `Time`                                 | `Time`            | `i`                                                                 | validity, values                           | yes                                                      |
 | `Time64(P)`                                                                            | `Time64 { precision }`                 | `Time64`          | `l`                                                                 | validity, values                           | yes                                                      |
+| `IntervalYear` ... `IntervalNanosecond`                                                 | `Interval(IntervalKind)`               | `Interval`        | `tDs`/`tDm`/`tDu`/`tDn` for s/ms/us/ns, else `l`                    | validity, values                           | yes                                                      |
 | `Nullable(T)`                                                                          | `Nullable(T)`                          | inner T's variant | inner's                                                             | inner's, validity populated                | n/a                                                      |
 | `LowCardinality(T)` for an allowed inner `T` (see the type section)                    | `LowCardinality(Box<ChType>)`          | `Dictionary`      | `i` (index type; values type in the dictionary child)               | validity, i32 indices (+ dictionary child) | via inner `Nullable`                                     |
 | `Array(T)` for any supported element `T`                                               | `Array(Box<ChType>)`                   | `Array`           | `+L` (LargeList; element type in the item child)                    | validity, i64 offsets (+ item child)       | no (array level); element nulls via `Array(Nullable(T))` |
@@ -863,6 +864,69 @@ Confirmed at `v26.6.1.1193-stable` from
 `src/DataTypes/Serializations/SerializationTime64.{h,cpp}`, and
 `src/DataTypes/Serializations/SerializationDecimalBase.cpp`.
 
+### Interval types
+
+**Type string(s):** the 11 exact, case-sensitive canonical names
+`IntervalYear`, `IntervalQuarter`, `IntervalMonth`, `IntervalWeek`,
+`IntervalDay`, `IntervalHour`, `IntervalMinute`, `IntervalSecond`,
+`IntervalMillisecond`, `IntervalMicrosecond`, and `IntervalNanosecond`. There
+are no parameters or aliases in a Native header.
+
+**Logical type:** `ChType::Interval(IntervalKind)`, where `IntervalKind` has one
+variant for each unit above. `Display` emits the matching canonical name, so
+`parse(display(t)) == t` for every kind.
+
+**Wire payload:** `num_rows * 8` bytes, one contiguous little-endian signed
+`Int64` count per row, with no per-row framing and no in-band unit tag. The unit
+is carried only by the type string. The per-column bulk-state prefix reads zero
+bytes and the custom-serialization marker is 0x00. Decode and encode use the
+same primitive bulk path as `Int64`.
+
+**Arrow export:** 2 buffers in order, validity then values, zero-copy. The four
+units whose physical `i64` count exactly matches an Arrow Duration unit export
+as Duration: `IntervalSecond` -> `tDs`, `IntervalMillisecond` -> `tDm`,
+`IntervalMicrosecond` -> `tDu`, and `IntervalNanosecond` -> `tDn`. The other
+seven kinds export as `l` (Arrow int64, raw counts). Arrow's calendar interval
+layouts are physically incompatible with ClickHouse's one-`Int64` count, and
+Arrow has no exact duration unit for year, quarter, month, week, day, hour, or
+minute. Converting those would require per-value work and a new buffer, so the
+core preserves the raw i64 and the exact unit remains in `ChType`.
+
+**Rust buffer:** `Column::Interval(PrimitiveColumn<i64>)`, `{ values, validity }`,
+length `num_rows`. All 11 kinds share this physical column variant; the exact
+unit lives in the schema's `ChType::Interval`, the same Column-vs-ChType split
+used for `Time64` precision and `DateTime64` timezone.
+
+**Notes:** all 11 kinds are legal inside `Nullable` and `LowCardinality` at the
+pinned tag. A `LowCardinality(Interval*)` dictionary body is a plain contiguous
+Interval i64 run and uses the ordinary dictionary/index framing. Bare Interval
+and `LowCardinality(Interval*)` are legal Map keys; only the generic Map ban on
+nullable keys applies. Persisted `LowCardinality(Interval*)` schema declarations
+and explicit CAST targets require
+`allow_suspicious_low_cardinality_types = 1`, but that validation gate does not
+change the type's legality or wire bytes. It is the generic fixed-width numeric
+LowCardinality guard, not an Interval-specific restriction. Server expressions
+can still produce `LowCardinality(Interval*)` results without the setting, and
+clients need no setting to decode them. Intervals are leaf types for
+`MAX_TYPE_DEPTH`; wrappers and containers charge their ordinary levels, with no
+Interval-specific depth.
+
+**Introduction version:** undetermined from the shallow `.server-src` checkout;
+not guessed. All 11 are registered and stable at `v26.6.1.1193-stable`.
+
+**Server reference:** `DataTypeInterval::doGetName`,
+`DataTypeInterval::doGetSerialization`, and `registerDataTypeInterval` in
+`src/DataTypes/DataTypeInterval.{h,cpp}`; the unit names in
+`src/Common/IntervalKind.{h,cpp}`; `SerializationInterval` in
+`src/DataTypes/Serializations/SerializationInterval.h`; and the contiguous
+little-endian bulk methods in
+`src/DataTypes/Serializations/SerializationNumber.cpp`. Nullable legality was
+confirmed through `src/DataTypes/DataTypeNullable.cpp`, LowCardinality legality
+through `DataTypeNumberBase::canBeInsideLowCardinality` and
+`src/DataTypes/DataTypeLowCardinality.cpp`, and Map-key legality through
+`src/DataTypes/DataTypeMap.cpp`. All claims in this section are confirmed at
+`v26.6.1.1193-stable`; none are inferred.
+
 ### Nullable(T)
 
 **Type string(s):** `Nullable(T)` where `T` is any supported non-wrapper type
@@ -914,7 +978,8 @@ rejects any other inner as `UnsupportedType`.
 the fixed-width numerics (`Int8`/`Int16`/`Int32`/`Int64`,
 `UInt8`/`UInt16`/`UInt32`/`UInt64`, `Float32`/`Float64`), the wide integers
 (`Int128`/`UInt128`/`Int256`/`UInt256`), `Bool`, the number-backed temporals
-`Date`, `Date32`, `DateTime`, and `Time`, and `UUID`/`IPv4`/`IPv6`. The
+`Date`, `Date32`, `DateTime`, `Time`, every `Interval*`, and
+`UUID`/`IPv4`/`IPv6`. The
 dictionary values are that inner type serialized as a plain column body:
 varint-length strings for `String`, raw fixed-width bytes otherwise (4 bytes per
 `IPv4` entry, 16 bytes per `UUID`/`IPv6`/`Int128`/`UInt128` entry, 32 bytes per
@@ -950,11 +1015,14 @@ with the types this crate decodes, confirmed against the server source at
   width-16/32 `FixedBinary`-backed dictionary value column
   (`Int128`/`UInt128`/`Int256`/`UInt256`).
 
-The fixed-width numeric and temporal inners, and `IPv4`/`IPv6`, require the server
-setting `allow_suspicious_low_cardinality_types=1` at table-creation time. That is
-a server-side creation guard only: it has no effect on the wire bytes and is not
-needed to decode a column the server already produced. `String`, `FixedString`,
-and `UUID` are allowed unconditionally.
+The fixed-width numeric, temporal, and Interval inners, and `IPv4`/`IPv6`,
+require the server setting `allow_suspicious_low_cardinality_types=1` in
+persisted schema declarations and explicit `CAST` targets. That is a server-side
+type-use guard only, shared by fixed-width numeric types rather than specific to
+Interval. It does not prevent server expressions from returning these
+LowCardinality types without the setting, has no effect on the wire bytes, and
+is not needed to decode a column the server already produced. `String`,
+`FixedString`, and `UUID` are allowed unconditionally.
 
 **Logical type:** `ChType::LowCardinality(Box<ChType>)`.
 
@@ -1620,7 +1688,8 @@ Encode coverage is kept a subset of decode coverage and grows the same
 one-type-at-a-time way; the two are currently at parity.
 Encodable today: `Bool`, the fixed-width numerics (`Int8`..`Int64`,
 `UInt8`..`UInt64`, `Float32`, `Float64`), the temporals (`Date`, `Date32`,
-`DateTime`, `DateTime64`, `Time`, `Time64`), `UUID`, `IPv4`, `IPv6`, `String`,
+`DateTime`, `DateTime64`, `Time`, `Time64`, and every `Interval*`), `UUID`,
+`IPv4`, `IPv6`, `String`,
 `FixedString(N)`,
 `Enum8`/`Enum16`, `Decimal(P, S)`, the wide integers
 (`Int128`/`UInt128`/`Int256`/`UInt256`, a verbatim fixed-width body byte-identical
@@ -1878,8 +1947,8 @@ When a block has `num_rows == 0` the chunk is dropped from `chunks`, but the
 schema is still established. If a consumer constructs or inspects an empty column
 directly (`empty_column` in `src/native/decode/mod.rs`), the empty shapes are:
 
-- Numerics and `Bool`: empty value or bit buffer, length 0. `IPv4` (a `u32`
-  primitive) is the same.
+- Numerics, `Interval*`, and `Bool`: empty value or bit buffer, length 0.
+  `IPv4` (a `u32` primitive) is the same.
 - `String`: `offsets == [0]` (length 1, the required leading zero) and empty
   data.
 - `FixedString(N)`: empty data, width preserved. `UUID` and `IPv6` are the same
@@ -1916,7 +1985,8 @@ Not yet supported, tracked as planned phases in `src/schema.rs`:
 - `LowCardinality(T)` for an inner type outside the allowlist in the
   `LowCardinality(T)` section. The wrapper and its allowed inners (String,
   FixedString, the fixed-width numerics, the wide integers, Bool, Date, Date32,
-  DateTime, Time, UUID/IPv4/IPv6, with or without an inner `Nullable`) are
+  DateTime, Time, every `Interval*`, UUID/IPv4/IPv6, with or without an inner
+  `Nullable`) are
   supported; any other inner is rejected as `UnsupportedType`. This includes
   `DateTime64`, `Time64`, every `Decimal`, and `Enum8`/`Enum16`, all of which the
   server itself forbids as LC inners (`canBeInsideLowCardinality()` is false), so
