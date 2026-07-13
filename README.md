@@ -191,7 +191,7 @@ block bytes for `INSERT` with `native::encode::encode_block` or
 - `src/batch.rs` - `ColBatch` and `ChunkedBatch` result model.
 - `src/bitmap.rs` - validity bitmap conversion and storage.
 - `src/native/` - Native-format varints, block decode, stream decode, and block encode.
-- `src/ffi.rs` - Arrow C Data Interface export.
+- `src/ffi/mod.rs` - Arrow C Data Interface export.
 
 ## Testing
 

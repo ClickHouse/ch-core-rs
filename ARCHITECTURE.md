@@ -38,7 +38,7 @@ ClickHouse server
 ```
 
 The diagram is the decode (read) path. The same buffers run the inverse
-direction too: `native/encode.rs` encodes them back into Native block bytes for
+direction too: `native/encode/mod.rs` encodes them back into Native block bytes for
 `INSERT ... FORMAT Native`.
 
 The division of labor is strict:
@@ -117,11 +117,14 @@ src/schema.rs            ClickHouse logical type model (ChType, Field, Schema)
 src/column.rs            physical columnar buffers (Column and its variants)
 src/batch.rs             ColBatch (one block) and ChunkedBatch (one result)
 src/bitmap.rs            bit-packed validity bitmaps, CH null map conversion
+src/native/protocol.rs   shared wire-protocol constants
+src/native/type_parser.rs  type-string parser + type-shape predicates
 src/native/varint.rs     ByteReader slice cursor + LEB128 varints
-src/native/decode.rs     block framing, type-string parsing, per-type decode
-src/native/encode.rs     block framing + per-type Native encode (insert path)
+src/native/decode/mod.rs block framing, header validation, per-type decode
+src/native/encode/mod.rs block framing + per-type Native encode (insert path)
+src/native/encode/validate.rs encode precondition validation
 src/native/stream_decoder.rs  push-based incremental decoding
-src/ffi.rs               Arrow C Data Interface export (schema/array/stream)
+src/ffi/mod.rs           Arrow C Data Interface export (schema/array/stream)
 ```
 
 ### The data model
@@ -164,7 +167,7 @@ ownership of them (see below). Zero-row blocks (the server commonly sends a
 zero-row trailer) contribute schema validation but are dropped from the chunk
 list.
 
-### Decoding the Native format (`native/decode.rs`)
+### Decoding the Native format (`native/decode/mod.rs`)
 
 **The cursor.** All decoding runs over `ByteReader`, a plain slice cursor
 (`&[u8]` + position). The input is always already in memory, so there is no
@@ -288,7 +291,7 @@ The interesting machinery is how it avoids wasted work on partial data:
 Transport-level backpressure stays a binding/client responsibility; the core
 just decodes what it is given.
 
-### Arrow C Data Interface export (`src/ffi.rs`)
+### Arrow C Data Interface export (`src/ffi/mod.rs`)
 
 This is how the buffers cross a language boundary with zero copies and zero
 shared dependencies. The Arrow C Data Interface is a tiny C-compatible
@@ -325,7 +328,7 @@ temporal type only when the physical width matches exactly (`Date32` ->
 raw integer type is exposed and interpretation is left to the binding. Buffers
 are never widened or rescaled at the FFI layer.
 
-### Encoding the Native format (`native/encode.rs`)
+### Encoding the Native format (`native/encode/mod.rs`)
 
 The inverse of the decode path: `encode_block` and `encode_chunked` turn a
 `ColBatch` (or each chunk of a `ChunkedBatch`) back into Native block bytes the

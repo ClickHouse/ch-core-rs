@@ -32,7 +32,7 @@ not.
 Zero-row HTTP and `clickhouse-client` Native queries on the current local
 server emit an empty response, not a schema-bearing zero-row Native block. The
 decoder's zero-row block behavior remains covered by unit tests in
-`src/native/decode.rs`.
+`src/native/decode/tests/`.
 
 ## Refreshing
 
@@ -55,7 +55,7 @@ fixture list, protocol revisions, or first-byte hexdumps change.
 
 The framed fixture is captured with `client_protocol_version` set to the pinned
 version's `DBMS_TCP_PROTOCOL_VERSION` (`54485` for `v26.6.1.1193-stable`, see
-`src/native/decode.rs`). The server caps the negotiated revision at its own
+`src/native/protocol.rs`). The server caps the negotiated revision at its own
 maximum, so if you point the script at a different server version, update that
 number in `scripts/gen_fixtures.sh`, the fixture file name, and
 `tests/integration.rs` to the new negotiated revision. The full type-adding

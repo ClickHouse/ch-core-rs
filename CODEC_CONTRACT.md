@@ -4,9 +4,9 @@ This is the definitive reference for what `ch-core-rs` decodes and encodes, and
 for the exact shapes on both sides of each path. The crate runs two inverse
 paths over one shared columnar model and one shared wire format:
 
-- **Decode** (`src/native/decode.rs`): ClickHouse `FORMAT Native` bytes ->
-  `Column` buffers -> Arrow C Data export (`src/ffi.rs`).
-- **Encode** (`src/native/encode.rs`): `Column` buffers -> ClickHouse
+- **Decode** (`src/native/decode/mod.rs`): ClickHouse `FORMAT Native` bytes ->
+  `Column` buffers -> Arrow C Data export (`src/ffi/mod.rs`).
+- **Encode** (`src/native/encode/mod.rs`): `Column` buffers -> ClickHouse
   `FORMAT Native` bytes the server accepts for `INSERT`.
 
 For every supported ClickHouse type this doc records three views, all shared by
@@ -16,7 +16,7 @@ both paths:
    is one description of one format; the two paths are exact inverses over it.
 2. The raw Rust `Column` buffers defined in `src/column.rs`: decode's output and
    encode's input.
-3. The Arrow C Data export produced by `src/ffi.rs`: the format string, the
+3. The Arrow C Data export produced by `src/ffi/mod.rs`: the format string, the
    buffer count, and the buffer order. This is the primary decode contract
    surface. Encode has no Arrow export; it consumes the `Column` buffers directly.
 
@@ -52,14 +52,14 @@ describes.
 Every type section uses the same fields, in the same order:
 
 - **Type string(s)**: the exact ClickHouse type name(s) that `parse_ch_type`
-  in `src/native/decode.rs` accepts for this type.
+  in `src/native/type_parser.rs` accepts for this type.
 - **Logical type**: the `ChType` variant in `src/schema.rs`.
 - **Wire payload**: the bytes decode reads and encode writes for this column, for
   a block of `num_rows` rows. The two paths are exact inverses over these bytes.
   This is the per-column payload only. Block framing and the nullable null map are
   described once below, not repeated per type.
 - **Arrow export**: the Arrow format string and the buffers emitted by
-  `export_column_array` in `src/ffi.rs`, in order. Decode only.
+  `export_column_array` in `src/ffi/mod.rs`, in order. Decode only.
 - **Rust buffer**: the `Column` variant and the fields of its backing struct in
   `src/column.rs`. This is decode's output and encode's input.
 - **Notes**: edge cases, range limits, and anything a consumer can get wrong.
@@ -216,7 +216,7 @@ binary type-header support is added.
 
 ### How the decoder reads this
 
-`decode_next_block` in `src/native/decode.rs`, driven by
+`decode_next_block` in `src/native/decode/mod.rs`, driven by
 `DecodeOptions.protocol_revision`:
 
 - When `protocol_revision > 0`, it parses the block info preamble by field
@@ -1012,7 +1012,7 @@ BETWEEN the `LowCardinality` and its `Nullable`: `LowCardinality(SAF(anyLast,
 Nullable(String)))` is a real server header (live-confirmed at
 `v26.6.1.1193-stable`), and chained SAF is legal. All `LowCardinality` sites
 resolve `(nullable, dict_value_type)` through one shared helper,
-`low_cardinality_dict_value_type` in `src/native/decode.rs`, which strips the
+`low_cardinality_dict_value_type` in `src/native/type_parser.rs`, which strips the
 full SAF chain, unwraps the optional `Nullable`, then strips any further SAF
 chain, so the aliased forms decode, encode, and export exactly as the
 equivalent plain `LowCardinality(Nullable(T))`. See the
@@ -1425,7 +1425,7 @@ split the temporals and `Decimal` use for their metadata.
   Every `LowCardinality` site (decode, the completeness scan, the zero-row empty
   column, header validation, encode validate/write, and the Arrow schema export)
   resolves its inner through one shared helper, `low_cardinality_dict_value_type`
-  in `src/native/decode.rs`, which strips the full SAF chain, unwraps the optional
+  in `src/native/type_parser.rs`, which strips the full SAF chain, unwraps the optional
   `Nullable`, then strips any further SAF chain beneath it, returning
   `(nullable, dict_value_type)`. This is not a single-level see-through: chained
   SAF (`SimpleAggregateFunction(anyLast, SimpleAggregateFunction(sum, UInt64))`,
@@ -1568,7 +1568,7 @@ name with `backQuoteIfNeed` exactly like `DataTypeTuple`, and the runtime type i
 
 ## Encoding
 
-`src/native/encode.rs` is the inverse of the decode path: it turns a `ColBatch`
+`src/native/encode/mod.rs` is the inverse of the decode path: it turns a `ColBatch`
 (or each chunk of a `ChunkedBatch`) back into the Native block bytes the server
 accepts for `INSERT`. The wire it produces is exactly the wire the per-type
 sections above describe and exactly what `decode_next_block` reads at the same
@@ -1876,7 +1876,7 @@ mirror of the "Zero-row output" section below.
 
 When a block has `num_rows == 0` the chunk is dropped from `chunks`, but the
 schema is still established. If a consumer constructs or inspects an empty column
-directly (`empty_column` in `src/native/decode.rs`), the empty shapes are:
+directly (`empty_column` in `src/native/decode/mod.rs`), the empty shapes are:
 
 - Numerics and `Bool`: empty value or bit buffer, length 0. `IPv4` (a `u32`
   primitive) is the same.

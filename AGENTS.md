@@ -53,7 +53,7 @@ These are the reasons the crate exists. Do not erode them.
   This is a deliberate design choice (see `README.md`), not an oversight.
 - **Arrow-compatible buffer layout.** Fixed-width columns use one contiguous
   typed buffer, strings use offsets plus data, booleans and nullability use
-  packed bitmaps (bit 1 = valid). Keep new types Arrow-shaped so `ffi.rs` can
+  packed bitmaps (bit 1 = valid). Keep new types Arrow-shaped so `ffi/mod.rs` can
   export them through the Arrow C Data Interface.
 
 ## Role
@@ -77,7 +77,7 @@ Hold the code to the standard of a well-run public Rust crate.
 ### Idiomatic Rust
 
 - Match the surrounding style: module-level `//!` docs, item-level `///` docs,
-  the `// ----` section banners already used in `decode.rs` and `ffi.rs`.
+  the `// ----` section banners already used in `decode/mod.rs` and `ffi/mod.rs`.
 - Prefer expressions and iterators where they are clear, but never at the cost
   of an allocation or a bounds check in the hot decode loop. Clarity and speed
   both matter here; when they conflict in the hot path, measure.
@@ -99,7 +99,7 @@ Hold the code to the standard of a well-run public Rust crate.
 
 - Prefer safe code. Reach for `unsafe` only for a real, measured reason: the
   little-endian read-into-typed-buffer fast path, and the Arrow C Data FFI in
-  `ffi.rs`. Both are inherently unsafe and that is fine.
+  `ffi/mod.rs`. Both are inherently unsafe and that is fine.
 - Every `unsafe` block must carry a `// Safety:` comment that states the
   invariant being upheld and why it holds. Match the quality of the existing
   comment in the `decode_primitive!` macro. A new `unsafe` block without a
@@ -109,7 +109,7 @@ Hold the code to the standard of a well-run public Rust crate.
 - The FFI layer must uphold the Arrow C Data Interface contract: `repr(C)`
   structs, correct `release` callbacks, and keeping `Arc<ColBatch>` alive in
   private data for as long as a consumer holds the buffers. Do not change
-  ownership or release semantics without reading the spec linked in `ffi.rs`.
+  ownership or release semantics without reading the spec linked in `ffi/mod.rs`.
 
 ### Performance discipline (this is the hot path)
 
@@ -127,7 +127,7 @@ Hold the code to the standard of a well-run public Rust crate.
 ### Tests and docs
 
 - Decode logic ships with unit tests. Follow the existing pattern: the
-  `BlockBuilder` helper in `decode.rs` assembles wire bytes; new types get an
+  `BlockBuilder` helper in `decode/tests/mod.rs` assembles wire bytes; new types get an
   analogous round-trip or decode test. Cover the nullable variant, the zero-row
   block, and at least one multi-block case for any new column type.
 - Document the wire layout you implement in a `///` comment on the decoder,
@@ -268,13 +268,14 @@ and check the item off as part of the same change. The per-type workflow:
 3. Add or enable the logical variant in `src/schema.rs` (`ChType`). The enum
    already carries commented-out placeholders for the planned phases (temporal,
    decimal, UUID/IP, enums, LowCardinality, containers, wide ints).
-4. Teach `parse_ch_type` in `src/native/decode.rs` to parse the ClickHouse type
+4. Teach `parse_ch_type` in `src/native/type_parser.rs` to parse the ClickHouse type
    string into that variant.
 5. Decode the wire bytes into a `Column` variant in `src/column.rs`, keeping the
    buffer layout Arrow-compatible.
-6. Add Arrow format and buffer export in `src/ffi.rs`.
-7. Encode the type back to Native bytes in `src/native/encode.rs`: add its
-   validation preconditions and its body writer so encode coverage keeps pace
+6. Add Arrow format and buffer export in `src/ffi/mod.rs`.
+7. Encode the type back to Native bytes in `src/native/encode/mod.rs`: add its
+   validation preconditions (in `src/native/encode/validate.rs`) and its body
+   writer so encode coverage keeps pace
    with decode. Prefer landing encode in the same change. If you defer it, the
    type stays `EncodeError::UnsupportedType` on the write side until it lands.
 8. Add unit tests in the relevant module using the `BlockBuilder` pattern: cover

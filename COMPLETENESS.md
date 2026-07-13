@@ -54,7 +54,7 @@ default; the user may override it.
   live-confirmed real server header at `v26.6.1.1193-stable`), and SAF chains are
   legal to any depth. The per-site single-level SAF see-through was replaced with
   one shared full-chain helper, `low_cardinality_dict_value_type`
-  (`src/native/decode.rs`), consulted by every `LowCardinality` site on both
+  (`src/native/type_parser.rs`), consulted by every `LowCardinality` site on both
   paths and the Arrow export, so header validation, the nullability decision, and
   the Arrow schema export can no longer disagree with the body paths. New fixture
   column `lc_nsaf`, new unit/round-trip tests, and the live INSERT test extended.
@@ -121,12 +121,12 @@ default; the user may override it.
     such as `SimpleAggregateFunction(anyLast, SimpleAggregateFunction(sum,
     UInt64))` is live-constructible. Every `LowCardinality` site therefore
     resolves its inner through ONE shared helper,
-    `low_cardinality_dict_value_type` (`src/native/decode.rs`), which strips the
+    `low_cardinality_dict_value_type` (`src/native/type_parser.rs`), which strips the
     full SAF chain, unwraps the optional `Nullable`, then strips any further SAF
     chain beneath it, returning `(nullable, dict_value_type)`. Decode, the scan,
     `empty_column`, header validation, encode validate/write,
     `is_encodable`/`nullable_at_this_level`, and the Arrow schema export
-    (`dictionary_value_type`/`field_is_nullable` in `src/ffi.rs`) all call it, so
+    (`dictionary_value_type`/`field_is_nullable` in `src/ffi/mod.rs`) all call it, so
     a single-level see-through gap ("one path resolves the alias, another does
     not") cannot recur. A per-column single-level SAF unwrap must not be
     reintroduced at any of these sites.
@@ -163,7 +163,7 @@ default; the user may override it.
     `MAX_TYPE_DEPTH` as `InconsistentBatch`, deliberately NOT
     `UnsupportedType`: that variant clones and `Display`s the `ChType`, both of
     which recurse to full depth, so the error itself would overflow on the
-    input the check rejects. The `type_depth` walk in `encode.rs` is an
+    input the check rejects. The `type_depth` walk in `encode/validate.rs` is an
     explicit worklist since the multi-child containers (`Tuple`, `Map`)
     landed.
   - `Nullable(Tuple)` IS legal on the wire (`DataTypeTuple::canBeInsideNullable()`
@@ -174,7 +174,7 @@ default; the user may override it.
     `canBeInsideLowCardinality()` false) and are rejected.
   - Map keys: `Nullable(K)` and `LowCardinality(Nullable(K))` are forbidden
     (`DataTypeMap::isValidKeyType`); plain `LowCardinality(K)` keys are legal.
-    One shared predicate (`is_valid_map_key_type` in `src/native/decode.rs`)
+    One shared predicate (`is_valid_map_key_type` in `src/native/type_parser.rs`)
     is consulted by decode header validation, the scan, and encode, so the
     sides cannot drift.
   - A zero-element `Tuple()` is constructible and emittable and writes exactly
@@ -255,7 +255,7 @@ default; the user may override it.
     original introduction). Record a type's introduction version only when it is
     determinable from the source; do not guess from memory.
   - `LowCardinality` inner support is gated by `is_low_cardinality_inner`
-    (`src/native/decode.rs`), the `canBeInsideLowCardinality()` allowlist
+    (`src/native/type_parser.rs`), the `canBeInsideLowCardinality()` allowlist
     intersected with decoded types. It now includes `UUID`/`IPv4`/`IPv6`. Both
     `decode_low_cardinality_dictionary` and the scan's `skip_low_cardinality_data`
     consult it, so decode and `block_end` agree on which columns are accepted. The
@@ -319,9 +319,9 @@ is not done, and must not be checked off, until all of these hold:
    in), plus whether its layout is version dependent or experimental at the pin.
 3. `ChType` variant added or enabled in `src/schema.rs`, with `Display`
    round-tripping the canonical type name.
-4. `parse_ch_type` in `src/native/decode.rs` parses the type string.
+4. `parse_ch_type` in `src/native/type_parser.rs` parses the type string.
 5. Wire bytes decode into a `Column` variant in `src/column.rs`, Arrow-shaped.
-6. Arrow format string and buffer export added in `src/ffi.rs`.
+6. Arrow format string and buffer export added in `src/ffi/mod.rs`.
 7. Unit tests using the `BlockBuilder` pattern: plain, `Nullable`, zero-row, and
    at least one multi-block case.
 8. Live-server coverage: extend the `all_types` query in
@@ -494,7 +494,7 @@ is not done, and must not be checked off, until all of these hold:
         Inside `LowCardinality`, the alias may sit BETWEEN the LC and its
         removeNullable `Nullable`; every LC site resolves the inner through one
         shared full-chain helper `low_cardinality_dict_value_type`
-        (`src/native/decode.rs`) so header validation, the nullability decision,
+        (`src/native/type_parser.rs`) so header validation, the nullability decision,
         the body paths, and the Arrow export cannot drift. Confirmed against the
         server source (`DataTypeCustomSimpleAggregateFunction`,
         v26.6.1.1193-stable) and verified with the
@@ -744,7 +744,7 @@ where the across-release churn lives.
 - [ ] Sparse column serialization - the nonzero custom-serialization marker the
       decoder currently rejects. Needed wherever the server emits sparse columns.
 - [x] Multiple-stream bulk-state prefix - the per-column read is generalized via
-      `read_state_prefix` in `src/native/decode.rs`, so a type with a real
+      `read_state_prefix` in `src/native/decode/mod.rs`, so a type with a real
       `deserializeBinaryBulkStatePrefix` declares its prefix in one place instead
       of the old "prefix reads zero bytes" assumption. `LowCardinality` reads its
       8-byte key version through it; every other type reads zero bytes. The
@@ -762,8 +762,8 @@ where the across-release churn lives.
 Now in active development (priority shifted here 2026-07-01). The aim is to turn
 columnar input, the same `Column`/`ColBatch` model the decoder produces, into
 `FORMAT Native` block bytes the server accepts for `INSERT`. Lives in
-`src/native/encode.rs` (`encode_block`, `encode_chunked`, `EncodeOptions`,
-`EncodeError`), the mirror of `src/native/decode.rs`. Framing is the exact inverse
+`src/native/encode/mod.rs` (`encode_block`, `encode_chunked`, `EncodeOptions`,
+`EncodeError`), the mirror of `src/native/decode/mod.rs`. Framing is the exact inverse
 of the decoder, confirmed against `NativeWriter::write`, `BlockInfo::write`, and
 `NativeInputFormat` at v26.6.1.1193-stable via the `clickhouse-server-reader`
 sub-agent. Encode coverage is kept a subset of decode coverage: any type or
@@ -978,11 +978,11 @@ direction and encode is its exact inverse, so no `clickhouse-server-reader` read
 and no new committed fixtures are needed (the exceptions are the wrappers, where
 the framing detail matters: see `LowCardinality`). For a plain, non-wrapper type:
 
-1. Add a `(ChType, Column)` arm in `encode_column_data` (`src/native/encode.rs`)
-   that writes the inverse of that type's decoder in `src/native/decode.rs`. Keep
+1. Add a `(ChType, Column)` arm in `encode_column_data` (`src/native/encode/mod.rs`)
+   that writes the inverse of that type's decoder in `src/native/decode/mod.rs`. Keep
    the pair-match so the on-wire type string (from `ChType::Display`) and the body
    (from the `Column` buffer) can never diverge.
-2. Add a round-trip unit test in `encode.rs`: build a `ColBatch`, `encode_block`,
+2. Add a round-trip unit test in `encode/tests/`: build a `ColBatch`, `encode_block`,
    `decode_all_bytes`, assert equality, at rev 0 and rev 54485, plus the nullable
    form once the null map lands.
 3. Add a column to `tests/live_insert.rs` so the live server confirms it accepts
