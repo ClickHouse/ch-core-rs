@@ -131,9 +131,11 @@ pub enum ChType {
     // groupArrayArray, groupArrayLastArray, groupUniqArrayArray,
     // groupUniqArrayArrayMap, sumMappedArrays, minMappedArrays, maxMappedArrays)
     // but the decoder does NOT enforce it: a server-authored header is trusted
-    // and the list grows across versions. This is a top-level-only spelling; the
-    // parser rejects it inside any wrapper or container (the reversed nesting is
-    // unobserved on the wire, so shipping its inferred layout would be a guess).
+    // and the list grows across versions. The parser accepts the spelling at any
+    // nesting depth, so `Nullable`, `LowCardinality`, `Tuple`, `Array`, and `Map`
+    // over a `SimpleAggregateFunction` all parse and delegate through `inner`
+    // (the wrapped forms are observed live headers, e.g. an AggregatingMergeTree
+    // `LowCardinality(SimpleAggregateFunction(anyLast, String))` column).
     SimpleAggregateFunction {
         func: String,
         inner: Box<ChType>,
@@ -517,7 +519,11 @@ impl ChType {
     /// `ChType` because the geo and `Nested` expansions are synthesized rather
     /// than stored; the clone is bounded by the parsed type depth and never runs
     /// per row.
-    pub(crate) fn physical_delegate(&self) -> Option<ChType> {
+    ///
+    /// Public so a binding crate can reuse the same single expansion point when
+    /// mapping decoded columns to host values or building columns for encode,
+    /// rather than duplicating the geo/Nested/SAF layout and drifting from it.
+    pub fn physical_delegate(&self) -> Option<ChType> {
         match self {
             ChType::SimpleAggregateFunction { inner, .. } => Some((**inner).clone()),
             ChType::Geo(kind) => Some(kind.underlying_type()),

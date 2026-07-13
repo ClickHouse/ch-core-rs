@@ -1447,7 +1447,10 @@ pub(crate) fn is_low_cardinality_inner(dict_value_type: &ChType) -> bool {
 /// returns a borrow rather than an owned type; the geo/`Nested` aliases are never
 /// legal here and resolve (through `is_low_cardinality_inner`) to a rejected
 /// `Tuple`/`Array` anyway.
-pub(crate) fn low_cardinality_dict_value_type(inner: &ChType) -> (bool, &ChType) {
+///
+/// Public so a binding crate resolves a `LowCardinality` inner the same way,
+/// rather than duplicating the SAF/`Nullable` stripping and drifting from it.
+pub fn low_cardinality_dict_value_type(inner: &ChType) -> (bool, &ChType) {
     fn strip_saf(mut t: &ChType) -> &ChType {
         while let ChType::SimpleAggregateFunction { inner, .. } = t {
             t = inner.as_ref();
