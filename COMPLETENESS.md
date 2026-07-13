@@ -47,43 +47,55 @@ point-in-time snapshot for the next agent, not a changelog. Keep it short. Alway
 include a "Recommended next" with a one-line reason, so the next agent has a
 default; the user may override it.
 
-- **Last updated:** 2026-07-13. Implemented all 11 `Interval*` logical types at
-  decode/encode parity, including parser, scanner, zero-row handling,
-  `Nullable`, `LowCardinality`, Arrow export, synthetic tests, live INSERT
-  coverage, and the shared `all_types` fixture query/assertions. Both committed
-  fixtures were recaptured from ClickHouse 26.6.1.1193 and the full integration
-  and live INSERT gates pass. Fixture coverage includes plain, Nullable,
-  LowCardinality, and `Map(IntervalDay, String)` columns.
-- **Implementation shape:** `ChType::Interval(IntervalKind)` preserves the exact
-  logical unit while every kind shares one `Column::Interval(PrimitiveColumn<i64>)`
-  physical buffer. Decode uses the existing direct primitive `Int64` hot path,
-  encode writes its inverse, and the scanner skips exactly 8 bytes per value.
-  Arrow exports Second/Millisecond/Microsecond/Nanosecond as `tDs`/`tDm`/`tDu`/
-  `tDn`; the seven non-fixed or unsupported-duration units remain raw signed
-  `Int64` (`l`) without copying.
+- **Last updated:** 2026-07-13. Implemented `BFloat16` at decode/encode parity,
+  including parser, scanner, zero-row and multi-block handling, `Nullable`,
+  `LowCardinality`, Arrow export, exact-bit unit tests, live INSERT coverage, and
+  real-server fixture assertions. Both `all_types` fixtures were recaptured from
+  ClickHouse 26.6.1.1193 with plain, Nullable, and LowCardinality BFloat16
+  columns, and the integration and live INSERT gates pass.
+- **Implementation shape:** `ChType::BFloat16` preserves the logical type and
+  `Column::BFloat16(PrimitiveColumn<[u8; 2]>)` stores each raw little-endian
+  16-bit word verbatim, with the two-byte width enforced by the element type.
+  Decode performs one contiguous copy into the column buffer, encode writes it
+  verbatim, and the scanner skips exactly 2 bytes per value. Arrow has no
+  BFloat16 primitive, so export is honest zero-copy FixedSizeBinary(2), `w:2`;
+  `e` would incorrectly claim IEEE binary16 and `S` would incorrectly claim
+  UInt16 semantics.
 - **Pinned server tag:** `v26.6.1.1193-stable`, protocol revision **54485**.
-  Confirmed server paths for this item: `DataTypeInterval.{h,cpp}`
-  (`DataTypeInterval::doGetName`/`doGetSerialization` and
-  `registerDataTypeInterval`), `Common/IntervalKind.{h,cpp}`,
-  `Serializations/SerializationInterval.h`, and
-  `Serializations/SerializationNumber.cpp` (binary bulk read/write). Nullable,
+  Confirmed server paths for this item: `DataTypesNumber.cpp`
+  (`registerDataTypeNumbers`/`createNumericDataType<BFloat16>`),
+  `DataTypesNumber.h` (`DataTypeNumber<BFloat16>`),
+  `Serializations/SerializationNumber.cpp`
+  (`SerializationNumber<BFloat16>` bulk read/write), and
+  `base/base/BFloat16.h` (raw word and Float32 conversion). Nullable,
   LowCardinality, and Map-key legality were confirmed in
   `DataTypeNullable.cpp`, `DataTypeNumberBase.h` /
-  `DataTypeLowCardinality.cpp`, and `DataTypeMap.cpp`. All interval findings are
-  confirmed; none are inferred. Local source, capture server, fixtures, and
-  contract citations are aligned to 26.6.1.1193.
+  `DataTypeLowCardinality.cpp`, and `DataTypeMap.cpp`. Wire, wrapper, and key
+  findings are confirmed. Settings history confirms the 24.11 experimental gate
+  and 25.1 default-on change; the exact first shipped release is inferred as
+  24.11. Local source, capture server, fixtures, and contract citations are
+  aligned to 26.6.1.1193.
 - **Scope:** completeness still means uncompressed HTTP `FORMAT Native`; TCP and
   the currently unwired compression framing remain out of scope.
-- **Build/test status:** `cargo test` is green (496 unit + 3 integration;
-  unrelated live tests and the doctest remain ignored), clippy is clean with
-  `-D warnings`, and fmt is clean. The two `all_types` fixtures were recaptured
-  at 90 columns (leading varint `0x5a`) for revisions 0 and 54485. The live
-  `insert_roundtrips_through_server` test passes against ClickHouse
-  26.6.1.1193 with all 11 plain Interval kinds plus Nullable and
-  LowCardinality representatives.
-- **Recommended next:** implement **`BFloat16`**. It is the next compact scalar
-  type and can reuse the fixed-width primitive path; `Nothing` can follow.
+- **Build/test status:** `cargo test` is green (512 unit + 3 integration;
+  unrelated live tests and the doctest remain ignored). The two `all_types`
+  fixtures were recaptured at 93 columns (leading varint `0x5d`) for revisions 0
+  and 54485. The live `insert_roundtrips_through_server` test passes against
+  ClickHouse 26.6.1.1193 with plain, Nullable, and LowCardinality BFloat16. Fmt
+  is clean, `cargo build` passes, and clippy is clean with `-D warnings`.
+- **Recommended next:** implement **`Nothing`**. It is the remaining compact
+  Tier 2 scalar edge case and has a zero-width body.
 - **Active gotchas / context:**
+  - BFloat16 dense Native data is exactly two raw little-endian bytes per row,
+    with no type-specific state. The server's Float32 conversion truncates the
+    low 16 bits. `Nullable`, `LowCardinality`, and bare/plain-LC Map keys are
+    legal; numeric LC declarations need
+    `allow_suspicious_low_cardinality_types = 1`, which does not affect the wire.
+    Null-row nested bits are unspecified. Settings history CONFIRMS an
+    experimental gate in compatibility version 24.11 and default-on in 25.1;
+    the exact first shipped release is only INFERRED as 24.11 from this shallow
+    checkout. Arrow has no BFloat16 primitive: keep the structurally width-2
+    buffer and `w:2` export unless Arrow adds a compatible standard type.
   - All 11 interval names are distinct case-sensitive logical type tags, even
     though their body is the same signed little-endian `Int64` count. Do not
     collapse them into `Int64` or a physical delegate. `Nullable` and
@@ -345,6 +357,7 @@ is not done, and must not be checked off, until all of these hold:
 - [x] `Int8`, `Int16`, `Int32`, `Int64`
 - [x] `UInt8`, `UInt16`, `UInt32`, `UInt64`
 - [x] `Float32`, `Float64`
+- [x] `BFloat16`
 - [x] `String`
 - [x] `FixedString(N)`
 - [x] `UUID`, `IPv4`, `IPv6`
@@ -688,11 +701,17 @@ introduction), so record them per type only when determinable.
       legal Nullable/LowCardinality inners and Map keys. See "Implemented" and
       the `CODEC_CONTRACT.md` type section.
 - [ ] `Nothing` - the type of a bare `NULL`; zero-width, edge case.
-- [ ] `BFloat16` - 2-byte float, the top 16 bits of an IEEE-754 `Float32` (sign +
+- [x] `BFloat16` - 2-byte float, the top 16 bits of an IEEE-754 `Float32` (sign +
       8-bit exponent + 7-bit truncated mantissa), serialized raw little-endian via
       `SerializationNumber<BFloat16>` with no per-row framing. Confirmed registered
       and stable at v26.6.1.1193-stable (`registerDataTypeNumbers`; the
-      `allow_experimental_bfloat16_type` gate is now an obsolete no-op).
+      `allow_experimental_bfloat16_type` gate is now an obsolete no-op). Decode
+      and encode preserve raw words in
+      `Column::BFloat16(PrimitiveColumn<[u8; 2]>)`; Arrow exports `w:2` because
+      `e` is incompatible IEEE binary16 and `S` would misstate integer semantics.
+      Legal Nullable/LowCardinality inner
+      and Map key, with the generic suspicious numeric-LC construction gate.
+      Verified by plain/Nullable/LowCardinality live fixtures and live INSERT.
 - [x] `Time` - decode AND encode done. 4-byte little-endian signed `Int32` of
       seconds, can be negative (documented text range
       [-999:59:59, 999:59:59], while Native accepts any i32 payload); no

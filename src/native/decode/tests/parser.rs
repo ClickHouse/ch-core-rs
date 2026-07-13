@@ -175,6 +175,15 @@ fn test_parse_ch_type_intervals() {
 }
 
 #[test]
+fn test_parse_ch_type_bfloat16() {
+    assert_eq!(parse_ch_type("BFloat16"), Some(ChType::BFloat16));
+    assert_eq!(ChType::BFloat16.to_string(), "BFloat16");
+    for unsupported in ["bfloat16", "Bfloat16", "BFloat16()", "BFloat32"] {
+        assert_eq!(parse_ch_type(unsupported), None, "accepted {unsupported}");
+    }
+}
+
+#[test]
 fn test_ch_type_display_round_trips_through_parser() {
     // Display renders the canonical ClickHouse type name, which is the
     // string bindings hand to users. Every representative variant must
@@ -191,6 +200,7 @@ fn test_ch_type_display_round_trips_through_parser() {
         ChType::UInt64,
         ChType::Float32,
         ChType::Float64,
+        ChType::BFloat16,
         ChType::String,
         ChType::FixedString(16),
         ChType::Date,

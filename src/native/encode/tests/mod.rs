@@ -7,6 +7,7 @@ use crate::native::protocol::MAX_TYPE_DEPTH;
 use crate::native::type_parser::parse_ch_type;
 use crate::schema::{GeoKind, IntervalKind, Schema};
 
+mod bfloat16;
 mod bool;
 mod containers;
 mod decimal;
@@ -102,6 +103,7 @@ fn assert_columns_eq(left: &Column, right: &Column, label: &str) {
         (Column::UInt64(x), Column::UInt64(y)) => eq!(x, y),
         (Column::Float32(x), Column::Float32(y)) => eq!(x, y),
         (Column::Float64(x), Column::Float64(y)) => eq!(x, y),
+        (Column::BFloat16(x), Column::BFloat16(y)) => eq!(x, y),
         (Column::Date(x), Column::Date(y)) => eq!(x, y),
         (Column::Date32(x), Column::Date32(y)) => eq!(x, y),
         (Column::DateTime(x), Column::DateTime(y)) => eq!(x, y),

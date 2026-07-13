@@ -103,6 +103,83 @@ fn test_export_fixed_binary_column() {
 }
 
 #[test]
+fn test_export_bfloat16_as_fixed_size_binary_zero_copy() {
+    // Arrow has no BFloat16 primitive. `e` means the incompatible IEEE
+    // binary16 layout, so expose the exact two-byte words as FixedSizeBinary(2).
+    assert_eq!(arrow_format(&ChType::BFloat16), "w:2");
+
+    let raw_data = vec![[0x80, 0x3f], [0xa0, 0xbf], [0x80, 0x7f]];
+    let raw_ptr = raw_data.as_ptr() as *const c_void;
+    let validity = Bitmap::from_ch_null_map(&[0, 1, 0]);
+    let validity_ptr = validity.as_bytes().as_ptr() as *const c_void;
+    let batch = Arc::new(ColBatch::new(
+        Schema::new(vec![Field {
+            name: "bf".into(),
+            ch_type: ChType::Nullable(Box::new(ChType::BFloat16)),
+        }]),
+        vec![Column::BFloat16(PrimitiveColumn::new_nullable(
+            raw_data, validity,
+        ))],
+        3,
+    ));
+
+    // Safety: the zeroed FFI outputs are writable and the batch remains alive
+    // until each matching release callback is invoked below.
+    unsafe {
+        let mut schema_out: ArrowSchema = std::mem::zeroed();
+        export_schema(&batch.schema, &mut schema_out);
+        let child = &**schema_out.children.add(0);
+        assert_eq!(CStr::from_ptr(child.format).to_str().unwrap(), "w:2");
+        assert_eq!(child.flags, 2);
+        assert_eq!(child.n_children, 0);
+        assert!(child.dictionary.is_null());
+        (schema_out.release.unwrap())(&mut schema_out);
+
+        let mut array: ArrowArray = std::mem::zeroed();
+        export_batch_array(&batch, &mut array);
+        let child = &**array.children.add(0);
+        assert_eq!(child.length, 3);
+        assert_eq!(child.null_count, 1);
+        assert_eq!(child.n_buffers, 2);
+        assert_eq!(*child.buffers.add(0), validity_ptr);
+        assert_eq!(*child.buffers.add(1), raw_ptr);
+        assert_eq!(child.n_children, 0);
+        assert!(child.dictionary.is_null());
+        (array.release.unwrap())(&mut array);
+    }
+}
+
+#[test]
+fn test_export_zero_row_bfloat16_as_fixed_size_binary() {
+    let raw_data = Vec::<[u8; 2]>::new();
+    let raw_ptr = raw_data.as_ptr() as *const c_void;
+    let batch = Arc::new(ColBatch::new(
+        Schema::new(vec![Field {
+            name: "bf".into(),
+            ch_type: ChType::BFloat16,
+        }]),
+        vec![Column::BFloat16(PrimitiveColumn::new(raw_data))],
+        0,
+    ));
+
+    // Safety: the zeroed FFI output is writable and the batch remains alive
+    // until the matching release callback is invoked below.
+    unsafe {
+        let mut array: ArrowArray = std::mem::zeroed();
+        export_batch_array(&batch, &mut array);
+        let child = &**array.children.add(0);
+        assert_eq!(child.length, 0);
+        assert_eq!(child.null_count, 0);
+        assert_eq!(child.n_buffers, 2);
+        assert!((*child.buffers.add(0)).is_null());
+        assert_eq!(*child.buffers.add(1), raw_ptr);
+        assert_eq!(child.n_children, 0);
+        assert!(child.dictionary.is_null());
+        (array.release.unwrap())(&mut array);
+    }
+}
+
+#[test]
 fn test_arrow_format_uuid_ipv4_ipv6() {
     // IPv4 exports as Arrow uint32 (`I`), zero-copy. UUID and IPv6 export as
     // Arrow fixed-size binary of width 16 (`w:16`); the crate emits plain

@@ -353,7 +353,17 @@ SELECT
     -- Map(IntervalDay, String): bare Interval keys are legal. This captures the
     -- ordinary Array(Tuple(keys, values)) Map body with an Interval-backed key
     -- run, including an empty row and multiple entries in one row.
-    CAST(multiIf(n = 0, map(), n = 1, map(toIntervalDay(13), 'user_1'), n = 2, map(toIntervalDay(-79), 'a', toIntervalDay(13), 'user_2'), map(toIntervalDay(258), 'x')), 'Map(IntervalDay, String)') AS m_id
+    CAST(multiIf(n = 0, map(), n = 1, map(toIntervalDay(13), 'user_1'), n = 2, map(toIntervalDay(-79), 'a', toIntervalDay(13), 'user_2'), map(toIntervalDay(258), 'x')), 'Map(IntervalDay, String)') AS m_id,
+    -- BFloat16: raw 16-bit words containing the top half of IEEE-754 Float32.
+    -- These finite values are exactly representable, so the committed words
+    -- are deterministic: BFA0, 0000, 4060, 429E.
+    CAST(multiIf(n = 0, '-1.25', n = 1, '0', n = 2, '3.5', '79'), 'BFloat16') AS bf,
+    -- Nullable uses the ordinary null-map then the complete 2-byte nested run.
+    CAST(multiIf(n = 1, NULL, n = 3, NULL, n = 0, toFloat32(13), toFloat32(79)), 'Nullable(BFloat16)') AS nbf,
+    -- BFloat16 is a legal numeric LowCardinality inner. Repeated 13 proves a
+    -- real width-2 dictionary body plus indexes; the suspicious-LC setting
+    -- below is a construction-time gate only.
+    CAST(multiIf(n = 0, toFloat32(13), n = 1, toFloat32(79), n = 2, toFloat32(13), toFloat32(258)), 'LowCardinality(BFloat16)') AS lc_bf
 FROM numbers(4)
 SETTINGS allow_suspicious_low_cardinality_types = 1, enable_nullable_tuple_type = 1, enable_time_time64_type = 1, flatten_nested = 0
 FORMAT Native

@@ -936,6 +936,7 @@ fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
             | (ChType::UInt64, Column::UInt64(_))
             | (ChType::Float32, Column::Float32(_))
             | (ChType::Float64, Column::Float64(_))
+            | (ChType::BFloat16, Column::BFloat16(_))
             | (ChType::Date, Column::Date(_))
             | (ChType::Date32, Column::Date32(_))
             | (ChType::DateTime { .. }, Column::DateTime(_))

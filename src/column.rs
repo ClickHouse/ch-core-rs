@@ -514,6 +514,10 @@ pub enum Column {
     UInt64(PrimitiveColumn<u64>),
     Float32(PrimitiveColumn<f32>),
     Float64(PrimitiveColumn<f64>),
+    // ClickHouse BFloat16 is a raw little-endian 16-bit floating-point word.
+    // One `[u8; 2]` per row makes the width invariant structural, keeps the
+    // layout host-independent, and exports zero-copy as FixedSizeBinary(2).
+    BFloat16(PrimitiveColumn<[u8; 2]>),
     // Temporal types decoded at their faithful native width. No widening or
     // rescaling happens here; the type metadata (timezone, precision) lives in
     // the schema's ChType, not in these buffers.
@@ -587,6 +591,7 @@ impl Column {
             Column::UInt64(c) => c.len(),
             Column::Float32(c) => c.len(),
             Column::Float64(c) => c.len(),
+            Column::BFloat16(c) => c.len(),
             Column::Date(c) => c.len(),
             Column::Date32(c) => c.len(),
             Column::DateTime(c) => c.len(),
@@ -629,6 +634,7 @@ impl Column {
             Column::UInt64(c) => c.null_count(),
             Column::Float32(c) => c.null_count(),
             Column::Float64(c) => c.null_count(),
+            Column::BFloat16(c) => c.null_count(),
             Column::Date(c) => c.null_count(),
             Column::Date32(c) => c.null_count(),
             Column::DateTime(c) => c.null_count(),
@@ -667,6 +673,7 @@ impl Column {
             Column::UInt64(c) => c.validity.as_ref(),
             Column::Float32(c) => c.validity.as_ref(),
             Column::Float64(c) => c.validity.as_ref(),
+            Column::BFloat16(c) => c.validity.as_ref(),
             Column::Date(c) => c.validity.as_ref(),
             Column::Date32(c) => c.validity.as_ref(),
             Column::DateTime(c) => c.validity.as_ref(),
@@ -767,5 +774,9 @@ mod tests {
         assert_eq!(Column::UInt32(PrimitiveColumn::new(vec![1u32])).len(), 1);
         assert_eq!(Column::UInt64(PrimitiveColumn::new(vec![1u64])).len(), 1);
         assert_eq!(Column::Float32(PrimitiveColumn::new(vec![1.0f32])).len(), 1);
+        assert_eq!(
+            Column::BFloat16(PrimitiveColumn::new(vec![[0x80, 0x3f]])).len(),
+            1
+        );
     }
 }

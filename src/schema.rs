@@ -16,6 +16,11 @@ pub enum ChType {
     UInt64,
     Float32,
     Float64,
+    // BFloat16 stores the top 16 bits of an IEEE-754 Float32. The core keeps
+    // each little-endian 2-byte word verbatim rather than adding a host
+    // BFloat16 dependency or converting per value; bindings interpret the bits
+    // using this logical tag.
+    BFloat16,
 
     // Wide integers. Each is a raw contiguous little-endian two's-complement
     // (signed) or unsigned fixed-width integer on the wire, 16 bytes for the
@@ -325,6 +330,7 @@ impl std::fmt::Display for ChType {
             ChType::UInt64 => write!(f, "UInt64"),
             ChType::Float32 => write!(f, "Float32"),
             ChType::Float64 => write!(f, "Float64"),
+            ChType::BFloat16 => write!(f, "BFloat16"),
             ChType::Int128 => write!(f, "Int128"),
             ChType::UInt128 => write!(f, "UInt128"),
             ChType::Int256 => write!(f, "Int256"),

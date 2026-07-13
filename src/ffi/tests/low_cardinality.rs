@@ -201,6 +201,52 @@ fn test_export_low_cardinality_uint32() {
 }
 
 #[test]
+fn test_export_low_cardinality_bfloat16_child_zero_copy() {
+    let values_data = vec![[0x00, 0x00], [0x50, 0x41], [0x9e, 0x42]];
+    let values_ptr = values_data.as_ptr() as *const c_void;
+    let schema = Schema::new(vec![Field {
+        name: "lc_bf".into(),
+        ch_type: ChType::LowCardinality(Box::new(ChType::BFloat16)),
+    }]);
+    let values = Column::BFloat16(PrimitiveColumn::new(values_data));
+    let dictionary = DictionaryColumn::new(vec![1, 2, 1], values);
+    let batch = Arc::new(ColBatch::new(
+        schema,
+        vec![Column::Dictionary(dictionary)],
+        3,
+    ));
+
+    // Safety: the zeroed FFI outputs are writable and the batch remains alive
+    // until each matching release callback is invoked below.
+    unsafe {
+        let mut schema_out: ArrowSchema = std::mem::zeroed();
+        export_schema(&batch.schema, &mut schema_out);
+        let field = &**schema_out.children.add(0);
+        assert_eq!(CStr::from_ptr(field.format).to_str().unwrap(), "i");
+        assert_eq!(field.flags, 0);
+        assert!(!field.dictionary.is_null());
+        let values_schema = &*field.dictionary;
+        assert_eq!(
+            CStr::from_ptr(values_schema.format).to_str().unwrap(),
+            "w:2"
+        );
+        assert_eq!(values_schema.flags, 0);
+        (schema_out.release.unwrap())(&mut schema_out);
+
+        let mut array: ArrowArray = std::mem::zeroed();
+        export_batch_array(&batch, &mut array);
+        let field = &**array.children.add(0);
+        assert!(!field.dictionary.is_null());
+        let values = &*field.dictionary;
+        assert_eq!(values.length, 3);
+        assert_eq!(values.n_buffers, 2);
+        assert!((*values.buffers.add(0)).is_null());
+        assert_eq!(*values.buffers.add(1), values_ptr);
+        (array.release.unwrap())(&mut array);
+    }
+}
+
+#[test]
 fn test_export_low_cardinality_interval_formats_and_buffers() {
     let second_values = vec![0i64, 13, 79];
     let second_indices = vec![1i32, 2, 1];

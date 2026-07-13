@@ -439,6 +439,9 @@ fn assert_all_types(batch: &ChunkedBatch) {
                     Box::new(ChType::String),
                 ),
             ),
+            Expected::Exact("bf", ChType::BFloat16),
+            Expected::Exact("nbf", ChType::Nullable(Box::new(ChType::BFloat16))),
+            Expected::Exact("lc_bf", ChType::LowCardinality(Box::new(ChType::BFloat16))),
         ],
     );
 
@@ -1445,6 +1448,50 @@ fn assert_all_types(batch: &ChunkedBatch) {
             }
             other => panic!("expected (Interval, Utf8) entries, got {other:?}"),
         }
+    }
+
+    // BFloat16 (col 90): raw two-byte words, kept verbatim rather than widened
+    // to Float32. These correspond to -1.25, 0, 3.5, and 79.
+    assert_bfloat16_bits(block.column(90), &[0xbfa0, 0x0000, 0x4060, 0x429e]);
+
+    // Nullable(BFloat16) (col 91): rows 13, NULL, 79, NULL. The nested bits on
+    // null rows are placeholders; validity is the logical contract.
+    match block.column(91) {
+        Column::BFloat16(c) => {
+            assert_eq!(u16::from_le_bytes(c.values[0]), 0x4150);
+            assert_eq!(u16::from_le_bytes(c.values[2]), 0x429e);
+            assert_eq!(c.null_count(), 2);
+        }
+        other => panic!("expected nullable BFloat16, got {other:?}"),
+    }
+    assert_validity(block.column(91), &[true, false, true, false]);
+
+    // LowCardinality(BFloat16) (col 92): resolve the per-block dictionary and
+    // compare the exact raw words for 13, 79, 13, and 258.
+    match block.column(92) {
+        Column::Dictionary(d) => {
+            let values = match d.values.as_ref() {
+                Column::BFloat16(values) => values,
+                other => panic!("expected BFloat16 dictionary values, got {other:?}"),
+            };
+            let resolved: Vec<u16> = d
+                .indices
+                .iter()
+                .map(|index| u16::from_le_bytes(values.values[*index as usize]))
+                .collect();
+            assert_eq!(resolved, vec![0x4150, 0x429e, 0x4150, 0x4381]);
+        }
+        other => panic!("expected BFloat16 dictionary, got {other:?}"),
+    }
+}
+
+fn assert_bfloat16_bits(column: &Column, expected: &[u16]) {
+    match column {
+        Column::BFloat16(c) => {
+            let actual: Vec<u16> = c.values.iter().copied().map(u16::from_le_bytes).collect();
+            assert_eq!(actual, expected);
+        }
+        other => panic!("expected BFloat16, got {other:?}"),
     }
 }
 

@@ -253,6 +253,7 @@ than an error.
 | `UInt64`                                                                               | `UInt64`                               | `UInt64`          | `L`                                                                 | validity, values                           | yes                                                      |
 | `Float32`                                                                              | `Float32`                              | `Float32`         | `f`                                                                 | validity, values                           | yes                                                      |
 | `Float64`                                                                              | `Float64`                              | `Float64`         | `g`                                                                 | validity, values                           | yes                                                      |
+| `BFloat16`                                                                             | `BFloat16`                             | `BFloat16`        | `w:2`                                                               | validity, data                             | yes                                                      |
 | `String`                                                                               | `String`                               | `Utf8`            | `u`                                                                 | validity, offsets, data                    | yes                                                      |
 | `FixedString(N)`                                                                       | `FixedString(N)`                       | `FixedBinary`     | `w:N`                                                               | validity, data                             | yes                                                      |
 | `UUID`                                                                                 | `Uuid`                                 | `Uuid`            | `w:16`                                                              | validity, data                             | yes                                                      |
@@ -329,6 +330,68 @@ their wire bit patterns.
 `src/DataTypes/Serializations/SerializationNumber.cpp`. On little-endian hosts it
 is a single bulk raw read into the column buffer; big-endian hosts byte-swap per
 element. Confirmed at `v26.6.1.1193-stable`.
+
+### BFloat16
+
+**Type string(s):** `BFloat16`. This is the exact case-sensitive canonical name
+written in Native text headers. The server's general numeric factory tolerates
+up to two creation-time arguments and normalizes them away, but `getName()`
+always emits the bare `BFloat16`, so the Native decoder accepts only that
+canonical spelling.
+
+**Logical type:** `ChType::BFloat16`.
+
+**Wire payload:** exactly `num_rows * 2` contiguous bytes, one raw BFloat16 word
+per row in little-endian order, with no per-row framing and no BFloat-specific
+bulk-state prefix or suffix. The 16-bit word is the top half of an IEEE-754
+Float32: 1 sign bit, 8 exponent bits, and 7 mantissa bits. Server conversion
+from Float32 truncates the low 16 bits rather than rounding. Every raw pattern,
+including signed zero, infinities, subnormals, and NaN payloads, passes through
+unchanged.
+
+**Arrow export:** format `w:2` (FixedSizeBinary(2)), with 2 buffers in order:
+validity, then the raw data bytes. Arrow's `e` format is IEEE binary16, whose
+exponent and mantissa layout is incompatible with BFloat16. Exporting as `S`
+would preserve the bits but falsely advertise UInt16 numeric semantics. The
+opaque width-2 export is lossless, host-independent, and zero-copy; a binding
+uses the accompanying `ChType::BFloat16` to materialize host BFloat16 or Float32
+values.
+
+**Rust buffer:** `Column::BFloat16(PrimitiveColumn<[u8; 2]>)` with
+`values.len() == num_rows` and an optional validity bitmap. Each array element
+is one exact little-endian wire word, so the width-2 invariant is structural and
+cannot disagree with the Arrow `w:2` schema. Decode performs one column
+allocation and one contiguous copy, with no widening, conversion, or per-value
+allocation. Encode writes the same bytes verbatim after validating the row
+count.
+
+**Wrappers and keys:** `Nullable(BFloat16)`, `LowCardinality(BFloat16)`, and
+`LowCardinality(Nullable(BFloat16))` are legal. BFloat16 is a numeric
+LowCardinality inner, so persisted schema declarations and explicit CAST targets
+need `allow_suspicious_low_cardinality_types = 1`; that setting has no effect on
+wire bytes. Bare and non-nullable-LowCardinality BFloat16 Map keys are legal.
+Nullable and `LowCardinality(Nullable(BFloat16))` Map keys are illegal under the
+generic Map key rule. A null row's nested two bytes are an unspecified
+placeholder; validity is authoritative.
+
+**Introduction version:** the server settings history confirms an experimental
+BFloat16 gate was added in compatibility version 24.11, defaulted on in 25.1,
+and is obsolete and always true at the pin. The exact first shipped release is
+**inferred** to be 24.11, not confirmed from this shallow checkout.
+
+**Server reference:** `registerDataTypeNumbers` and
+`createNumericDataType<BFloat16>` in `src/DataTypes/DataTypesNumber.cpp`;
+`DataTypeNumber<BFloat16>` in `src/DataTypes/DataTypesNumber.h`;
+`SerializationNumber<BFloat16>::serializeBinaryBulk` and
+`deserializeBinaryBulk` in
+`src/DataTypes/Serializations/SerializationNumber.cpp`; the raw word and
+Float32 conversion in `base/base/BFloat16.h`; Nullable/LowCardinality/Map
+legality in `src/DataTypes/DataTypeNullable.cpp`,
+`src/DataTypes/DataTypeNumberBase.h`, `src/DataTypes/DataTypeLowCardinality.cpp`,
+and `src/DataTypes/DataTypeMap.cpp`. The raw width and byte order are also
+covered by server tests `03269_bf16` and `03733_sparse_negative_zero`. All wire,
+wrapper, and key claims above are confirmed at `v26.6.1.1193-stable`; only the
+exact introduction release is inferred.
 
 ### Bool
 
@@ -976,13 +1039,15 @@ rejects any other inner as `UnsupportedType`.
 
 **Allowed inner types (after `removeNullable`):** `String`, `FixedString(N)`,
 the fixed-width numerics (`Int8`/`Int16`/`Int32`/`Int64`,
-`UInt8`/`UInt16`/`UInt32`/`UInt64`, `Float32`/`Float64`), the wide integers
+`UInt8`/`UInt16`/`UInt32`/`UInt64`, `Float32`/`Float64`, `BFloat16`), the wide
+integers
 (`Int128`/`UInt128`/`Int256`/`UInt256`), `Bool`, the number-backed temporals
 `Date`, `Date32`, `DateTime`, `Time`, every `Interval*`, and
 `UUID`/`IPv4`/`IPv6`. The
 dictionary values are that inner type serialized as a plain column body:
 varint-length strings for `String`, raw fixed-width bytes otherwise (4 bytes per
-`IPv4` entry, 16 bytes per `UUID`/`IPv6`/`Int128`/`UInt128` entry, 32 bytes per
+`IPv4` entry, 2 bytes per `BFloat16` entry, 16 bytes per
+`UUID`/`IPv6`/`Int128`/`UInt128` entry, 32 bytes per
 `Int256`/`UInt256` entry). Support follows directly from the per-type body
 decoder.
 
@@ -1687,7 +1752,7 @@ defensive fall-through that validation already rules out.
 Encode coverage is kept a subset of decode coverage and grows the same
 one-type-at-a-time way; the two are currently at parity.
 Encodable today: `Bool`, the fixed-width numerics (`Int8`..`Int64`,
-`UInt8`..`UInt64`, `Float32`, `Float64`), the temporals (`Date`, `Date32`,
+`UInt8`..`UInt64`, `Float32`, `Float64`, `BFloat16`), the temporals (`Date`, `Date32`,
 `DateTime`, `DateTime64`, `Time`, `Time64`, and every `Interval*`), `UUID`,
 `IPv4`, `IPv6`, `String`,
 `FixedString(N)`,
@@ -1949,6 +2014,8 @@ directly (`empty_column` in `src/native/decode/mod.rs`), the empty shapes are:
 
 - Numerics, `Interval*`, and `Bool`: empty value or bit buffer, length 0.
   `IPv4` (a `u32` primitive) is the same.
+- `BFloat16`: empty `[u8; 2]` values buffer with its distinct BFloat16 logical
+  and Column tags.
 - `String`: `offsets == [0]` (length 1, the required leading zero) and empty
   data.
 - `FixedString(N)`: empty data, width preserved. `UUID` and `IPv6` are the same
@@ -1984,7 +2051,8 @@ Not yet supported, tracked as planned phases in `src/schema.rs`:
 
 - `LowCardinality(T)` for an inner type outside the allowlist in the
   `LowCardinality(T)` section. The wrapper and its allowed inners (String,
-  FixedString, the fixed-width numerics, the wide integers, Bool, Date, Date32,
+  FixedString, the fixed-width numerics including BFloat16, the wide integers,
+  Bool, Date, Date32,
   DateTime, Time, every `Interval*`, UUID/IPv4/IPv6, with or without an inner
   `Nullable`) are
   supported; any other inner is rejected as `UnsupportedType`. This includes

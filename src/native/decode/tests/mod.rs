@@ -4,6 +4,7 @@ use crate::native::type_parser::decimal_bits_from_precision;
 use crate::native::varint::write_varint;
 use crate::schema::{GeoKind, IntervalKind};
 
+mod bfloat16;
 mod containers;
 mod decimal;
 mod framing;
@@ -154,6 +155,14 @@ impl BlockBuilder {
     fn float64_data(mut self, values: &[f64]) -> Self {
         for &v in values {
             self.buf.extend_from_slice(&v.to_le_bytes());
+        }
+        self
+    }
+
+    /// BFloat16 body: one raw little-endian 16-bit floating-point word per row.
+    fn bfloat16_data(mut self, bits: &[u16]) -> Self {
+        for &word in bits {
+            self.buf.extend_from_slice(&word.to_le_bytes());
         }
         self
     }

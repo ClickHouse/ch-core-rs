@@ -198,6 +198,10 @@ fn arrow_format(ch_type: &ChType) -> String {
         ChType::UInt64 => "L".into(),
         ChType::Float32 => "f".into(),
         ChType::Float64 => "g".into(),
+        // Arrow has no native BFloat16 type: `e` is IEEE binary16, whose bit
+        // layout differs. Export the raw little-endian word honestly as
+        // FixedSizeBinary(2), preserving every bit pattern without a copy.
+        ChType::BFloat16 => "w:2".into(),
         // Temporal export is zero-copy: never widen or rescale a buffer. Map to
         // a real Arrow temporal type only on an exact same-width match, else
         // expose the raw integer primitive.
@@ -622,6 +626,7 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
         Column::UInt64(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
         Column::Float32(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
         Column::Float64(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
+        Column::BFloat16(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
         Column::Date(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
         Column::Date32(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
         Column::DateTime(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),

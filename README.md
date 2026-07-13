@@ -129,7 +129,7 @@ Not implemented yet:
 - `Bool`
 - `Int8`, `Int16`, `Int32`, `Int64`
 - `UInt8`, `UInt16`, `UInt32`, `UInt64`
-- `Float32`, `Float64`
+- `Float32`, `Float64`, `BFloat16`
 - `String`
 - `FixedString(N)`
 - `Date`, `Date32`, `DateTime`, `DateTime64(P[, tz])`, `Time`, `Time64(P)`

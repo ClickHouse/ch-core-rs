@@ -284,6 +284,32 @@ fn decode_fixed_binary_data(
     Ok(reader.read_slice(total)?.to_vec())
 }
 
+/// Decode one dense BFloat16 run as exact little-endian two-byte words.
+///
+/// At v26.6.1.1193-stable, `SerializationNumber<BFloat16>::deserializeBinaryBulk`
+/// reads exactly 2 bytes per row. The `[u8; 2]` element type preserves those
+/// bytes verbatim on every host and makes the width invariant structural for
+/// the Arrow FixedSizeBinary(2) export.
+fn decode_bfloat16_data(reader: &mut ByteReader, num_rows: usize) -> io::Result<Vec<[u8; 2]>> {
+    let total = num_rows.checked_mul(2).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "BFloat16 column byte length overflows usize",
+        )
+    })?;
+    let src = reader.read_slice(total)?;
+    let mut values = Vec::<[u8; 2]>::with_capacity(num_rows);
+    // Safety: the allocation has capacity for exactly `num_rows` two-byte
+    // arrays, every bit pattern is valid for `[u8; 2]`, and `total` was checked
+    // as `num_rows * 2`. The copy initializes all elements before the Vec length
+    // is set, and source and destination are distinct allocations.
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), values.as_mut_ptr().cast::<u8>(), total);
+        values.set_len(num_rows);
+    }
+    Ok(values)
+}
+
 // ---------------------------------------------------------------------------
 // Bulk-state prefix
 // ---------------------------------------------------------------------------
@@ -974,6 +1000,14 @@ fn read_array_offsets(
 /// metadata in the body. See `src/DataTypes/DataTypeInterval.{h,cpp}`,
 /// `src/DataTypes/Serializations/SerializationInterval.h`, and
 /// `src/DataTypes/Serializations/SerializationNumber.cpp`.
+///
+/// `BFloat16` is likewise a contiguous `num_rows * 2` byte run at this tag.
+/// `DataTypeNumber<BFloat16>` is registered by `registerDataTypeNumbers` in
+/// `src/DataTypes/DataTypesNumber.cpp`; its bulk body uses
+/// `SerializationNumber<BFloat16>` in
+/// `src/DataTypes/Serializations/SerializationNumber.cpp`. The core preserves
+/// the raw little-endian 16-bit words in structurally width-2 `[u8; 2]` values,
+/// including NaN payloads, without converting per value.
 fn decode_column_body(
     reader: &mut ByteReader,
     inner_type: &ChType,
@@ -1025,6 +1059,10 @@ fn decode_column_body(
         ChType::Float64 => {
             let values = decode_primitive!(reader, num_rows, f64);
             Column::Float64(PrimitiveColumn { values, validity })
+        }
+        ChType::BFloat16 => {
+            let values = decode_bfloat16_data(reader, num_rows)?;
+            Column::BFloat16(PrimitiveColumn { values, validity })
         }
         // Temporal types are plain bulk integers on the wire; timezone and
         // precision are type metadata only and do not appear in the bytes. They
@@ -1297,6 +1335,10 @@ fn empty_column(ch_type: &ChType) -> Column {
             validity: empty_validity,
         }),
         ChType::Float64 => Column::Float64(PrimitiveColumn {
+            values: vec![],
+            validity: empty_validity,
+        }),
+        ChType::BFloat16 => Column::BFloat16(PrimitiveColumn {
             values: vec![],
             validity: empty_validity,
         }),
@@ -1928,9 +1970,11 @@ fn skip_column_body(
         ChType::Bool | ChType::Int8 | ChType::UInt8 | ChType::Enum8 { .. } => {
             reader.skip(num_rows)?
         }
-        ChType::Int16 | ChType::UInt16 | ChType::Date | ChType::Enum16 { .. } => {
-            reader.skip(num_rows.saturating_mul(2))?
-        }
+        ChType::Int16
+        | ChType::UInt16
+        | ChType::BFloat16
+        | ChType::Date
+        | ChType::Enum16 { .. } => reader.skip(num_rows.saturating_mul(2))?,
         ChType::Int32
         | ChType::UInt32
         | ChType::Float32

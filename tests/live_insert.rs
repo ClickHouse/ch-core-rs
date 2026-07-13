@@ -63,6 +63,12 @@ fn fixed_binary_column(width: usize, values: &[&[u8]]) -> FixedBinaryColumn {
     FixedBinaryColumn::new(data, width)
 }
 
+/// Build a BFloat16 column from exact raw bit words, stored in Native
+/// little-endian byte order.
+fn bfloat16_column(bits: &[u16]) -> PrimitiveColumn<[u8; 2]> {
+    PrimitiveColumn::new(bits.iter().map(|word| word.to_le_bytes()).collect())
+}
+
 /// Build a DecimalColumn from raw wire-order fixed-width byte values.
 fn decimal_column(width: usize, precision: u8, scale: u8, values: &[&[u8]]) -> DecimalColumn {
     let mut data = Vec::with_capacity(width * values.len());
@@ -291,6 +297,9 @@ fn sample_batch() -> ColBatch {
             "lc_ih",
             ChType::LowCardinality(Box::new(ChType::Interval(IntervalKind::Hour))),
         ),
+        ("bf", ChType::BFloat16),
+        ("nbf", ChType::Nullable(Box::new(ChType::BFloat16))),
+        ("lc_bf", ChType::LowCardinality(Box::new(ChType::BFloat16))),
     ]
     .into_iter()
     .map(|(name, ch_type)| Field {
@@ -305,6 +314,8 @@ fn sample_batch() -> ColBatch {
     ns.validity = Some(validity());
     let mut nu = fixed_binary_column(16, &[&[0x13; 16], &[0u8; 16], &[0x79; 16], &[0u8; 16]]);
     nu.validity = Some(validity());
+    let mut nbf = bfloat16_column(&[0x4150, 0x0000, 0x429e, 0x0000]);
+    nbf.validity = Some(validity());
     let dec32_neg = (-13i32).to_le_bytes();
     let dec32_zero = 0i32.to_le_bytes();
     let dec32_pos = 79i32.to_le_bytes();
@@ -694,6 +705,15 @@ fn sample_batch() -> ColBatch {
         Column::Dictionary(DictionaryColumn::new(
             vec![1, 2, 1, 3],
             Column::Interval(PrimitiveColumn::new(vec![0, 13, 79, 258])),
+        )),
+        // BFloat16 words are stored as exact raw little-endian bytes. Include
+        // plain, Nullable, and LowCardinality shapes so the live server proves
+        // every generic wrapper path accepts the width-2 body.
+        Column::BFloat16(bfloat16_column(&[0xbfa0, 0x0000, 0x4060, 0x429e])),
+        Column::BFloat16(nbf),
+        Column::Dictionary(DictionaryColumn::new(
+            vec![1, 2, 1, 3],
+            Column::BFloat16(bfloat16_column(&[0x0000, 0x4150, 0x429e, 0x4381])),
         )),
     ];
 
@@ -1100,6 +1120,7 @@ fn raw_column_repr(column: &Column) -> Vec<String> {
         // rows; render the wire bytes verbatim (any reordering/byteswap shows up
         // here). Signedness is type metadata, not per-row data, so the four
         // wide-int variants render identically.
+        Column::BFloat16(c) => c.values.iter().map(|v| format!("{v:?}")).collect(),
         Column::Uuid(c)
         | Column::Ipv6(c)
         | Column::FixedBinary(c)
@@ -1229,7 +1250,9 @@ fn insert_roundtrips_through_server() {
          iy IntervalYear, iq IntervalQuarter, imo IntervalMonth, iw IntervalWeek, \
          id IntervalDay, ih IntervalHour, imi IntervalMinute, isecond IntervalSecond, \
          ims IntervalMillisecond, ius IntervalMicrosecond, ins IntervalNanosecond, \
-         nid Nullable(IntervalDay), lc_ih LowCardinality(IntervalHour)) ENGINE = Memory"
+         nid Nullable(IntervalDay), lc_ih LowCardinality(IntervalHour), \
+         bf BFloat16, nbf Nullable(BFloat16), \
+         lc_bf LowCardinality(BFloat16)) ENGINE = Memory"
         ),
         // LowCardinality(Int256) is a suspicious LC inner (a numeric), gated at
         // CREATE time by allow_suspicious_low_cardinality_types (a creation-time
@@ -1261,7 +1284,8 @@ fn insert_roundtrips_through_server() {
          tup, tup_named, arr_tup, ntup, \
          m, m_lc, m_nv, m_arr, arr_m, m_empty, \
          t, t64, nt, nt64, lc_time, \
-         iy, iq, imo, iw, id, ih, imi, isecond, ims, ius, ins, nid, lc_ih \
+         iy, iq, imo, iw, id, ih, imi, isecond, ims, ius, ins, nid, lc_ih, \
+         bf, nbf, lc_bf \
          FROM {TABLE} ORDER BY i32 FORMAT Native"
     ));
     let decoded = decode_all_bytes(

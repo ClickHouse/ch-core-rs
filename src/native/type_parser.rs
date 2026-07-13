@@ -322,6 +322,9 @@ fn parse_ch_type_depth(type_name: &str, depth: usize) -> Option<ChType> {
         "UInt64" => Some(ChType::UInt64),
         "Float32" => Some(ChType::Float32),
         "Float64" => Some(ChType::Float64),
+        // Registered under this exact case-sensitive name by
+        // `registerDataTypeNumbers`; the server exposes no alias.
+        "BFloat16" => Some(ChType::BFloat16),
         // Wide integers. The server emits exactly these case-sensitive spellings
         // (no parameters, no aliases) via `DataTypeNumber<T>::doGetName`.
         "Int128" => Some(ChType::Int128),
@@ -894,6 +897,7 @@ pub(crate) fn is_low_cardinality_inner(dict_value_type: &ChType) -> bool {
             | ChType::UInt64
             | ChType::Float32
             | ChType::Float64
+            | ChType::BFloat16
             // The wide integers are `DataTypeNumberBase` subclasses whose
             // `canBeInsideLowCardinality()` is final-true, so
             // `LowCardinality(Int128)` etc. are legal on the wire (the server

@@ -10,7 +10,7 @@
 //! at v26.6.1.1193-stable).
 //!
 //! Scope: this encodes `Bool`, the fixed-width numeric types (`Int8`..`Int64`,
-//! `UInt8`..`UInt64`, `Float32`, `Float64`), the temporal types (`Date`,
+//! `UInt8`..`UInt64`, `Float32`, `Float64`, `BFloat16`), the temporal types (`Date`,
 //! `Date32`, `DateTime`, `DateTime64`, `Time`, `Time64`, and all 11
 //! `Interval*` kinds), `UUID`, `IPv4`, `IPv6`, `String`, `FixedString(N)`,
 //! `Enum8`/`Enum16`, `Decimal(P, S)`, the
@@ -670,6 +670,10 @@ fn encode_column_body(
         (ChType::UInt64, Column::UInt64(c)) => encode_primitive!(buf, &c.values, u64),
         (ChType::Float32, Column::Float32(c)) => encode_primitive!(buf, &c.values, f32),
         (ChType::Float64, Column::Float64(c)) => encode_primitive!(buf, &c.values, f64),
+        // BFloat16 has no stable Rust primitive and Arrow has no native
+        // BFloat16 type. Each `[u8; 2]` holds one exact little-endian wire word,
+        // so write the contiguous array buffer without conversion.
+        (ChType::BFloat16, Column::BFloat16(c)) => encode_bfloat16_data(buf, c),
         // Temporal types are plain little-endian primitives at their native width;
         // timezone and precision live only in the type string (rendered by
         // `ChType::Display`), never in the per-row data, so each is just the
@@ -807,6 +811,11 @@ fn encode_fixed_binary_data(buf: &mut Vec<u8>, col: &FixedBinaryColumn) {
     buf.extend_from_slice(&col.data);
 }
 
+/// Encode exact BFloat16 words from a structurally width-2 row buffer.
+fn encode_bfloat16_data(buf: &mut Vec<u8>, col: &crate::column::PrimitiveColumn<[u8; 2]>) {
+    buf.extend_from_slice(col.values.as_flattened());
+}
+
 /// Encode a `Decimal(P, S)` column body: one contiguous fixed-width scaled
 /// integer per row, written verbatim from `DecimalColumn::data`.
 ///
@@ -875,6 +884,7 @@ fn is_encodable(ch_type: &ChType) -> bool {
         | ChType::UInt64
         | ChType::Float32
         | ChType::Float64
+        | ChType::BFloat16
         | ChType::Date
         | ChType::Date32
         | ChType::DateTime { .. }
