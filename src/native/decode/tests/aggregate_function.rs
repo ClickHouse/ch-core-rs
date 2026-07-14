@@ -444,6 +444,30 @@ fn decode_sum_truncated_fixed_width_state_is_unexpected_eof() {
 }
 
 #[test]
+fn decode_sum_inflated_row_count_with_truncated_payload_is_unexpected_eof() {
+    // A hostile header declares 60 rows of an 8-byte `sum` accumulator but
+    // carries only 80 payload bytes (ten states). The block is padded enough for
+    // 60 to slip past `check_header_count` (60 <= the bytes remaining at the
+    // header), so the width guard in `decode_aggregate_states` is what keeps the
+    // i64 offsets reservation from ballooning to 8x the count. Either way the
+    // decode must fail cleanly as "need more bytes", never panic or over-reserve.
+    let data = BlockBuilder::new()
+        .header(1, 60)
+        .column_header("s", "AggregateFunction(sum, UInt64)")
+        .raw_bytes(&[0x0d; 80])
+        .build();
+
+    assert!(matches!(
+        decode_all_bytes(&data, &DecodeOptions::default()),
+        Err(DecodeError::Io(ref error)) if error.kind() == io::ErrorKind::UnexpectedEof
+    ));
+    assert!(matches!(
+        block_end(&data, &DecodeOptions::default()),
+        Err(DecodeError::Io(ref error)) if error.kind() == io::ErrorKind::UnexpectedEof
+    ));
+}
+
+#[test]
 fn unsupported_aggregate_layouts_and_wrappers_are_rejected_at_zero_rows() {
     for type_name in [
         "AggregateFunction(avg, UInt64)",

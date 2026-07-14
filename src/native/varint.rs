@@ -41,6 +41,29 @@ impl<'a> ByteReader<'a> {
         self.bytes.len() - self.pos
     }
 
+    /// Cap a speculative `Vec::with_capacity(count)` at the number of items the
+    /// not-yet-read input could actually produce.
+    ///
+    /// A block header's `num_rows`/`num_cols` is only bounded by
+    /// `check_header_count` at one byte per item, so a per-item output buffer
+    /// wider than a byte (an 8-byte aggregate offset, a `Field`/`Column`
+    /// record) could otherwise reserve several times the input size for a
+    /// hostile count. Every item of a run occupies at least `min_item_bytes` on
+    /// the wire, so the remaining input holds at most
+    /// `remaining() / min_item_bytes` of them; reserving beyond that is pure
+    /// speculation. This mirrors the read-before-allocate cap in the
+    /// `decode_primitive!` macro, which reserves exactly the bytes it already
+    /// read.
+    ///
+    /// The result is never larger than `count`, so a legitimate run (whose
+    /// bytes are all present) reserves its full size and never reallocates; the
+    /// cap only bites a truncated or inflated count, whose decode fails anyway.
+    /// `min_item_bytes` is clamped to at least 1 so a zero can never divide.
+    #[inline]
+    pub(crate) fn capacity_for(&self, count: usize, min_item_bytes: usize) -> usize {
+        count.min(self.remaining() / min_item_bytes.max(1))
+    }
+
     /// Read a single byte.
     #[inline]
     pub fn read_u8(&mut self) -> io::Result<u8> {
@@ -293,6 +316,41 @@ mod tests {
         let data = [0x02u8, 0xFF, 0xFE];
         let err = ByteReader::new(&data).read_varint_string().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_capacity_for_caps_at_producible_items() {
+        // 80 bytes remaining, each item at least 8 bytes: at most 10 items, so a
+        // hostile count of 60 is trimmed to 10.
+        let data = [0u8; 80];
+        assert_eq!(ByteReader::new(&data).capacity_for(60, 8), 10);
+
+        // No trim when the input could hold the whole count: 80 bytes remaining
+        // holds 10 eight-byte items, so a count of 10 returns exactly 10, and any
+        // smaller count is returned unchanged.
+        assert_eq!(ByteReader::new(&data).capacity_for(10, 8), 10);
+        assert_eq!(ByteReader::new(&data).capacity_for(3, 8), 3);
+
+        // A partial cursor advance shrinks the producible bound: after consuming
+        // 8 bytes, 72 remain -> 9 eight-byte items.
+        let mut r = ByteReader::new(&data);
+        r.skip(8).unwrap();
+        assert_eq!(r.capacity_for(60, 8), 9);
+    }
+
+    #[test]
+    fn test_capacity_for_edge_cases() {
+        let data = [0u8; 80];
+        // A zero count reserves nothing regardless of remaining bytes.
+        assert_eq!(ByteReader::new(&data).capacity_for(0, 8), 0);
+
+        // No remaining bytes can produce no items.
+        assert_eq!(ByteReader::new(&[]).capacity_for(60, 8), 0);
+
+        // `min_item_bytes` of 0 is clamped to 1 so the division cannot panic; the
+        // cap then falls back to one byte per item (remaining bytes).
+        assert_eq!(ByteReader::new(&data).capacity_for(60, 0), 60);
+        assert_eq!(ByteReader::new(&data).capacity_for(200, 0), 80);
     }
 
     #[test]

@@ -390,6 +390,25 @@ fn test_oversized_column_count_rejected() {
 }
 
 #[test]
+fn test_inflated_column_count_with_truncated_headers_rejected() {
+    // A count that slips past `check_header_count` (num_cols <= remaining) but is
+    // still inflated far beyond the headers actually present: 30 declared columns
+    // behind only six real Int8 headers. The per-column reservation is capped at
+    // what the remaining bytes could frame, and the header-read loop then runs
+    // out on the seventh column and reports "need more bytes" cleanly.
+    let mut builder = BlockBuilder::new().header(30, 0);
+    for name in ["a", "b", "c", "d", "e", "f"] {
+        builder = builder.column_header(name, "Int8");
+    }
+    let data = builder.build();
+
+    match decode_all_bytes(&data, &DecodeOptions::default()) {
+        Err(DecodeError::Io(e)) => assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof),
+        other => panic!("expected UnexpectedEof, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_multi_block_date_kept_as_chunks() {
     // Date blocks stay separate chunks, never concatenated.
     let mut data = BlockBuilder::new()

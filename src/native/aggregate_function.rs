@@ -31,6 +31,21 @@ pub(crate) enum AggregateStateCodec {
     Sum { state_width: usize },
 }
 
+impl AggregateStateCodec {
+    /// Fewest wire bytes one serialized state can occupy.
+    ///
+    /// A `Count` VarUInt64 and a `nothingUInt64` placeholder are each at least
+    /// one byte; a `Sum` accumulator is exactly `state_width`. Used to cap the
+    /// speculative offsets reservation in [`decode_aggregate_states`] at the
+    /// rows the remaining input could actually hold.
+    pub(crate) fn min_state_bytes(self) -> usize {
+        match self {
+            AggregateStateCodec::Count | AggregateStateCodec::NothingUInt64 => 1,
+            AggregateStateCodec::Sum { state_width } => state_width,
+        }
+    }
+}
+
 /// Whether `arg` is exactly `Nullable(Nothing)`, the only-null argument shape
 /// that makes `count` collapse to `nothingUInt64` on the wire.
 fn is_nullable_nothing(arg: &ChType) -> bool {
@@ -181,13 +196,20 @@ pub(crate) fn decode_state_codec(ch_type: &ChType) -> Result<AggregateStateCodec
 /// width selected by its argument. The walk records row ends while validating
 /// each state, then copies the complete contiguous run once. There is one offsets
 /// allocation and one data allocation per column, with no per-row allocation.
+///
+/// The offsets vector holds 8-byte i64 end offsets, so a hostile `num_rows`
+/// (which the block header only bounds at one byte per row) could otherwise
+/// reserve up to 8x the input before the run is read. It is capped at the rows
+/// the remaining input could actually hold, given each state's minimum wire
+/// width, mirroring the read-before-allocate cap in `decode_primitive!`.
 pub(crate) fn decode_aggregate_states(
     reader: &mut ByteReader<'_>,
     codec: AggregateStateCodec,
     num_rows: usize,
 ) -> io::Result<AggregateStateColumn> {
     let start = reader.position();
-    let mut offsets = Vec::with_capacity(num_rows.saturating_add(1));
+    let capacity = reader.capacity_for(num_rows, codec.min_state_bytes());
+    let mut offsets = Vec::with_capacity(capacity.saturating_add(1));
     offsets.push(0);
 
     // Walk every state boundary over the borrowed run, collecting Arrow offsets,

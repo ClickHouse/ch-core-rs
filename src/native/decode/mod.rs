@@ -234,12 +234,19 @@ fn decode_bool_data(reader: &mut ByteReader, num_rows: usize) -> io::Result<Bool
 /// `data` with one `extend_from_slice`: one copy per string, zero per-row heap
 /// allocations.
 fn decode_string_data(reader: &mut ByteReader, num_rows: usize) -> io::Result<(Vec<i32>, Vec<u8>)> {
-    let mut offsets = Vec::with_capacity(num_rows + 1);
+    // Each value is at least its one-byte varint length prefix, so the input
+    // cannot hold more than `remaining()` values. Cap both reservations there
+    // before the read loop: a genuine `num_rows`-row column has >= `num_rows`
+    // payload bytes, so the cap equals `num_rows` and never reallocates, while a
+    // hostile count near the block size cannot drive a 4x (i32 offsets)
+    // over-reservation ahead of the truncation error.
+    let value_capacity = reader.capacity_for(num_rows, 1);
+    let mut offsets = Vec::with_capacity(value_capacity + 1);
     // Reserve a lower bound of one byte per value so the common short-string
     // case does not start from a zero-capacity buffer and reallocate from
     // scratch on the first few pushes. `extend_from_slice` still grows it for
     // longer strings.
-    let mut data = Vec::with_capacity(num_rows);
+    let mut data = Vec::with_capacity(value_capacity);
     let mut offset: i32 = 0;
     offsets.push(offset);
 
@@ -560,6 +567,10 @@ fn decode_low_cardinality_indices(
     })?;
     let raw = reader.read_slice(total)?;
 
+    // `read_slice(total)` above already proved `total = num_rows * index_width`
+    // bytes are present, so `num_rows` is bounded by the bytes actually read
+    // (read-before-allocate, like `decode_primitive!`); no separate capacity cap
+    // is needed here.
     let mut indices = Vec::with_capacity(num_rows);
     // Per-row null map, only allocated for the nullable inner type. One byte per
     // row, 0x00 = present, 0x01 = null, the same encoding `from_ch_null_map`
@@ -1739,6 +1750,12 @@ fn varint_usize(value: u64, what: &str) -> io::Result<usize> {
 /// the process on an oversized request, and bounds every capacity reservation
 /// in the block body at the input size. Reported as `UnexpectedEof` so the
 /// streaming decoder treats a truncated stream as "need more bytes".
+///
+/// This is a one-byte-per-item bound. A reservation whose per-item element is
+/// wider than a byte (the `Field`/`Column` records here, the i64 aggregate
+/// offsets) narrows it further with [`ByteReader::capacity_for`], so the
+/// reservation tracks the items the remaining input could actually produce
+/// rather than the raw count.
 fn check_header_count(count: usize, what: &str, reader: &ByteReader) -> Result<(), DecodeError> {
     let remaining = reader.remaining();
     if count > remaining {
@@ -1761,8 +1778,17 @@ fn decode_block_body(
     check_header_count(num_cols, "column count", reader)?;
     check_header_count(num_rows, "row count", reader)?;
 
-    let mut fields = Vec::with_capacity(num_cols);
-    let mut columns = Vec::with_capacity(num_cols);
+    // `check_header_count` bounds `num_cols` at one byte per column, but each
+    // column also stores a `Field` and a `Column` several dozen bytes wide, so a
+    // hostile count near `remaining()` could reserve many times the input. A
+    // column header is at minimum a name-length varint and a type-length varint,
+    // so two bytes; cap the reservation at what the remaining input could
+    // actually frame. A real block always carries >= 2 header bytes per column,
+    // so this never shrinks a legitimate reservation, it only defuses an
+    // inflated count.
+    let col_capacity = reader.capacity_for(num_cols, 2);
+    let mut fields = Vec::with_capacity(col_capacity);
+    let mut columns = Vec::with_capacity(col_capacity);
 
     for _ in 0..num_cols {
         let (col_name, ch_type) = read_column_header(reader, options)?;
