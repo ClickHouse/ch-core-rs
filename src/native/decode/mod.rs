@@ -1264,10 +1264,11 @@ fn decode_column_body(
         // admits only layouts whose row boundary is confirmed. At
         // v26.6.1.1193-stable, `AggregateFunction(count[, T])` is one VarUInt64
         // per row, `AggregateFunction(nothingUInt64, Nullable(Nothing))` is one
-        // 0x00 byte per row, and exact base `sum` over a non-nullable numeric or
-        // Enum is one fixed-width accumulator. Preserve each state's exact
-        // serialized bytes in LargeBinary layout; the argument types are
-        // metadata and do not recurse here.
+        // 0x00 byte per row, and exact base `sum` over a numeric or Enum is one
+        // fixed-width accumulator. A Nullable sum argument adds a leading flag
+        // and omits the accumulator when no non-NULL value was seen. Preserve
+        // each state's exact serialized bytes in LargeBinary layout; the
+        // argument types are metadata and do not recurse here.
         ChType::AggregateFunction { .. } => {
             // `can_be_inside_nullable` excludes `AggregateFunction`, so
             // `parse_ch_type` never yields `Nullable(AggregateFunction(...))` and

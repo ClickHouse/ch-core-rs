@@ -281,7 +281,7 @@ than an error.
 | `Tuple(T1, ...)` / `Tuple(name1 T1, ...)` for supported element types, incl. `Tuple()` | `Tuple(Vec<(Option<String>, ChType)>)` | `Tuple`           | `+s` (struct; element types in the children)                        | validity (one child per element)           | yes (`Nullable(Tuple(...))` is legal)                    |
 | `Map(K, V)` for a legal key type and supported `K`/`V`                                 | `Map(Box<ChType>, Box<ChType>)`        | `Map`             | `+L` (LargeList of an `entries` struct with `key`/`value` children) | validity, i64 offsets (+ entries child)    | no (map level); value nulls via `Map(K, Nullable(V))`    |
 | `SimpleAggregateFunction(func, T)` for a supported inner `T`                            | `SimpleAggregateFunction { func, inner }` | inner `T`'s    | inner `T`'s                                                         | inner `T`'s                                | via inner `Nullable` iff `Nullable(T)` is legal          |
-| Registered exact `AggregateFunction` codecs: `count`, canonical `nothingUInt64`, and base `sum` over non-nullable numeric/Enum arguments | `AggregateFunction { function, arguments }` | `AggregateState` | `Z` (LargeBinary) | validity, i64 offsets, state data | no |
+| Registered exact `AggregateFunction` codecs: `count`, canonical `nothingUInt64`, and base `sum` over plain or Nullable numeric/Enum arguments | `AggregateFunction { function, arguments }` | `AggregateState` | `Z` (LargeBinary) | validity, i64 offsets, state data | no |
 | `Point`                                                                                | `Geo(GeoKind::Point)`                  | `Tuple`           | `+s` (struct of two `g` Float64 children)                          | validity (two Float64 children)            | yes (`Nullable(Point)` is legal)                         |
 | `Ring`, `LineString`, `MultiLineString`, `Polygon`, `MultiPolygon`                     | `Geo(GeoKind::*)`                       | `Array`           | `+L` (LargeList chain over a Point `+s` struct)                     | validity, i64 offsets (+ item child)       | no (they expand to `Array`)                              |
 | `Nested(name1 T1, ...)` for supported field types                                      | `Nested(Vec<(String, ChType)>)`        | `Array`           | `+L` (LargeList of a `+s` struct with the field names)             | validity, i64 offsets (+ item struct child) | no (it is an `Array`)                                    |
@@ -1675,19 +1675,21 @@ export are the inner type's; see that type's section. Confirmed at
 `AggregateFunction(count, T)`, where `T` is one server-constructible type this
 crate can parse, plus the single canonical spelling
 `AggregateFunction(nothingUInt64, Nullable(Nothing))`, and
-`AggregateFunction(sum, T)` for exactly one non-nullable numeric or Enum `T`.
-The supported sum argument set is Bool, Int8..Int256, UInt8..UInt256,
-BFloat16, Float32, Float64, Enum8, Enum16, and Decimal(P, S). Grammatically valid
-but illegal shapes, such as a forbidden `LowCardinality` inner or a nullable
-`Map` key, are rejected recursively. The general server grammar is
+`AggregateFunction(sum, T)` for exactly one plain or Nullable numeric or Enum
+`T`. The supported sum value set is Bool, Int8..Int256, UInt8..UInt256,
+BFloat16, Float32, Float64, Enum8, Enum16, and Decimal(P, S), each either bare or
+wrapped once in `Nullable`. Grammatically valid but illegal shapes, such as a
+forbidden `LowCardinality` inner or a nullable `Map` key, are rejected
+recursively. The general server grammar is
 `AggregateFunction([version, ]function[(parameters...)] [, argument types...])`,
 but each function owns a different state serializer. These codecs accept only the
 exact base function names `count` (with zero or one argument, but see the
 canonicalization note below) and `nothingUInt64` (with exactly the single
 `Nullable(Nothing)` argument), plus parameterless unary `sum` over the argument
 set above. `countDistinct`, `sumWithOverflow`, and other functions or combinators
-are not aliases for these layouts. `sum(Nullable(T))` remains unsupported because
-the Null adapter adds a flag and conditional nested accumulator.
+are not aliases for these layouts. `sum(Nullable(Nothing))` is not a nullable sum
+state: the server canonicalizes it to the separate, currently unsupported
+`AggregateFunction(nothingNull, Nullable(Nothing))`.
 
 **count(Nullable(Nothing)) canonicalization:** the `count, Nullable(Nothing)`
 spelling never appears on the wire, so it is rejected on both paths. Parsing the
@@ -1747,6 +1749,14 @@ can preserve them.
   Decimal256 remains a 32-byte Decimal256 scaled integer. Deserialize performs
   no semantic value validation: any complete accumulator bit pattern, including
   a Float64 NaN payload, is valid.
+- `sum` with `Nullable(T)`: one flag byte first. Canonical serialization writes
+  `0x00` when no non-NULL input was accumulated and stops the row state there.
+  It writes `0x01` when a value is present, followed immediately by the ordinary
+  8-, 16-, or 32-byte sum accumulator selected above. The server deserializer's
+  `readBinary(bool)` accepts any nonzero flag as present, so decode and encode
+  validation do too and preserve the exact flag byte. A nonzero flag without a
+  complete accumulator is truncation. The flag is aggregate-state data, not an
+  outer ClickHouse null map or Arrow validity bitmap.
 
 In all cases states are adjacent with no row delimiter, per-state length,
 aggregate-column length, prefix, suffix, or in-body version word. The argument
@@ -1767,10 +1777,13 @@ fixed-width, so the walk bounds-checks the `num_rows`-byte run once, rejects any
 nonzero byte, and fills offsets `i -> i`. There is one offsets allocation and one
 data allocation per column, with no per-row allocation. Fixed-width sum decode
 bounds-checks `num_rows * state_width` once and computes each offset
-arithmetically. Encode validates every offset and row slice with the same codec
-(each `count` slice is exactly one VarUInt64; each `nothingUInt64` slice is
-exactly `[0x00]`; each sum slice has the selected accumulator width), then writes
-`data` in one copy.
+arithmetically. Nullable sum walks the borrowed input once, branches on each
+flag, records the variable row ends, then makes the same single contiguous data
+copy. Encode validates every offset and row slice with the same codec: each
+`count` slice is exactly one VarUInt64, each `nothingUInt64` slice is exactly
+`[0x00]`, each plain sum slice has the selected accumulator width, and each
+nullable sum slice is either `[0x00]` or one nonzero byte plus exactly that
+accumulator width. It then writes `data` in one copy.
 
 **Wrappers and containers:** an outer `Nullable(AggregateFunction(...))` and
 `LowCardinality(AggregateFunction(...))` are illegal and rejected.
@@ -1782,9 +1795,8 @@ empty data, and Native writes no state body.
 zero-row block. This is required for safe framing: Native provides no generic
 way to locate the next state or next column. New functions must register a
 boundary codec shared by materializing decode, `block_end`, and encode
-validation. The nullable `sum` adapter remains deferred because its state adds a
-flag and a conditional accumulator; it needs a separate confirmed boundary
-codec.
+validation. `AggregateFunction(nothingNull, Nullable(Nothing))` and every other
+aggregate function remain deferred until their exact boundary codec is added.
 
 **Introduction version:** the `count` function documentation records ClickHouse
 1.1, but the original introduction release of the `AggregateFunction` data type
@@ -1809,7 +1821,13 @@ in `src/AggregateFunctions/Helpers.h`, accumulator promotion in
 `src/Core/Field.h` (`NearestFieldTypeImpl`), sum state serialization in
 `src/AggregateFunctions/AggregateFunctionSum.h`
 (`AggregateFunctionSumData::write`/`read`), and Native column dispatch in
-`src/Formats/NativeReader.cpp` / `NativeWriter.cpp`. Confirmed at
+`src/Formats/NativeReader.cpp` / `NativeWriter.cpp`. Nullable sum's adapter is
+confirmed in `AggregateFunctionNullBase::serialize`/`deserialize` and
+`AggregateFunctionNullUnary` in
+`src/AggregateFunctions/Combinators/AggregateFunctionNull.h`, with construction
+in `AggregateFunctionCombinatorNull::transformAggregateFunction` and
+`transformArguments` in `AggregateFunctionNull.cpp`; bool byte behavior is in
+`src/IO/ReadHelpers.h` and `WriteHelpers.h`. Confirmed at
 `v26.6.1.1193-stable`.
 
 ### Geo types: Point, Ring, LineString, MultiLineString, Polygon, MultiPolygon
@@ -1998,10 +2016,12 @@ expand to `Tuple`/`Array` of `Float64`), and `Nested(name1 T1, ...)`
 (encodable when every field type is) each encode as their physical delegate,
 with no new body writer: encode, like decode, recurses on
 `ChType::physical_delegate`. The exact `AggregateFunction` state codecs for
-`count`, canonical `nothingUInt64`, and base `sum` are also encodable from an
-`AggregateStateColumn` after every i64 offset and row state is validated (each
-`count` slice exactly one VarUInt64, each `nothingUInt64` slice exactly `[0x00]`,
-and each sum slice exactly its selected 8/16/32-byte accumulator width); the
+`count`, canonical `nothingUInt64`, and base `sum` over plain or Nullable
+numeric/Enum arguments are also encodable from an `AggregateStateColumn` after
+every i64 offset and row state is validated (each `count` slice exactly one
+VarUInt64, each `nothingUInt64` slice exactly `[0x00]`, each plain sum slice
+exactly its selected 8/16/32-byte accumulator width, and each nullable sum slice
+one false flag or one nonzero flag plus that width); the
 `count, Nullable(Nothing)` spelling is rejected as
 `UnsupportedType` since the server canonicalizes it to `nothingUInt64`. Any other
 type is `UnsupportedType`, at every row count including zero. This is deliberately
@@ -2287,7 +2307,7 @@ fallback. A consumer can treat an unsupported type as a hard decode error.
 Not yet supported, tracked as planned phases in `src/schema.rs`:
 
 - `AggregateFunction(...)` state serializers other than exact `count`, canonical
-  `nothingUInt64`, and base `sum` over the listed non-nullable numeric/Enum
+  `nothingUInt64`, and base `sum` over the listed plain or Nullable numeric/Enum
   arguments. Native does not length-prefix aggregate states or their column, so
   every additional function needs a confirmed boundary codec. Unknown functions
   are rejected even at zero rows rather than accepted with a body the streaming

@@ -662,6 +662,8 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
         }
         // Arrow LargeBinary: validity (always null because ClickHouse forbids
         // Nullable(AggregateFunction)), i64 offsets, then serialized state data.
+        // A nullable aggregate ARGUMENT such as sum(Nullable(T)) keeps its
+        // presence flag inside each opaque state slice, not in Arrow validity.
         // All three buffers borrow the batch-owned AggregateStateColumn and are
         // kept alive by ArrayPrivateData's Arc<ColBatch>.
         Column::AggregateState(c) => {

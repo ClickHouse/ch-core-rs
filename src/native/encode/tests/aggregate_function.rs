@@ -113,6 +113,42 @@ fn sum_batch() -> ColBatch {
     )
 }
 
+fn nullable_sum_states(width: usize) -> AggregateStateColumn {
+    // Row 0 has no non-NULL input. Rows 1 and 2 carry an accumulator; row 2's
+    // noncanonical true flag proves the decoder and encoder mirror the server's
+    // any-nonzero bool reader while preserving state bytes exactly.
+    let mut data = vec![0x00, 0x01];
+    data.extend(std::iter::repeat_n(0x0d, width));
+    data.push(0x80);
+    data.extend(std::iter::repeat_n(0x4f, width));
+    AggregateStateColumn::new(vec![0, 1, (width + 2) as i64, (2 * width + 3) as i64], data)
+}
+
+fn nullable_sum_batch() -> ColBatch {
+    ColBatch::new(
+        Schema::new(vec![
+            Field {
+                name: "u".into(),
+                ch_type: parse_ch_type("AggregateFunction(sum, Nullable(UInt8))").unwrap(),
+            },
+            Field {
+                name: "d".into(),
+                ch_type: parse_ch_type("AggregateFunction(sum, Nullable(Decimal(9, 2)))").unwrap(),
+            },
+            Field {
+                name: "w".into(),
+                ch_type: parse_ch_type("AggregateFunction(sum, Nullable(UInt256))").unwrap(),
+            },
+        ]),
+        vec![
+            Column::AggregateState(nullable_sum_states(8)),
+            Column::AggregateState(nullable_sum_states(16)),
+            Column::AggregateState(nullable_sum_states(32)),
+        ],
+        3,
+    )
+}
+
 #[test]
 fn roundtrip_sum_states_rev0() {
     roundtrip(&sum_batch(), 0);
@@ -121,6 +157,16 @@ fn roundtrip_sum_states_rev0() {
 #[test]
 fn roundtrip_sum_states_tcp_revision() {
     roundtrip(&sum_batch(), DBMS_TCP_PROTOCOL_VERSION);
+}
+
+#[test]
+fn roundtrip_nullable_sum_states_rev0() {
+    roundtrip(&nullable_sum_batch(), 0);
+}
+
+#[test]
+fn roundtrip_nullable_sum_states_tcp_revision() {
+    roundtrip(&nullable_sum_batch(), DBMS_TCP_PROTOCOL_VERSION);
 }
 
 #[test]
@@ -145,23 +191,46 @@ fn rev0_frames_sum_state_bytes_verbatim() {
 }
 
 #[test]
-fn zero_row_sum_state_encodes_schema_without_body() {
+fn rev0_frames_nullable_sum_state_bytes_verbatim() {
+    let states = nullable_sum_states(8);
     let batch = ColBatch::new(
         Schema::new(vec![Field {
             name: "s".into(),
-            ch_type: parse_ch_type("AggregateFunction(sum, BFloat16)").unwrap(),
+            ch_type: parse_ch_type("AggregateFunction(sum, Nullable(UInt8))").unwrap(),
         }]),
-        vec![Column::AggregateState(AggregateStateColumn::new(
-            vec![0],
-            vec![],
-        ))],
-        0,
+        vec![Column::AggregateState(states.clone())],
+        3,
     );
 
     let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+    assert!(bytes.ends_with(&states.data));
     let decoded = decode_all_bytes(&bytes, &DecodeOptions::default()).unwrap();
-    assert_eq!(decoded.num_chunks(), 0);
-    assert_eq!(decoded.schema, batch.schema);
+    assert_batches_eq(&batch, &decoded.chunks[0]);
+}
+
+#[test]
+fn zero_row_sum_state_encodes_schema_without_body() {
+    for type_name in [
+        "AggregateFunction(sum, BFloat16)",
+        "AggregateFunction(sum, Nullable(BFloat16))",
+    ] {
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "s".into(),
+                ch_type: parse_ch_type(type_name).unwrap(),
+            }]),
+            vec![Column::AggregateState(AggregateStateColumn::new(
+                vec![0],
+                vec![],
+            ))],
+            0,
+        );
+
+        let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+        let decoded = decode_all_bytes(&bytes, &DecodeOptions::default()).unwrap();
+        assert_eq!(decoded.num_chunks(), 0);
+        assert_eq!(decoded.schema, batch.schema);
+    }
 }
 
 #[test]
@@ -179,6 +248,37 @@ fn sum_state_validation_rejects_wrong_width_states() {
             vec![Column::AggregateState(AggregateStateColumn::new(
                 vec![0, wrong_width as i64],
                 vec![0x0d; wrong_width],
+            ))],
+            1,
+        );
+        assert!(matches!(
+            encode_block(&batch, &EncodeOptions::default()),
+            Err(EncodeError::InconsistentBatch { .. })
+        ));
+    }
+}
+
+#[test]
+fn nullable_sum_state_validation_rejects_bad_conditional_shapes() {
+    let width = 8;
+    let states = [
+        vec![],
+        // A false flag must end the row immediately.
+        vec![0x00, 0x0d],
+        // A true flag requires exactly one complete accumulator.
+        vec![0x01; width],
+        vec![0x01; width + 2],
+    ];
+
+    for state in states {
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "s".into(),
+                ch_type: parse_ch_type("AggregateFunction(sum, Nullable(UInt64))").unwrap(),
+            }]),
+            vec![Column::AggregateState(AggregateStateColumn::new(
+                vec![0, state.len() as i64],
+                state,
             ))],
             1,
         );

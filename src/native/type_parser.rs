@@ -188,7 +188,7 @@ fn parse_ch_type_depth(type_name: &str, depth: usize) -> Option<ChType> {
     // remain UnsupportedType even for zero rows, otherwise the streaming scan
     // could not locate the next column. At v26.6.1.1193-stable the registered
     // codecs are exact `count`, canonical `nothingUInt64`, and exact base `sum`
-    // over one non-nullable numeric or Enum argument. Each argument is type
+    // over one plain or Nullable numeric or Enum argument. Each argument is type
     // metadata but still recurses at depth + 1 so hostile nested headers remain
     // bounded by MAX_TYPE_DEPTH.
     //

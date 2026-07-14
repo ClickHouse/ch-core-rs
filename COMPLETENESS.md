@@ -47,306 +47,73 @@ point-in-time snapshot for the next agent, not a changelog. Keep it short. Alway
 include a "Recommended next" with a one-line reason, so the next agent has a
 default; the user may override it.
 
-- **Last updated:** 2026-07-14. Tier 3 `AggregateFunction(...)` now has three
-  function-specific state codecs at decode/encode parity: exact `count`,
-  canonical `nothingUInt64`, and exact base `sum` over every non-nullable
-  numeric and Enum argument accepted by the pinned server. Sum state widths are
-  8 bytes for Bool, native <=64-bit integers, floats/BFloat16, and Enums; 16
-  bytes for 128-bit integers and Decimal32/64/128; and 32 bytes for 256-bit
-  integers and Decimal256. Parser, streaming scan, zero-row and multi-block
-  handling, `Array` composition, Arrow LargeBinary, state validation,
-  real-server fixtures, and live INSERT + `finalizeAggregation` are covered.
-  The broad item remains open because Native has no generic state framing.
-- **Implementation shape:**
-  `ChType::AggregateFunction { function, arguments }` plus
-  `Column::AggregateState(AggregateStateColumn { offsets: Vec<i64>, data })`.
-  `src/native/aggregate_function.rs` is the single state-codec registry shared
-  by decode, `block_end`, and encode validation. `AggregateStateCodec` has three
-  variants: `Count` (one unsigned VarUInt64 per row, preserved byte-for-byte) and
-  `NothingUInt64` (one `0x00` byte per row; decode rejects any nonzero byte as
-  `InvalidData`, mirroring the server's `INCORRECT_DATA`; encode requires each
-  row to be exactly `[0x00]`), plus `Sum { state_width }`. Sum decode checks the
-  complete `num_rows * state_width` run once, computes i64 offsets
-  arithmetically, and copies the contiguous body once. Arrow exports `Z`
-  LargeBinary; encode requires each row slice to have the selected width, then
-  writes the data once. Unknown functions are rejected even for zero rows.
-- **Pinned server tag:** `v26.6.1.1193-stable`, protocol revision **54485**.
-  Confirmed server paths for this item:
-  `DataTypes/Serializations/SerializationAggregateFunction.{h,cpp}`
-  (`SerializationAggregateFunction` bulk state loop, no prefix/suffix/length),
-  `AggregateFunctions/IAggregateFunction.h` (`serializeBatch`,
-  `createAndDeserializeBatch`),
-  `AggregateFunctions/AggregateFunctionCount.{h,cpp}` (one VarUInt64 state),
-  `AggregateFunctions/AggregateFunctionNothing.h`
-  (`AggregateFunctionNothingImpl::serialize`/`deserialize`, one `'\0'` byte and
-  the `INCORRECT_DATA` guard),
-  `AggregateFunctions/Combinators/AggregateFunctionNull.cpp`
-  (`AggregateFunctionCombinatorNull::transformAggregateFunction`, the count ->
-  nothingUInt64 collapse), `IO/VarInt.h`,
-  `DataTypes/DataTypeAggregateFunction.{h,cpp}` (`getNameImpl` canonical name and
-  wrapper capabilities), `AggregateFunctions/AggregateFunctionSum.{h,cpp}`
-  (`createAggregateFunctionSum`, `SumSimple`,
-  `AggregateFunctionSumData::write`/`read`),
-  `AggregateFunctions/Helpers.h` (`createWithNumericType`,
-  `createWithDecimalType`), `Core/Field.h` (`NearestFieldTypeImpl`), and
-  `Formats/NativeReader.cpp` / `NativeWriter.cpp`. The
-  AggregateFunction data type's historical introduction version remains
-  undetermined. The count function docs say 1.1, which does not establish the
-  data type's introduction.
-- **Scope:** completeness still means uncompressed HTTP `FORMAT Native`; TCP and
-  the currently unwired compression framing remain out of scope.
-- **Build/test status:** `cargo test` is green (590 unit + 3 integration; 6 live
-  tests and the doctest remain ignored). The two `all_types` fixtures were
-  recaptured from ClickHouse 26.6.1.1193 at 102 columns (leading varint `0x66`)
-  for revisions 0 and 54485. The final five sum columns cover UInt8, BFloat16,
-  Decimal32, UInt256, and Enum8 states. The dedicated live sum INSERT/finalize
-  test passes for Int32, Decimal32, UInt256, and Enum8 arguments against the same
-  server version. `cargo build`, fmt, clippy with `-D warnings`, and
-  `git diff --check` are clean.
-- **Recommended next:** confirm and add exact **nullable `sum`** state codecs for
-  numeric and Enum arguments. This completes the sum family, but its Null adapter
-  flag and conditional accumulator require a separate authoritative layout read.
-- **Active gotchas / context:**
-  - AggregateFunction is not generically opaque-decodable. Native writes each
-    concrete function's state immediately after the previous one, with no row
-    length, column length, prefix, suffix, or in-body version word. Whole-column
-    passthrough cannot locate the next column and cannot form an Arrow array.
-    Every supported signature must register a boundary codec shared by decode,
-    scan, and encode validation. `countDistinct` is NOT count-shaped. Base
-    `countIf` and `countArray` delegate to count's VarUInt state but remain
-    unregistered until their signatures are handled explicitly. Direct
-    Nullable/LowCardinality wrappers are illegal; Array, Tuple, and Map values
-    are legal. Protocol revision can select versioned aggregate states even
-    though no version word appears in the body; count is unversioned.
-  - Exact base `sum` is unary and parameterless. Its registered direct arguments
-    are Bool, Int8..Int256, UInt8..UInt256, BFloat16/Float32/Float64,
-    Enum8/Enum16, and Decimal(P, S). The state is the promoted accumulator, not
-    necessarily the argument width: <=64-bit integers and Enums -> 8 bytes,
-    BFloat16/Float32 -> Float64 (8), 128-bit integers -> 16, 256-bit integers ->
-    32, Decimal32/64/128 -> Decimal128 (16), Decimal256 -> Decimal256 (32).
-    Deserialize performs no semantic value validation. Nullable sum is NOT this
-    layout: the Null adapter adds a flag and conditional nested state, so the
-    registry rejects it until a separate codec lands. Temporal, interval, IP,
-    UUID, String, wrapper, and container arguments are also rejected.
-  - `count(Nullable(Nothing))` NEVER reaches the wire under the `count` name: the
-    server's Null combinator substitutes `AggregateFunctionNothingUInt64` (count
-    registers `returns_default_when_only_null = true` and `Nullable(Nothing)` is
-    `onlyNull`) and `getNameImpl` renders
-    `AggregateFunction(nothingUInt64, Nullable(Nothing))`. The `count` codec
-    therefore rejects a single `Nullable(Nothing)` argument, and `nothingUInt64`
-    is registered separately with a one-`0x00`-byte-per-row state. The
-    `nothingUInt64` gate is restricted to the confirmed `Nullable(Nothing)`
-    argument shape only, not any argument list, because that name is synthesized
-    solely by the count collapse and only for `Nullable(Nothing)`. Every other
-    count spelling (`count()`, `count(T)`, `count(Nullable(T))` for `T != Nothing`)
-    keeps the VarUInt64 `count` codec unchanged. Constructing the fixture via
-    `countState(toNullable(NULL))` does not work (it constant-folds to `UInt64`);
-    `CAST(unhex('00'), 'AggregateFunction(nothingUInt64, Nullable(Nothing))')` is
-    the authentic construction and finalizes to a count of 0.
-  - `Nothing` is the one type whose logical width (zero) differs from its wire
-    width (one byte per row): the placeholder byte is `'0'` (0x30) on write and
-    UNVALIDATED on read, so decode must consume `num_rows` bytes (truncation is
-    an error) while accepting arbitrary byte values. Do not "optimize" the body
-    away. A bare `NULL` literal arrives as `Nullable(Nothing)` (null map first,
-    then the full placeholder body); `NothingColumn` keeps that structural mask
-    only so re-encoding is byte-faithful - Arrow ignores it and reports every
-    row null. `LowCardinality(Nothing)` never appears on the wire
-    (`canBeInsideLowCardinality()` is false) and both sides reject it; do not
-    add `Nothing` to the LC allowlist.
-  - BFloat16 dense Native data is exactly two raw little-endian bytes per row,
-    with no type-specific state. The server's Float32 conversion truncates the
-    low 16 bits. `Nullable`, `LowCardinality`, and bare/plain-LC Map keys are
-    legal; numeric LC declarations need
-    `allow_suspicious_low_cardinality_types = 1`, which does not affect the wire.
-    Null-row nested bits are unspecified. Settings history CONFIRMS an
-    experimental gate in compatibility version 24.11 and default-on in 25.1;
-    the exact first shipped release is only INFERRED as 24.11 from this shallow
-    checkout. Arrow has no BFloat16 primitive: keep the structurally width-2
-    buffer and `w:2` export unless Arrow adds a compatible standard type.
-  - All 11 interval names are distinct case-sensitive logical type tags, even
-    though their body is the same signed little-endian `Int64` count. Do not
-    collapse them into `Int64` or a physical delegate. `Nullable` and
-    `LowCardinality` are legal for every interval kind, and bare or plain-LC
-    interval Map keys are legal. Persisted LC-Interval schema declarations and
-    explicit CAST targets still require
-    `allow_suspicious_low_cardinality_types = 1`; this is the generic
-    fixed-width numeric guard, not an Interval-specific restriction. Server
-    expressions can return LC-Interval results without it, and the gate does not
-    affect the wire. Only the four fixed Arrow duration units use `tD*`;
-    calendar and non-Arrow-duration units intentionally export as `l`.
-  - `SimpleAggregateFunction`, the six geo aliases, and `Nested` are pure name
-    decorations resolved through `ChType::physical_delegate` (`src/schema.rs`),
-    the single seam every dispatcher recurses on. SAF is legal at ANY nesting
-    position and the server emits its spelling verbatim inside
-    wrappers/containers: `Nullable(SAF)`, `LowCardinality(SAF)`, `Tuple(v SAF)`,
-    `Array(SAF)`, and `Map(String, SAF)` were all confirmed live at 26.6.1.1193
-    (CREATE + Native header hexdump), corroborated by the server test
-    `04329_tuple_element_aggregation_reject_nullable_tuple.sql`. Wrapper legality
-    delegates to the inner: `Nullable(SAF(T))` is legal iff `Nullable(T)` is, and
-    `is_low_cardinality_inner`/`is_valid_map_key_type` see through the alias.
-    SAF chains are legal to any depth, and the alias may sit BETWEEN a
-    `LowCardinality` and its removeNullable `Nullable`:
-    `LowCardinality(SimpleAggregateFunction(anyLast, Nullable(String)))` is a real
-    server header (live-confirmed, fixture `lc_nsaf` with a NULL), and chained SAF
-    such as `SimpleAggregateFunction(anyLast, SimpleAggregateFunction(sum,
-    UInt64))` is live-constructible. Every `LowCardinality` site therefore
-    resolves its inner through ONE shared helper,
-    `low_cardinality_dict_value_type` (`src/native/type_parser.rs`), which strips the
-    full SAF chain, unwraps the optional `Nullable`, then strips any further SAF
-    chain beneath it, returning `(nullable, dict_value_type)`. Decode, the scan,
-    `empty_column`, header validation, encode validate/write,
-    `is_encodable`/`nullable_at_this_level`, and the Arrow schema export
-    (`dictionary_value_type`/`field_is_nullable` in `src/ffi/mod.rs`) all call it, so
-    a single-level see-through gap ("one path resolves the alias, another does
-    not") cannot recur. A per-column single-level SAF unwrap must not be
-    reintroduced at any of these sites.
-  - A zero-row block with any alias header decodes via `empty_column`'s recursive
-    delegation. The FIRST implementation had an `unreachable!` panic here (an
-    alias inner reaching the panic arm on an untrusted 0-row header); review
-    caught it and it is fixed by recursing on `physical_delegate` at the very top
-    of `empty_column`, before the `Nullable` unwrap. Any new per-type dispatcher
-    must do the same delegate-first recursion or it will panic on a zero-row
-    alias column.
-  - `Nested` inside a container (`Array(Nested(...))`) is accepted leniently on
-    DECODE, but that layout is INFERRED from the delegation architecture, not
-    test-confirmed against the server. Server-side flattening is not recursive,
-    so deep `Nested`-in-`Nested` under `flatten_nested = 0` is real. Do not claim
-    the in-container case as confirmed without a live capture.
-  - Depth parity: `MAX_TYPE_DEPTH` charges each alias its PHYSICAL expansion on
-    both the parse and encode sides (SAF +1, Nested +2 for its Array+Tuple, geo
-    `GeoKind::expansion_depth` 1..4). This keeps decode-accept and encode-accept
-    in exact agreement at the cap, so an alias-tipped header that decodes is
-    always re-encodable. A future alias must charge the same depth on both sides.
-  - Map key legality resolves through the delegate: a `Point`/geo (or SAF) key
-    delegates to its underlying `Tuple`/`Array`, which passes the server's bare
-    `isValidKeyType` predicate, so `Map(Point, V)` is accepted leniently. This is
-    pre-existing delegation behavior, not separately confirmed against the server
-    for geo keys (see `FINDINGS.md`).
-  - A zero-length `LowCardinality` run (reachable when rows > 0 but every
-    array or map is empty) has NO body bytes at all:
-    `SerializationLowCardinality::serializeBinaryBulkWithMultipleStreams`
-    early-returns at `limit == 0`. Both directions handle it (`decode_values`/
-    `skip_values` gate on `num_rows == 0`; `encode_column_values` writes
-    nothing), and the gates compose through `Tuple` elements and `Map`
-    keys/values (covered by the all-empty fixture columns and unit tests).
-  - The encoder rejects a caller-constructed type nested deeper than
-    `MAX_TYPE_DEPTH` as `InconsistentBatch`, deliberately NOT
-    `UnsupportedType`: that variant clones and `Display`s the `ChType`, both of
-    which recurse to full depth, so the error itself would overflow on the
-    input the check rejects. The `type_depth` walk in `encode/validate.rs` is an
-    explicit worklist since the multi-child containers (`Tuple`, `Map`)
-    landed.
-  - `Nullable(Tuple)` IS legal on the wire (`DataTypeTuple::canBeInsideNullable()`
-    is true; the beta `enable_nullable_tuple_type` setting gates DDL only, not
-    the wire) and is decoded/encoded with the ordinary null-map-then-body
-    framing. `Nullable(Map)`, `LowCardinality(Tuple)`, and
-    `LowCardinality(Map)` are all illegal (`canBeInsideNullable()` false /
-    `canBeInsideLowCardinality()` false) and are rejected.
-  - Map keys: `Nullable(K)` and `LowCardinality(Nullable(K))` are forbidden
-    (`DataTypeMap::isValidKeyType`); plain `LowCardinality(K)` keys are legal.
-    One shared predicate (`is_valid_map_key_type` in `src/native/type_parser.rs`)
-    is consulted by decode header validation, the scan, and encode, so the
-    sides cannot drift.
-  - A zero-element `Tuple()` is constructible and emittable and writes exactly
-    ONE literal ASCII '0' (0x30) placeholder byte per row; decode skips those
-    bytes without validating their value (the server uses `tryIgnore`).
-  - Map on the Native wire is ALWAYS the plain BASIC `Array(Tuple(K, V))`
-    layout: `NativeReader` uses `enableAllSupportedSerializations()` and
-    `NativeWriter` the `IDataType::getSerializationInfo` default, both leaving
-    `map_serialization_version` at BASIC, so the bucketed WITH_BUCKETS on-disk
-    mode never reaches the wire in either direction.
-  - Tuple element names: decode is lenient (accepts what a server-authored
-    header says, including shapes the server would reject at creation), while
-    encode mirrors `DataTypeTuple::checkTupleNames` plus the factory's
-    all-or-nothing rule (empty name, exact-lowercase `null`, duplicates, and
-    mixed named/unnamed -> `UnsupportedType`). `Display` quotes any-case
-    `null` (the server's `isValidIdentifier` excludes it case-insensitively).
-  - Map exports as Arrow `+L` LargeList of `entries: struct<key, value>`, NOT
-    `+m`: the Arrow map type mandates i32 offsets and has no large variant, so
-    `+m` would force a per-offset narrowing copy. The `entries`/`key`/`value`
-    naming keeps the export shape-isomorphic to Arrow Map; a binding that
-    wants a real Map type does the cast on its side (noted in
-    `CODEC_CONTRACT.md`).
-  - `Array` offsets export as an Arrow **LargeList** (`+L`, 64-bit offsets), not a
-    List (`+l`). Deliberate: ClickHouse offsets are `UInt64` and count elements, so
-    an i32 cap would be a real completeness gap. A binding on a consumer that lacks
-    LargeList support would need its own conversion (noted in `CODEC_CONTRACT.md`).
-  - A new `MAX_TYPE_DEPTH = 100` cap in `parse_ch_type` bounds recursion for the
-    whole decoder (parse -> decode -> scan -> Arrow export all recurse only as deep
-    as the parsed `ChType`). Added with `Array` (an arbitrarily nestable container
-    read from an untrusted header) and it also closes a PRE-EXISTING
-    `LowCardinality(LowCardinality(...))` stack-overflow-on-malformed-input vector.
-    An over-deep type surfaces as `UnsupportedType`.
-  - `Decimal` is NOT a legal `LowCardinality` inner: `DataTypeDecimal` is a
-    `DataTypeDecimalBase` subclass whose `canBeInsideLowCardinality()` is false, so
-    `LowCardinality(Decimal...)` can never appear on the wire. The crate decodes
-    `Decimal` as an ordinary column but `is_low_cardinality_inner` still rejects
-    it. Do not add `Decimal` to the LC allowlist.
-  - Only the canonical `Decimal(P, S)` spelling is parsed. The creation-time-only
-    `Decimal32(S)`..`Decimal256(S)` spellings never appear in a Native header (the
-    server normalizes them), so they are NOT parsed and surface as
-    `UnsupportedType` if ever seen, mirroring the `Enum8(`/`Enum16(`-only decision.
-  - Arrow decimal export emits the native-width format string `d:P,S` (128-bit) /
-    `d:P,S,bits` (32/64/256-bit), deliberately NOT widening narrow decimals to 128
-    (that would cost a per-value copy in the decode loop). `decimal32`/`decimal64`/
-    `decimal256` are newer in the Arrow C Data Interface than `decimal128`, so
-    consumer support for the non-128 widths varies; the `arrow-ffi-specialist`
-    should confirm the exact format-string spelling and downstream consumer
-    compatibility before any binding relies on the narrow/256-bit exports.
-  - `Enum` is NOT a legal `LowCardinality` inner: `DataTypeEnum` does not inherit
-    `DataTypeNumberBase`, so `canBeInsideLowCardinality()` is false and the server
-    throws `ILLEGAL_TYPE_OF_ARGUMENT` on `LowCardinality(Enum...)` at construction.
-    The crate decodes `Enum8`/`Enum16` as ordinary columns but `is_low_cardinality_inner`
-    still rejects them, so a (never-emitted) `LowCardinality(Enum...)` surfaces as
-    `UnsupportedType`. Do not add `Enum` to the LC allowlist.
-  - Wide integers (`Int128`/`UInt128`/`Int256`/`UInt256`) ARE legal
-    `LowCardinality` and `Nullable` inners, in contrast to
-    `Decimal`/`Enum`/`DateTime64`/`Time64` above: they are numerics, and
-    `DataTypeNumberBase::canBeInsideLowCardinality()` is final/true, so
-    `LowCardinality(Int128)` etc. appear on the wire and are IN the
-    `is_low_cardinality_inner` allowlist (server tests `02125_low_cardinality_int256`
-    and `02459_low_cardinality_uint128_aggregator` corroborate). They decode as a
-    host-agnostic verbatim little-endian passthrough (the `Decimal` path, NOT
-    `decode_primitive!`, so no host byteswap and no native `i128`/`i256`), export
-    as Arrow FixedSizeBinary `w:16`/`w:32`, and carry signedness only in the
-    `ChType`: the Arrow format string does not, and `w:16` is shared with
-    `UUID`/`IPv6`. A binding recovers the integer by reading the 16/32 bytes as a
-    little-endian value of that width, two's-complement signed for
-    `Int128`/`Int256`. `allow_suspicious_low_cardinality_types` is a server-side
-    type-use guard on persisted schema declarations and explicit `CAST` targets.
-    It does not gate wire results or decoding. Introduction version undetermined
-    from the shallow pin.
-  - V1 done (v26.6.1.1193-stable): the Tier lists are authoritative against
-    `DataTypeFactory`. `Geometry` and `QBit(T, N)` are registered and GA in Tier 3;
-    `QBit`'s `SerializationQBit` wire layout is still unexamined - read it via the
-    `clickhouse-server-reader` sub-agent before implementing `QBit`. Legacy
-    `Object('json')` does not exist at this pin; do not implement it.
-  - Per-type introduction versions are mostly undetermined from the local shallow
-    `.server-src` checkout (its `CHANGELOG.md` records behavior changes, not
-    original introduction). Record a type's introduction version only when it is
-    determinable from the source; do not guess from memory.
-  - `LowCardinality` inner support is gated by `is_low_cardinality_inner`
-    (`src/native/type_parser.rs`), the `canBeInsideLowCardinality()` allowlist
-    intersected with decoded types. It includes `UUID`/`IPv4`/`IPv6` and every
-    `Interval*` kind. Both
-    `decode_low_cardinality_dictionary` and the scan's `skip_low_cardinality_data`
-    consult it, so decode and `block_end` agree on which columns are accepted. The
-    `allow_suspicious_low_cardinality_types` setting is a generic server-side
-    type-use guard for persisted schema declarations and explicit `CAST` targets.
-    It is needed for numerics, temporals, intervals, and `IPv4`/`IPv6`, but not
-    for `UUID`. Server expressions can still return these `LowCardinality` types
-    without the setting, and it does not affect wire results or decoding.
-  - The per-column bulk-state prefix is generalized (`read_state_prefix`).
-    `LowCardinality` reads its 8-byte key version through it; the containers
-    (`Array`, `Tuple`, `Map`) and `Nullable` write nothing of their own and
-    recurse (Tuple per element in order, Map key then value), so a nested LC
-    leaf's key version hoists to the very front of the column. Every other
-    type reads zero bytes. Note the prefix is emitted per column per block in
-    Native and only when the block has rows, not once per column overall.
-- **Key references:** per-type workflow is in `AGENTS.md` ("Adding A New
-  ClickHouse Type"). Output contract is `CODEC_CONTRACT.md`. Deferred
-  decisions are in `FINDINGS.md`. Type enum and planned placeholders are in
-  `src/schema.rs`.
+- **Last updated:** 2026-07-14. Tier 3 `AggregateFunction(...)` now supports
+  exact `count`, canonical `nothingUInt64`, and exact base `sum` over every
+  plain or Nullable numeric, Decimal, and Enum argument accepted by the pinned
+  server, at decode/encode parity. The broad AggregateFunction item remains open
+  because Native supplies no generic state framing.
+- **Implementation shape:** `src/native/aggregate_function.rs` is the single
+  private registry shared by parse/header validation, materialized decode,
+  `block_end`, and encode validation. Public output remains
+  `Column::AggregateState(AggregateStateColumn { offsets: Vec<i64>, data })`
+  and Arrow LargeBinary `Z`. Plain sum retains its fixed-width bulk fast path.
+  Nullable sum uses `NullableSum { state_width }`: one flag byte per row, then
+  the 8-, 16-, or 32-byte nested accumulator only for a nonzero flag. Decode
+  walks the borrowed run once, records variable offsets, and copies the complete
+  data run once. Encode validates row slices once, then copies the data once.
+  There are no per-row allocations and no new public variants.
+- **Pinned server:** `v26.6.1.1193-stable`, protocol revision 54485. Every
+  nullable-sum wire claim here is **CONFIRMED**, with no inferred layout:
+  `AggregateFunctions/Combinators/AggregateFunctionNull.{h,cpp}`
+  (`AggregateFunctionNullBase::serialize`/`deserialize`,
+  `AggregateFunctionNullUnary`,
+  `AggregateFunctionCombinatorNull::transformArguments` and
+  `transformAggregateFunction`),
+  `AggregateFunctions/AggregateFunctionSum.{h,cpp}`,
+  `AggregateFunctions/Helpers.h`, `Core/Field.h`,
+  `DataTypes/Serializations/SerializationAggregateFunction.cpp`,
+  `AggregateFunctions/IAggregateFunction.h`, `IO/ReadHelpers.h`, and
+  `IO/WriteHelpers.h`. Canonical serialization emits flag `0x00` or
+  `0x01`; deserialize accepts any nonzero byte as true. A false flag has no
+  accumulator body. A true flag requires the complete nested accumulator.
+- **Coverage/status:** `cargo test` passes 605 unit tests plus 3 fixture
+  integration tests. `cargo build`, `cargo fmt -- --check`,
+  `cargo clippy --all-targets -- -D warnings`, and `git diff --check` pass.
+  The ignored live nullable-sum INSERT plus `finalizeAggregation` test passes
+  against ClickHouse 26.6.1.1193. Both all-types fixtures were recaptured at
+  103 columns, leading varint `0x67`, for revisions 0 and 54485. Coverage
+  includes every accepted signature, mixed false/true and noncanonical flags,
+  truncation, zero rows, multiple blocks, Array composition, byte-by-byte
+  streaming, variable-offset Arrow export, encode validation, real server bytes,
+  and live semantic finalization.
+- **Scope:** frame compression and its unwired files remain untouched and out of
+  scope. Completeness still means uncompressed HTTP `FORMAT Native`.
+- **Recommended next:** add canonical
+  `AggregateFunction(nothingNull, Nullable(Nothing))`. The nullable-sum source
+  read already confirmed its one-`0x00`-byte state and nonzero rejection, so it
+  is the smallest authoritative next AggregateFunction boundary codec.
+- **Active gotchas:**
+  - Aggregate states are adjacent with no row length, column length, prefix,
+    suffix, or in-body version. Unknown signatures must remain unsupported even
+    for zero rows until one shared boundary codec is registered.
+  - `sum(Nullable(Nothing))` does not use NullableSum. The server canonicalizes
+    it to `nothingNull`. Keep it rejected until that distinct codec lands.
+  - Nullable sum's flag is part of opaque aggregate state data, not ClickHouse
+    column nullability or Arrow validity. Outer
+    `Nullable(AggregateFunction(...))` and LowCardinality wrappers remain
+    illegal; Array, Tuple, and Map values compose normally.
+  - Sum accumulator widths are 8 bytes for Bool, native integers up to 64 bits,
+    BFloat16/Float32/Float64, and Enums; 16 bytes for 128-bit integers and
+    Decimal32/64/128; and 32 bytes for 256-bit integers and Decimal256.
+  - `count(Nullable(Nothing))` separately canonicalizes to
+    `nothingUInt64`, already registered as exactly one zero byte per row.
+- **Key references:** the per-type workflow is in `AGENTS.md`. The exact
+  buffer and wire contract is in `CODEC_CONTRACT.md`. The implementation is in
+  `src/native/aggregate_function.rs`; focused tests are in
+  `src/native/decode/tests/aggregate_function.rs`,
+  `src/native/encode/tests/aggregate_function.rs`,
+  `src/ffi/tests/aggregate_function.rs`, `src/native/stream_decoder.rs`,
+  `tests/integration.rs`, and `tests/live_insert.rs`.
 
 ---
 
@@ -845,11 +612,12 @@ where the across-release churn lives.
 - [~] `AggregateFunction(...)` - function-specific coverage in progress. Exact
       unversioned base `count` with zero or one argument type is done at
       decode/encode parity, as are canonical `nothingUInt64` and exact base
-      `sum` for every non-nullable numeric and Enum argument. States are stored
-      as raw bytes with i64 row offsets and exported as Arrow LargeBinary. The
-      generic item stays open because Native has no state/column length framing;
-      each additional signature needs a confirmed boundary codec. Recommended
-      next: nullable `sum`, whose Null adapter adds a flag and conditional body.
+      `sum` for every plain or Nullable numeric and Enum argument. States are
+      stored as raw bytes with i64 row offsets and exported as Arrow LargeBinary.
+      The generic item stays open because Native has no state/column length
+      framing; each additional signature needs a confirmed boundary codec.
+      Recommended next: canonical `nothingNull` for `sum(Nullable(Nothing))`,
+      whose one-byte layout was confirmed during nullable sum investigation.
 - [ ] `Variant(...)` - discriminator stream plus per-variant columns.
 - [ ] `Dynamic` - self-describing, carries its own type info; optional
       `Dynamic(max_types=N)` form.

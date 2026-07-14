@@ -1509,6 +1509,10 @@ fn aggregate_function_sum_roundtrips_through_server() {
     let mut decimal_states = Vec::new();
     let mut wide_states = Vec::new();
     let mut enum_states = Vec::new();
+    let mut nullable_int_states = vec![0x00, 0x01];
+    nullable_int_states.extend_from_slice(&(-13i64).to_le_bytes());
+    nullable_int_states.push(0x01);
+    nullable_int_states.extend_from_slice(&79i64.to_le_bytes());
     for ((int_value, decimal_value), (wide_value, enum_value)) in
         [(-13i64, 1300i128), (0, 0), (79, -7900)].into_iter().zip([
             (13u64, 0i64),
@@ -1534,6 +1538,13 @@ fn aggregate_function_sum_roundtrips_through_server() {
                 ch_type: ChType::AggregateFunction {
                     function: "sum".into(),
                     arguments: vec![ChType::Int32],
+                },
+            },
+            Field {
+                name: "ni".into(),
+                ch_type: ChType::AggregateFunction {
+                    function: "sum".into(),
+                    arguments: vec![ChType::Nullable(Box::new(ChType::Int32))],
                 },
             },
             Field {
@@ -1568,6 +1579,10 @@ fn aggregate_function_sum_roundtrips_through_server() {
             Column::UInt8(PrimitiveColumn::new(vec![0, 1, 2])),
             Column::AggregateState(AggregateStateColumn::new(vec![0, 8, 16, 24], int_states)),
             Column::AggregateState(AggregateStateColumn::new(
+                vec![0, 1, 10, 19],
+                nullable_int_states,
+            )),
+            Column::AggregateState(AggregateStateColumn::new(
                 vec![0, 16, 32, 48],
                 decimal_states,
             )),
@@ -1581,6 +1596,7 @@ fn aggregate_function_sum_roundtrips_through_server() {
     server.ddl(&format!(
         "CREATE TABLE {AGG_SUM_TABLE} \
          (id UInt8, i AggregateFunction(sum, Int32), \
+         ni AggregateFunction(sum, Nullable(Int32)), \
          d AggregateFunction(sum, Decimal(9, 2)), \
          w AggregateFunction(sum, UInt256), \
          e AggregateFunction(sum, Enum8('debit' = -3, 'credit' = 7))) ENGINE = Memory"
@@ -1590,7 +1606,8 @@ fn aggregate_function_sum_roundtrips_through_server() {
     server.insert_native_into(AGG_SUM_TABLE, &bytes);
 
     let native = server.select(&format!(
-        "SELECT id, finalizeAggregation(i), finalizeAggregation(d), \
+        "SELECT id, finalizeAggregation(i), finalizeAggregation(ni), \
+         finalizeAggregation(d), \
          finalizeAggregation(w), finalizeAggregation(e) \
          FROM {AGG_SUM_TABLE} ORDER BY id FORMAT Native"
     ));
@@ -1605,6 +1622,17 @@ fn aggregate_function_sum_roundtrips_through_server() {
         other => panic!("expected finalized Int64 sums, got {other:?}"),
     }
     match block.column(2) {
+        Column::Int64(c) => {
+            let validity = c.validity.as_ref().expect("nullable finalized sum");
+            assert_eq!(validity.null_count(), 1);
+            assert!(!validity.is_valid(0));
+            assert!(validity.is_valid(1));
+            assert!(validity.is_valid(2));
+            assert_eq!(&c.values[1..], &[-13, 79]);
+        }
+        other => panic!("expected finalized Nullable(Int64) sum, got {other:?}"),
+    }
+    match block.column(3) {
         Column::Decimal(c) => {
             assert_eq!((c.precision, c.scale, c.width), (38, 2, 16));
             let expected: Vec<u8> = [1300i128, 0, -7900]
@@ -1615,7 +1643,7 @@ fn aggregate_function_sum_roundtrips_through_server() {
         }
         other => panic!("expected finalized Decimal sums, got {other:?}"),
     }
-    match block.column(3) {
+    match block.column(4) {
         Column::UInt256(c) => {
             assert_eq!(c.width, 32);
             let expected: Vec<u8> = [13u64, 79, 258]
@@ -1630,7 +1658,7 @@ fn aggregate_function_sum_roundtrips_through_server() {
         }
         other => panic!("expected finalized UInt256 sums, got {other:?}"),
     }
-    match block.column(4) {
+    match block.column(5) {
         Column::Int64(c) => assert_eq!(c.values, vec![0, 4, 14]),
         other => panic!("expected finalized Enum Int64 sums, got {other:?}"),
     }

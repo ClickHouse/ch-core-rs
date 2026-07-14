@@ -78,6 +78,16 @@ Cite file and class or function names in your answers. Do not cite line numbers,
 
 `src/DataTypes/DataTypeVariant.{cpp,h}`, `src/DataTypes/DataTypeDynamic.{cpp,h}`, `src/DataTypes/Serializations/SerializationVariant.{cpp,h}`, `SerializationVariantElement.{cpp,h}`, `SerializationDynamic.{cpp,h}`, `SerializationDynamicElement.{cpp,h}`, `SerializationDynamicHelpers.{cpp,h}`. Variant: per-row discriminant byte selecting one of the variant type columns. Dynamic: self-describing variant with schema transmitted via `DataTypesBinaryEncoding`.
 
+### AggregateFunction (aggregate state serialization)
+
+`src/DataTypes/DataTypeAggregateFunction.{cpp,h}` (type string printing via `getNameImpl`, `canBeInsideNullable` returns false), `src/DataTypes/Serializations/SerializationAggregateFunction.{cpp,h}` (bulk path: one opaque state per row, each written by the function's own `serialize`). The per-function state layout lives on the aggregate function classes, not the serialization:
+
+- **Function interface and properties**: `src/AggregateFunctions/IAggregateFunction.{cpp,h}` — `serialize`/`deserialize` per function, `AggregateFunctionProperties` (`returns_default_when_only_null`), `getStateType`, `isVersioned`/`getDefaultVersion`, default `getOwnNullAdapter`.
+- **Factory and combinator dispatch**: `src/AggregateFunctions/AggregateFunctionFactory.cpp` — `get` strips Nullable arguments and routes through the `Null` combinator; `getImpl` returns null for only-null arguments unless `returns_default_when_only_null`. This is where alias resolution and function substitution happen.
+- **Null combinator**: `src/AggregateFunctions/Combinators/AggregateFunctionNull.{cpp,h}` — `AggregateFunctionCombinatorNull::transformAggregateFunction` picks `AggregateFunctionNullUnary`/`Variadic` (template params `result_is_nullable`, `serialize_flag`) or substitutes `nothingNull`/`nothingUInt64` for only-null arguments. `AggregateFunctionNullBase::serialize` writes one `writeBinary(bool)` flag byte (when `serialize_flag`), then the nested state only if the flag is true; `readBinary(bool)` in `src/IO/ReadHelpers.h` accepts any nonzero byte.
+- **Individual functions**: `src/AggregateFunctions/AggregateFunctionXXX.{cpp,h}` — e.g. `AggregateFunctionSum.h` (`AggregateFunctionSumData::write`/`read`, fixed-width little-endian accumulator with `NearestFieldType` promotions from `src/Core/Field.h`), `AggregateFunctionCount.h` (VarUInt64), `AggregateFunctionNothing.h` (`AggregateFunctionNothingImpl`: exactly one byte that must be `0x00`, strict on read).
+- **State combinator** (`-State`, e.g. `sumState`): `src/AggregateFunctions/Combinators/AggregateFunctionState.{cpp,h}` — forwards `serialize`/`deserialize` to the nested function with no extra framing.
+
 ### IPv4 and IPv6
 
 `src/DataTypes/DataTypeIPv4andIPv6.{cpp,h}`, `src/DataTypes/Serializations/SerializationIPv4andIPv6.{cpp,h}`. Wire: UInt32 for IPv4, 16 bytes for IPv6.

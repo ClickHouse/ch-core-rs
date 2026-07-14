@@ -398,6 +398,11 @@ SELECT
     arrayReduce('sumState', arrayMap(x -> toDecimal32(x, 2), range(n))) AS agg_sum_d32,
     -- UInt256 keeps its native 32-byte accumulator width.
     arrayReduce('sumState', arrayMap(x -> toUInt256(x), range(n))) AS agg_sum_u256,
+    -- Nullable sum adds one presence byte per state and writes the nested
+    -- accumulator only after a true flag. These rows yield absent, absent,
+    -- present(13), and present(92), so the following Enum column grounds the
+    -- variable state boundary against real server bytes.
+    arrayReduce('sumState', multiIf(n = 0, CAST([], 'Array(Nullable(UInt8))'), n = 1, CAST([NULL], 'Array(Nullable(UInt8))'), n = 2, CAST([13, NULL], 'Array(Nullable(UInt8))'), CAST([NULL, 79, 13], 'Array(Nullable(UInt8))'))) AS agg_sum_nu8,
     -- Enum8 and Enum16 both sum into signed Int64 states; one Enum8 fixture is
     -- enough to ground the explicit Enum dispatch against real server bytes.
     arrayReduce('sumState', arrayMap(x -> CAST(x, 'Enum8(\'zero\' = 0, \'one\' = 1, \'two\' = 2)'), range(n))) AS agg_sum_e8

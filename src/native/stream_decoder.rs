@@ -237,6 +237,20 @@ mod tests {
         buf
     }
 
+    /// Helper: build one nullable UInt8 sum-state column (no framing).
+    fn make_nullable_sum_block(name: &str, num_rows: usize, states: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_varint(&mut buf, 1);
+        write_varint(&mut buf, num_rows as u64);
+        write_varint(&mut buf, name.len() as u64);
+        buf.extend_from_slice(name.as_bytes());
+        let type_name = b"AggregateFunction(sum, Nullable(UInt8))";
+        write_varint(&mut buf, type_name.len() as u64);
+        buf.extend_from_slice(type_name);
+        buf.extend_from_slice(states);
+        buf
+    }
+
     #[test]
     fn test_single_feed_single_block() {
         let mut dec = StreamDecoder::new(DecodeOptions::default());
@@ -444,6 +458,45 @@ mod tests {
             }
             _ => panic!("expected Utf8"),
         }
+    }
+
+    #[test]
+    fn test_nullable_sum_block_byte_by_byte() {
+        // Split through both true flags and their conditional accumulators. The
+        // allocation-free boundary scan must wait for the complete final state,
+        // then materialize the variable LargeBinary offsets exactly once.
+        let mut states = vec![0x00, 0x01];
+        states.extend_from_slice(&13u64.to_le_bytes());
+        states.push(0x02);
+        states.extend_from_slice(&79u64.to_le_bytes());
+        let data = make_nullable_sum_block("s", 3, &states);
+        let mut dec = StreamDecoder::new(DecodeOptions::default());
+
+        let mut blocks = Vec::new();
+        for byte in data {
+            blocks.extend(dec.feed(&[byte]).unwrap());
+        }
+        blocks.extend(dec.finish().unwrap());
+
+        assert_eq!(blocks.len(), 1);
+        match blocks[0].column(0) {
+            Column::AggregateState(c) => {
+                assert_eq!(c.offsets, vec![0, 1, 10, 19]);
+                assert_eq!(c.data, states);
+            }
+            other => panic!("expected AggregateState, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_nullable_sum_true_flag_without_accumulator_stays_truncated() {
+        let data = make_nullable_sum_block("s", 2, &[0x00, 0x01]);
+        let mut dec = StreamDecoder::new(DecodeOptions::default());
+        assert!(dec.feed(&data).unwrap().is_empty());
+        assert!(matches!(
+            dec.finish(),
+            Err(DecodeError::Io(ref error)) if error.kind() == io::ErrorKind::UnexpectedEof
+        ));
     }
 
     #[test]

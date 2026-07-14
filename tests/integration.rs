@@ -491,6 +491,13 @@ fn assert_all_types(batch: &ChunkedBatch) {
                 },
             ),
             Expected::Exact(
+                "agg_sum_nu8",
+                ChType::AggregateFunction {
+                    function: "sum".to_string(),
+                    arguments: vec![ChType::Nullable(Box::new(ChType::UInt8))],
+                },
+            ),
+            Expected::Exact(
                 "agg_sum_e8",
                 ChType::AggregateFunction {
                     function: "sum".to_string(),
@@ -1650,8 +1657,23 @@ fn assert_all_types(batch: &ChunkedBatch) {
         other => panic!("expected AggregateState, got {other:?}"),
     }
 
-    // AggregateFunction(sum, Enum8(...)) (col 101): Enum8 promotes to Int64.
+    // AggregateFunction(sum, Nullable(UInt8)) (col 101): empty and all-null
+    // inputs are one false flag byte each. Present states are one true flag plus
+    // the UInt64 accumulator, here 13 and 92.
     match block.column(101) {
+        Column::AggregateState(c) => {
+            assert_eq!(c.offsets, vec![0i64, 1, 2, 11, 20]);
+            let mut expected = vec![0x00, 0x00, 0x01];
+            expected.extend_from_slice(&13u64.to_le_bytes());
+            expected.push(0x01);
+            expected.extend_from_slice(&92u64.to_le_bytes());
+            assert_eq!(c.data, expected);
+        }
+        other => panic!("expected AggregateState, got {other:?}"),
+    }
+
+    // AggregateFunction(sum, Enum8(...)) (col 102): Enum8 promotes to Int64.
+    match block.column(102) {
         Column::AggregateState(c) => {
             assert_eq!(c.offsets, vec![0i64, 8, 16, 24, 32]);
             let expected: Vec<u8> = [0i64, 0, 1, 3]
