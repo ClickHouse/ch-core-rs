@@ -29,8 +29,8 @@ use std::process::{Command, Stdio};
 use ch_core_rs::batch::ColBatch;
 use ch_core_rs::bitmap::Bitmap;
 use ch_core_rs::column::{
-    ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn, MapColumn,
-    NothingColumn, PrimitiveColumn, TupleColumn, Utf8Column,
+    AggregateStateColumn, ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn,
+    FixedBinaryColumn, MapColumn, NothingColumn, PrimitiveColumn, TupleColumn, Utf8Column,
 };
 use ch_core_rs::native::decode::{decode_all_bytes, DecodeOptions};
 use ch_core_rs::native::encode::{encode_block, EncodeOptions};
@@ -39,6 +39,8 @@ use ch_core_rs::schema::{ChType, Field, GeoKind, IntervalKind, Schema};
 const TABLE: &str = "ch_core_rs_encode_test";
 const LC_U16_TABLE: &str = "ch_core_rs_encode_lc_u16_test";
 const GSN_TABLE: &str = "ch_core_rs_encode_gsn_test";
+const AGG_COUNT_TABLE: &str = "ch_core_rs_encode_agg_count_test";
+const AGG_NOTHING_TABLE: &str = "ch_core_rs_encode_agg_nothing_test";
 
 /// Build a `Utf8Column` from raw byte values, computing Arrow offsets the same
 /// way the decoder does.
@@ -1128,6 +1130,7 @@ fn raw_column_repr(column: &Column) -> Vec<String> {
         Column::Enum8(c) => c.values.iter().map(|v| v.to_string()).collect(),
         Column::Enum16(c) => c.values.iter().map(|v| v.to_string()).collect(),
         Column::Utf8(c) => (0..c.len()).map(|i| format!("{:?}", c.value(i))).collect(),
+        Column::AggregateState(c) => (0..c.len()).map(|i| format!("{:?}", c.value(i))).collect(),
         // IPv4 is physically a u32; UUID and IPv6 are raw 16-byte rows, so
         // render the wire bytes verbatim (any reordering would show up here).
         Column::Ipv4(c) => c.values.iter().map(|v| v.to_string()).collect(),
@@ -1384,6 +1387,115 @@ fn low_cardinality_fixed_string_u16_dictionary_roundtrips_through_server() {
             "column {col} ({}) differs after server round-trip",
             batch.schema.fields[col].name
         );
+    }
+}
+
+#[test]
+#[ignore = "requires a live ClickHouse server matching .server-ref; run with --ignored"]
+fn aggregate_function_count_roundtrips_through_server() {
+    let server = Server::from_env();
+    let batch = ColBatch::new(
+        Schema::new(vec![
+            Field {
+                name: "id".into(),
+                ch_type: ChType::UInt8,
+            },
+            Field {
+                name: "c".into(),
+                ch_type: ChType::AggregateFunction {
+                    function: "count".into(),
+                    arguments: vec![],
+                },
+            },
+        ]),
+        vec![
+            Column::UInt8(PrimitiveColumn::new(vec![0, 1, 2, 3])),
+            Column::AggregateState(AggregateStateColumn::new(
+                vec![0, 1, 2, 3, 5],
+                vec![0x00, 0x01, 0x0d, 0x80, 0x01],
+            )),
+        ],
+        4,
+    );
+
+    server.ddl(&format!("DROP TABLE IF EXISTS {AGG_COUNT_TABLE}"));
+    server.ddl(&format!(
+        "CREATE TABLE {AGG_COUNT_TABLE} (id UInt8, c AggregateFunction(count)) ENGINE = Memory"
+    ));
+
+    let bytes = encode_block(&batch, &EncodeOptions::default()).expect("encode count states");
+    server.insert_native_into(AGG_COUNT_TABLE, &bytes);
+
+    // Finalize on the server so this checks the raw states were accepted and
+    // interpreted as counts, not merely replayed as opaque bytes.
+    let native = server.select(&format!(
+        "SELECT id, finalizeAggregation(c) AS count FROM {AGG_COUNT_TABLE} ORDER BY id FORMAT Native"
+    ));
+    let decoded = decode_all_bytes(&native, &DecodeOptions::default())
+        .expect("decode finalized count states");
+    server.ddl(&format!("DROP TABLE IF EXISTS {AGG_COUNT_TABLE}"));
+
+    assert_eq!(decoded.num_rows(), 4);
+    match decoded.chunks[0].column(1) {
+        Column::UInt64(c) => assert_eq!(c.values, vec![0, 1, 13, 128]),
+        other => panic!("expected finalized UInt64 counts, got {other:?}"),
+    }
+}
+
+#[test]
+#[ignore = "requires a live ClickHouse server matching .server-ref; run with --ignored"]
+fn aggregate_function_nothing_uint64_roundtrips_through_server() {
+    let server = Server::from_env();
+    let batch = ColBatch::new(
+        Schema::new(vec![
+            Field {
+                name: "id".into(),
+                ch_type: ChType::UInt8,
+            },
+            Field {
+                name: "c".into(),
+                ch_type: ChType::AggregateFunction {
+                    function: "nothingUInt64".into(),
+                    arguments: vec![ChType::Nullable(Box::new(ChType::Nothing))],
+                },
+            },
+        ]),
+        vec![
+            Column::UInt8(PrimitiveColumn::new(vec![0, 1, 2])),
+            // One 0x00 placeholder byte per row; the server rejects any nonzero
+            // byte as INCORRECT_DATA on read.
+            Column::AggregateState(AggregateStateColumn::new(
+                vec![0, 1, 2, 3],
+                vec![0x00, 0x00, 0x00],
+            )),
+        ],
+        3,
+    );
+
+    server.ddl(&format!("DROP TABLE IF EXISTS {AGG_NOTHING_TABLE}"));
+    server.ddl(&format!(
+        "CREATE TABLE {AGG_NOTHING_TABLE} \
+         (id UInt8, c AggregateFunction(nothingUInt64, Nullable(Nothing))) ENGINE = Memory"
+    ));
+
+    let bytes =
+        encode_block(&batch, &EncodeOptions::default()).expect("encode nothingUInt64 states");
+    server.insert_native_into(AGG_NOTHING_TABLE, &bytes);
+
+    // Finalize on the server so this checks the raw states were accepted and
+    // interpreted as an only-null count (every row resolves to 0), not merely
+    // replayed as opaque bytes.
+    let native = server.select(&format!(
+        "SELECT id, finalizeAggregation(c) AS count FROM {AGG_NOTHING_TABLE} ORDER BY id FORMAT Native"
+    ));
+    let decoded = decode_all_bytes(&native, &DecodeOptions::default())
+        .expect("decode finalized nothingUInt64 states");
+    server.ddl(&format!("DROP TABLE IF EXISTS {AGG_NOTHING_TABLE}"));
+
+    assert_eq!(decoded.num_rows(), 3);
+    match decoded.chunks[0].column(1) {
+        Column::UInt64(c) => assert_eq!(c.values, vec![0, 0, 0]),
+        other => panic!("expected finalized UInt64 counts, got {other:?}"),
     }
 }
 

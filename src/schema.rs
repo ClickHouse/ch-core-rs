@@ -154,6 +154,25 @@ pub enum ChType {
         inner: Box<ChType>,
     },
 
+    // `AggregateFunction` is a real opaque aggregation state, not the
+    // name-decoration alias above. Native carries no generic row or column
+    // lengths: the concrete aggregate function owns the state serializer. The
+    // logical type therefore preserves the function spelling (including literal
+    // parameters) and argument types. Decode/encode accept only signatures with
+    // an explicitly registered state-boundary codec.
+    //
+    // No state version is stored. The server omits version 0 from canonical type
+    // names and emits no other version at the pin, so the parser rejects an
+    // explicit leading integer: a spelling like `AggregateFunction(2, sum,
+    // UInt64)` treats `2` as an unknown function name and surfaces as
+    // `UnsupportedType`. Versioning is reintroduced with the first confirmed
+    // versioned codec, and may key off the negotiated protocol revision rather
+    // than the type string.
+    AggregateFunction {
+        function: String,
+        arguments: Vec<ChType>,
+    },
+
     // Geo aliases (`DataTypeCustomGeo`): `Point` = `Tuple(Float64, Float64)`
     // (unnamed elements), `Ring`/`LineString` = `Array(Point)`,
     // `Polygon`/`MultiLineString` = `Array(Array(Point))`, `MultiPolygon` =
@@ -380,6 +399,16 @@ impl std::fmt::Display for ChType {
             // parser.
             ChType::SimpleAggregateFunction { func, inner } => {
                 write!(f, "SimpleAggregateFunction({func}, {inner})")
+            }
+            ChType::AggregateFunction {
+                function,
+                arguments,
+            } => {
+                write!(f, "AggregateFunction({function}")?;
+                for argument in arguments {
+                    write!(f, ", {argument}")?;
+                }
+                write!(f, ")")
             }
             // The bare alias spelling, never the expanded form.
             ChType::Geo(kind) => write!(f, "{}", kind.name()),

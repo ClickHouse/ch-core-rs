@@ -4,6 +4,7 @@ use crate::native::type_parser::decimal_bits_from_precision;
 use crate::native::varint::write_varint;
 use crate::schema::{GeoKind, IntervalKind};
 
+mod aggregate_function;
 mod bfloat16;
 mod containers;
 mod decimal;

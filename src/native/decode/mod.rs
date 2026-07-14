@@ -4,8 +4,11 @@ use std::sync::Arc;
 use crate::batch::{ChunkedBatch, ColBatch};
 use crate::bitmap::Bitmap;
 use crate::column::{
-    ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn, MapColumn,
-    NothingColumn, PrimitiveColumn, TupleColumn, Utf8Column,
+    AggregateStateColumn, ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn,
+    FixedBinaryColumn, MapColumn, NothingColumn, PrimitiveColumn, TupleColumn, Utf8Column,
+};
+use crate::native::aggregate_function::{
+    decode_aggregate_states, decode_state_codec, scan_aggregate_states,
 };
 use crate::native::varint::ByteReader;
 use crate::schema::{ChType, Field, Schema};
@@ -16,7 +19,7 @@ pub use crate::native::protocol::{
 use crate::native::protocol::{
     LC_HAS_ADDITIONAL_KEYS_BIT, LC_NEED_GLOBAL_DICTIONARY_BIT, LOW_CARDINALITY_KEY_VERSION,
 };
-use crate::native::type_parser::{is_low_cardinality_inner, is_valid_map_key_type};
+use crate::native::type_parser::{is_low_cardinality_inner, unsupported_header_type_name};
 pub use crate::native::type_parser::{low_cardinality_dict_value_type, parse_ch_type};
 
 /// Errors that can occur during Native format decoding.
@@ -1245,6 +1248,30 @@ fn decode_column_body(
                 None => Column::UInt256(FixedBinaryColumn::new(data, 32)),
             }
         }
+        // `SerializationAggregateFunction` writes concrete function states
+        // back-to-back with no generic length framing. The shared registry
+        // admits only layouts whose row boundary is confirmed. At
+        // v26.6.1.1193-stable, `AggregateFunction(count[, T])` is one VarUInt64
+        // per row and `AggregateFunction(nothingUInt64, Nullable(Nothing))` is
+        // one 0x00 byte per row. Preserve each state's exact serialized bytes in
+        // LargeBinary layout; the argument types are metadata and do not recurse
+        // here.
+        ChType::AggregateFunction { .. } => {
+            // `can_be_inside_nullable` excludes `AggregateFunction`, so
+            // `parse_ch_type` never yields `Nullable(AggregateFunction(...))` and
+            // this arm is only ever reached with `validity == None`. Return an
+            // error rather than panic, matching the catch-all arms below: the
+            // states decoder ignores `validity`, so a future regression must
+            // degrade to a clean decode error, not a silently dropped null map.
+            if validity.is_some() {
+                return Err(DecodeError::UnsupportedType {
+                    column: String::new(),
+                    type_name: inner_type.to_string(),
+                });
+            }
+            let codec = decode_state_codec(inner_type)?;
+            Column::AggregateState(decode_aggregate_states(reader, codec, num_rows)?)
+        }
         // Defense in depth: `parse_ch_type` rejects a wrapper nested where the
         // single-level unwrap in `decode_values` cannot handle it, and
         // `LowCardinality`, `Array`, and `Tuple` are dispatched by `decode_values`
@@ -1457,6 +1484,11 @@ fn empty_column(ch_type: &ChType) -> Column {
             Some(bm) => FixedBinaryColumn::new_nullable(vec![], 32, bm),
             None => FixedBinaryColumn::new(vec![], 32),
         }),
+        // A zero-row Native block skips aggregate `readData` entirely. The
+        // LargeBinary shape still carries Arrow's required leading zero offset.
+        ChType::AggregateFunction { .. } => {
+            Column::AggregateState(AggregateStateColumn::new(vec![0], vec![]))
+        }
         // A zero-row block reads no LowCardinality prefix or data (the server
         // gates `readData` on having rows), so the empty dictionary column has no
         // indices and an empty values dictionary. The values column is an empty
@@ -1669,58 +1701,13 @@ fn read_column_header(
 /// [`parse_ch_type`] succeeds, and that parser caps nesting at
 /// [`MAX_TYPE_DEPTH`](crate::native::protocol::MAX_TYPE_DEPTH).
 fn validate_header_type(col_name: &str, ch_type: &ChType) -> Result<(), DecodeError> {
-    // A name-decoration alias (SimpleAggregateFunction, geo, Nested) is legal
-    // exactly when the physical type it delegates to is, so validate the
-    // delegate. This catches a forbidden `LowCardinality` inner nested inside a
-    // `Nested` element (e.g. `Nested(a LowCardinality(Decimal(9, 4)))`) on every
-    // path, at header time, regardless of row count.
-    if let Some(under) = ch_type.physical_delegate() {
-        return validate_header_type(col_name, &under);
-    }
-    match ch_type {
-        ChType::LowCardinality(inner) => {
-            // Resolve through the shared helper (full SAF chain + optional
-            // Nullable + inner SAF chain) so an aliased inner like
-            // `SimpleAggregateFunction(anyLast, Nullable(String))` is validated on
-            // its physical dictionary value type, not rejected because the raw
-            // inner is not itself an allowed LC inner.
-            let (_, dict_value_type) = low_cardinality_dict_value_type(inner);
-            if !is_low_cardinality_inner(dict_value_type) {
-                return Err(DecodeError::UnsupportedType {
-                    column: col_name.to_string(),
-                    type_name: format!("LowCardinality({dict_value_type})"),
-                });
-            }
-            Ok(())
-        }
-        // Recurse into the element/inner so a forbidden LC nested inside a
-        // container is caught at header time on every path. `Nullable`'s inner is
-        // usually concrete (the parser rejects a wrapper inside `Nullable`, with
-        // `Tuple` the one legal container), so its recursion mostly matters for a
-        // `Nullable(Tuple(...))`.
-        ChType::Array(inner) => validate_header_type(col_name, inner),
-        ChType::Nullable(inner) => validate_header_type(col_name, inner),
-        ChType::Tuple(elements) => {
-            for (_, element_type) in elements {
-                validate_header_type(col_name, element_type)?;
-            }
-            Ok(())
-        }
-        // A Map key must satisfy the server's key constraint; a header that
-        // violates it never comes from an honest server, and accepting it
-        // would decode a column the type system says cannot exist. Both
-        // children then recurse like the Tuple elements.
-        ChType::Map(key, value) => {
-            if !is_valid_map_key_type(key) {
-                return Err(DecodeError::UnsupportedType {
-                    column: col_name.to_string(),
-                    type_name: format!("Map({key}, {value})"),
-                });
-            }
-            validate_header_type(col_name, key)?;
-            validate_header_type(col_name, value)
-        }
-        _ => Ok(()),
+    if let Some(type_name) = unsupported_header_type_name(ch_type) {
+        Err(DecodeError::UnsupportedType {
+            column: col_name.to_string(),
+            type_name,
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -2032,6 +2019,14 @@ fn skip_column_body(
                 let len = varint_usize(reader.read_varint()?, "String value length")?;
                 reader.skip(len)?;
             }
+        }
+        // Aggregate states have no outer length. Walk the run through the same
+        // boundary-only codec materializing decode uses (via
+        // `scan_aggregate_states` with no offset collection), so `block_end`
+        // stops at exactly the same next-column boundary decode would.
+        ChType::AggregateFunction { .. } => {
+            let codec = decode_state_codec(inner_type)?;
+            scan_aggregate_states(reader, codec, num_rows, None)?;
         }
         // `read_column_header` already rejected unsupported types, Nullable is
         // unwrapped by the callers, and LowCardinality, Array, Tuple, and Map

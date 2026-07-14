@@ -132,6 +132,124 @@ fn test_decode_low_cardinality_bfloat16() {
 }
 
 #[test]
+fn test_decode_low_cardinality_nullable_bfloat16() {
+    // Dictionary slot 0 is the NULL sentinel (inner default 0x0000); the
+    // dictionary body is a bare width-2 BFloat16 run.
+    let dictionary_bits = [ZERO, 0x3fa0, 0x429e]; // sentinel, 1.25, 79
+    let dictionary: Vec<u8> = dictionary_bits
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect();
+    let indices = [1u64, 0, 2, 0, 1];
+    let data = BlockBuilder::new()
+        .header(1, indices.len())
+        .column_header("lcn", "LowCardinality(Nullable(BFloat16))")
+        .low_cardinality_block(dictionary_bits.len(), &dictionary, &indices, 1)
+        .build();
+
+    let decoded = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+    assert_eq!(
+        decoded.schema.fields[0].ch_type,
+        ChType::LowCardinality(Box::new(ChType::Nullable(Box::new(ChType::BFloat16))))
+    );
+    match decoded.chunks[0].column(0) {
+        Column::Dictionary(c) => {
+            assert_eq!(c.indices, vec![1, 0, 2, 0, 1]);
+            assert_eq!(c.null_count(), 2);
+            let bm = c.validity.as_ref().expect("nullable dictionary validity");
+            let actual: Vec<bool> = (0..indices.len()).map(|row| bm.is_valid(row)).collect();
+            assert_eq!(actual, vec![true, false, true, false, true]);
+            match c.values.as_ref() {
+                Column::BFloat16(values) => {
+                    assert_eq!(values.values, expected_words(&dictionary_bits));
+                    assert!(values.validity.is_none());
+                }
+                other => panic!("expected BFloat16 dictionary values, got {other:?}"),
+            }
+        }
+        other => panic!("expected BFloat16 dictionary, got {other:?}"),
+    }
+    assert_eq!(
+        block_end(&data, &DecodeOptions::default()).unwrap(),
+        Some(data.len())
+    );
+}
+
+#[test]
+fn test_decode_array_bfloat16() {
+    // End-offsets [2, 2, 4]: row 1 is empty. The element body is the raw
+    // 2-byte word run.
+    let bits = [0x3fa0, NEG_ZERO, 0x4060, 0x429e]; // 1.25, -0.0, 3.5, 79
+    let data = BlockBuilder::new()
+        .header(1, 3)
+        .column_header("a", "Array(BFloat16)")
+        .array_offsets(&[2, 2, 4])
+        .bfloat16_data(&bits)
+        .build();
+
+    let decoded = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+    assert_eq!(
+        decoded.schema.fields[0].ch_type,
+        ChType::Array(Box::new(ChType::BFloat16))
+    );
+    let arr = as_array(decoded.chunks[0].column(0));
+    assert_eq!(arr.offsets, vec![0i64, 2, 2, 4]);
+    assert_eq!(arr.null_count(), 0);
+    match arr.values.as_ref() {
+        Column::BFloat16(v) => {
+            assert_eq!(v.values, expected_words(&bits));
+            assert!(v.validity.is_none());
+        }
+        other => panic!("expected BFloat16 element values, got {other:?}"),
+    }
+    assert_eq!(
+        block_end(&data, &DecodeOptions::default()).unwrap(),
+        Some(data.len())
+    );
+}
+
+#[test]
+fn test_decode_map_bfloat16_key() {
+    // Map(BFloat16, String): end-offsets then the flattened key run then the
+    // flattened value run. Rows: {1.25: "a"} / {} / {3.5: "b", 79: "c"}.
+    let key_bits = [0x3fa0, 0x4060, 0x429e];
+    let data = BlockBuilder::new()
+        .header(1, 3)
+        .column_header("m", "Map(BFloat16, String)")
+        .array_offsets(&[1, 1, 3])
+        .bfloat16_data(&key_bits)
+        .string_data(&["a", "b", "c"])
+        .build();
+
+    let decoded = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+    assert_eq!(
+        decoded.schema.fields[0].ch_type,
+        ChType::Map(Box::new(ChType::BFloat16), Box::new(ChType::String))
+    );
+    let m = as_map(decoded.chunks[0].column(0));
+    assert_eq!(m.offsets, vec![0i64, 1, 1, 3]);
+    assert_eq!(m.null_count(), 0);
+    let (keys, values) = map_entries(m);
+    match keys {
+        Column::BFloat16(c) => assert_eq!(c.values, expected_words(&key_bits)),
+        other => panic!("expected BFloat16 keys, got {other:?}"),
+    }
+    match values {
+        Column::Utf8(c) => {
+            assert_eq!(c.len(), 3);
+            assert_eq!(c.value(0), b"a");
+            assert_eq!(c.value(1), b"b");
+            assert_eq!(c.value(2), b"c");
+        }
+        other => panic!("expected Utf8 values, got {other:?}"),
+    }
+    assert_eq!(
+        block_end(&data, &DecodeOptions::default()).unwrap(),
+        Some(data.len())
+    );
+}
+
+#[test]
 fn test_decode_bfloat16_zero_rows() {
     let data = BlockBuilder::new()
         .header(2, 0)

@@ -1,12 +1,15 @@
 use super::*;
 use crate::bitmap::Bitmap;
-use crate::column::{DecimalColumn, DictionaryColumn, NothingColumn, PrimitiveColumn};
+use crate::column::{
+    AggregateStateColumn, DecimalColumn, DictionaryColumn, NothingColumn, PrimitiveColumn,
+};
 use crate::native::decode::{decode_all_bytes, DecodeOptions, DBMS_TCP_PROTOCOL_VERSION};
 use crate::native::encode::validate::type_depth;
 use crate::native::protocol::MAX_TYPE_DEPTH;
 use crate::native::type_parser::parse_ch_type;
 use crate::schema::{GeoKind, IntervalKind, Schema};
 
+mod aggregate_function;
 mod bfloat16;
 mod bool;
 mod containers;
@@ -128,6 +131,10 @@ fn assert_columns_eq(left: &Column, right: &Column, label: &str) {
             assert_eq!(x.data, y.data, "{label} data differ");
         }
         (Column::Utf8(x), Column::Utf8(y)) => {
+            assert_eq!(x.offsets, y.offsets, "{label} offsets differ");
+            assert_eq!(x.data, y.data, "{label} data differ");
+        }
+        (Column::AggregateState(x), Column::AggregateState(y)) => {
             assert_eq!(x.offsets, y.offsets, "{label} offsets differ");
             assert_eq!(x.data, y.data, "{label} data differ");
         }

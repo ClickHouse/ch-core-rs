@@ -371,7 +371,21 @@ SELECT
     -- Bare Nothing cannot hold a non-null value, but it is the inferred element
     -- type of an empty array. All four rows are empty, so the flattened Nothing
     -- run has length zero while the literal Array(Nothing) header reaches Native.
-    CAST([], 'Array(Nothing)') AS arr_nothing
+    CAST([], 'Array(Nothing)') AS arr_nothing,
+    -- AggregateFunction(count, UInt64): each row is a concrete count state,
+    -- serialized as one VarUInt64 with no outer row/column length. arrayReduce
+    -- produces counts 0, 1, 2, 3 from arrays of those lengths, so the committed
+    -- fixture confirms both the canonical header and the function-specific body.
+    arrayReduce('countState', range(n)) AS agg_count,
+    -- AggregateFunction(nothingUInt64, Nullable(Nothing)): the canonical name the
+    -- server assigns when count collapses over an only-null argument
+    -- (count(Nullable(Nothing)) -> AggregateFunctionNothingUInt64). Its state is a
+    -- single 0x00 byte per row (AggregateFunctionNothingImpl::serialize), and
+    -- finalizeAggregation resolves it to a count of 0. CAST to the canonical type
+    -- string is the authentic construction: countState(toNullable(NULL)) constant-
+    -- folds away, but CAST(unhex('00'), '...') emits the canonical header with the
+    -- one-zero-byte state (live-confirmed at v26.6.1.1193-stable).
+    CAST(unhex('00'), 'AggregateFunction(nothingUInt64, Nullable(Nothing))') AS agg_nothing
 FROM numbers(4)
 SETTINGS allow_suspicious_low_cardinality_types = 1, enable_nullable_tuple_type = 1, enable_time_time64_type = 1, flatten_nested = 0
 FORMAT Native

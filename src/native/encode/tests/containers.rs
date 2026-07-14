@@ -1286,14 +1286,28 @@ fn array_missing_leading_zero_offset_is_rejected() {
 
 #[test]
 fn array_wrong_offsets_length_is_rejected() {
-    // An empty offsets vector reports 0 rows through the saturating len()
-    // and so passes the row-count check at num_rows = 0, but it is not the
-    // well-formed `[0]` shape; the explicit num_rows + 1 length check
-    // rejects it before `offsets[0]` is read.
-    let batch = array_batch_from_parts(vec![], vec![], 0);
+    // At a nonzero row count the offsets must be exactly num_rows + 1 (a leading
+    // 0 plus one end-offset per row). A single [0] over one row is one short and
+    // is rejected before any element bytes are written.
+    let batch = array_batch_from_parts(vec![0], vec![], 1);
     match encode_block(&batch, &EncodeOptions::default()).unwrap_err() {
         EncodeError::InconsistentBatch { .. } => {}
         other => panic!("expected InconsistentBatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn array_zero_rows_accepts_empty_or_sentinel_offsets() {
+    // Uniform zero-row offset policy, shared by String/Array/Map/AggregateFunction:
+    // a zero-row column accepts either an empty offsets vec or the single [0]
+    // sentinel the decoder emits, both over empty element data. An empty vec
+    // reports 0 rows through ArrayColumn::len()'s saturating subtraction, so it
+    // passes the row-count check, and the shared validator accepts it leniently
+    // rather than regressing bindings that hand back an empty offsets buffer.
+    for offsets in [vec![], vec![0i64]] {
+        let batch = array_batch_from_parts(offsets, vec![], 0);
+        encode_block(&batch, &EncodeOptions::default())
+            .expect("zero-row array with empty or [0] offsets should encode");
     }
 }
 

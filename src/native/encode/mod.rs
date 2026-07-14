@@ -19,7 +19,8 @@
 //! encodable element type (including nested arrays), `Tuple(T1, ...)`
 //! (named or unnamed, including the zero-element `Tuple()`) over encodable
 //! element types, and `Map(K, V)` for a legal key type and any encodable
-//! key/value types. The plain types and `Tuple` also compose inside a
+//! key/value types, plus exact unversioned `AggregateFunction(count[, T])`
+//! serialized states. The plain types and `Tuple` also compose inside a
 //! `Nullable(T)` wrapper (a per-row null map precedes the inner values). Every
 //! other column type returns [`EncodeError::UnsupportedType`] until its
 //! encoder lands, the same one-type-at-a-time growth the decode path follows.
@@ -29,6 +30,7 @@ use crate::column::{
     ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn, MapColumn,
     TupleColumn, Utf8Column,
 };
+use crate::native::aggregate_function::aggregate_state_codec;
 use crate::schema::{ChType, Field};
 
 use super::protocol::{
@@ -745,6 +747,12 @@ fn encode_column_body(
         | (ChType::UInt128, Column::UInt128(c))
         | (ChType::Int256, Column::Int256(c))
         | (ChType::UInt256, Column::UInt256(c)) => encode_fixed_binary_data(buf, c),
+        // AggregateStateColumn stores the exact serialized row states in one
+        // contiguous buffer. Validation has already checked every offset and
+        // state with the selected function-specific codec, so this is one copy.
+        (ChType::AggregateFunction { .. }, Column::AggregateState(c)) => {
+            buf.extend_from_slice(&c.data)
+        }
         // Defensive: `validate_column` rejects every unsupported type and every
         // mismatched `(type, buffer)` pair before the write phase, so this arm
         // cannot occur for a validated batch. It returns the same error validation
@@ -870,6 +878,14 @@ fn column_error(field: &Field, ch_type: &ChType) -> EncodeError {
 /// [`encode_array_data`]. The `Nullable` wrapper composes with any non-wrapper
 /// type here via [`encode_null_map`]. Extend it as each new type's arm lands in
 /// [`encode_column_body`] or [`encode_column_values`].
+///
+/// This predicate answers "does a body writer exist for this type", a question
+/// distinct from "is this type-string legal" (owned by
+/// [`unsupported_header_type_name`]). It is a self-contained truth about encoder
+/// coverage that [`column_error`] must be able to call in isolation, so its
+/// `LowCardinality`-inner and `Map`-key arms re-spell those legality rules
+/// rather than delegating to that walker: routing through it would couple this
+/// predicate to validation ordering and conflate encodable with legal.
 fn is_encodable(ch_type: &ChType) -> bool {
     match ch_type {
         ChType::LowCardinality(inner) => {
@@ -934,6 +950,7 @@ fn is_encodable(ch_type: &ChType) -> bool {
         ChType::Map(key, value) => {
             is_valid_map_key_type(key) && is_encodable(key) && is_encodable(value.inner())
         }
+        ChType::AggregateFunction { .. } => aggregate_state_codec(ch_type).is_some(),
         // Name-decoration aliases are encodable exactly when their physical
         // delegate is: `SimpleAggregateFunction` over its inner, a geo alias over
         // its Tuple/Array-of-Float64 nesting (always encodable), and `Nested`

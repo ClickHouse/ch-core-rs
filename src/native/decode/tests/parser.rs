@@ -958,6 +958,74 @@ fn test_parse_ch_type_simple_aggregate_function() {
 }
 
 #[test]
+fn parse_aggregate_function_count_signatures_and_display() {
+    let bare = ChType::AggregateFunction {
+        function: "count".into(),
+        arguments: vec![],
+    };
+    let nullable_arg = ChType::AggregateFunction {
+        function: "count".into(),
+        arguments: vec![ChType::Nullable(Box::new(ChType::String))],
+    };
+
+    assert_eq!(
+        parse_ch_type("AggregateFunction(count)"),
+        Some(bare.clone())
+    );
+    assert_eq!(
+        parse_ch_type("AggregateFunction(count, Nullable(String))"),
+        Some(nullable_arg.clone())
+    );
+    assert_eq!(bare.to_string(), "AggregateFunction(count)");
+    assert_eq!(
+        nullable_arg.to_string(),
+        "AggregateFunction(count, Nullable(String))"
+    );
+}
+
+#[test]
+fn parse_aggregate_function_nothing_uint64_signature_and_display() {
+    // count(Nullable(Nothing)) collapses to this canonical name on the wire, so
+    // this is the spelling a Native header actually carries.
+    let nothing_uint64 = ChType::AggregateFunction {
+        function: "nothingUInt64".into(),
+        arguments: vec![ChType::Nullable(Box::new(ChType::Nothing))],
+    };
+    assert_eq!(
+        parse_ch_type("AggregateFunction(nothingUInt64, Nullable(Nothing))"),
+        Some(nothing_uint64.clone())
+    );
+    assert_eq!(
+        nothing_uint64.to_string(),
+        "AggregateFunction(nothingUInt64, Nullable(Nothing))"
+    );
+}
+
+#[test]
+fn parse_aggregate_function_rejects_unregistered_state_layouts() {
+    for type_name in [
+        "AggregateFunction()",
+        "AggregateFunction(sum, UInt64)",
+        "AggregateFunction(countDistinct, UInt64)",
+        "AggregateFunction(count, UInt8, UInt16)",
+        "AggregateFunction(1, count)",
+        "AggregateFunction(count, LowCardinality(Decimal(9, 4)))",
+        "AggregateFunction(count, Map(Nullable(UInt8), UInt8))",
+        "AggregateFunction(count, Tuple(a UInt8, a UInt8))",
+        // count(Nullable(Nothing)) is renamed to nothingUInt64 by the server, so
+        // the count spelling is never on the wire and must not parse.
+        "AggregateFunction(count, Nullable(Nothing))",
+        // nothingUInt64 is confirmed only with the Nullable(Nothing) argument.
+        "AggregateFunction(nothingUInt64)",
+        "AggregateFunction(nothingUInt64, UInt64)",
+        "AggregateFunction(nothingUInt64, Nothing)",
+        "Nullable(AggregateFunction(count))",
+    ] {
+        assert_eq!(parse_ch_type(type_name), None, "accepted {type_name}");
+    }
+}
+
+#[test]
 fn test_simple_aggregate_function_display_round_trips() {
     for spelling in [
         "SimpleAggregateFunction(sum, Float64)",

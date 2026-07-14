@@ -141,6 +141,7 @@ Not implemented yet:
 - `Decimal(P, S)`
 - `UUID`, `IPv4`, `IPv6`
 - `Enum8(...)`, `Enum16(...)`
+- `AggregateFunction(count)` and `AggregateFunction(count, T)` state columns
 - `LowCardinality(T)` for the allowed inner types above, excluding server-forbidden
   combinations such as `Nothing`, `Decimal`, `DateTime64`, `Time64`, and `Enum`
 

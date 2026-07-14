@@ -1,0 +1,236 @@
+//! Function-specific codecs for ClickHouse `AggregateFunction(...)` states.
+//!
+//! Native does not length-prefix an aggregate state or its containing column.
+//! Each aggregate function serializes its row states back-to-back, so decode
+//! and the streaming completeness scan must agree on the exact state boundary.
+//! Keep that knowledge in this module and add signatures only after confirming
+//! their concrete server serializer.
+
+use std::io;
+
+use crate::column::AggregateStateColumn;
+use crate::native::decode::DecodeError;
+use crate::native::varint::{skip_varint, ByteReader};
+use crate::schema::ChType;
+
+/// A state layout whose row boundary this crate can find safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AggregateStateCodec {
+    /// `AggregateFunction(count)` and `AggregateFunction(count, T)` (with
+    /// `T != Nullable(Nothing)`) serialize one unsigned VarUInt64 count per row.
+    Count,
+    /// `AggregateFunction(nothingUInt64, Nullable(Nothing))` serializes exactly
+    /// one `0x00` byte per row. This is the canonical name the server assigns
+    /// when `count` collapses over an only-null argument (see
+    /// [`aggregate_state_codec`]); the state is a fixed-width 1-byte placeholder,
+    /// and any nonzero byte is `INCORRECT_DATA` on the server.
+    NothingUInt64,
+}
+
+/// Whether `arg` is exactly `Nullable(Nothing)`, the only-null argument shape
+/// that makes `count` collapse to `nothingUInt64` on the wire.
+fn is_nullable_nothing(arg: &ChType) -> bool {
+    matches!(arg, ChType::Nullable(inner) if matches!(**inner, ChType::Nothing))
+}
+
+/// Select the state codec for one declared aggregate type.
+///
+/// At ClickHouse `v26.6.1.1193-stable`, no aggregate function is treated as
+/// opaque bytes: aggregate states have function-specific serialization and no
+/// generic length framing, so an unknown function must stay `UnsupportedType`
+/// (returning `None` here) or the streaming scan could not locate the next
+/// column. Two exact base signatures are registered:
+///
+/// - `count`, unversioned, with zero or one argument type, writes one VarUInt64
+///   per row (`AggregateFunctionCount::serialize`). `count` is strictly unary,
+///   so `createAggregateFunctionCount` throws for more than one argument.
+/// - `nothingUInt64` with a single `Nullable(Nothing)` argument writes one
+///   `0x00` byte per row (`AggregateFunctionNothingImpl::serialize`).
+///
+/// The one exception carved out of `count` is `count, Nullable(Nothing)`.
+/// Parsing the type string `AggregateFunction(count, Nullable(Nothing))` resolves
+/// through `AggregateFunctionFactory::get` ->
+/// `AggregateFunctionCombinatorNull::transformAggregateFunction`: because
+/// `AggregateFunctionCount` registers `returns_default_when_only_null = true` and
+/// `Nullable(Nothing).onlyNull()` is true, the server substitutes
+/// `AggregateFunctionNothingUInt64`, and `DataTypeAggregateFunction::getNameImpl`
+/// renders the canonical `AggregateFunction(nothingUInt64, Nullable(Nothing))`.
+/// `NativeWriter` writes that canonical name, so the `count, Nullable(Nothing)`
+/// spelling never appears on the wire. Admitting the VarUInt `Count` codec under
+/// that header would be a wire-format mismatch, since a server that parses the
+/// name resolves the one-zero-byte `nothingUInt64` codec, so it is rejected here.
+///
+/// The `nothingUInt64` gate is deliberately restricted to the confirmed
+/// `Nullable(Nothing)` argument shape rather than any argument list. That name is
+/// synthesized only by the count collapse at this tag, and that collapse only
+/// happens for `Nullable(Nothing)`, so it is the only spelling the server emits.
+/// Accepting other argument lists would fabricate headers the server never
+/// writes and, on encode, that it could not parse back to `nothingUInt64`. The
+/// analogous parameterized `nothing*` forms exist for other functions, but only
+/// the confirmed shape is implemented.
+///
+/// All confirmed against the server source at `v26.6.1.1193-stable`:
+/// `AggregateFunctionCount::serialize`,
+/// `AggregateFunctionCombinatorNull::transformAggregateFunction` in
+/// `AggregateFunctions/Combinators/AggregateFunctionNull.cpp`,
+/// `AggregateFunctionNothingImpl::serialize`/`deserialize` in
+/// `AggregateFunctions/AggregateFunctionNothing.h`, and
+/// `DataTypeAggregateFunction::getNameImpl`.
+pub(crate) fn aggregate_state_codec(ch_type: &ChType) -> Option<AggregateStateCodec> {
+    let ChType::AggregateFunction {
+        function,
+        arguments,
+    } = ch_type
+    else {
+        return None;
+    };
+    match function.as_str() {
+        "count" if arguments.len() <= 1 && !arguments.iter().any(is_nullable_nothing) => {
+            Some(AggregateStateCodec::Count)
+        }
+        "nothingUInt64" if arguments.len() == 1 && is_nullable_nothing(&arguments[0]) => {
+            Some(AggregateStateCodec::NothingUInt64)
+        }
+        _ => None,
+    }
+}
+
+/// Resolve the state codec for a decode-side `AggregateFunction` column, mapping
+/// an unregistered signature to the `UnsupportedType` decode error.
+///
+/// Shared by the materializing decoder (`decode_column_body`) and the streaming
+/// scan (`skip_column_body`) so both report the exact same error, with an empty
+/// `column` name the caller fills in, for a signature with no registered
+/// state-boundary codec.
+pub(crate) fn decode_state_codec(ch_type: &ChType) -> Result<AggregateStateCodec, DecodeError> {
+    aggregate_state_codec(ch_type).ok_or_else(|| DecodeError::UnsupportedType {
+        column: String::new(),
+        type_name: ch_type.to_string(),
+    })
+}
+
+/// Decode `num_rows` serialized states, preserving each row's exact wire bytes.
+///
+/// `AggregateFunction(count[, T])` uses one unsigned VarUInt64 per state
+/// (`AggregateFunctionCount::serialize` / `deserialize` at
+/// `v26.6.1.1193-stable`); `AggregateFunction(nothingUInt64, Nullable(Nothing))`
+/// uses one `0x00` byte per state. The walk records row ends while validating
+/// each state, then copies the complete contiguous run once. There is one
+/// offsets allocation and one data allocation per column, with no per-row
+/// allocation.
+pub(crate) fn decode_aggregate_states(
+    reader: &mut ByteReader<'_>,
+    codec: AggregateStateCodec,
+    num_rows: usize,
+) -> io::Result<AggregateStateColumn> {
+    let start = reader.position();
+    let mut offsets = Vec::with_capacity(num_rows.saturating_add(1));
+    offsets.push(0);
+
+    // Walk every state boundary over the borrowed run, collecting Arrow offsets,
+    // then copy the whole contiguous body once.
+    scan_aggregate_states(reader, codec, num_rows, Some(&mut offsets))?;
+
+    let data = reader.consumed_slice(start)?.to_vec();
+    Ok(AggregateStateColumn::new(offsets, data))
+}
+
+/// Walk `num_rows` serialized state boundaries with the selected codec, advancing
+/// the reader once past the whole run. Shared by allocating decode (which passes
+/// `Some` and receives Arrow-shaped i64 end offsets relative to the run start)
+/// and `block_end` scanning (which passes `None` and only advances), so the
+/// streaming decoder can never disagree with materialization on the boundary.
+///
+/// The run is borrowed once and walked with a LOCAL cursor index, so the per-row
+/// varint scan stays in registers: [`skip_varint`] reads the continuation bytes
+/// without accumulating the count the boundary walk discards, and there is no
+/// per-byte `ByteReader` field access. The reader is advanced a single time at
+/// the end. `Some`/`None` is matched once, outside the loop, so the offset
+/// collection adds no per-row branch to the scan path.
+pub(crate) fn scan_aggregate_states(
+    reader: &mut ByteReader<'_>,
+    codec: AggregateStateCodec,
+    num_rows: usize,
+    collect: Option<&mut Vec<i64>>,
+) -> io::Result<()> {
+    let bytes = reader.remaining_slice();
+    let mut pos = 0usize;
+
+    match codec {
+        AggregateStateCodec::Count => match collect {
+            Some(offsets) => {
+                for _ in 0..num_rows {
+                    pos = skip_varint(bytes, pos)?;
+                    // `pos` is relative to the run start, so it is the row's Arrow
+                    // end offset directly. It only ever grows, so it cannot
+                    // underflow; the range check catches the (unreachable in
+                    // practice) case of a run past the i64 LargeBinary offset
+                    // width, and the map_err runs only on that error path.
+                    offsets.push(i64::try_from(pos).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "aggregate state data exceeds Arrow LargeBinary offset range",
+                        )
+                    })?);
+                }
+            }
+            None => {
+                for _ in 0..num_rows {
+                    pos = skip_varint(bytes, pos)?;
+                }
+            }
+        },
+        // `nothingUInt64` is a fixed-width 1-byte state: one `0x00` per row
+        // (`AggregateFunctionNothingImpl::serialize` writes one '\0', and
+        // `deserialize` throws INCORRECT_DATA if the byte is nonzero, at
+        // `v26.6.1.1193-stable`). The boundary walk is trivial: bounds-check the
+        // whole `num_rows`-byte run once, reject any nonzero byte as InvalidData
+        // (mirroring the server), then record offsets i -> i.
+        AggregateStateCodec::NothingUInt64 => {
+            let states = bytes.get(..num_rows).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "failed to fill whole buffer")
+            })?;
+            if states.iter().any(|&b| b != 0) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "AggregateFunction(nothingUInt64) state byte must be zero",
+                ));
+            }
+            pos = num_rows;
+            if let Some(offsets) = collect {
+                // The largest offset pushed is `num_rows`, so one range check
+                // covers every pushed offset; each `i <= num_rows` then casts to
+                // i64 without a per-row conversion or a lossy narrowing.
+                i64::try_from(num_rows).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "aggregate state data exceeds Arrow LargeBinary offset range",
+                    )
+                })?;
+                for i in 1..=num_rows {
+                    offsets.push(i as i64);
+                }
+            }
+        }
+    }
+
+    // Advance the shared cursor past the whole run in one step. Every byte in
+    // `0..pos` was already proven present by `skip_varint`, so this cannot fail;
+    // it is one bounds check per column, not per row.
+    reader.skip(pos)
+}
+
+/// Validate that one caller-provided row slice contains exactly one state for
+/// `codec`, with no trailing bytes that would misframe the next row or column.
+pub(crate) fn is_valid_aggregate_state(bytes: &[u8], codec: AggregateStateCodec) -> bool {
+    match codec {
+        // Exactly one VarUInt64 that consumes the whole slice: a trailing byte or
+        // a malformed varint (truncated or overlong) is invalid.
+        AggregateStateCodec::Count => {
+            matches!(skip_varint(bytes, 0), Ok(end) if end == bytes.len())
+        }
+        // Exactly one `0x00` byte: the server's `nothingUInt64` placeholder. A
+        // nonzero byte, an empty slice, or trailing bytes are all invalid.
+        AggregateStateCodec::NothingUInt64 => bytes == [0x00],
+    }
+}

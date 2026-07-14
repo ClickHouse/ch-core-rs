@@ -681,3 +681,34 @@ fn test_export_schema_tolerates_nul_in_wire_names() {
         (out.release.unwrap())(&mut out);
     }
 }
+
+#[test]
+fn export_empty_offsets_utf8_has_valid_leading_zero_offset() {
+    // A hand-built String column with an empty offsets Vec is a zero-row column
+    // (Utf8Column::len is offsets.len().saturating_sub(1)). The decoder always
+    // emits [0], but Column fields are public. The export must not hand out the
+    // dangling as_ptr of a zero-capacity Vec; it substitutes a 'static single
+    // zero so the i32 offsets buffer satisfies Arrow's length + 1 contract.
+    let batch = Arc::new(ColBatch::new(
+        Schema::new(vec![Field {
+            name: "s".into(),
+            ch_type: ChType::String,
+        }]),
+        vec![Column::Utf8(Utf8Column::new(vec![], vec![]))],
+        0,
+    ));
+
+    // Safety: output is a writable zeroed C Data array, released below.
+    unsafe {
+        let mut array: ArrowArray = std::mem::zeroed();
+        export_batch_array(&batch, &mut array);
+        let child = &**array.children.add(0);
+        assert_eq!(child.length, 0);
+        assert_eq!(child.null_count, 0);
+        assert_eq!(child.n_buffers, 3);
+        let offsets = *child.buffers.add(1) as *const i32;
+        assert!(!offsets.is_null());
+        assert_eq!(*offsets, 0);
+        (array.release.unwrap())(&mut array);
+    }
+}

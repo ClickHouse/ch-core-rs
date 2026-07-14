@@ -146,6 +146,9 @@ Arrow-shaped buffer containers:
 - `Utf8Column`: Arrow string layout, `offsets: Vec<i32>` of length rows+1 plus
   one `data: Vec<u8>` buffer. Row `i` is `data[offsets[i]..offsets[i+1]]`.
 - `FixedBinaryColumn`: one contiguous `width * num_rows` byte buffer.
+- `AggregateStateColumn`: Arrow LargeBinary layout, `offsets: Vec<i64>` plus
+  exact serialized aggregate-state bytes. Native has no generic state length,
+  so only function signatures with a registered boundary codec can build it.
 - `BoolColumn`: bit-packed LSB-first bitmap, exactly Arrow's boolean layout.
 
 **Nullability (`bitmap.rs`).** ClickHouse sends nulls as one byte per row

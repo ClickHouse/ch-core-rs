@@ -34,6 +34,23 @@ fn bfloat16_batch() -> ColBatch {
     )
 }
 
+// `LowCardinality(Nullable(BFloat16))`: index 0 is the NULL sentinel and the
+// dictionary body is the bare non-nullable inner type.
+fn bfloat16_low_cardinality_nullable_batch() -> ColBatch {
+    ColBatch::new(
+        Schema::new(vec![Field {
+            name: "lcn_bf".into(),
+            ch_type: ChType::LowCardinality(Box::new(ChType::Nullable(Box::new(ChType::BFloat16)))),
+        }]),
+        vec![Column::Dictionary(DictionaryColumn::new_nullable(
+            vec![1, 0, 2, 0],
+            Column::BFloat16(bfloat16_column(&[0x0000, 0x3fa0, 0x429e])),
+            Bitmap::from_ch_null_map(&[0, 1, 0, 1]),
+        ))],
+        4,
+    )
+}
+
 #[test]
 fn roundtrip_bfloat16_rev0() {
     roundtrip(&bfloat16_batch(), 0);
@@ -42,6 +59,19 @@ fn roundtrip_bfloat16_rev0() {
 #[test]
 fn roundtrip_bfloat16_tcp_revision() {
     roundtrip(&bfloat16_batch(), DBMS_TCP_PROTOCOL_VERSION);
+}
+
+#[test]
+fn roundtrip_nullable_low_cardinality_bfloat16_rev0() {
+    roundtrip(&bfloat16_low_cardinality_nullable_batch(), 0);
+}
+
+#[test]
+fn roundtrip_nullable_low_cardinality_bfloat16_tcp_revision() {
+    roundtrip(
+        &bfloat16_low_cardinality_nullable_batch(),
+        DBMS_TCP_PROTOCOL_VERSION,
+    );
 }
 
 #[test]

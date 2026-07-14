@@ -699,3 +699,32 @@ fn test_export_map_buffers() {
         (array.release.unwrap())(&mut array);
     }
 }
+
+#[test]
+fn export_empty_offsets_array_has_valid_leading_zero_offset() {
+    // A hand-built Array column with an empty offsets Vec is a zero-row LargeList
+    // (ArrayColumn::len is offsets.len().saturating_sub(1)). The decoder always
+    // emits [0], but Column fields are public, so the export must not hand out
+    // the dangling as_ptr of a zero-capacity Vec; it substitutes a 'static
+    // single zero so the i64 offsets buffer keeps Arrow's length + 1 contract.
+    let schema = Schema::new(vec![Field {
+        name: "arr".into(),
+        ch_type: ChType::Array(Box::new(ChType::Int32)),
+    }]);
+    let values = Column::Int32(PrimitiveColumn::new(vec![]));
+    let col = Column::Array(crate::column::ArrayColumn::new(vec![], values));
+    let batch = Arc::new(ColBatch::new(schema, vec![col], 0));
+
+    // Safety: output is a writable zeroed C Data array, released below.
+    unsafe {
+        let mut array: ArrowArray = std::mem::zeroed();
+        export_batch_array(&batch, &mut array);
+        let c0 = &**array.children.add(0);
+        assert_eq!(c0.length, 0);
+        assert_eq!(c0.n_buffers, 2);
+        let offsets = *c0.buffers.add(1) as *const i64;
+        assert!(!offsets.is_null());
+        assert_eq!(*offsets, 0);
+        (array.release.unwrap())(&mut array);
+    }
+}

@@ -444,6 +444,20 @@ fn assert_all_types(batch: &ChunkedBatch) {
             Expected::Exact("lc_bf", ChType::LowCardinality(Box::new(ChType::BFloat16))),
             Expected::Exact("nothing", ChType::Nullable(Box::new(ChType::Nothing))),
             Expected::Exact("arr_nothing", ChType::Array(Box::new(ChType::Nothing))),
+            Expected::Exact(
+                "agg_count",
+                ChType::AggregateFunction {
+                    function: "count".to_string(),
+                    arguments: vec![ChType::UInt64],
+                },
+            ),
+            Expected::Exact(
+                "agg_nothing",
+                ChType::AggregateFunction {
+                    function: "nothingUInt64".to_string(),
+                    arguments: vec![ChType::Nullable(Box::new(ChType::Nothing))],
+                },
+            ),
         ],
     );
 
@@ -1509,6 +1523,29 @@ fn assert_all_types(batch: &ChunkedBatch) {
             }
         }
         other => panic!("expected Array(Nothing), got {other:?}"),
+    }
+
+    // AggregateFunction(count, UInt64) (col 95): one raw VarUInt64 state per
+    // row, produced by arrayReduce over arrays of lengths 0, 1, 2, and 3. The
+    // state bytes are exposed as Arrow LargeBinary offsets plus data.
+    match block.column(95) {
+        Column::AggregateState(c) => {
+            assert_eq!(c.offsets, vec![0i64, 1, 2, 3, 4]);
+            assert_eq!(c.data, vec![0x00, 0x01, 0x02, 0x03]);
+        }
+        other => panic!("expected AggregateState, got {other:?}"),
+    }
+
+    // AggregateFunction(nothingUInt64, Nullable(Nothing)) (col 96): the canonical
+    // name for the count(Nullable(Nothing)) collapse, one 0x00 byte per row. The
+    // fixed-width state exports as LargeBinary offsets i -> i over an all-zero
+    // data run.
+    match block.column(96) {
+        Column::AggregateState(c) => {
+            assert_eq!(c.offsets, vec![0i64, 1, 2, 3, 4]);
+            assert_eq!(c.data, vec![0x00, 0x00, 0x00, 0x00]);
+        }
+        other => panic!("expected AggregateState, got {other:?}"),
     }
 }
 

@@ -2,11 +2,13 @@ use super::*;
 use crate::batch::ColBatch;
 use crate::bitmap::Bitmap;
 use crate::column::{
-    ArrayColumn, Column, DictionaryColumn, NothingColumn, PrimitiveColumn, TupleColumn, Utf8Column,
+    AggregateStateColumn, ArrayColumn, Column, DictionaryColumn, NothingColumn, PrimitiveColumn,
+    TupleColumn, Utf8Column,
 };
 use crate::schema::{ChType, Field, GeoKind, IntervalKind, Schema};
 use std::ffi::CStr;
 
+mod aggregate_function;
 mod containers;
 mod low_cardinality;
 mod nothing;

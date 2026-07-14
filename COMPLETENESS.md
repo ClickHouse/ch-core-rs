@@ -47,47 +47,89 @@ point-in-time snapshot for the next agent, not a changelog. Keep it short. Alway
 include a "Recommended next" with a one-line reason, so the next agent has a
 default; the user may override it.
 
-- **Last updated:** 2026-07-14. Implemented `Nothing` at decode/encode parity,
-  including parser, scanner, zero-row and multi-block handling, `Nullable`,
-  container composition (`Array(Nothing)`, Tuple/Map positions), Arrow Null
-  export, exact-wire-byte unit tests, live INSERT coverage, and real-server
-  fixture assertions. Both `all_types` fixtures were recaptured from ClickHouse
-  26.6.1.1193 with `Nullable(Nothing)` and `Array(Nothing)` columns, and the
-  integration and live INSERT gates pass. Tier 2 is now complete.
-- **Implementation shape:** `ChType::Nothing` plus
-  `Column::Nothing(NothingColumn { len, validity })` - no value buffer; `len`
-  carries the row count and `validity` retains the structural null map of
-  `Nullable(Nothing)` for Native re-encoding (`null_count()` is always `len`).
-  The key wire fact: Nothing is zero-width in memory but NOT on the wire -
-  encode writes one ASCII `'0'` (0x30) placeholder byte per row, decode and the
-  scan consume one arbitrary byte per row without validating it.
-  `LowCardinality(Nothing)` is rejected on both sides. Arrow export is the Null
-  type (format `n`, zero buffers, every row null by definition).
+- **Last updated:** 2026-07-14. Tier 3 `AggregateFunction(...)` now has two
+  function-specific state codecs at decode/encode parity: exact unversioned base
+  `count` (zero or one argument, `T != Nullable(Nothing)`) writing one VarUInt64
+  per row, and `nothingUInt64` with a single `Nullable(Nothing)` argument writing
+  one `0x00` byte per row. The latter closed the confirmed gap that
+  `count(Nullable(Nothing))` canonicalizes to `nothingUInt64` on the wire.
+  Parser, streaming scan, zero-row and multi-block handling, `Array` composition,
+  Arrow LargeBinary, state-offset validation, real-server fixtures, and live
+  INSERT + `finalizeAggregation` are covered for both. The broad AggregateFunction
+  item remains open because Native has no generic state framing and every function
+  family needs its own boundary codec.
+- **Implementation shape:**
+  `ChType::AggregateFunction { function, arguments }` plus
+  `Column::AggregateState(AggregateStateColumn { offsets: Vec<i64>, data })`.
+  `src/native/aggregate_function.rs` is the single state-codec registry shared
+  by decode, `block_end`, and encode validation. `AggregateStateCodec` has two
+  variants: `Count` (one unsigned VarUInt64 per row, preserved byte-for-byte) and
+  `NothingUInt64` (one `0x00` byte per row; decode rejects any nonzero byte as
+  `InvalidData`, mirroring the server's `INCORRECT_DATA`; encode requires each
+  row to be exactly `[0x00]`). Decode records row-end offsets and copies the
+  contiguous body once; the `NothingUInt64` walk is the trivial fixed-width case
+  (bounds-check `num_rows` bytes once, verify all zero, fill offsets `i -> i`).
+  Arrow exports `Z` LargeBinary; encode validates each slice then writes the data
+  once. Unknown functions are rejected at header time even for zero rows.
 - **Pinned server tag:** `v26.6.1.1193-stable`, protocol revision **54485**.
-  Confirmed server paths for this item: `DataTypes/DataTypeNothing.{h,cpp}`
-  (`DataTypeNothing`, `registerDataTypeNothing`, exact case-sensitive canonical
-  name `Nothing`), `Serializations/SerializationNothing.{h,cpp}` (one 0x30 byte
-  per row on write, one ignored byte per row on read),
-  `Serializations/SerializationNullable.cpp` (null map first, then the complete
-  nested body), and `Formats/NativeReader.cpp` / `NativeWriter.cpp` (no
-  revision or setting gate). The historical introduction version remains
-  undetermined and must not be guessed. Local source, capture server, fixtures,
-  and contract citations are aligned to 26.6.1.1193.
+  Confirmed server paths for this item:
+  `DataTypes/Serializations/SerializationAggregateFunction.{h,cpp}`
+  (`SerializationAggregateFunction` bulk state loop, no prefix/suffix/length),
+  `AggregateFunctions/IAggregateFunction.h` (`serializeBatch`,
+  `createAndDeserializeBatch`),
+  `AggregateFunctions/AggregateFunctionCount.{h,cpp}` (one VarUInt64 state),
+  `AggregateFunctions/AggregateFunctionNothing.h`
+  (`AggregateFunctionNothingImpl::serialize`/`deserialize`, one `'\0'` byte and
+  the `INCORRECT_DATA` guard),
+  `AggregateFunctions/Combinators/AggregateFunctionNull.cpp`
+  (`AggregateFunctionCombinatorNull::transformAggregateFunction`, the count ->
+  nothingUInt64 collapse), `IO/VarInt.h`,
+  `DataTypes/DataTypeAggregateFunction.{h,cpp}` (`getNameImpl` canonical name and
+  wrapper capabilities), and `Formats/NativeReader.cpp` / `NativeWriter.cpp`. The
+  AggregateFunction data type's historical introduction version remains
+  undetermined. The count function docs say 1.1, which does not establish the
+  data type's introduction.
 - **Scope:** completeness still means uncompressed HTTP `FORMAT Native`; TCP and
   the currently unwired compression framing remain out of scope.
-- **Build/test status:** `cargo test` is green (533 unit + 3 integration;
-  unrelated live tests and the doctest remain ignored). The two `all_types`
-  fixtures were recaptured at 95 columns (leading varint `0x5f`) for revisions 0
-  and 54485. The live `insert_roundtrips_through_server` test passes against
-  ClickHouse 26.6.1.1193 with `Nullable(Nothing)` and `Array(Nothing)`. Fmt is
-  clean, `cargo build` passes, clippy is clean with `-D warnings`, and
-  `git diff --check` is clean.
-- **Recommended next:** implement **`AggregateFunction(...)`**. Tier 2 is done,
-  and it is the first Tier 3 item: unlike `Variant`/`Dynamic`/`JSON` it carries
-  no in-band structure header churn, but its opaque per-function state blobs are
-  a large surface - start with a `clickhouse-server-reader` pass over
-  `SerializationAggregateFunction` before committing to a column representation.
+- **Build/test status:** `cargo test` is green (578 unit + 3 integration; 5 live
+  tests and the doctest remain ignored). The two `all_types` fixtures were
+  recaptured from ClickHouse 26.6.1.1193 at 97 columns (leading varint `0x61`)
+  for revisions 0 and 54485, adding `agg_nothing`
+  (`AggregateFunction(nothingUInt64, Nullable(Nothing))`, four `0x00` states)
+  alongside the count states 0, 1, 2, 3. The dedicated live count-state and
+  nothingUInt64 INSERT/finalize tests pass against the same server version.
+  `cargo build`, fmt, clippy with `-D warnings`, and `git diff --check` are clean.
+- **Recommended next:** add the exact base **`AggregateFunction(sum, T)`** codec
+  for non-nullable numeric and Enum `T`. The server read already confirmed its
+  fixed accumulator-width mapping; keep nullable `sum` deferred because its Null
+  adapter adds a flag and conditional body.
 - **Active gotchas / context:**
+  - AggregateFunction is not generically opaque-decodable. Native writes each
+    concrete function's state immediately after the previous one, with no row
+    length, column length, prefix, suffix, or in-body version word. Whole-column
+    passthrough cannot locate the next column and cannot form an Arrow array.
+    Every supported signature must register a boundary codec shared by decode,
+    scan, and encode validation. `countDistinct` is NOT count-shaped. Base
+    `countIf` and `countArray` delegate to count's VarUInt state but remain
+    unregistered until their signatures are handled explicitly. Direct
+    Nullable/LowCardinality wrappers are illegal; Array, Tuple, and Map values
+    are legal. Protocol revision can select versioned aggregate states even
+    though no version word appears in the body; count is unversioned.
+  - `count(Nullable(Nothing))` NEVER reaches the wire under the `count` name: the
+    server's Null combinator substitutes `AggregateFunctionNothingUInt64` (count
+    registers `returns_default_when_only_null = true` and `Nullable(Nothing)` is
+    `onlyNull`) and `getNameImpl` renders
+    `AggregateFunction(nothingUInt64, Nullable(Nothing))`. The `count` codec
+    therefore rejects a single `Nullable(Nothing)` argument, and `nothingUInt64`
+    is registered separately with a one-`0x00`-byte-per-row state. The
+    `nothingUInt64` gate is restricted to the confirmed `Nullable(Nothing)`
+    argument shape only, not any argument list, because that name is synthesized
+    solely by the count collapse and only for `Nullable(Nothing)`. Every other
+    count spelling (`count()`, `count(T)`, `count(Nullable(T))` for `T != Nothing`)
+    keeps the VarUInt64 `count` codec unchanged. Constructing the fixture via
+    `countState(toNullable(NULL))` does not work (it constant-folds to `UInt64`);
+    `CAST(unhex('00'), 'AggregateFunction(nothingUInt64, Nullable(Nothing))')` is
+    the authentic construction and finalizes to a count of 0.
   - `Nothing` is the one type whose logical width (zero) differs from its wire
     width (one byte per row): the placeholder byte is `'0'` (0x30) on write and
     UNVALIDATED on read, so decode must consume `num_rows` bytes (truncation is
@@ -785,8 +827,13 @@ branch on the protocol revision, but the self-describing types (`Variant`,
 `Dynamic`, `JSON`) carry their own in-band version/structure headers, which is
 where the across-release churn lives.
 
-- [ ] `AggregateFunction(...)` - opaque aggregation state; large surface, decode
-      fidelity is hard.
+- [~] `AggregateFunction(...)` - function-specific coverage in progress. Exact
+      unversioned base `count` with zero or one argument type is done at
+      decode/encode parity, stored as raw state bytes with i64 row offsets and
+      exported as Arrow LargeBinary. The generic item stays open because Native
+      has no state/column length framing; each additional function needs a
+      confirmed boundary codec. Recommended next: exact base `sum` for
+      non-nullable numeric and Enum arguments.
 - [ ] `Variant(...)` - discriminator stream plus per-variant columns.
 - [ ] `Dynamic` - self-describing, carries its own type info; optional
       `Dynamic(max_types=N)` form.

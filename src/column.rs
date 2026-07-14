@@ -216,6 +216,44 @@ impl Utf8Column {
     }
 }
 
+/// Serialized ClickHouse `AggregateFunction(...)` states in Arrow LargeBinary
+/// layout.
+///
+/// Row `i` is the exact Native state byte slice
+/// `data[offsets[i]..offsets[i + 1]]`. Offsets are i64 because aggregate states
+/// have no generic size bound and Arrow LargeBinary (`Z`) is the honest
+/// zero-copy representation. The logical aggregate function, arguments, and
+/// state version remain in [`crate::schema::ChType`].
+#[derive(Debug, Clone)]
+pub struct AggregateStateColumn {
+    pub offsets: Vec<i64>,
+    pub data: Vec<u8>,
+}
+
+impl AggregateStateColumn {
+    pub fn new(offsets: Vec<i64>, data: Vec<u8>) -> Self {
+        Self { offsets, data }
+    }
+
+    pub fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn null_count(&self) -> usize {
+        0
+    }
+
+    pub fn value(&self, index: usize) -> &[u8] {
+        let start = self.offsets[index] as usize;
+        let end = self.offsets[index + 1] as usize;
+        &self.data[start..end]
+    }
+}
+
 /// Fixed-size binary column. Each row is exactly `width` bytes.
 ///
 /// Arrow layout: contiguous buffer of `width * num_rows` bytes.
@@ -574,6 +612,7 @@ pub enum Column {
     // in the schema's ChType::Interval tag, mirroring Time64 precision metadata.
     Interval(PrimitiveColumn<i64>),
     Utf8(Utf8Column),
+    AggregateState(AggregateStateColumn),
     FixedBinary(FixedBinaryColumn),
     // IPv4 is a UInt32 on the wire (the standard IPv4 numeric form), decoded at
     // its faithful native width like the other numerics. IPv6 and UUID are raw
@@ -644,6 +683,7 @@ impl Column {
             Column::Time64(c) => c.len(),
             Column::Interval(c) => c.len(),
             Column::Utf8(c) => c.len(),
+            Column::AggregateState(c) => c.len(),
             Column::FixedBinary(c) => c.len(),
             Column::Ipv4(c) => c.len(),
             Column::Ipv6(c) => c.len(),
@@ -688,6 +728,7 @@ impl Column {
             Column::Time64(c) => c.null_count(),
             Column::Interval(c) => c.null_count(),
             Column::Utf8(c) => c.null_count(),
+            Column::AggregateState(c) => c.null_count(),
             Column::FixedBinary(c) => c.null_count(),
             Column::Ipv4(c) => c.null_count(),
             Column::Ipv6(c) => c.null_count(),
@@ -728,6 +769,7 @@ impl Column {
             Column::Time64(c) => c.validity.as_ref(),
             Column::Interval(c) => c.validity.as_ref(),
             Column::Utf8(c) => c.validity.as_ref(),
+            Column::AggregateState(_) => None,
             Column::FixedBinary(c) => c.validity.as_ref(),
             Column::Ipv4(c) => c.validity.as_ref(),
             Column::Ipv6(c) => c.validity.as_ref(),

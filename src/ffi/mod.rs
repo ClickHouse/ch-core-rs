@@ -257,6 +257,11 @@ fn arrow_format(ch_type: &ChType) -> String {
             | IntervalKind::Minute => "l".into(),
         },
         ChType::String => "u".into(),
+        // Serialized aggregate states are opaque binary values whose row
+        // boundaries were recovered by a function-specific Native codec.
+        // LargeBinary is the honest zero-copy Arrow storage: the state can be
+        // variable width and has no UTF-8 semantics or 2 GiB aggregate-data cap.
+        ChType::AggregateFunction { .. } => "Z".into(),
         ChType::FixedString(n) => format!("w:{n}"),
         // IPv4 is the standard UInt32 numeric value, exported as Arrow uint32
         // (`I`), zero-copy like DateTime. IPv6 and UUID are raw 16-byte blobs,
@@ -645,7 +650,16 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
                 Some(bm) => buffers.push(bm.as_bytes().as_ptr() as *const c_void),
                 None => buffers.push(ptr::null()),
             }
-            buffers.push(c.offsets.as_ptr() as *const c_void);
+            push_offsets(&mut buffers, &c.offsets, EMPTY_OFFSETS_I32.as_ptr());
+            buffers.push(c.data.as_ptr() as *const c_void);
+        }
+        // Arrow LargeBinary: validity (always null because ClickHouse forbids
+        // Nullable(AggregateFunction)), i64 offsets, then serialized state data.
+        // All three buffers borrow the batch-owned AggregateStateColumn and are
+        // kept alive by ArrayPrivateData's Arc<ColBatch>.
+        Column::AggregateState(c) => {
+            buffers.push(ptr::null());
+            push_offsets(&mut buffers, &c.offsets, EMPTY_OFFSETS_I64.as_ptr());
             buffers.push(c.data.as_ptr() as *const c_void);
         }
         Column::FixedBinary(c) => {
@@ -722,7 +736,7 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
         // until release.
         Column::Array(c) => {
             buffers.push(ptr::null());
-            buffers.push(c.offsets.as_ptr() as *const c_void);
+            push_offsets(&mut buffers, &c.offsets, EMPTY_OFFSETS_I64.as_ptr());
 
             // Safety: an all-zero `ArrowArray` is a valid initial value, the same
             // niche argument as the `Dictionary` arm's `dict_child` above;
@@ -766,7 +780,7 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
         // children). Ownership follows the same private-data pattern.
         Column::Map(c) => {
             buffers.push(ptr::null());
-            buffers.push(c.offsets.as_ptr() as *const c_void);
+            push_offsets(&mut buffers, &c.offsets, EMPTY_OFFSETS_I64.as_ptr());
 
             // Safety: an all-zero `ArrowArray` is a valid initial value, the
             // same niche argument as the `Dictionary` arm's `dict_child` above;
@@ -822,6 +836,38 @@ fn push_primitive_buffers<T>(
         None => buffers.push(ptr::null()),
     }
     buffers.push(values.as_ptr() as *const c_void);
+}
+
+/// A single zero offset: the offsets buffer for a length-0 variable-length array
+/// whose column carries an empty `offsets` `Vec`.
+///
+/// The Arrow C Data Interface requires the offsets buffer of a variable-size
+/// binary or list array to hold `length + 1` elements starting with 0 (Columnar
+/// format spec, "Variable-size Binary Layout"). For a length-0 array that is
+/// exactly one element, so the buffer's byte size is nonzero and its pointer MAY
+/// NOT be null: the C Data Interface allows a null buffer pointer only when the
+/// buffer's byte size would be 0 (see ArrowArray.buffers). A hand-built column
+/// can leave `offsets` empty (a zero-capacity `Vec` whose `as_ptr()` is a
+/// dangling pointer with no leading 0); the decoder always emits `[0]`, but
+/// `Column` fields are public. Exporting these shared 'static single zeros keeps
+/// the exported buffer spec-compliant and interoperable with strict consumers
+/// (pyarrow, arrow-rs) instead of handing out a dangling pointer. A 'static
+/// outlives every consumer and is never freed by a release callback, which frees
+/// only the boxed private data and releases child arrays.
+static EMPTY_OFFSETS_I32: [i32; 1] = [0];
+static EMPTY_OFFSETS_I64: [i64; 1] = [0];
+
+/// Push a variable-length column's offsets buffer, substituting a 'static single
+/// zero when `offsets` is empty so the export never hands out the dangling
+/// `as_ptr()` of a zero-capacity `Vec` and always satisfies Arrow's `length + 1`
+/// offsets contract (see [`EMPTY_OFFSETS_I32`] / [`EMPTY_OFFSETS_I64`]).
+fn push_offsets<T>(buffers: &mut Vec<*const c_void>, offsets: &[T], empty: *const T) {
+    let ptr = if offsets.is_empty() {
+        empty
+    } else {
+        offsets.as_ptr()
+    };
+    buffers.push(ptr as *const c_void);
 }
 
 /// # Safety

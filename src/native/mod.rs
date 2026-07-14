@@ -1,3 +1,4 @@
+pub(crate) mod aggregate_function;
 pub mod decode;
 pub mod encode;
 pub(crate) mod protocol;

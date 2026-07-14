@@ -4,13 +4,16 @@
 
 use crate::batch::ColBatch;
 use crate::column::{
-    ArrayColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn, MapColumn,
-    TupleColumn, Utf8Column,
+    AggregateStateColumn, ArrayColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn,
+    MapColumn, TupleColumn, Utf8Column,
+};
+use crate::native::aggregate_function::{
+    aggregate_state_codec, is_valid_aggregate_state, AggregateStateCodec,
 };
 use crate::native::protocol::MAX_TYPE_DEPTH;
 use crate::native::type_parser::{
-    decimal_bits_from_precision, is_low_cardinality_inner, is_simple_aggregate_func_spelling,
-    is_valid_map_key_type, low_cardinality_dict_value_type, parse_ch_type,
+    decimal_bits_from_precision, is_simple_aggregate_func_spelling,
+    low_cardinality_dict_value_type, parse_ch_type, unsupported_header_type_name,
 };
 use crate::schema::{ChType, Field};
 
@@ -72,6 +75,18 @@ fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<()
     // validation guards). Run once here, after the depth cap so the recursive walk
     // is bounded, and before any bytes are written.
     validate_saf_func_spellings(field, &field.ch_type)?;
+
+    // AggregateFunction argument types are metadata for the state body, but
+    // the server still constructs them while resolving the aggregate
+    // signature. Apply the same recursive semantic shape validation as decode
+    // before accepting a caller-built header. This also keeps the ordinary
+    // nested LowCardinality and Map constraints centralized.
+    if unsupported_header_type_name(&field.ch_type).is_some() {
+        return Err(EncodeError::UnsupportedType {
+            column: field.name.clone(),
+            ch_type: field.ch_type.clone(),
+        });
+    }
 
     // Row count: the column must carry exactly the rows the block declares.
     if column.len() != num_rows {
@@ -302,6 +317,15 @@ fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<()
         validate_utf8_column(field, c, num_rows)?;
     }
 
+    if let (ChType::AggregateFunction { .. }, Column::AggregateState(c)) = (value_type, column) {
+        // The blanket `unsupported_header_type_name` check at the top of this
+        // function owns codec legality, so a registered codec is guaranteed
+        // here. Resolve it once and hand it to the per-row state validation.
+        if let Some(codec) = aggregate_state_codec(value_type) {
+            validate_aggregate_state_column(field, value_type, codec, c, num_rows)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -373,6 +397,12 @@ fn validate_saf_func_spellings(field: &Field, ch_type: &ChType) -> Result<(), En
             validate_saf_func_spellings(field, key)?;
             validate_saf_func_spellings(field, value)
         }
+        ChType::AggregateFunction { arguments, .. } => {
+            for argument in arguments {
+                validate_saf_func_spellings(field, argument)?;
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -402,6 +432,11 @@ pub(super) fn type_depth(ch_type: &ChType) -> usize {
             ChType::Map(key, value) => {
                 work.push((key, depth + 1));
                 work.push((value, depth + 1));
+            }
+            ChType::AggregateFunction { arguments, .. } => {
+                for argument in arguments {
+                    work.push((argument, depth + 1));
+                }
             }
             // Name-decoration aliases contribute the depth of the physical type
             // they delegate to, so a geo/Nested alias near the cap is not
@@ -542,6 +577,112 @@ fn validate_decimal(
     Ok(())
 }
 
+/// Offset element type shared by the Arrow variable-length columns: `i32` for
+/// `String`, `i64` for `Array`/`Map`/`AggregateFunction` state. Lets
+/// [`validate_offsets`] check both widths with one implementation instead of the
+/// four hand-rolled copies these validators used to carry.
+trait Offset: Copy + Ord + std::fmt::Display {
+    /// The Arrow zero start offset for this width.
+    const ZERO: Self;
+    /// The offset as a `usize`, or `None` if it is negative or wider than the
+    /// host `usize`.
+    fn to_usize(self) -> Option<usize>;
+}
+
+impl Offset for i32 {
+    const ZERO: Self = 0;
+    fn to_usize(self) -> Option<usize> {
+        usize::try_from(self).ok()
+    }
+}
+
+impl Offset for i64 {
+    const ZERO: Self = 0;
+    fn to_usize(self) -> Option<usize> {
+        usize::try_from(self).ok()
+    }
+}
+
+/// Validate the Arrow offset invariants shared by every variable-length column
+/// (`String`, `Array`, `Map`, and `AggregateFunction` state).
+///
+/// A well-formed offset array has `num_rows + 1` entries starting at 0, is
+/// monotonically non-decreasing (which, from the zero start, also proves every
+/// offset is non-negative, so the `as usize`/`as u64` casts the body writers
+/// perform cannot wrap), and ends at `content_len`, the length of the buffer the
+/// offsets index into (data bytes for `String`/`AggregateFunction`, flattened
+/// element/entry count for `Array`/`Map`). A final offset short of `content_len`
+/// would silently drop trailing content from the wire; one past it would slice
+/// out of bounds, a stream the server rejects with `INCORRECT_DATA`.
+///
+/// Zero-row policy is uniform and lenient: a zero-row column may carry either an
+/// empty offsets vec or the single sentinel `[0]` (what the decoder emits), with
+/// empty content. Each caller layers its own type-specific checks on top (the
+/// per-row aggregate state validity, the array/map element recursion). `label`
+/// names the offset kind and `content_label` its content unit for error
+/// messages.
+fn validate_offsets<O: Offset>(
+    field: &Field,
+    label: &str,
+    content_label: &str,
+    offsets: &[O],
+    content_len: usize,
+    num_rows: usize,
+) -> Result<(), EncodeError> {
+    let reject = |detail: String| Err(EncodeError::InconsistentBatch { detail });
+
+    // A zero-row column carries no content and either the single sentinel `[0]`
+    // (what the decoder emits) or no offsets at all. Accept both, reject else.
+    if num_rows == 0 {
+        let well_formed_empty = content_len == 0
+            && (offsets.is_empty() || (offsets.len() == 1 && offsets[0] == O::ZERO));
+        if well_formed_empty {
+            return Ok(());
+        }
+        return reject(format!(
+            "column {:?} declares 0 rows but carries {} {label} offsets and {content_len} {content_label}",
+            field.name,
+            offsets.len(),
+        ));
+    }
+
+    // Arrow layout: one offset per row plus a trailing end offset.
+    if offsets.len() != num_rows + 1 {
+        return reject(format!(
+            "column {:?} declares {num_rows} rows so it needs {} {label} offsets (a leading 0 plus one end-offset per row), but carries {}",
+            field.name,
+            num_rows + 1,
+            offsets.len()
+        ));
+    }
+    // Offsets start at 0 (Arrow convention).
+    if offsets[0] != O::ZERO {
+        return reject(format!(
+            "column {:?} has a nonzero first {label} offset {}; Arrow offsets start at 0",
+            field.name, offsets[0]
+        ));
+    }
+    // Monotonic non-decreasing; from the zero start this also proves every
+    // offset is non-negative, so the body writers' casts cannot wrap.
+    for pair in offsets.windows(2) {
+        if pair[1] < pair[0] {
+            return reject(format!(
+                "column {:?} has non-monotonic {label} offsets ({} then {})",
+                field.name, pair[0], pair[1]
+            ));
+        }
+    }
+    // The final offset must cover the content buffer exactly.
+    let end = offsets[num_rows];
+    if end.to_usize() != Some(content_len) {
+        return reject(format!(
+            "column {:?} {label} offsets end at {end} but the column holds {content_len} {content_label}",
+            field.name
+        ));
+    }
+    Ok(())
+}
+
 /// Validate a `LowCardinality(T)` dictionary column before any bytes are written.
 ///
 /// The Native payload carries a per-block dictionary plus row indexes. For
@@ -561,7 +702,11 @@ fn validate_low_cardinality(
     // `LowCardinality(SAF(anyLast, Nullable(String)))` and a chained SAF.
     let (nullable, dict_value_type) = low_cardinality_dict_value_type(inner);
 
-    if !is_low_cardinality_inner(dict_value_type) || !is_encodable(dict_value_type) {
+    // LowCardinality inner legality (canBeInsideLowCardinality) is owned by the
+    // blanket `unsupported_header_type_name` check in `validate_column`; only the
+    // encoder-coverage guard (does a body writer for this inner exist yet)
+    // remains here.
+    if !is_encodable(dict_value_type) {
         return Err(EncodeError::UnsupportedType {
             column: field.name.clone(),
             ch_type: field.ch_type.clone(),
@@ -661,48 +806,23 @@ fn validate_array(
     col: &ArrayColumn,
     num_rows: usize,
 ) -> Result<(), EncodeError> {
-    let reject = |detail: String| Err(EncodeError::InconsistentBatch { detail });
-
-    // Arrow list layout: a leading 0 plus one end-offset per row. Mostly implied
-    // by the `column.len() == num_rows` check earlier in `validate_column`
-    // (`ArrayColumn::len()` is `offsets.len().saturating_sub(1)`), but that
-    // saturates, so an empty offsets vector still reports 0 rows; assert the
-    // exact length so `offsets[0]` and `offsets[num_rows]` below are in range.
-    if col.offsets.len() != num_rows + 1 {
-        return reject(format!(
-            "column {:?} declares {num_rows} rows so it needs {} Array offsets (a leading 0 plus one end-offset per row), but carries {}",
-            field.name,
-            num_rows + 1,
-            col.offsets.len()
-        ));
-    }
-    if col.offsets[0] != 0 {
-        return reject(format!(
-            "column {:?} has a nonzero first Array offset {}; Arrow list offsets start at 0",
-            field.name, col.offsets[0]
-        ));
-    }
-    // Monotonic non-decreasing from the zero start also proves every offset is
-    // non-negative, so the `as u64` casts in `encode_array_data` cannot change
-    // the value. Equal adjacent offsets (empty rows) are fine, matching the
-    // server's own non-decreasing check in `deserializeOffsetsBinaryBulk`.
-    for pair in col.offsets.windows(2) {
-        if pair[1] < pair[0] {
-            return reject(format!(
-                "column {:?} has non-monotonic Array offsets ({} then {})",
-                field.name, pair[0], pair[1]
-            ));
-        }
-    }
-    let total_elements = col.offsets[num_rows];
+    // Arrow LargeList offset invariants (shape, leading 0, monotonic, final
+    // offset == flattened element count). Equal adjacent offsets (empty rows)
+    // are fine, matching the server's own non-decreasing check in
+    // `deserializeOffsetsBinaryBulk`.
     let element_rows = col.values.len();
-    if i64::try_from(element_rows) != Ok(total_elements) {
-        return reject(format!(
-            "column {:?} Array offsets end at {total_elements} but the flattened element column holds {element_rows} rows",
-            field.name
-        ));
-    }
+    validate_offsets(
+        field,
+        "Array",
+        "flattened element rows",
+        &col.offsets,
+        element_rows,
+        num_rows,
+    )?;
 
+    // The element column is validated recursively as its own column of
+    // `element_rows` rows, so every element-level guard applies to the flattened
+    // buffer too.
     let element_field = Field {
         name: format!("{} element", field.name),
         ch_type: inner.clone(),
@@ -726,43 +846,17 @@ fn validate_array(
 /// validation; its row count is `TupleColumn::len`, already checked against
 /// `num_rows` by the caller.
 ///
-/// Element names must also be a set the server can construct: the decode
-/// parser deliberately round-trips any received name shape (a server-authored
-/// header is preserved as written), so the type-string round-trip check in
-/// [`validate_column`] cannot catch a caller-constructed illegal name; it is
-/// rejected here instead (see the name checks below).
+/// Tuple element-name legality (no mixed named/unnamed, empty, reserved
+/// lowercase `null`, or duplicate names, per `DataTypeTuple::checkTupleNames`)
+/// is owned by the blanket `unsupported_header_type_name` check in
+/// [`validate_column`], which reports it as `UnsupportedType`; only buffer shape
+/// is checked here.
 fn validate_tuple(
     field: &Field,
     elements: &[(Option<String>, ChType)],
     col: &TupleColumn,
     num_rows: usize,
 ) -> Result<(), EncodeError> {
-    // Mirror the server's tuple-name legality exactly (confirmed at
-    // v26.6.1.1193-stable, `src/DataTypes/DataTypeTuple.cpp`): the type factory
-    // rejects mixed named/unnamed elements ("Names are specified not for all
-    // elements of Tuple type"), and `checkTupleNames` rejects an empty name,
-    // the exact-lowercase reserved name "null" (it would collide with the
-    // Nullable null-map subcolumn name; "NULL"/"Null" are fine and render
-    // backtick-quoted), and duplicate names. A type violating any of these
-    // cannot exist on the server, so the rejection is `UnsupportedType`, the
-    // same classification as an illegal Map key.
-    let named = elements.iter().filter(|(name, _)| name.is_some()).count();
-    let mixed_names = named != 0 && named != elements.len();
-    let illegal_name = elements
-        .iter()
-        .any(|(name, _)| matches!(name.as_deref(), Some("") | Some("null")));
-    // O(n^2) over the element names; tuples are small and this runs once per
-    // column validation, never per row.
-    let duplicate_name = elements.iter().enumerate().any(|(i, (name, _))| {
-        name.is_some() && elements[..i].iter().any(|(other, _)| other == name)
-    });
-    if mixed_names || illegal_name || duplicate_name {
-        return Err(EncodeError::UnsupportedType {
-            column: field.name.clone(),
-            ch_type: field.ch_type.clone(),
-        });
-    }
-
     if elements.len() != col.fields.len() {
         return Err(EncodeError::InconsistentBatch {
             detail: format!(
@@ -792,8 +886,9 @@ fn validate_tuple(
 /// flattened key and value runs, so the same Arrow offset invariants as
 /// [`validate_array`] must hold: `num_rows + 1` offsets starting at 0,
 /// monotonically non-decreasing, final offset equal to the flattened entries
-/// length. The key type must satisfy the server's `DataTypeMap::isValidKeyType`
-/// constraint (no `Nullable` or `LowCardinality(Nullable(...))` key), reported
+/// length. Map key legality (the server's `DataTypeMap::isValidKeyType`: no
+/// `Nullable` or `LowCardinality(Nullable(...))` key) is owned by the blanket
+/// `unsupported_header_type_name` check in [`validate_column`], which reports it
 /// as `UnsupportedType` since the type itself cannot exist on the server. The
 /// entries buffer must be a two-field `Tuple` column (keys then values) whose
 /// fields are validated recursively as their own columns of
@@ -808,46 +903,22 @@ fn validate_map(
 ) -> Result<(), EncodeError> {
     let reject = |detail: String| Err(EncodeError::InconsistentBatch { detail });
 
-    if !is_valid_map_key_type(key) {
-        return Err(EncodeError::UnsupportedType {
-            column: field.name.clone(),
-            ch_type: field.ch_type.clone(),
-        });
-    }
+    // Map key legality (no `Nullable` or `LowCardinality(Nullable(...))` key) is
+    // owned by the blanket `unsupported_header_type_name` check in
+    // `validate_column`; only buffer shape is checked here.
 
     // The same Arrow list offset invariants as `validate_array`; `MapColumn`'s
     // offsets are physically the Array offsets of the wire's
     // Array(Tuple(keys, values)).
-    if col.offsets.len() != num_rows + 1 {
-        return reject(format!(
-            "column {:?} declares {num_rows} rows so it needs {} Map offsets (a leading 0 plus one end-offset per row), but carries {}",
-            field.name,
-            num_rows + 1,
-            col.offsets.len()
-        ));
-    }
-    if col.offsets[0] != 0 {
-        return reject(format!(
-            "column {:?} has a nonzero first Map offset {}; Arrow list offsets start at 0",
-            field.name, col.offsets[0]
-        ));
-    }
-    for pair in col.offsets.windows(2) {
-        if pair[1] < pair[0] {
-            return reject(format!(
-                "column {:?} has non-monotonic Map offsets ({} then {})",
-                field.name, pair[0], pair[1]
-            ));
-        }
-    }
-    let total_entries = col.offsets[num_rows];
     let entry_rows = col.entries.len();
-    if i64::try_from(entry_rows) != Ok(total_entries) {
-        return reject(format!(
-            "column {:?} Map offsets end at {total_entries} but the flattened entries column holds {entry_rows} rows",
-            field.name
-        ));
-    }
+    validate_offsets(
+        field,
+        "Map",
+        "flattened entry rows",
+        &col.offsets,
+        entry_rows,
+        num_rows,
+    )?;
 
     // The entries buffer must be the two-field keys/values tuple; each field is
     // then validated recursively as its own column of `entry_rows` rows.
@@ -904,6 +975,12 @@ fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
     // below.
     if let Some(under) = value_type.physical_delegate() {
         return column_variant_matches(&under, column);
+    }
+    if let (ChType::AggregateFunction { .. }, Column::AggregateState(_)) = (value_type, column) {
+        // Codec legality is owned by the blanket `unsupported_header_type_name`
+        // check in `validate_column`, which runs before this; only the buffer
+        // variant remains to match here.
+        return true;
     }
     // `Array(T)` matches only if the flattened element column matches the
     // element value type in turn, recursing the same way `decode_array` decodes
@@ -978,6 +1055,47 @@ fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
     )
 }
 
+/// Validate an Arrow LargeBinary aggregate-state buffer and every row's
+/// function-specific state boundary before writing any bytes.
+///
+/// `codec` is resolved once by [`validate_column`] (codec legality is owned by
+/// its blanket `unsupported_header_type_name` check), so this only checks the
+/// LargeBinary offsets and each row's state.
+fn validate_aggregate_state_column(
+    field: &Field,
+    ch_type: &ChType,
+    codec: AggregateStateCodec,
+    col: &AggregateStateColumn,
+    num_rows: usize,
+) -> Result<(), EncodeError> {
+    // Arrow LargeBinary offset invariants (shape, leading 0, monotonic, final
+    // offset == data length).
+    validate_offsets(
+        field,
+        "AggregateFunction state",
+        "state data bytes",
+        &col.offsets,
+        col.data.len(),
+        num_rows,
+    )?;
+
+    // Each row's slice must be exactly one valid serialized state. `validate_offsets`
+    // proved every offset non-negative, monotonic, and within the data buffer,
+    // so the casts and slice below cannot wrap or go out of bounds.
+    for (row, pair) in col.offsets.windows(2).enumerate() {
+        let state = &col.data[pair[0] as usize..pair[1] as usize];
+        if !is_valid_aggregate_state(state, codec) {
+            return Err(EncodeError::InconsistentBatch {
+                detail: format!(
+                    "column {:?} row {row} is not exactly one valid serialized {ch_type} state",
+                    field.name
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Validate a `Utf8Column`'s Arrow offsets before its body is written.
 ///
 /// [`encode_string_data`] slices `data[offsets[i]..offsets[i+1]]` per row, so a
@@ -985,72 +1103,23 @@ fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
 /// `data.len()`, or a negative offset (which `as usize` wraps to a huge value)
 /// would panic mid-write, and offsets that do not cover `data` exactly would
 /// silently drop leading or trailing bytes from the wire. `Column` fields are
-/// public and bindings build these by hand for the insert path, so reject all of
-/// these as [`EncodeError::InconsistentBatch`] here rather than trust the buffer.
-/// This is O(num_rows) once per column, off the per-byte write path.
+/// public and bindings build these by hand for the insert path, so the shared
+/// [`validate_offsets`] guard rejects all of these as
+/// [`EncodeError::InconsistentBatch`] rather than trust the buffer. `String`
+/// carries no per-type extras beyond the offset invariants, so this is a thin
+/// wrapper over that guard. This is O(num_rows) once per column, off the
+/// per-byte write path.
 fn validate_utf8_column(
     field: &Field,
     col: &Utf8Column,
     num_rows: usize,
 ) -> Result<(), EncodeError> {
-    let reject = |detail: String| Err(EncodeError::InconsistentBatch { detail });
-
-    // A zero-row column carries no data and either the single sentinel `[0]` (what
-    // the decoder emits) or no offsets at all. Accept both, reject anything else.
-    if num_rows == 0 {
-        let well_formed_empty =
-            col.data.is_empty() && (col.offsets.is_empty() || col.offsets == [0]);
-        if well_formed_empty {
-            return Ok(());
-        }
-        return reject(format!(
-            "column {:?} declares 0 rows but carries {} offsets and {} data bytes",
-            field.name,
-            col.offsets.len(),
-            col.data.len()
-        ));
-    }
-
-    // Arrow layout: one offset per row plus a trailing end offset. This is already
-    // implied by the `column.len() == num_rows` check earlier in `validate_column`
-    // (`Utf8Column::len()` is `offsets.len() - 1`), but assert it explicitly so the
-    // `offsets[num_rows]` index below is in range regardless of check ordering.
-    if col.offsets.len() != num_rows + 1 {
-        return reject(format!(
-            "column {:?} declares {num_rows} rows so it needs {} offsets, but carries {}",
-            field.name,
-            num_rows + 1,
-            col.offsets.len()
-        ));
-    }
-    // Offsets must start at 0 (Arrow convention) and be monotonic non-decreasing.
-    // Checking monotonicity from a zero start also proves every offset is
-    // non-negative, so the `as usize` casts in `encode_string_data` cannot wrap.
-    if col.offsets[0] != 0 {
-        return reject(format!(
-            "column {:?} has a nonzero first offset {}; Arrow string offsets start at 0",
-            field.name, col.offsets[0]
-        ));
-    }
-    for pair in col.offsets.windows(2) {
-        if pair[1] < pair[0] {
-            return reject(format!(
-                "column {:?} has non-monotonic offsets ({} then {})",
-                field.name, pair[0], pair[1]
-            ));
-        }
-    }
-    // The final offset must cover the data buffer exactly: a smaller value would
-    // leave trailing bytes that never reach the wire (silent data loss), a larger
-    // one would slice out of bounds. `offsets[0] == 0` and monotonicity above make
-    // this final offset non-negative, so the cast is sound.
-    let end = col.offsets[num_rows];
-    if end as usize != col.data.len() {
-        return reject(format!(
-            "column {:?} offsets end at {end} but the data buffer holds {} bytes",
-            field.name,
-            col.data.len()
-        ));
-    }
-    Ok(())
+    validate_offsets(
+        field,
+        "String",
+        "data bytes",
+        &col.offsets,
+        col.data.len(),
+        num_rows,
+    )
 }

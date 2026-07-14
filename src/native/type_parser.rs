@@ -4,6 +4,7 @@
 //! No wire I/O lives here: the parser takes a `&str` and returns an
 //! `Option<ChType>`, so it is self-contained.
 
+use crate::native::aggregate_function::aggregate_state_codec;
 use crate::native::protocol::MAX_TYPE_DEPTH;
 use crate::schema::{ChType, GeoKind, IntervalKind};
 
@@ -177,6 +178,44 @@ fn parse_ch_type_depth(type_name: &str, depth: usize) -> Option<ChType> {
                 func: func.to_string(),
                 inner: Box::new(inner_type),
             });
+        }
+    }
+
+    // AggregateFunction(func[, T]). Unlike SimpleAggregateFunction, this is a
+    // real opaque state whose concrete aggregate function owns its row
+    // serialization. Native adds no generic length prefix, so parsing is
+    // deliberately gated by `aggregate_state_codec`: an unknown function must
+    // remain UnsupportedType even for zero rows, otherwise the streaming scan
+    // could not locate the next column. At v26.6.1.1193-stable the first
+    // supported codec is exact `count`, with zero or one argument type. Each
+    // argument is type metadata but still recurses at depth + 1 so hostile
+    // nested headers remain bounded by MAX_TYPE_DEPTH.
+    //
+    // No state version is parsed. The server omits version 0 from canonical
+    // names and emits no other version at the pin, so the first token is always
+    // the function name. A versioned spelling like `AggregateFunction(2, sum,
+    // UInt64)` treats `2` as an unknown function name and parse-rejects cleanly
+    // (`UnsupportedType`); the explicit `AggregateFunction(0, count)` spelling,
+    // which the server never emits, is likewise rejected rather than accepted.
+    // Versioning is reintroduced with the first confirmed versioned codec.
+    if let Some(inner) = type_name.strip_prefix("AggregateFunction(") {
+        if let Some(inner) = inner.strip_suffix(')') {
+            let parts = split_top_level_commas(inner.trim_matches(' '))?;
+            let function = parts.first()?.trim_matches(' ');
+            if function.is_empty() {
+                return None;
+            }
+
+            let mut arguments = Vec::with_capacity(parts.len() - 1);
+            for argument in &parts[1..] {
+                arguments.push(parse_ch_type_depth(argument.trim_matches(' '), depth + 1)?);
+            }
+
+            let ch_type = ChType::AggregateFunction {
+                function: function.to_string(),
+                arguments,
+            };
+            return (unsupported_header_type_name(&ch_type).is_none()).then_some(ch_type);
         }
     }
 
@@ -407,8 +446,98 @@ fn can_be_inside_nullable(inner: &ChType) -> bool {
     }
     !matches!(
         inner,
-        ChType::Nullable(_) | ChType::LowCardinality(_) | ChType::Array(_) | ChType::Map(..)
+        ChType::Nullable(_)
+            | ChType::LowCardinality(_)
+            | ChType::Array(_)
+            | ChType::Map(..)
+            | ChType::AggregateFunction { .. }
     )
+}
+
+/// Return the first server-invalid or decoder-unsupported type shape nested in
+/// `ch_type`, rendered the same way a Native header spells it.
+///
+/// Parsing and semantic type construction are deliberately separate in this
+/// crate: for example, `LowCardinality(Decimal(9, 4))` and a `Map` with a
+/// nullable key are grammatically well-formed but server-invalid. Aggregate
+/// function arguments are metadata rather than nested column bodies, but the
+/// server still constructs each argument type while resolving the function, so
+/// this single walk covers them too.
+///
+/// This is the one owner of type-string legality for both directions: decode's
+/// `validate_header_type` and encode's `validate_column` both run it, so nested
+/// semantic restrictions (`LowCardinality` inners, `Map` keys, `Tuple` element
+/// names, registered aggregate codecs) are enforced in exactly one place.
+/// `Tuple` element-name legality is checked uniformly, not just inside aggregate
+/// arguments: the server cannot construct a tuple with mixed, empty, reserved
+/// `null`, or duplicate names, so such a header is unsupported wherever it
+/// appears. Unnamed tuples remain valid.
+pub(crate) fn unsupported_header_type_name(ch_type: &ChType) -> Option<String> {
+    if let Some(under) = ch_type.physical_delegate() {
+        return unsupported_header_type_name(&under);
+    }
+
+    match ch_type {
+        ChType::LowCardinality(inner) => {
+            let (_, dict_value_type) = low_cardinality_dict_value_type(inner);
+            (!is_low_cardinality_inner(dict_value_type))
+                .then(|| format!("LowCardinality({dict_value_type})"))
+        }
+        // Wrapper legality is enforced by the parser's Nullable arm. Recurse
+        // only for nested semantic restrictions so existing encode error
+        // classification for a caller-built illegal outer wrapper stays with
+        // the type-string round-trip check.
+        ChType::Nullable(inner) => unsupported_header_type_name(inner),
+        ChType::Array(inner) => unsupported_header_type_name(inner),
+        ChType::Tuple(elements) => {
+            if !is_valid_tuple_element_names(elements) {
+                Some(ch_type.to_string())
+            } else {
+                elements
+                    .iter()
+                    .find_map(|(_, element_type)| unsupported_header_type_name(element_type))
+            }
+        }
+        ChType::Map(key, value) => {
+            if !is_valid_map_key_type(key) {
+                Some(ch_type.to_string())
+            } else {
+                unsupported_header_type_name(key).or_else(|| unsupported_header_type_name(value))
+            }
+        }
+        ChType::AggregateFunction { arguments, .. } => {
+            if aggregate_state_codec(ch_type).is_none() {
+                Some(ch_type.to_string())
+            } else {
+                arguments.iter().find_map(unsupported_header_type_name)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether Tuple element names satisfy the server's construction rules.
+///
+/// An unnamed tuple is legal, as is a fully named tuple. Mixed named/unnamed
+/// elements, an empty or exact-lowercase `null` name, and duplicates are
+/// rejected by `DataTypeTuple::checkTupleNames` at v26.6.1.1193-stable.
+pub(crate) fn is_valid_tuple_element_names(elements: &[(Option<String>, ChType)]) -> bool {
+    let named = elements.iter().filter(|(name, _)| name.is_some()).count();
+    if named != 0 && named != elements.len() {
+        return false;
+    }
+    if elements
+        .iter()
+        .any(|(name, _)| matches!(name.as_deref(), Some("") | Some("null")))
+    {
+        return false;
+    }
+
+    // O(n^2) over names. Tuples are small, and this runs once per declared
+    // type, never per row.
+    !elements.iter().enumerate().any(|(i, (name, _))| {
+        name.is_some() && elements[..i].iter().any(|(other, _)| other == name)
+    })
 }
 
 /// Parse the element list of a `Nested(...)` type string into `(name, type)`
@@ -418,11 +547,11 @@ fn can_be_inside_nullable(inner: &ChType) -> bool {
 /// list (`Nested()`) returns `None` (-> `UnsupportedType`); the server rejects
 /// both at parse time. The list is split on top-level commas with the same
 /// paren/quote-aware splitter the Tuple arm uses, and each element is parsed by
-/// [`parse_tuple_element`] at `depth + 1`. Decode is otherwise lenient: an empty
-/// name, the reserved lowercase `null`, or duplicate names are accepted as
-/// written and round-trip through `Display`, mirroring the Tuple decode leniency
-/// (the encoder mirrors `checkTupleNames` and rejects those shapes on the way
-/// back out, via the Tuple delegation).
+/// [`parse_tuple_element`] at `depth + 1`. The parser itself accepts an empty
+/// name, the reserved lowercase `null`, or duplicate names as written (they
+/// round-trip through `Display`), but `unsupported_header_type_name` enforces
+/// `checkTupleNames` uniformly, so both decode header validation and encode
+/// reject those shapes (via the Tuple delegation).
 fn parse_nested_elements(inner: &str, depth: usize) -> Option<Vec<(String, ChType)>> {
     let trimmed = inner.trim_matches(' ');
     if trimmed.is_empty() {
