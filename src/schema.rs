@@ -4,6 +4,10 @@
 /// rather than mapping to Arrow or Python types at this layer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChType {
+    // ClickHouse Nothing has no value buffer, but its Native bulk
+    // serialization still carries one ignored placeholder byte per row.
+    Nothing,
+
     // Fixed-width numerics
     Bool,
     Int8,
@@ -319,6 +323,7 @@ impl Schema {
 impl std::fmt::Display for ChType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ChType::Nothing => write!(f, "Nothing"),
             ChType::Bool => write!(f, "Bool"),
             ChType::Int8 => write!(f, "Int8"),
             ChType::Int16 => write!(f, "Int16"),

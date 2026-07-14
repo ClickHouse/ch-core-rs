@@ -30,7 +30,7 @@ use ch_core_rs::batch::ColBatch;
 use ch_core_rs::bitmap::Bitmap;
 use ch_core_rs::column::{
     ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn, MapColumn,
-    PrimitiveColumn, TupleColumn, Utf8Column,
+    NothingColumn, PrimitiveColumn, TupleColumn, Utf8Column,
 };
 use ch_core_rs::native::decode::{decode_all_bytes, DecodeOptions};
 use ch_core_rs::native::encode::{encode_block, EncodeOptions};
@@ -300,6 +300,10 @@ fn sample_batch() -> ColBatch {
         ("bf", ChType::BFloat16),
         ("nbf", ChType::Nullable(Box::new(ChType::BFloat16))),
         ("lc_bf", ChType::LowCardinality(Box::new(ChType::BFloat16))),
+        (
+            "tn",
+            ChType::Tuple(vec![(None, ChType::Nullable(Box::new(ChType::Nothing)))]),
+        ),
     ]
     .into_iter()
     .map(|(name, ch_type)| Field {
@@ -715,6 +719,16 @@ fn sample_batch() -> ColBatch {
             vec![1, 2, 1, 3],
             Column::BFloat16(bfloat16_column(&[0x0000, 0x4150, 0x429e, 0x4381])),
         )),
+        // Top-level Nullable(Nothing) cannot be stored in a table, but the
+        // server permits it as a Tuple element. This grounds the encoder's
+        // null-map-then-placeholder body against a real INSERT path.
+        Column::Tuple(TupleColumn::new(
+            vec![Column::Nothing(NothingColumn::new_nullable(
+                4,
+                Bitmap::from_ch_null_map(&[1, 1, 1, 1]),
+            ))],
+            4,
+        )),
     ];
 
     ColBatch::new(Schema::new(fields), columns, 4)
@@ -1087,6 +1101,7 @@ impl Server {
 /// server-side dictionary reordering does not affect the live INSERT comparison.
 fn raw_column_repr(column: &Column) -> Vec<String> {
     match column {
+        Column::Nothing(c) => vec!["NULL".to_string(); c.len()],
         Column::Int8(c) => c.values.iter().map(|v| v.to_string()).collect(),
         Column::Int16(c) => c.values.iter().map(|v| v.to_string()).collect(),
         Column::Int32(c) => c.values.iter().map(|v| v.to_string()).collect(),
@@ -1252,7 +1267,8 @@ fn insert_roundtrips_through_server() {
          ims IntervalMillisecond, ius IntervalMicrosecond, ins IntervalNanosecond, \
          nid Nullable(IntervalDay), lc_ih LowCardinality(IntervalHour), \
          bf BFloat16, nbf Nullable(BFloat16), \
-         lc_bf LowCardinality(BFloat16)) ENGINE = Memory"
+         lc_bf LowCardinality(BFloat16), \
+         tn Tuple(Nullable(Nothing))) ENGINE = Memory"
         ),
         // LowCardinality(Int256) is a suspicious LC inner (a numeric), gated at
         // CREATE time by allow_suspicious_low_cardinality_types (a creation-time
@@ -1285,7 +1301,7 @@ fn insert_roundtrips_through_server() {
          m, m_lc, m_nv, m_arr, arr_m, m_empty, \
          t, t64, nt, nt64, lc_time, \
          iy, iq, imo, iw, id, ih, imi, isecond, ims, ius, ins, nid, lc_ih, \
-         bf, nbf, lc_bf \
+         bf, nbf, lc_bf, tn \
          FROM {TABLE} ORDER BY i32 FORMAT Native"
     ));
     let decoded = decode_all_bytes(

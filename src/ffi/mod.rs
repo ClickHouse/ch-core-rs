@@ -187,6 +187,8 @@ unsafe extern "C" fn release_stream(stream: *mut ArrowArrayStream) {
 
 fn arrow_format(ch_type: &ChType) -> String {
     match ch_type {
+        // Arrow Null has no data buffers; every row is intrinsically null.
+        ChType::Nothing => "n".into(),
         ChType::Bool => "b".into(),
         ChType::Int8 => "c".into(),
         ChType::Int16 => "s".into(),
@@ -609,6 +611,10 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
     let mut dictionary: *mut ArrowArray = ptr::null_mut();
 
     match col {
+        // Arrow Null has zero buffers. A `Nullable(Nothing)` column retains its
+        // ClickHouse null map for Native re-encoding, but Arrow ignores it and
+        // treats every row as null by definition.
+        Column::Nothing(_) => {}
         Column::Bool(c) => {
             match &c.validity {
                 Some(bm) => buffers.push(bm.as_bytes().as_ptr() as *const c_void),
@@ -786,7 +792,11 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
     array.null_count = null_count;
     array.offset = 0;
     array.n_buffers = pd.buffers.len() as i64;
-    array.buffers = pd.buffers.as_ptr() as *mut *const c_void;
+    array.buffers = if pd.buffers.is_empty() {
+        ptr::null_mut()
+    } else {
+        pd.buffers.as_ptr() as *mut *const c_void
+    };
     array.n_children = n_children;
     // `pd.children` heap buffer is stable across the `Box::into_raw(pd)` move
     // below, so this pointer stays valid until release. Null when there are no

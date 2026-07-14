@@ -130,6 +130,7 @@ Not implemented yet:
 - `Int8`, `Int16`, `Int32`, `Int64`
 - `UInt8`, `UInt16`, `UInt32`, `UInt64`
 - `Float32`, `Float64`, `BFloat16`
+- `Nothing`
 - `String`
 - `FixedString(N)`
 - `Date`, `Date32`, `DateTime`, `DateTime64(P[, tz])`, `Time`, `Time64(P)`
@@ -141,7 +142,7 @@ Not implemented yet:
 - `UUID`, `IPv4`, `IPv6`
 - `Enum8(...)`, `Enum16(...)`
 - `LowCardinality(T)` for the allowed inner types above, excluding server-forbidden
-  combinations such as `Decimal`, `DateTime64`, `Time64`, and `Enum`
+  combinations such as `Nothing`, `Decimal`, `DateTime64`, `Time64`, and `Enum`
 
 Unsupported types raise a decode error rather than guessing.
 

@@ -202,6 +202,23 @@ fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<()
                 });
             }
         }
+    // Arrow Null arrays report every row as null intrinsically even for a bare
+    // ClickHouse `Nothing`. That intrinsic count is not a caller-supplied
+    // validity violation: Nothing has no value domain and is legal without a
+    // Nullable wrapper. Still reject actual null bits in a caller-attached
+    // structural mask, since a bare Nothing writes no null map and would drop
+    // them. An all-valid attached bitmap follows the existing non-nullable
+    // policy and is harmless.
+    } else if matches!(value_type, ChType::Nothing) {
+        let structural_nulls = column.validity().map_or(0, |v| v.null_count());
+        if structural_nulls > 0 {
+            return Err(EncodeError::InconsistentBatch {
+                detail: format!(
+                    "column {:?} is not Nullable but its validity bitmap marks {structural_nulls} rows null; the null map is not written",
+                    field.name
+                ),
+            });
+        }
     } else if column.null_count() > 0 {
         return Err(EncodeError::InconsistentBatch {
             detail: format!(
@@ -925,7 +942,8 @@ fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
     }
     matches!(
         (value_type, column),
-        (ChType::Bool, Column::Bool(_))
+        (ChType::Nothing, Column::Nothing(_))
+            | (ChType::Bool, Column::Bool(_))
             | (ChType::Int8, Column::Int8(_))
             | (ChType::Int16, Column::Int16(_))
             | (ChType::Int32, Column::Int32(_))

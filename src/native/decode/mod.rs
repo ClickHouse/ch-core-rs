@@ -5,7 +5,7 @@ use crate::batch::{ChunkedBatch, ColBatch};
 use crate::bitmap::Bitmap;
 use crate::column::{
     ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn, MapColumn,
-    PrimitiveColumn, TupleColumn, Utf8Column,
+    NothingColumn, PrimitiveColumn, TupleColumn, Utf8Column,
 };
 use crate::native::varint::ByteReader;
 use crate::schema::{ChType, Field, Schema};
@@ -1008,6 +1008,13 @@ fn read_array_offsets(
 /// `src/DataTypes/Serializations/SerializationNumber.cpp`. The core preserves
 /// the raw little-endian 16-bit words in structurally width-2 `[u8; 2]` values,
 /// including NaN payloads, without converting per value.
+///
+/// `Nothing` is the exceptional zero-width logical type with a nonzero Native
+/// body. At v26.6.1.1193-stable,
+/// `SerializationNothing::deserializeBinaryBulk` in
+/// `src/DataTypes/Serializations/SerializationNothing.cpp` consumes exactly one
+/// arbitrary byte per row and performs no value validation. The decoder skips
+/// that run and stores only its row count plus any outer Nullable mask.
 fn decode_column_body(
     reader: &mut ByteReader,
     inner_type: &ChType,
@@ -1015,6 +1022,18 @@ fn decode_column_body(
     validity: Option<Bitmap>,
 ) -> Result<Column, DecodeError> {
     let column = match inner_type {
+        // At v26.6.1.1193-stable, `SerializationNothing::deserializeBinaryBulk`
+        // in `src/DataTypes/Serializations/SerializationNothing.cpp` consumes
+        // exactly one byte per row with no value validation. Nothing has no
+        // physical value buffer, so retain only the row count and any structural
+        // `Nullable(Nothing)` mask decoded by the caller.
+        ChType::Nothing => {
+            reader.skip(num_rows)?;
+            match validity {
+                Some(bm) => Column::Nothing(NothingColumn::new_nullable(num_rows, bm)),
+                None => Column::Nothing(NothingColumn::new(num_rows)),
+            }
+        }
         ChType::Bool => {
             let mut col = decode_bool_data(reader, num_rows)?;
             col.validity = validity;
@@ -1293,6 +1312,10 @@ fn empty_column(ch_type: &ChType) -> Column {
     let inner = resolved.as_ref().unwrap_or(inner);
 
     match inner {
+        ChType::Nothing => Column::Nothing(match empty_validity {
+            Some(bm) => NothingColumn::new_nullable(0, bm),
+            None => NothingColumn::new(0),
+        }),
         ChType::Bool => Column::Bool(if nullable {
             BoolColumn::empty_nullable()
         } else {
@@ -1966,6 +1989,9 @@ fn skip_column_body(
     num_rows: usize,
 ) -> Result<(), DecodeError> {
     match inner_type {
+        // `SerializationNothing::deserializeBinaryBulk` consumes one ignored
+        // byte per row, matching the allocating decoder above.
+        ChType::Nothing => reader.skip(num_rows)?,
         // Enum8 is 1 byte/row (like Int8); Enum16 is 2 bytes/row (like Int16).
         ChType::Bool | ChType::Int8 | ChType::UInt8 | ChType::Enum8 { .. } => {
             reader.skip(num_rows)?

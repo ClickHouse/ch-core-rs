@@ -311,6 +311,9 @@ fn parse_ch_type_depth(type_name: &str, depth: usize) -> Option<ChType> {
     }
 
     match type_name {
+        // `DataTypeNothing` is registered under this exact case-sensitive
+        // canonical name, with no alias.
+        "Nothing" => Some(ChType::Nothing),
         "Bool" | "Boolean" => Some(ChType::Bool),
         "Int8" => Some(ChType::Int8),
         "Int16" => Some(ChType::Int16),

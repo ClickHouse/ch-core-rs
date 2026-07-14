@@ -1,6 +1,19 @@
 use super::*;
 
 #[test]
+fn parse_nothing_and_nullable_nothing_are_case_sensitive() {
+    assert_eq!(parse_ch_type("Nothing"), Some(ChType::Nothing));
+    assert_eq!(
+        parse_ch_type("Nullable(Nothing)"),
+        Some(ChType::Nullable(Box::new(ChType::Nothing)))
+    );
+    assert_eq!(ChType::Nothing.to_string(), "Nothing");
+    assert_eq!(parse_ch_type("nothing"), None);
+    assert_eq!(parse_ch_type("NOTHING"), None);
+    assert_eq!(parse_ch_type("Nothing "), None);
+}
+
+#[test]
 fn test_nested_nullable_type_is_rejected() {
     // `Nullable(Nullable(T))` is not a type ClickHouse emits, and the
     // single-`Nullable` unwrap in decode/scan cannot handle it, so it must be

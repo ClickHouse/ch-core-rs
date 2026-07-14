@@ -9,7 +9,7 @@
 //! `src/Core/BlockInfo.cpp`, and `src/Processors/Formats/Impl/NativeFormat.cpp`
 //! at v26.6.1.1193-stable).
 //!
-//! Scope: this encodes `Bool`, the fixed-width numeric types (`Int8`..`Int64`,
+//! Scope: this encodes `Nothing`, `Bool`, the fixed-width numeric types (`Int8`..`Int64`,
 //! `UInt8`..`UInt64`, `Float32`, `Float64`, `BFloat16`), the temporal types (`Date`,
 //! `Date32`, `DateTime`, `DateTime64`, `Time`, `Time64`, and all 11
 //! `Interval*` kinds), `UUID`, `IPv4`, `IPv6`, `String`, `FixedString(N)`,
@@ -659,6 +659,14 @@ fn encode_column_body(
     column: &Column,
 ) -> Result<(), EncodeError> {
     match (ch_type, column) {
+        // At v26.6.1.1193-stable,
+        // `SerializationNothing::serializeBinaryBulk` in
+        // `src/DataTypes/Serializations/SerializationNothing.cpp` writes one
+        // ASCII '0' placeholder byte per row. The decoder accepts arbitrary
+        // placeholder values, but encode uses the server's canonical byte.
+        (ChType::Nothing, Column::Nothing(c)) => {
+            buf.resize(buf.len() + c.len, b'0');
+        }
         (ChType::Bool, Column::Bool(c)) => encode_bool_data(buf, c),
         (ChType::Int8, Column::Int8(c)) => encode_primitive!(buf, &c.values, i8),
         (ChType::Int16, Column::Int16(c)) => encode_primitive!(buf, &c.values, i16),
@@ -873,7 +881,8 @@ fn is_encodable(ch_type: &ChType) -> bool {
             let (_, dict_value_type) = low_cardinality_dict_value_type(inner);
             is_low_cardinality_inner(dict_value_type) && is_encodable(dict_value_type)
         }
-        ChType::Bool
+        ChType::Nothing
+        | ChType::Bool
         | ChType::Int8
         | ChType::Int16
         | ChType::Int32

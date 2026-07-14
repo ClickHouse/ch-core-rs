@@ -1,5 +1,47 @@
 use crate::bitmap::Bitmap;
 
+/// A ClickHouse `Nothing` column.
+///
+/// Nothing has no value buffer. `len` carries the row count, while `validity`
+/// retains the structural null map of `Nullable(Nothing)` for Native
+/// decode-to-encode fidelity. Arrow exports both forms as its Null type and
+/// therefore ignores this bitmap.
+#[derive(Debug, Clone)]
+pub struct NothingColumn {
+    pub len: usize,
+    pub validity: Option<Bitmap>,
+}
+
+impl NothingColumn {
+    pub fn new(len: usize) -> Self {
+        Self {
+            len,
+            validity: None,
+        }
+    }
+
+    pub fn new_nullable(len: usize, validity: Bitmap) -> Self {
+        Self {
+            len,
+            validity: Some(validity),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Every value in an Arrow Null array is intrinsically null, independent
+    /// of the retained ClickHouse structural null map.
+    pub fn null_count(&self) -> usize {
+        self.len
+    }
+}
+
 /// A fixed-width column of primitive values.
 #[derive(Debug, Clone)]
 pub struct PrimitiveColumn<T: Clone> {
@@ -503,6 +545,7 @@ impl MapColumn {
 /// Enum over all supported column types.
 #[derive(Debug, Clone)]
 pub enum Column {
+    Nothing(NothingColumn),
     Bool(BoolColumn),
     Int8(PrimitiveColumn<i8>),
     Int16(PrimitiveColumn<i16>),
@@ -580,6 +623,7 @@ pub enum Column {
 impl Column {
     pub fn len(&self) -> usize {
         match self {
+            Column::Nothing(c) => c.len(),
             Column::Bool(c) => c.len(),
             Column::Int8(c) => c.len(),
             Column::Int16(c) => c.len(),
@@ -623,6 +667,7 @@ impl Column {
 
     pub fn null_count(&self) -> usize {
         match self {
+            Column::Nothing(c) => c.null_count(),
             Column::Bool(c) => c.null_count(),
             Column::Int8(c) => c.null_count(),
             Column::Int16(c) => c.null_count(),
@@ -662,6 +707,7 @@ impl Column {
 
     pub fn validity(&self) -> Option<&Bitmap> {
         match self {
+            Column::Nothing(c) => c.validity.as_ref(),
             Column::Bool(c) => c.validity.as_ref(),
             Column::Int8(c) => c.validity.as_ref(),
             Column::Int16(c) => c.validity.as_ref(),

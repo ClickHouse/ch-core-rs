@@ -10,6 +10,7 @@ mod decimal;
 mod framing;
 mod interval;
 mod low_cardinality;
+mod nothing;
 mod numeric;
 mod parser;
 mod saf_geo;

@@ -47,45 +47,57 @@ point-in-time snapshot for the next agent, not a changelog. Keep it short. Alway
 include a "Recommended next" with a one-line reason, so the next agent has a
 default; the user may override it.
 
-- **Last updated:** 2026-07-13. Implemented `BFloat16` at decode/encode parity,
+- **Last updated:** 2026-07-14. Implemented `Nothing` at decode/encode parity,
   including parser, scanner, zero-row and multi-block handling, `Nullable`,
-  `LowCardinality`, Arrow export, exact-bit unit tests, live INSERT coverage, and
-  real-server fixture assertions. Both `all_types` fixtures were recaptured from
-  ClickHouse 26.6.1.1193 with plain, Nullable, and LowCardinality BFloat16
-  columns, and the integration and live INSERT gates pass.
-- **Implementation shape:** `ChType::BFloat16` preserves the logical type and
-  `Column::BFloat16(PrimitiveColumn<[u8; 2]>)` stores each raw little-endian
-  16-bit word verbatim, with the two-byte width enforced by the element type.
-  Decode performs one contiguous copy into the column buffer, encode writes it
-  verbatim, and the scanner skips exactly 2 bytes per value. Arrow has no
-  BFloat16 primitive, so export is honest zero-copy FixedSizeBinary(2), `w:2`;
-  `e` would incorrectly claim IEEE binary16 and `S` would incorrectly claim
-  UInt16 semantics.
+  container composition (`Array(Nothing)`, Tuple/Map positions), Arrow Null
+  export, exact-wire-byte unit tests, live INSERT coverage, and real-server
+  fixture assertions. Both `all_types` fixtures were recaptured from ClickHouse
+  26.6.1.1193 with `Nullable(Nothing)` and `Array(Nothing)` columns, and the
+  integration and live INSERT gates pass. Tier 2 is now complete.
+- **Implementation shape:** `ChType::Nothing` plus
+  `Column::Nothing(NothingColumn { len, validity })` - no value buffer; `len`
+  carries the row count and `validity` retains the structural null map of
+  `Nullable(Nothing)` for Native re-encoding (`null_count()` is always `len`).
+  The key wire fact: Nothing is zero-width in memory but NOT on the wire -
+  encode writes one ASCII `'0'` (0x30) placeholder byte per row, decode and the
+  scan consume one arbitrary byte per row without validating it.
+  `LowCardinality(Nothing)` is rejected on both sides. Arrow export is the Null
+  type (format `n`, zero buffers, every row null by definition).
 - **Pinned server tag:** `v26.6.1.1193-stable`, protocol revision **54485**.
-  Confirmed server paths for this item: `DataTypesNumber.cpp`
-  (`registerDataTypeNumbers`/`createNumericDataType<BFloat16>`),
-  `DataTypesNumber.h` (`DataTypeNumber<BFloat16>`),
-  `Serializations/SerializationNumber.cpp`
-  (`SerializationNumber<BFloat16>` bulk read/write), and
-  `base/base/BFloat16.h` (raw word and Float32 conversion). Nullable,
-  LowCardinality, and Map-key legality were confirmed in
-  `DataTypeNullable.cpp`, `DataTypeNumberBase.h` /
-  `DataTypeLowCardinality.cpp`, and `DataTypeMap.cpp`. Wire, wrapper, and key
-  findings are confirmed. Settings history confirms the 24.11 experimental gate
-  and 25.1 default-on change; the exact first shipped release is inferred as
-  24.11. Local source, capture server, fixtures, and contract citations are
-  aligned to 26.6.1.1193.
+  Confirmed server paths for this item: `DataTypes/DataTypeNothing.{h,cpp}`
+  (`DataTypeNothing`, `registerDataTypeNothing`, exact case-sensitive canonical
+  name `Nothing`), `Serializations/SerializationNothing.{h,cpp}` (one 0x30 byte
+  per row on write, one ignored byte per row on read),
+  `Serializations/SerializationNullable.cpp` (null map first, then the complete
+  nested body), and `Formats/NativeReader.cpp` / `NativeWriter.cpp` (no
+  revision or setting gate). The historical introduction version remains
+  undetermined and must not be guessed. Local source, capture server, fixtures,
+  and contract citations are aligned to 26.6.1.1193.
 - **Scope:** completeness still means uncompressed HTTP `FORMAT Native`; TCP and
   the currently unwired compression framing remain out of scope.
-- **Build/test status:** `cargo test` is green (512 unit + 3 integration;
+- **Build/test status:** `cargo test` is green (533 unit + 3 integration;
   unrelated live tests and the doctest remain ignored). The two `all_types`
-  fixtures were recaptured at 93 columns (leading varint `0x5d`) for revisions 0
+  fixtures were recaptured at 95 columns (leading varint `0x5f`) for revisions 0
   and 54485. The live `insert_roundtrips_through_server` test passes against
-  ClickHouse 26.6.1.1193 with plain, Nullable, and LowCardinality BFloat16. Fmt
-  is clean, `cargo build` passes, and clippy is clean with `-D warnings`.
-- **Recommended next:** implement **`Nothing`**. It is the remaining compact
-  Tier 2 scalar edge case and has a zero-width body.
+  ClickHouse 26.6.1.1193 with `Nullable(Nothing)` and `Array(Nothing)`. Fmt is
+  clean, `cargo build` passes, clippy is clean with `-D warnings`, and
+  `git diff --check` is clean.
+- **Recommended next:** implement **`AggregateFunction(...)`**. Tier 2 is done,
+  and it is the first Tier 3 item: unlike `Variant`/`Dynamic`/`JSON` it carries
+  no in-band structure header churn, but its opaque per-function state blobs are
+  a large surface - start with a `clickhouse-server-reader` pass over
+  `SerializationAggregateFunction` before committing to a column representation.
 - **Active gotchas / context:**
+  - `Nothing` is the one type whose logical width (zero) differs from its wire
+    width (one byte per row): the placeholder byte is `'0'` (0x30) on write and
+    UNVALIDATED on read, so decode must consume `num_rows` bytes (truncation is
+    an error) while accepting arbitrary byte values. Do not "optimize" the body
+    away. A bare `NULL` literal arrives as `Nullable(Nothing)` (null map first,
+    then the full placeholder body); `NothingColumn` keeps that structural mask
+    only so re-encoding is byte-faithful - Arrow ignores it and reports every
+    row null. `LowCardinality(Nothing)` never appears on the wire
+    (`canBeInsideLowCardinality()` is false) and both sides reject it; do not
+    add `Nothing` to the LC allowlist.
   - BFloat16 dense Native data is exactly two raw little-endian bytes per row,
     with no type-specific state. The server's Float32 conversion truncates the
     low 16 bits. `Nullable`, `LowCardinality`, and bare/plain-LC Map keys are
@@ -574,6 +586,30 @@ is not done, and must not be checked off, until all of these hold:
         remain out of scope. Confirmed against the server source (`DataTypeNested`,
         v26.6.1.1193-stable) and verified with the `nst` live-server fixture
         column; encode runs green in the live INSERT test.
+- [x] `Nothing` (decode and encode)
+      - the type of a bare `NULL` literal (canonical query-result type
+        `Nullable(Nothing)`) and the inferred element type of an empty array
+        literal. Zero-width in memory but NOT on the Native wire:
+        `SerializationNothing::serializeBinaryBulk` writes one ASCII `'0'`
+        (0x30) placeholder byte per row and `deserializeBinaryBulk` consumes one
+        arbitrary byte per row without validating its value, so decode accepts
+        any placeholder byte and encode emits the server's canonical 0x30.
+        `Nullable(Nothing)` uses the ordinary framing: `num_rows` null-map bytes
+        first, then the complete one-byte-per-row nested Nothing body.
+        `LowCardinality(Nothing)` and `LowCardinality(Nullable(Nothing))` are
+        illegal (`canBeInsideLowCardinality()` is false); `Array(Nothing)`,
+        Tuple elements, Map values, and a bare Nothing Map key are
+        constructible (the flattened runs are semantically empty). Decoded into
+        `Column::Nothing(NothingColumn { len, validity })` - no value buffer;
+        `validity` retains the structural null map of `Nullable(Nothing)` for
+        Native re-encoding, and `null_count()` is always `len` because Nothing
+        has no values. Arrow export is the Null type (`n`) with zero buffers.
+        Confirmed against the server source (`DataTypeNothing`,
+        `SerializationNothing`, v26.6.1.1193-stable; no revision or setting
+        gate; introduction version undetermined - do not guess it) and verified
+        with the `nothing` (`Nullable(Nothing)`) and `arr_nothing`
+        (`Array(Nothing)`) live-server fixture columns; encode runs green in
+        the live INSERT test.
 
 ---
 
@@ -700,7 +736,14 @@ introduction), so record them per type only when determinable.
       done. One signed Int64 body per row, with exact logical unit preservation;
       legal Nullable/LowCardinality inners and Map keys. See "Implemented" and
       the `CODEC_CONTRACT.md` type section.
-- [ ] `Nothing` - the type of a bare `NULL`; zero-width, edge case.
+- [x] `Nothing` - decode AND encode done. The type of a bare `NULL`; zero-width
+      in memory but NOT on the Native wire: `SerializationNothing` writes one
+      ASCII `'0'` (0x30) placeholder byte per row and decode consumes one
+      arbitrary byte per row without validating it. `Nullable(Nothing)` is legal
+      (null map first, then the full one-byte-per-row body);
+      `LowCardinality(Nothing)` is illegal. Arrow export is the Null type (`n`,
+      zero buffers). See "Implemented" and the `CODEC_CONTRACT.md` type section.
+      Introduction version undetermined; do not guess it.
 - [x] `BFloat16` - 2-byte float, the top 16 bits of an IEEE-754 `Float32` (sign +
       8-bit exponent + 7-bit truncated mantissa), serialized raw little-endian via
       `SerializationNumber<BFloat16>` with no per-row framing. Confirmed registered

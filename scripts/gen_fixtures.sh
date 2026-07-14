@@ -363,7 +363,15 @@ SELECT
     -- BFloat16 is a legal numeric LowCardinality inner. Repeated 13 proves a
     -- real width-2 dictionary body plus indexes; the suspicious-LC setting
     -- below is a construction-time gate only.
-    CAST(multiIf(n = 0, toFloat32(13), n = 1, toFloat32(79), n = 2, toFloat32(13), toFloat32(258)), 'LowCardinality(BFloat16)') AS lc_bf
+    CAST(multiIf(n = 0, toFloat32(13), n = 1, toFloat32(79), n = 2, toFloat32(13), toFloat32(258)), 'LowCardinality(BFloat16)') AS lc_bf,
+    -- A NULL literal has the canonical query-result type Nullable(Nothing).
+    -- Native writes the four-byte null map first, then one ASCII '0'
+    -- placeholder byte per row for the nested Nothing body.
+    NULL AS nothing,
+    -- Bare Nothing cannot hold a non-null value, but it is the inferred element
+    -- type of an empty array. All four rows are empty, so the flattened Nothing
+    -- run has length zero while the literal Array(Nothing) header reaches Native.
+    CAST([], 'Array(Nothing)') AS arr_nothing
 FROM numbers(4)
 SETTINGS allow_suspicious_low_cardinality_types = 1, enable_nullable_tuple_type = 1, enable_time_time64_type = 1, flatten_nested = 0
 FORMAT Native

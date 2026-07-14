@@ -442,6 +442,8 @@ fn assert_all_types(batch: &ChunkedBatch) {
             Expected::Exact("bf", ChType::BFloat16),
             Expected::Exact("nbf", ChType::Nullable(Box::new(ChType::BFloat16))),
             Expected::Exact("lc_bf", ChType::LowCardinality(Box::new(ChType::BFloat16))),
+            Expected::Exact("nothing", ChType::Nullable(Box::new(ChType::Nothing))),
+            Expected::Exact("arr_nothing", ChType::Array(Box::new(ChType::Nothing))),
         ],
     );
 
@@ -1482,6 +1484,31 @@ fn assert_all_types(batch: &ChunkedBatch) {
             assert_eq!(resolved, vec![0x4150, 0x429e, 0x4150, 0x4381]);
         }
         other => panic!("expected BFloat16 dictionary, got {other:?}"),
+    }
+
+    // Nullable(Nothing) (col 93): every row is NULL. The physical column keeps
+    // only its logical length and the decoded ClickHouse null map; the nested
+    // ASCII '0' placeholder bytes carry no value.
+    match block.column(93) {
+        Column::Nothing(c) => {
+            assert_eq!(c.len(), 4);
+            assert_eq!(c.null_count(), 4);
+        }
+        other => panic!("expected Nothing, got {other:?}"),
+    }
+    assert_validity(block.column(93), &[false, false, false, false]);
+
+    // Array(Nothing) (col 94): Nothing cannot supply a real element, so every
+    // array is empty and the flattened child has length zero.
+    match block.column(94) {
+        Column::Array(c) => {
+            assert_eq!(c.offsets, vec![0i64, 0, 0, 0, 0]);
+            match c.values.as_ref() {
+                Column::Nothing(values) => assert_eq!(values.len(), 0),
+                other => panic!("expected Nothing array values, got {other:?}"),
+            }
+        }
+        other => panic!("expected Array(Nothing), got {other:?}"),
     }
 }
 

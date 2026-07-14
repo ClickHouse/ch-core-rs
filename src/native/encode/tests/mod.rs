@@ -1,6 +1,6 @@
 use super::*;
 use crate::bitmap::Bitmap;
-use crate::column::{DecimalColumn, DictionaryColumn, PrimitiveColumn};
+use crate::column::{DecimalColumn, DictionaryColumn, NothingColumn, PrimitiveColumn};
 use crate::native::decode::{decode_all_bytes, DecodeOptions, DBMS_TCP_PROTOCOL_VERSION};
 use crate::native::encode::validate::type_depth;
 use crate::native::protocol::MAX_TYPE_DEPTH;
@@ -13,6 +13,7 @@ mod containers;
 mod decimal;
 mod interval;
 mod low_cardinality;
+mod nothing;
 mod nullable;
 mod numeric;
 mod saf_geo;
@@ -87,6 +88,9 @@ fn assert_columns_eq(left: &Column, right: &Column, label: &str) {
         };
     }
     match (left, right) {
+        (Column::Nothing(x), Column::Nothing(y)) => {
+            assert_eq!(x.len, y.len, "{label} Nothing len differs");
+        }
         (Column::Bool(x), Column::Bool(y)) => {
             assert_eq!(x.len, y.len, "{label} bool len differs");
             for row in 0..x.len {

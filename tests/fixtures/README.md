@@ -13,15 +13,15 @@ cross-checked against the matching `.server-ref` tag `v26.6.1.1193-stable`.
 
 | File | Capture path | `protocol_revision` | First bytes |
 |------|--------------|---------------------|-------------|
-| `all_types_rev0.native` | HTTP `FORMAT Native` | `0` | `5d 04 02 69 38 04 49 6e 74 38 80 ff 00 7f 03 69` |
-| `all_types_rev54485.native` | HTTP `FORMAT Native` with `client_protocol_version=54485` | `54485` | `01 00 02 ff ff ff ff 03 00 00 5d 04 02 69 38 04` |
+| `all_types_rev0.native` | HTTP `FORMAT Native` | `0` | `5f 04 02 69 38 04 49 6e 74 38 80 ff 00 7f 03 69` |
+| `all_types_rev54485.native` | HTTP `FORMAT Native` with `client_protocol_version=54485` | `54485` | `01 00 02 ff ff ff ff 03 00 00 5f 04 02 69 38 04` |
 | `multi_block_rev0.native` | HTTP `FORMAT Native`, `max_block_size=2` | `0` | `01 02 01 6e 05 49 6e 74 33 32 0d 00 00 00 0e 00` |
 
 The framed fixture starts with the standard 10-byte `BlockInfo` preamble:
 `01 00 02 ff ff ff ff 03 00 00`.
 
-Both `all_types` fixtures now carry 93 columns, so the leading column-count
-varint is `0x5d` (93): at the very start of `all_types_rev0.native`, and
+Both `all_types` fixtures now carry 95 columns, so the leading column-count
+varint is `0x5f` (95): at the very start of `all_types_rev0.native`, and
 immediately after the 10-byte `BlockInfo` preamble in
 `all_types_rev54485.native`. Next is the `0x04` row-count varint (4 rows), then
 the first column: name length `0x02`, name `i8` (`69 38`), type length `0x04`,

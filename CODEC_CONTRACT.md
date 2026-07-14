@@ -254,6 +254,7 @@ than an error.
 | `Float32`                                                                              | `Float32`                              | `Float32`         | `f`                                                                 | validity, values                           | yes                                                      |
 | `Float64`                                                                              | `Float64`                              | `Float64`         | `g`                                                                 | validity, values                           | yes                                                      |
 | `BFloat16`                                                                             | `BFloat16`                             | `BFloat16`        | `w:2`                                                               | validity, data                             | yes                                                      |
+| `Nothing`                                                                              | `Nothing`                              | `Nothing`         | `n`                                                                 | none                                       | yes                                                      |
 | `String`                                                                               | `String`                               | `Utf8`            | `u`                                                                 | validity, offsets, data                    | yes                                                      |
 | `FixedString(N)`                                                                       | `FixedString(N)`                       | `FixedBinary`     | `w:N`                                                               | validity, data                             | yes                                                      |
 | `UUID`                                                                                 | `Uuid`                                 | `Uuid`            | `w:16`                                                              | validity, data                             | yes                                                      |
@@ -330,6 +331,83 @@ their wire bit patterns.
 `src/DataTypes/Serializations/SerializationNumber.cpp`. On little-endian hosts it
 is a single bulk raw read into the column buffer; big-endian hosts byte-swap per
 element. Confirmed at `v26.6.1.1193-stable`.
+
+### Nothing
+
+**Type string(s):** `Nothing`. This is the exact case-sensitive canonical name
+registered by `registerDataTypeNothing` and written in Native text headers.
+
+**Logical type:** `ChType::Nothing`.
+
+**Wire payload:** exactly `num_rows` bytes. The server writes one canonical
+ASCII `0` byte, `0x30`, per row. Its bulk reader consumes one byte per row and
+does not validate the byte value. There is no type-specific prefix, suffix,
+length, state, or endianness concern. `Nothing` is zero-width only in the
+server's in-memory column model; it is not zero-width on the Native wire. A
+zero-row block carries no body, under the ordinary Native `rows != 0` gate.
+
+For `Nullable(Nothing)`, the ordinary Nullable framing still applies: first
+`num_rows` null-map bytes, then the complete `num_rows`-byte nested Nothing
+body. A legitimately constructed column has `0x01` in every null-map slot and
+`0x30` in every nested slot. The server's Native reader structurally accepts
+other mask and placeholder bytes, so decode retains the mask and ignores the
+placeholder values. Encode writes the retained mask and canonicalizes every
+nested placeholder to `0x30`.
+
+**Arrow export:** Arrow Null, format `n`, with `length == num_rows`,
+`null_count == num_rows`, and zero buffers. `Nullable(Nothing)` has the same
+Arrow array body because Arrow Null is intrinsically all-null; the ClickHouse
+null map remains in the Rust column only for Native decode/encode fidelity.
+The field flags preserve the ClickHouse wrapper distinction: bare `Nothing`
+uses flags 0, while `Nullable(Nothing)` sets `ARROW_FLAG_NULLABLE` (2). Arrow
+defines field nullability independently from an array's observed null count, so
+the bare form remains a valid non-nullable Arrow field even though the Null
+array itself reports every slot null.
+
+**Rust buffer:** `Column::Nothing(NothingColumn { len, validity })`. The explicit
+length is required because there is no value buffer from which to recover the
+row count. `validity` is `None` for bare Nothing and retains the packed
+ClickHouse null map for `Nullable(Nothing)`. `null_count()` is always `len`,
+matching Arrow Null semantics rather than counting that retained structural
+mask. Decode performs no allocation or copy for the ignored body bytes beyond
+the optional Nullable bitmap that every nullable type already needs.
+
+**Wrappers, containers, and keys:** `Nullable(Nothing)` is legal.
+`LowCardinality(Nothing)` and `LowCardinality(Nullable(Nothing))` are illegal
+because Nothing does not opt into `canBeInsideLowCardinality`. `Array(Nothing)`,
+Tuple elements, Map values, and a bare Nothing Map key are constructible. A
+plain Nothing value cannot be created for a non-empty SQL result, so
+`Array(Nothing)` and maps with a Nothing key or value are semantically empty.
+Nullable Nothing Map keys remain illegal under the ordinary Map key rule.
+Top-level Nothing and Nullable(Nothing) cannot be stored in tables, though the
+type occurs in query results and can be nested in storable Tuple and Map types.
+
+**Introduction version:** undetermined from the shallow pinned checkout. No
+Nothing-specific setting, protocol-revision branch, or experimental gate exists
+at the pin.
+
+**Server reference:** all wire and legality claims above are **confirmed** at
+`v26.6.1.1193-stable`. The implementation relies on
+`DataTypeNothing` and `registerDataTypeNothing` in
+`src/DataTypes/DataTypeNothing.{h,cpp}`;
+`SerializationNothing::serializeBinaryBulk` and
+`SerializationNothing::deserializeBinaryBulk` in
+`src/DataTypes/Serializations/SerializationNothing.cpp`;
+`SerializationNullable::serializeBinaryBulkWithMultipleStreams` and its
+deserialize counterpart in
+`src/DataTypes/Serializations/SerializationNullable.cpp`;
+`NativeWriter::write` and `NativeReader::read` in
+`src/Formats/NativeWriter.cpp` and `src/Formats/NativeReader.cpp`; and the
+wrapper/container predicates in `DataTypeNullable`, `DataTypeLowCardinality`,
+`DataTypeArray`, `DataTypeTuple`, and `DataTypeMap`. Server tests
+`00570_empty_array_is_const`, `02294_nothing_arguments_in_functions`,
+`03034_ddls_and_merges_with_unusual_maps`,
+`03173_row_binary_and_native_with_binary_encoded_types`, and
+`03243_check_for_nullable_nothing_in_alter` corroborate the behavior. The
+header comment in `SerializationNothing.h` that says the bulk methods read and
+write zero bytes is stale and contradicted by both function bodies and live
+Native bytes. Only the introduction release is **inferred as unknown**, rather
+than guessed.
 
 ### BFloat16
 
@@ -1751,7 +1829,7 @@ defensive fall-through that validation already rules out.
 
 Encode coverage is kept a subset of decode coverage and grows the same
 one-type-at-a-time way; the two are currently at parity.
-Encodable today: `Bool`, the fixed-width numerics (`Int8`..`Int64`,
+Encodable today: `Nothing`, `Bool`, the fixed-width numerics (`Int8`..`Int64`,
 `UInt8`..`UInt64`, `Float32`, `Float64`, `BFloat16`), the temporals (`Date`, `Date32`,
 `DateTime`, `DateTime64`, `Time`, `Time64`, and every `Interval*`), `UUID`,
 `IPv4`, `IPv6`, `String`,
@@ -1928,6 +2006,10 @@ one valid wire form, and encode commits to these:
   which is the same string the server emits and the decoder parses.
 - **Bool.** Encode writes `0x00`/`0x01` per row. The decoder accepts any nonzero
   byte as true, but the server emits 0/1, so encode does too.
+- **Nothing.** Encode writes one canonical ASCII `0` byte, `0x30`, per row.
+  Decode accepts any placeholder byte because the server reader ignores its
+  value. For `Nullable(Nothing)`, the retained structural null map is written
+  first through the ordinary Nullable path, then the canonical placeholders.
 - **Nullable placeholder.** For a `Nullable(T)`, encode writes the null map, then
   the full inner body straight from the buffer, including whatever value sits in
   each null row's slot. It does not zero or otherwise rewrite null-row values, so
@@ -2014,6 +2096,8 @@ directly (`empty_column` in `src/native/decode/mod.rs`), the empty shapes are:
 
 - Numerics, `Interval*`, and `Bool`: empty value or bit buffer, length 0.
   `IPv4` (a `u32` primitive) is the same.
+- `Nothing`: explicit length 0 with no value buffer. `Nullable(Nothing)` also
+  retains an empty validity bitmap. Both have `null_count == 0`.
 - `BFloat16`: empty `[u8; 2]` values buffer with its distinct BFloat16 logical
   and Column tags.
 - `String`: `offsets == [0]` (length 1, the required leading zero) and empty
@@ -2056,7 +2140,7 @@ Not yet supported, tracked as planned phases in `src/schema.rs`:
   DateTime, Time, every `Interval*`, UUID/IPv4/IPv6, with or without an inner
   `Nullable`) are
   supported; any other inner is rejected as `UnsupportedType`. This includes
-  `DateTime64`, `Time64`, every `Decimal`, and `Enum8`/`Enum16`, all of which the
+  `Nothing`, `DateTime64`, `Time64`, every `Decimal`, and `Enum8`/`Enum16`, all of which the
   server itself forbids as LC inners (`canBeInsideLowCardinality()` is false), so
   they never appear in that position on the wire. Plain and nullable `Time64`
   columns remain supported.
