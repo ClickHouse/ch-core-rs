@@ -147,6 +147,8 @@ fn export_sum_state_as_large_binary_zero_copy() {
         let child = &**array.children.add(0);
         assert_eq!(child.length, 2);
         assert_eq!(child.null_count, 0);
+        assert_eq!(child.n_buffers, 3);
+        assert!((*child.buffers.add(0)).is_null());
         let offsets = *child.buffers.add(1) as *const i64;
         let data = *child.buffers.add(2) as *const u8;
         match batch.column(0) {
