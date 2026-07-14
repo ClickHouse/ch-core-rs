@@ -657,8 +657,10 @@ is not done, and must not be checked off, until all of these hold:
         constructible (the flattened runs are semantically empty). Decoded into
         `Column::Nothing(NothingColumn { len, validity })` - no value buffer;
         `validity` retains the structural null map of `Nullable(Nothing)` for
-        Native re-encoding, and `null_count()` is always `len` because Nothing
-        has no values. Arrow export is the Null type (`n`) with zero buffers.
+        Native re-encoding, and `null_count()` counts that mask like every
+        other column. Arrow export is the Null type (`n`) with zero buffers,
+        `null_count == len`, and a nullable field flag for both forms (Arrow
+        forbids a non-nullable Null field).
         Confirmed against the server source (`DataTypeNothing`,
         `SerializationNothing`, v26.6.1.1193-stable; no revision or setting
         gate; introduction version undetermined - do not guess it) and verified

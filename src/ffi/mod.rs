@@ -399,6 +399,8 @@ fn dictionary_value_type(ch_type: &ChType) -> &ChType {
 fn field_is_nullable(ch_type: &ChType) -> bool {
     match ch_type {
         ChType::Nullable(_) => true,
+        // Arrow requires Null-type fields to be nullable: every row is null.
+        ChType::Nothing => true,
         ChType::LowCardinality(inner) => low_cardinality_dict_value_type(inner).0,
         _ => false,
     }
@@ -609,7 +611,12 @@ unsafe fn export_column_array(batch: &Arc<ColBatch>, col_idx: usize, out: *mut A
 /// borrowed buffers stay valid until release.
 unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut ArrowArray) {
     let length = col.len() as i64;
-    let null_count = col.null_count() as i64;
+    // Arrow Null arrays report every row as null intrinsically; every other
+    // column reports its structural null count.
+    let null_count = match col {
+        Column::Nothing(c) => c.len() as i64,
+        _ => col.null_count() as i64,
+    };
 
     let mut buffers: Vec<*const c_void> = Vec::new();
     let mut children: Vec<*mut ArrowArray> = Vec::new();

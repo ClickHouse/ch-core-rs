@@ -56,8 +56,10 @@ fn assert_nothing_export(batch: &Arc<ColBatch>, expected_flags: i64, expected_le
 }
 
 #[test]
-fn export_bare_nothing_as_nonnullable_arrow_null() {
-    assert_nothing_export(&nothing_batch(false, 3), 0, 3);
+fn export_bare_nothing_as_nullable_arrow_null() {
+    // Arrow requires Null-type fields to be nullable even though bare
+    // ClickHouse Nothing carries no Nullable wrapper.
+    assert_nothing_export(&nothing_batch(false, 3), 2, 3);
 }
 
 #[test]
@@ -69,7 +71,7 @@ fn export_nullable_nothing_as_nullable_arrow_null_ignores_mask() {
 
 #[test]
 fn export_zero_row_nothing_as_empty_arrow_null() {
-    assert_nothing_export(&nothing_batch(false, 0), 0, 0);
+    assert_nothing_export(&nothing_batch(false, 0), 2, 0);
     assert_nothing_export(&nothing_batch(true, 0), 2, 0);
 }
 
@@ -102,7 +104,7 @@ fn export_array_nothing_child_is_zero_buffer_null() {
         let item = &**c0.children.add(0);
         assert_eq!(CStr::from_ptr(item.name).to_str().unwrap(), "item");
         assert_eq!(CStr::from_ptr(item.format).to_str().unwrap(), "n");
-        assert_eq!(item.flags, 0, "plain Nothing child carries no flags");
+        assert_eq!(item.flags, 2, "Nothing child is a nullable Null field");
         assert_eq!(item.n_children, 0, "Arrow Null has no grandchildren");
         assert!(item.children.is_null());
         assert!(item.dictionary.is_null());

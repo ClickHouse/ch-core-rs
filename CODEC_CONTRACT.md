@@ -360,18 +360,19 @@ nested placeholder to `0x30`.
 `null_count == num_rows`, and zero buffers. `Nullable(Nothing)` has the same
 Arrow array body because Arrow Null is intrinsically all-null; the ClickHouse
 null map remains in the Rust column only for Native decode/encode fidelity.
-The field flags preserve the ClickHouse wrapper distinction: bare `Nothing`
-uses flags 0, while `Nullable(Nothing)` sets `ARROW_FLAG_NULLABLE` (2). Arrow
-defines field nullability independently from an array's observed null count, so
-the bare form remains a valid non-nullable Arrow field even though the Null
-array itself reports every slot null.
+Both bare `Nothing` and `Nullable(Nothing)` set `ARROW_FLAG_NULLABLE` (2):
+Arrow requires a Null-type field to be nullable (pyarrow rejects a
+non-nullable Null field by construction), so the ClickHouse wrapper
+distinction is not preserved in the field flags. It survives in the ClickHouse
+type name carried alongside the schema.
 
 **Rust buffer:** `Column::Nothing(NothingColumn { len, validity })`. The explicit
 length is required because there is no value buffer from which to recover the
 row count. `validity` is `None` for bare Nothing and retains the packed
-ClickHouse null map for `Nullable(Nothing)`. `null_count()` is always `len`,
-matching Arrow Null semantics rather than counting that retained structural
-mask. Decode performs no allocation or copy for the ignored body bytes beyond
+ClickHouse null map for `Nullable(Nothing)`. `null_count()` counts that
+structural mask like every other column; the Arrow rule that a Null array
+reports every row null is applied at the FFI export site.
+Decode performs no allocation or copy for the ignored body bytes beyond
 the optional Nullable bitmap that every nullable type already needs.
 
 **Wrappers, containers, and keys:** `Nullable(Nothing)` is legal.

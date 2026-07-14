@@ -35,10 +35,11 @@ impl NothingColumn {
         self.len == 0
     }
 
-    /// Every value in an Arrow Null array is intrinsically null, independent
-    /// of the retained ClickHouse structural null map.
+    /// Structural nulls per the retained ClickHouse null map, like every
+    /// other column. The Arrow rule that a Null array reports every row as
+    /// null lives at the FFI export site.
     pub fn null_count(&self) -> usize {
-        self.len
+        self.validity.as_ref().map_or(0, |b| b.null_count())
     }
 }
 

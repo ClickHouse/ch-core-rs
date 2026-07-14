@@ -13,7 +13,7 @@ fn decode_nothing_accepts_arbitrary_placeholders() {
     match decoded.chunks[0].column(0) {
         Column::Nothing(c) => {
             assert_eq!(c.len, 4);
-            assert_eq!(c.null_count(), 4);
+            assert_eq!(c.null_count(), 0);
             assert!(c.validity.is_none());
         }
         other => panic!("expected Nothing, got {other:?}"),
@@ -66,8 +66,9 @@ fn decode_nullable_nothing_preserves_structural_mask() {
     match decoded.chunks[0].column(0) {
         Column::Nothing(c) => {
             assert_eq!(c.len, 4);
-            // Arrow Null semantics are intrinsic, independent of this mask.
-            assert_eq!(c.null_count(), 4);
+            // Structural nulls per the retained mask; Arrow's every-row-null
+            // rule applies only at the FFI export site.
+            assert_eq!(c.null_count(), 2);
             let validity = c.validity.as_ref().unwrap();
             assert_eq!(
                 (0..4).map(|row| validity.is_valid(row)).collect::<Vec<_>>(),
