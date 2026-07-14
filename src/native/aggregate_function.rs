@@ -25,6 +25,10 @@ pub(crate) enum AggregateStateCodec {
     /// [`aggregate_state_codec`]); the state is a fixed-width 1-byte placeholder,
     /// and any nonzero byte is `INCORRECT_DATA` on the server.
     NothingUInt64,
+    /// `AggregateFunction(sum, T)` for one supported non-nullable numeric or
+    /// Enum argument serializes one fixed-width accumulator per row. The width
+    /// is selected from `T` by [`sum_state_width`].
+    Sum { state_width: usize },
 }
 
 /// Whether `arg` is exactly `Nullable(Nothing)`, the only-null argument shape
@@ -33,19 +37,75 @@ fn is_nullable_nothing(arg: &ChType) -> bool {
     matches!(arg, ChType::Nullable(inner) if matches!(**inner, ChType::Nothing))
 }
 
+/// Fixed serialized accumulator width for exact base `sum` over one
+/// non-nullable argument.
+///
+/// At ClickHouse `v26.6.1.1193-stable`, `AggregateFunctionSumData::write` writes
+/// its accumulator with `writeBinaryLittleEndian`, and `NearestFieldTypeImpl`
+/// selects these accumulator representations:
+///
+/// - Bool and UInt8..UInt64 -> UInt64 (8 bytes)
+/// - Int8..Int64 and Enum8/Enum16 -> Int64 (8 bytes)
+/// - BFloat16/Float32/Float64 -> Float64 (8 bytes)
+/// - UInt128/Int128 -> the same 128-bit integer type (16 bytes)
+/// - UInt256/Int256 -> the same 256-bit integer type (32 bytes)
+/// - Decimal32/64/128 -> Decimal128 (16 bytes)
+/// - Decimal256 -> Decimal256 (32 bytes)
+///
+/// Each is a raw little-endian POD value with no in-body tag or length. The
+/// factory's numeric, Decimal, and explicit Enum dispatch arms exclude every
+/// other type. In particular, Nullable arguments are deliberately absent here:
+/// the aggregate Null adapter adds a flag and a conditional nested state, so it
+/// needs a separate codec before it can be framed safely.
+///
+/// Confirmed in `AggregateFunctionSum.cpp` (`SumSimple`,
+/// `createAggregateFunctionSum`), `AggregateFunctions/Helpers.h`
+/// (`createWithNumericType`, `createWithDecimalType`), `Core/Field.h`
+/// (`NearestFieldTypeImpl`), and `AggregateFunctionSum.h`
+/// (`AggregateFunctionSumData::write`/`read`).
+fn sum_state_width(arg: &ChType) -> Option<usize> {
+    match arg {
+        ChType::Bool
+        | ChType::Int8
+        | ChType::Int16
+        | ChType::Int32
+        | ChType::Int64
+        | ChType::UInt8
+        | ChType::UInt16
+        | ChType::UInt32
+        | ChType::UInt64
+        | ChType::Float32
+        | ChType::Float64
+        | ChType::BFloat16
+        | ChType::Enum8 { .. }
+        | ChType::Enum16 { .. } => Some(8),
+        ChType::Int128 | ChType::UInt128 => Some(16),
+        ChType::Int256 | ChType::UInt256 => Some(32),
+        ChType::Decimal {
+            bits: 32 | 64 | 128,
+            ..
+        } => Some(16),
+        ChType::Decimal { bits: 256, .. } => Some(32),
+        _ => None,
+    }
+}
+
 /// Select the state codec for one declared aggregate type.
 ///
 /// At ClickHouse `v26.6.1.1193-stable`, no aggregate function is treated as
 /// opaque bytes: aggregate states have function-specific serialization and no
 /// generic length framing, so an unknown function must stay `UnsupportedType`
 /// (returning `None` here) or the streaming scan could not locate the next
-/// column. Two exact base signatures are registered:
+/// column. Three exact base signatures are registered:
 ///
 /// - `count`, unversioned, with zero or one argument type, writes one VarUInt64
 ///   per row (`AggregateFunctionCount::serialize`). `count` is strictly unary,
 ///   so `createAggregateFunctionCount` throws for more than one argument.
 /// - `nothingUInt64` with a single `Nullable(Nothing)` argument writes one
 ///   `0x00` byte per row (`AggregateFunctionNothingImpl::serialize`).
+/// - `sum` with exactly one non-nullable numeric or Enum argument writes one
+///   fixed-width accumulator per row (`AggregateFunctionSumData::write`); see
+///   [`sum_state_width`] for the exact argument-to-width mapping.
 ///
 /// The one exception carved out of `count` is `count, Nullable(Nothing)`.
 /// Parsing the type string `AggregateFunction(count, Nullable(Nothing))` resolves
@@ -75,7 +135,8 @@ fn is_nullable_nothing(arg: &ChType) -> bool {
 /// `AggregateFunctions/Combinators/AggregateFunctionNull.cpp`,
 /// `AggregateFunctionNothingImpl::serialize`/`deserialize` in
 /// `AggregateFunctions/AggregateFunctionNothing.h`, and
-/// `DataTypeAggregateFunction::getNameImpl`.
+/// `DataTypeAggregateFunction::getNameImpl`, plus the sum references on
+/// [`sum_state_width`].
 pub(crate) fn aggregate_state_codec(ch_type: &ChType) -> Option<AggregateStateCodec> {
     let ChType::AggregateFunction {
         function,
@@ -91,6 +152,8 @@ pub(crate) fn aggregate_state_codec(ch_type: &ChType) -> Option<AggregateStateCo
         "nothingUInt64" if arguments.len() == 1 && is_nullable_nothing(&arguments[0]) => {
             Some(AggregateStateCodec::NothingUInt64)
         }
+        "sum" if arguments.len() == 1 => sum_state_width(&arguments[0])
+            .map(|state_width| AggregateStateCodec::Sum { state_width }),
         _ => None,
     }
 }
@@ -114,10 +177,10 @@ pub(crate) fn decode_state_codec(ch_type: &ChType) -> Result<AggregateStateCodec
 /// `AggregateFunction(count[, T])` uses one unsigned VarUInt64 per state
 /// (`AggregateFunctionCount::serialize` / `deserialize` at
 /// `v26.6.1.1193-stable`); `AggregateFunction(nothingUInt64, Nullable(Nothing))`
-/// uses one `0x00` byte per state. The walk records row ends while validating
-/// each state, then copies the complete contiguous run once. There is one
-/// offsets allocation and one data allocation per column, with no per-row
-/// allocation.
+/// uses one `0x00` byte per state; exact base `sum` uses the fixed accumulator
+/// width selected by its argument. The walk records row ends while validating
+/// each state, then copies the complete contiguous run once. There is one offsets
+/// allocation and one data allocation per column, with no per-row allocation.
 pub(crate) fn decode_aggregate_states(
     reader: &mut ByteReader<'_>,
     codec: AggregateStateCodec,
@@ -212,6 +275,35 @@ pub(crate) fn scan_aggregate_states(
                 }
             }
         }
+        // Exact base `sum` is a fixed-width POD accumulator with no semantic
+        // deserialize validation. Bounds-check the complete run once, then form
+        // Arrow offsets arithmetically. `checked_mul` handles hostile row counts
+        // without wrapping; a short available run remains UnexpectedEof so the
+        // streaming decoder can request more bytes.
+        AggregateStateCodec::Sum { state_width } => {
+            let total = num_rows.checked_mul(state_width).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "aggregate sum state byte length overflow",
+                )
+            })?;
+            bytes.get(..total).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "failed to fill whole buffer")
+            })?;
+            pos = total;
+            if let Some(offsets) = collect {
+                i64::try_from(total).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "aggregate state data exceeds Arrow LargeBinary offset range",
+                    )
+                })?;
+                // `total == num_rows * state_width` was checked above, so each
+                // intermediate product is in range. The one i64 check on total
+                // proves every smaller end offset can be cast without narrowing.
+                offsets.extend((1..=num_rows).map(|i| (i * state_width) as i64));
+            }
+        }
     }
 
     // Advance the shared cursor past the whole run in one step. Every byte in
@@ -232,5 +324,8 @@ pub(crate) fn is_valid_aggregate_state(bytes: &[u8], codec: AggregateStateCodec)
         // Exactly one `0x00` byte: the server's `nothingUInt64` placeholder. A
         // nonzero byte, an empty slice, or trailing bytes are all invalid.
         AggregateStateCodec::NothingUInt64 => bytes == [0x00],
+        // The server reads one raw accumulator and performs no value-level
+        // validation. Exact width is the entire row-boundary contract.
+        AggregateStateCodec::Sum { state_width } => bytes.len() == state_width,
     }
 }

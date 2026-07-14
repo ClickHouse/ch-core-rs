@@ -385,7 +385,22 @@ SELECT
     -- string is the authentic construction: countState(toNullable(NULL)) constant-
     -- folds away, but CAST(unhex('00'), '...') emits the canonical header with the
     -- one-zero-byte state (live-confirmed at v26.6.1.1193-stable).
-    CAST(unhex('00'), 'AggregateFunction(nothingUInt64, Nullable(Nothing))') AS agg_nothing
+    CAST(unhex('00'), 'AggregateFunction(nothingUInt64, Nullable(Nothing))') AS agg_nothing,
+    -- Exact base sum has one fixed-width accumulator per row and no generic
+    -- state framing. These representatives cover every accumulator width and
+    -- the special numeric/Enum promotion families. range(n) yields sums
+    -- 0, 0, 1, and 3 across the four rows.
+    arrayReduce('sumState', arrayMap(x -> toUInt8(x), range(n))) AS agg_sum_u8,
+    -- BFloat16 accumulates and serializes as one Float64 (8-byte) state.
+    arrayReduce('sumState', arrayMap(x -> toBFloat16(x), range(n))) AS agg_sum_bf,
+    -- Decimal32/64/128 sum into a 16-byte Decimal128 scaled integer. Scale 2
+    -- makes the four unscaled states 0, 0, 100, and 300.
+    arrayReduce('sumState', arrayMap(x -> toDecimal32(x, 2), range(n))) AS agg_sum_d32,
+    -- UInt256 keeps its native 32-byte accumulator width.
+    arrayReduce('sumState', arrayMap(x -> toUInt256(x), range(n))) AS agg_sum_u256,
+    -- Enum8 and Enum16 both sum into signed Int64 states; one Enum8 fixture is
+    -- enough to ground the explicit Enum dispatch against real server bytes.
+    arrayReduce('sumState', arrayMap(x -> CAST(x, 'Enum8(\'zero\' = 0, \'one\' = 1, \'two\' = 2)'), range(n))) AS agg_sum_e8
 FROM numbers(4)
 SETTINGS allow_suspicious_low_cardinality_types = 1, enable_nullable_tuple_type = 1, enable_time_time64_type = 1, flatten_nested = 0
 FORMAT Native

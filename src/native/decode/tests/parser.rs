@@ -1002,10 +1002,42 @@ fn parse_aggregate_function_nothing_uint64_signature_and_display() {
 }
 
 #[test]
+fn parse_aggregate_function_sum_signatures_and_display() {
+    // Every exact base sum argument accepted by the server is registered. The
+    // list covers every accumulator promotion and both Enum widths.
+    for type_name in [
+        "AggregateFunction(sum, Bool)",
+        "AggregateFunction(sum, UInt8)",
+        "AggregateFunction(sum, UInt16)",
+        "AggregateFunction(sum, UInt32)",
+        "AggregateFunction(sum, UInt64)",
+        "AggregateFunction(sum, Int8)",
+        "AggregateFunction(sum, Int16)",
+        "AggregateFunction(sum, Int32)",
+        "AggregateFunction(sum, Int64)",
+        "AggregateFunction(sum, UInt128)",
+        "AggregateFunction(sum, Int128)",
+        "AggregateFunction(sum, UInt256)",
+        "AggregateFunction(sum, Int256)",
+        "AggregateFunction(sum, BFloat16)",
+        "AggregateFunction(sum, Float32)",
+        "AggregateFunction(sum, Float64)",
+        "AggregateFunction(sum, Decimal(9, 4))",
+        "AggregateFunction(sum, Decimal(18, 4))",
+        "AggregateFunction(sum, Decimal(38, 4))",
+        "AggregateFunction(sum, Decimal(76, 4))",
+        "AggregateFunction(sum, Enum8('debit' = -3, 'credit' = 7))",
+        "AggregateFunction(sum, Enum16('debit' = -300, 'credit' = 700))",
+    ] {
+        let parsed = parse_ch_type(type_name).unwrap_or_else(|| panic!("rejected {type_name}"));
+        assert_eq!(parsed.to_string(), type_name);
+    }
+}
+
+#[test]
 fn parse_aggregate_function_rejects_unregistered_state_layouts() {
     for type_name in [
         "AggregateFunction()",
-        "AggregateFunction(sum, UInt64)",
         "AggregateFunction(countDistinct, UInt64)",
         "AggregateFunction(count, UInt8, UInt16)",
         "AggregateFunction(1, count)",
@@ -1019,6 +1051,17 @@ fn parse_aggregate_function_rejects_unregistered_state_layouts() {
         "AggregateFunction(nothingUInt64)",
         "AggregateFunction(nothingUInt64, UInt64)",
         "AggregateFunction(nothingUInt64, Nothing)",
+        // Exact base sum is unary and currently excludes its Nullable adapter,
+        // non-numeric types, and every other sum-family function name.
+        "AggregateFunction(sum)",
+        "AggregateFunction(sum, UInt8, UInt16)",
+        "AggregateFunction(sum, Nullable(UInt64))",
+        "AggregateFunction(sum, LowCardinality(UInt64))",
+        "AggregateFunction(sum, String)",
+        "AggregateFunction(sum, DateTime64(3))",
+        "AggregateFunction(sum, IPv4)",
+        "AggregateFunction(sum, IntervalDay)",
+        "AggregateFunction(sumWithOverflow, UInt64)",
         "Nullable(AggregateFunction(count))",
     ] {
         assert_eq!(parse_ch_type(type_name), None, "accepted {type_name}");

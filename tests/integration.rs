@@ -458,6 +458,51 @@ fn assert_all_types(batch: &ChunkedBatch) {
                     arguments: vec![ChType::Nullable(Box::new(ChType::Nothing))],
                 },
             ),
+            Expected::Exact(
+                "agg_sum_u8",
+                ChType::AggregateFunction {
+                    function: "sum".to_string(),
+                    arguments: vec![ChType::UInt8],
+                },
+            ),
+            Expected::Exact(
+                "agg_sum_bf",
+                ChType::AggregateFunction {
+                    function: "sum".to_string(),
+                    arguments: vec![ChType::BFloat16],
+                },
+            ),
+            Expected::Exact(
+                "agg_sum_d32",
+                ChType::AggregateFunction {
+                    function: "sum".to_string(),
+                    arguments: vec![ChType::Decimal {
+                        precision: 9,
+                        scale: 2,
+                        bits: 32,
+                    }],
+                },
+            ),
+            Expected::Exact(
+                "agg_sum_u256",
+                ChType::AggregateFunction {
+                    function: "sum".to_string(),
+                    arguments: vec![ChType::UInt256],
+                },
+            ),
+            Expected::Exact(
+                "agg_sum_e8",
+                ChType::AggregateFunction {
+                    function: "sum".to_string(),
+                    arguments: vec![ChType::Enum8 {
+                        variants: vec![
+                            ("zero".to_string(), 0),
+                            ("one".to_string(), 1),
+                            ("two".to_string(), 2),
+                        ],
+                    }],
+                },
+            ),
         ],
     );
 
@@ -1544,6 +1589,76 @@ fn assert_all_types(batch: &ChunkedBatch) {
         Column::AggregateState(c) => {
             assert_eq!(c.offsets, vec![0i64, 1, 2, 3, 4]);
             assert_eq!(c.data, vec![0x00, 0x00, 0x00, 0x00]);
+        }
+        other => panic!("expected AggregateState, got {other:?}"),
+    }
+
+    let sum_values = [0u64, 0, 1, 3];
+
+    // AggregateFunction(sum, UInt8) (col 97): UInt8 promotes to one UInt64
+    // accumulator per row, serialized as 8 little-endian bytes.
+    match block.column(97) {
+        Column::AggregateState(c) => {
+            assert_eq!(c.offsets, vec![0i64, 8, 16, 24, 32]);
+            let expected: Vec<u8> = sum_values.into_iter().flat_map(u64::to_le_bytes).collect();
+            assert_eq!(c.data, expected);
+        }
+        other => panic!("expected AggregateState, got {other:?}"),
+    }
+
+    // AggregateFunction(sum, BFloat16) (col 98): BFloat16 promotes to Float64.
+    match block.column(98) {
+        Column::AggregateState(c) => {
+            assert_eq!(c.offsets, vec![0i64, 8, 16, 24, 32]);
+            let expected: Vec<u8> = [0.0f64, 0.0, 1.0, 3.0]
+                .into_iter()
+                .flat_map(f64::to_le_bytes)
+                .collect();
+            assert_eq!(c.data, expected);
+        }
+        other => panic!("expected AggregateState, got {other:?}"),
+    }
+
+    // AggregateFunction(sum, Decimal(9, 2)) (col 99): Decimal32 promotes to a
+    // 16-byte Decimal128 state containing the raw scaled integer.
+    match block.column(99) {
+        Column::AggregateState(c) => {
+            assert_eq!(c.offsets, vec![0i64, 16, 32, 48, 64]);
+            let expected: Vec<u8> = [0i128, 0, 100, 300]
+                .into_iter()
+                .flat_map(i128::to_le_bytes)
+                .collect();
+            assert_eq!(c.data, expected);
+        }
+        other => panic!("expected AggregateState, got {other:?}"),
+    }
+
+    // AggregateFunction(sum, UInt256) (col 100): the accumulator stays 32 bytes.
+    match block.column(100) {
+        Column::AggregateState(c) => {
+            assert_eq!(c.offsets, vec![0i64, 32, 64, 96, 128]);
+            let expected: Vec<u8> = sum_values
+                .into_iter()
+                .flat_map(|value| {
+                    let mut bytes = [0u8; 32];
+                    bytes[..8].copy_from_slice(&value.to_le_bytes());
+                    bytes
+                })
+                .collect();
+            assert_eq!(c.data, expected);
+        }
+        other => panic!("expected AggregateState, got {other:?}"),
+    }
+
+    // AggregateFunction(sum, Enum8(...)) (col 101): Enum8 promotes to Int64.
+    match block.column(101) {
+        Column::AggregateState(c) => {
+            assert_eq!(c.offsets, vec![0i64, 8, 16, 24, 32]);
+            let expected: Vec<u8> = [0i64, 0, 1, 3]
+                .into_iter()
+                .flat_map(i64::to_le_bytes)
+                .collect();
+            assert_eq!(c.data, expected);
         }
         other => panic!("expected AggregateState, got {other:?}"),
     }

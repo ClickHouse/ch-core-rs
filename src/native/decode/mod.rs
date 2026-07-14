@@ -1252,10 +1252,11 @@ fn decode_column_body(
         // back-to-back with no generic length framing. The shared registry
         // admits only layouts whose row boundary is confirmed. At
         // v26.6.1.1193-stable, `AggregateFunction(count[, T])` is one VarUInt64
-        // per row and `AggregateFunction(nothingUInt64, Nullable(Nothing))` is
-        // one 0x00 byte per row. Preserve each state's exact serialized bytes in
-        // LargeBinary layout; the argument types are metadata and do not recurse
-        // here.
+        // per row, `AggregateFunction(nothingUInt64, Nullable(Nothing))` is one
+        // 0x00 byte per row, and exact base `sum` over a non-nullable numeric or
+        // Enum is one fixed-width accumulator. Preserve each state's exact
+        // serialized bytes in LargeBinary layout; the argument types are
+        // metadata and do not recurse here.
         ChType::AggregateFunction { .. } => {
             // `can_be_inside_nullable` excludes `AggregateFunction`, so
             // `parse_ch_type` never yields `Nullable(AggregateFunction(...))` and

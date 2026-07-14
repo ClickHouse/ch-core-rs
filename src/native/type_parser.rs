@@ -186,10 +186,11 @@ fn parse_ch_type_depth(type_name: &str, depth: usize) -> Option<ChType> {
     // serialization. Native adds no generic length prefix, so parsing is
     // deliberately gated by `aggregate_state_codec`: an unknown function must
     // remain UnsupportedType even for zero rows, otherwise the streaming scan
-    // could not locate the next column. At v26.6.1.1193-stable the first
-    // supported codec is exact `count`, with zero or one argument type. Each
-    // argument is type metadata but still recurses at depth + 1 so hostile
-    // nested headers remain bounded by MAX_TYPE_DEPTH.
+    // could not locate the next column. At v26.6.1.1193-stable the registered
+    // codecs are exact `count`, canonical `nothingUInt64`, and exact base `sum`
+    // over one non-nullable numeric or Enum argument. Each argument is type
+    // metadata but still recurses at depth + 1 so hostile nested headers remain
+    // bounded by MAX_TYPE_DEPTH.
     //
     // No state version is parsed. The server omits version 0 from canonical
     // names and emits no other version at the pin, so the first token is always

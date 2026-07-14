@@ -47,30 +47,29 @@ point-in-time snapshot for the next agent, not a changelog. Keep it short. Alway
 include a "Recommended next" with a one-line reason, so the next agent has a
 default; the user may override it.
 
-- **Last updated:** 2026-07-14. Tier 3 `AggregateFunction(...)` now has two
-  function-specific state codecs at decode/encode parity: exact unversioned base
-  `count` (zero or one argument, `T != Nullable(Nothing)`) writing one VarUInt64
-  per row, and `nothingUInt64` with a single `Nullable(Nothing)` argument writing
-  one `0x00` byte per row. The latter closed the confirmed gap that
-  `count(Nullable(Nothing))` canonicalizes to `nothingUInt64` on the wire.
-  Parser, streaming scan, zero-row and multi-block handling, `Array` composition,
-  Arrow LargeBinary, state-offset validation, real-server fixtures, and live
-  INSERT + `finalizeAggregation` are covered for both. The broad AggregateFunction
-  item remains open because Native has no generic state framing and every function
-  family needs its own boundary codec.
+- **Last updated:** 2026-07-14. Tier 3 `AggregateFunction(...)` now has three
+  function-specific state codecs at decode/encode parity: exact `count`,
+  canonical `nothingUInt64`, and exact base `sum` over every non-nullable
+  numeric and Enum argument accepted by the pinned server. Sum state widths are
+  8 bytes for Bool, native <=64-bit integers, floats/BFloat16, and Enums; 16
+  bytes for 128-bit integers and Decimal32/64/128; and 32 bytes for 256-bit
+  integers and Decimal256. Parser, streaming scan, zero-row and multi-block
+  handling, `Array` composition, Arrow LargeBinary, state validation,
+  real-server fixtures, and live INSERT + `finalizeAggregation` are covered.
+  The broad item remains open because Native has no generic state framing.
 - **Implementation shape:**
   `ChType::AggregateFunction { function, arguments }` plus
   `Column::AggregateState(AggregateStateColumn { offsets: Vec<i64>, data })`.
   `src/native/aggregate_function.rs` is the single state-codec registry shared
-  by decode, `block_end`, and encode validation. `AggregateStateCodec` has two
+  by decode, `block_end`, and encode validation. `AggregateStateCodec` has three
   variants: `Count` (one unsigned VarUInt64 per row, preserved byte-for-byte) and
   `NothingUInt64` (one `0x00` byte per row; decode rejects any nonzero byte as
   `InvalidData`, mirroring the server's `INCORRECT_DATA`; encode requires each
-  row to be exactly `[0x00]`). Decode records row-end offsets and copies the
-  contiguous body once; the `NothingUInt64` walk is the trivial fixed-width case
-  (bounds-check `num_rows` bytes once, verify all zero, fill offsets `i -> i`).
-  Arrow exports `Z` LargeBinary; encode validates each slice then writes the data
-  once. Unknown functions are rejected at header time even for zero rows.
+  row to be exactly `[0x00]`), plus `Sum { state_width }`. Sum decode checks the
+  complete `num_rows * state_width` run once, computes i64 offsets
+  arithmetically, and copies the contiguous body once. Arrow exports `Z`
+  LargeBinary; encode requires each row slice to have the selected width, then
+  writes the data once. Unknown functions are rejected even for zero rows.
 - **Pinned server tag:** `v26.6.1.1193-stable`, protocol revision **54485**.
   Confirmed server paths for this item:
   `DataTypes/Serializations/SerializationAggregateFunction.{h,cpp}`
@@ -85,24 +84,28 @@ default; the user may override it.
   (`AggregateFunctionCombinatorNull::transformAggregateFunction`, the count ->
   nothingUInt64 collapse), `IO/VarInt.h`,
   `DataTypes/DataTypeAggregateFunction.{h,cpp}` (`getNameImpl` canonical name and
-  wrapper capabilities), and `Formats/NativeReader.cpp` / `NativeWriter.cpp`. The
+  wrapper capabilities), `AggregateFunctions/AggregateFunctionSum.{h,cpp}`
+  (`createAggregateFunctionSum`, `SumSimple`,
+  `AggregateFunctionSumData::write`/`read`),
+  `AggregateFunctions/Helpers.h` (`createWithNumericType`,
+  `createWithDecimalType`), `Core/Field.h` (`NearestFieldTypeImpl`), and
+  `Formats/NativeReader.cpp` / `NativeWriter.cpp`. The
   AggregateFunction data type's historical introduction version remains
   undetermined. The count function docs say 1.1, which does not establish the
   data type's introduction.
 - **Scope:** completeness still means uncompressed HTTP `FORMAT Native`; TCP and
   the currently unwired compression framing remain out of scope.
-- **Build/test status:** `cargo test` is green (578 unit + 3 integration; 5 live
+- **Build/test status:** `cargo test` is green (590 unit + 3 integration; 6 live
   tests and the doctest remain ignored). The two `all_types` fixtures were
-  recaptured from ClickHouse 26.6.1.1193 at 97 columns (leading varint `0x61`)
-  for revisions 0 and 54485, adding `agg_nothing`
-  (`AggregateFunction(nothingUInt64, Nullable(Nothing))`, four `0x00` states)
-  alongside the count states 0, 1, 2, 3. The dedicated live count-state and
-  nothingUInt64 INSERT/finalize tests pass against the same server version.
-  `cargo build`, fmt, clippy with `-D warnings`, and `git diff --check` are clean.
-- **Recommended next:** add the exact base **`AggregateFunction(sum, T)`** codec
-  for non-nullable numeric and Enum `T`. The server read already confirmed its
-  fixed accumulator-width mapping; keep nullable `sum` deferred because its Null
-  adapter adds a flag and conditional body.
+  recaptured from ClickHouse 26.6.1.1193 at 102 columns (leading varint `0x66`)
+  for revisions 0 and 54485. The final five sum columns cover UInt8, BFloat16,
+  Decimal32, UInt256, and Enum8 states. The dedicated live sum INSERT/finalize
+  test passes for Int32, Decimal32, UInt256, and Enum8 arguments against the same
+  server version. `cargo build`, fmt, clippy with `-D warnings`, and
+  `git diff --check` are clean.
+- **Recommended next:** confirm and add exact **nullable `sum`** state codecs for
+  numeric and Enum arguments. This completes the sum family, but its Null adapter
+  flag and conditional accumulator require a separate authoritative layout read.
 - **Active gotchas / context:**
   - AggregateFunction is not generically opaque-decodable. Native writes each
     concrete function's state immediately after the previous one, with no row
@@ -115,6 +118,16 @@ default; the user may override it.
     Nullable/LowCardinality wrappers are illegal; Array, Tuple, and Map values
     are legal. Protocol revision can select versioned aggregate states even
     though no version word appears in the body; count is unversioned.
+  - Exact base `sum` is unary and parameterless. Its registered direct arguments
+    are Bool, Int8..Int256, UInt8..UInt256, BFloat16/Float32/Float64,
+    Enum8/Enum16, and Decimal(P, S). The state is the promoted accumulator, not
+    necessarily the argument width: <=64-bit integers and Enums -> 8 bytes,
+    BFloat16/Float32 -> Float64 (8), 128-bit integers -> 16, 256-bit integers ->
+    32, Decimal32/64/128 -> Decimal128 (16), Decimal256 -> Decimal256 (32).
+    Deserialize performs no semantic value validation. Nullable sum is NOT this
+    layout: the Null adapter adds a flag and conditional nested state, so the
+    registry rejects it until a separate codec lands. Temporal, interval, IP,
+    UUID, String, wrapper, and container arguments are also rejected.
   - `count(Nullable(Nothing))` NEVER reaches the wire under the `count` name: the
     server's Null combinator substitutes `AggregateFunctionNothingUInt64` (count
     registers `returns_default_when_only_null = true` and `Nullable(Nothing)` is
@@ -829,11 +842,12 @@ where the across-release churn lives.
 
 - [~] `AggregateFunction(...)` - function-specific coverage in progress. Exact
       unversioned base `count` with zero or one argument type is done at
-      decode/encode parity, stored as raw state bytes with i64 row offsets and
-      exported as Arrow LargeBinary. The generic item stays open because Native
-      has no state/column length framing; each additional function needs a
-      confirmed boundary codec. Recommended next: exact base `sum` for
-      non-nullable numeric and Enum arguments.
+      decode/encode parity, as are canonical `nothingUInt64` and exact base
+      `sum` for every non-nullable numeric and Enum argument. States are stored
+      as raw bytes with i64 row offsets and exported as Arrow LargeBinary. The
+      generic item stays open because Native has no state/column length framing;
+      each additional signature needs a confirmed boundary codec. Recommended
+      next: nullable `sum`, whose Null adapter adds a flag and conditional body.
 - [ ] `Variant(...)` - discriminator stream plus per-variant columns.
 - [ ] `Dynamic` - self-describing, carries its own type info; optional
       `Dynamic(max_types=N)` form.

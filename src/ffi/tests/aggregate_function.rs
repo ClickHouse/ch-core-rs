@@ -114,6 +114,55 @@ fn export_nothing_uint64_state_as_large_binary_zero_copy() {
 }
 
 #[test]
+fn export_sum_state_as_large_binary_zero_copy() {
+    // Fixed-width sum states use the same generic LargeBinary export. The
+    // logical type retains the accumulator contract while Arrow receives exact
+    // row slices without converting them into host numeric values.
+    let batch = Arc::new(ColBatch::new(
+        Schema::new(vec![Field {
+            name: "s".into(),
+            ch_type: ChType::AggregateFunction {
+                function: "sum".into(),
+                arguments: vec![ChType::UInt128],
+            },
+        }]),
+        vec![Column::AggregateState(AggregateStateColumn::new(
+            vec![0, 16, 32],
+            vec![0x0d; 32],
+        ))],
+        2,
+    ));
+
+    // Safety: both outputs are writable zeroed C Data structs. The batch owns
+    // the offsets and state data until both release callbacks run.
+    unsafe {
+        let mut schema: ArrowSchema = std::mem::zeroed();
+        export_schema(&batch.schema, &mut schema);
+        let field = &**schema.children.add(0);
+        assert_eq!(CStr::from_ptr(field.format).to_str().unwrap(), "Z");
+        (schema.release.unwrap())(&mut schema);
+
+        let mut array: ArrowArray = std::mem::zeroed();
+        export_batch_array(&batch, &mut array);
+        let child = &**array.children.add(0);
+        assert_eq!(child.length, 2);
+        assert_eq!(child.null_count, 0);
+        let offsets = *child.buffers.add(1) as *const i64;
+        let data = *child.buffers.add(2) as *const u8;
+        match batch.column(0) {
+            Column::AggregateState(c) => {
+                assert_eq!(offsets, c.offsets.as_ptr());
+                assert_eq!(data, c.data.as_ptr());
+            }
+            other => panic!("expected AggregateState, got {other:?}"),
+        }
+        assert_eq!(*offsets.add(2), 32);
+        assert_eq!(std::slice::from_raw_parts(data, 32), &[0x0d; 32]);
+        (array.release.unwrap())(&mut array);
+    }
+}
+
+#[test]
 fn export_zero_row_count_state_has_large_binary_offsets() {
     let batch = Arc::new(ColBatch::new(
         Schema::new(vec![Field {

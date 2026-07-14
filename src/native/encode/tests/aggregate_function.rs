@@ -56,6 +56,139 @@ fn rev0_frames_count_state_bytes_verbatim() {
     assert_batches_eq(&batch, &decoded.chunks[0]);
 }
 
+fn sum_batch() -> ColBatch {
+    let mut uint_states = Vec::new();
+    let mut decimal_states = Vec::new();
+    let mut wide_states = Vec::new();
+    let mut enum_states = Vec::new();
+    for value in [0u64, 13, 79] {
+        uint_states.extend_from_slice(&value.to_le_bytes());
+        decimal_states.extend_from_slice(&((value as i128) * 100).to_le_bytes());
+        wide_states.extend_from_slice(&value.to_le_bytes());
+        wide_states.extend_from_slice(&[0u8; 24]);
+        enum_states.extend_from_slice(&(value as i64).to_le_bytes());
+    }
+
+    ColBatch::new(
+        Schema::new(vec![
+            Field {
+                name: "u".into(),
+                ch_type: parse_ch_type("AggregateFunction(sum, UInt8)").unwrap(),
+            },
+            Field {
+                name: "d".into(),
+                ch_type: parse_ch_type("AggregateFunction(sum, Decimal(9, 2))").unwrap(),
+            },
+            Field {
+                name: "w".into(),
+                ch_type: parse_ch_type("AggregateFunction(sum, UInt256)").unwrap(),
+            },
+            Field {
+                name: "e".into(),
+                ch_type: parse_ch_type(
+                    "AggregateFunction(sum, Enum8('zero' = 0, 'thirteen' = 13, 'seventy_nine' = 79))",
+                )
+                .unwrap(),
+            },
+        ]),
+        vec![
+            Column::AggregateState(AggregateStateColumn::new(
+                vec![0, 8, 16, 24],
+                uint_states,
+            )),
+            Column::AggregateState(AggregateStateColumn::new(
+                vec![0, 16, 32, 48],
+                decimal_states,
+            )),
+            Column::AggregateState(AggregateStateColumn::new(
+                vec![0, 32, 64, 96],
+                wide_states,
+            )),
+            Column::AggregateState(AggregateStateColumn::new(
+                vec![0, 8, 16, 24],
+                enum_states,
+            )),
+        ],
+        3,
+    )
+}
+
+#[test]
+fn roundtrip_sum_states_rev0() {
+    roundtrip(&sum_batch(), 0);
+}
+
+#[test]
+fn roundtrip_sum_states_tcp_revision() {
+    roundtrip(&sum_batch(), DBMS_TCP_PROTOCOL_VERSION);
+}
+
+#[test]
+fn rev0_frames_sum_state_bytes_verbatim() {
+    let states = [13u64.to_le_bytes(), 79u64.to_le_bytes()].concat();
+    let batch = ColBatch::new(
+        Schema::new(vec![Field {
+            name: "s".into(),
+            ch_type: parse_ch_type("AggregateFunction(sum, UInt8)").unwrap(),
+        }]),
+        vec![Column::AggregateState(AggregateStateColumn::new(
+            vec![0, 8, 16],
+            states.clone(),
+        ))],
+        2,
+    );
+
+    let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+    assert!(bytes.ends_with(&states));
+    let decoded = decode_all_bytes(&bytes, &DecodeOptions::default()).unwrap();
+    assert_batches_eq(&batch, &decoded.chunks[0]);
+}
+
+#[test]
+fn zero_row_sum_state_encodes_schema_without_body() {
+    let batch = ColBatch::new(
+        Schema::new(vec![Field {
+            name: "s".into(),
+            ch_type: parse_ch_type("AggregateFunction(sum, BFloat16)").unwrap(),
+        }]),
+        vec![Column::AggregateState(AggregateStateColumn::new(
+            vec![0],
+            vec![],
+        ))],
+        0,
+    );
+
+    let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+    let decoded = decode_all_bytes(&bytes, &DecodeOptions::default()).unwrap();
+    assert_eq!(decoded.num_chunks(), 0);
+    assert_eq!(decoded.schema, batch.schema);
+}
+
+#[test]
+fn sum_state_validation_rejects_wrong_width_states() {
+    for (type_name, wrong_width) in [
+        ("AggregateFunction(sum, UInt64)", 7),
+        ("AggregateFunction(sum, Decimal(9, 2))", 15),
+        ("AggregateFunction(sum, UInt256)", 33),
+    ] {
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "s".into(),
+                ch_type: parse_ch_type(type_name).unwrap(),
+            }]),
+            vec![Column::AggregateState(AggregateStateColumn::new(
+                vec![0, wrong_width as i64],
+                vec![0x0d; wrong_width],
+            ))],
+            1,
+        );
+        assert!(matches!(
+            encode_block(&batch, &EncodeOptions::default()),
+            Err(EncodeError::InconsistentBatch { .. })
+        ));
+    }
+}
+
 #[test]
 fn zero_row_count_state_encodes_schema_without_body() {
     let batch = ColBatch::new(
@@ -205,7 +338,7 @@ fn unsupported_aggregate_function_is_not_encodable() {
         schema: Schema::new(vec![Field {
             name: "s".into(),
             ch_type: ChType::AggregateFunction {
-                function: "sum".into(),
+                function: "avg".into(),
                 arguments: vec![ChType::UInt64],
             },
         }]),

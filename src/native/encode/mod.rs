@@ -19,11 +19,12 @@
 //! encodable element type (including nested arrays), `Tuple(T1, ...)`
 //! (named or unnamed, including the zero-element `Tuple()`) over encodable
 //! element types, and `Map(K, V)` for a legal key type and any encodable
-//! key/value types, plus exact unversioned `AggregateFunction(count[, T])`
-//! serialized states. The plain types and `Tuple` also compose inside a
+//! key/value types, plus the registered exact `AggregateFunction` state codecs:
+//! `count`, canonical `nothingUInt64`, and base `sum` over one non-nullable
+//! numeric or Enum argument. The plain types and `Tuple` also compose inside a
 //! `Nullable(T)` wrapper (a per-row null map precedes the inner values). Every
-//! other column type returns [`EncodeError::UnsupportedType`] until its
-//! encoder lands, the same one-type-at-a-time growth the decode path follows.
+//! other column type returns [`EncodeError::UnsupportedType`] until its encoder
+//! lands, the same one-type-at-a-time growth the decode path follows.
 
 use crate::batch::{ChunkedBatch, ColBatch};
 use crate::column::{

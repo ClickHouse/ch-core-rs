@@ -41,6 +41,7 @@ const LC_U16_TABLE: &str = "ch_core_rs_encode_lc_u16_test";
 const GSN_TABLE: &str = "ch_core_rs_encode_gsn_test";
 const AGG_COUNT_TABLE: &str = "ch_core_rs_encode_agg_count_test";
 const AGG_NOTHING_TABLE: &str = "ch_core_rs_encode_agg_nothing_test";
+const AGG_SUM_TABLE: &str = "ch_core_rs_encode_agg_sum_test";
 
 /// Build a `Utf8Column` from raw byte values, computing Arrow offsets the same
 /// way the decoder does.
@@ -1496,6 +1497,142 @@ fn aggregate_function_nothing_uint64_roundtrips_through_server() {
     match decoded.chunks[0].column(1) {
         Column::UInt64(c) => assert_eq!(c.values, vec![0, 0, 0]),
         other => panic!("expected finalized UInt64 counts, got {other:?}"),
+    }
+}
+
+#[test]
+#[ignore = "requires a live ClickHouse server matching .server-ref; run with --ignored"]
+fn aggregate_function_sum_roundtrips_through_server() {
+    let server = Server::from_env();
+
+    let mut int_states = Vec::new();
+    let mut decimal_states = Vec::new();
+    let mut wide_states = Vec::new();
+    let mut enum_states = Vec::new();
+    for ((int_value, decimal_value), (wide_value, enum_value)) in
+        [(-13i64, 1300i128), (0, 0), (79, -7900)].into_iter().zip([
+            (13u64, 0i64),
+            (79, 4),
+            (258, 14),
+        ])
+    {
+        int_states.extend_from_slice(&int_value.to_le_bytes());
+        decimal_states.extend_from_slice(&decimal_value.to_le_bytes());
+        wide_states.extend_from_slice(&wide_value.to_le_bytes());
+        wide_states.extend_from_slice(&[0u8; 24]);
+        enum_states.extend_from_slice(&enum_value.to_le_bytes());
+    }
+
+    let batch = ColBatch::new(
+        Schema::new(vec![
+            Field {
+                name: "id".into(),
+                ch_type: ChType::UInt8,
+            },
+            Field {
+                name: "i".into(),
+                ch_type: ChType::AggregateFunction {
+                    function: "sum".into(),
+                    arguments: vec![ChType::Int32],
+                },
+            },
+            Field {
+                name: "d".into(),
+                ch_type: ChType::AggregateFunction {
+                    function: "sum".into(),
+                    arguments: vec![ChType::Decimal {
+                        precision: 9,
+                        scale: 2,
+                        bits: 32,
+                    }],
+                },
+            },
+            Field {
+                name: "w".into(),
+                ch_type: ChType::AggregateFunction {
+                    function: "sum".into(),
+                    arguments: vec![ChType::UInt256],
+                },
+            },
+            Field {
+                name: "e".into(),
+                ch_type: ChType::AggregateFunction {
+                    function: "sum".into(),
+                    arguments: vec![ChType::Enum8 {
+                        variants: vec![("debit".into(), -3), ("credit".into(), 7)],
+                    }],
+                },
+            },
+        ]),
+        vec![
+            Column::UInt8(PrimitiveColumn::new(vec![0, 1, 2])),
+            Column::AggregateState(AggregateStateColumn::new(vec![0, 8, 16, 24], int_states)),
+            Column::AggregateState(AggregateStateColumn::new(
+                vec![0, 16, 32, 48],
+                decimal_states,
+            )),
+            Column::AggregateState(AggregateStateColumn::new(vec![0, 32, 64, 96], wide_states)),
+            Column::AggregateState(AggregateStateColumn::new(vec![0, 8, 16, 24], enum_states)),
+        ],
+        3,
+    );
+
+    server.ddl(&format!("DROP TABLE IF EXISTS {AGG_SUM_TABLE}"));
+    server.ddl(&format!(
+        "CREATE TABLE {AGG_SUM_TABLE} \
+         (id UInt8, i AggregateFunction(sum, Int32), \
+         d AggregateFunction(sum, Decimal(9, 2)), \
+         w AggregateFunction(sum, UInt256), \
+         e AggregateFunction(sum, Enum8('debit' = -3, 'credit' = 7))) ENGINE = Memory"
+    ));
+
+    let bytes = encode_block(&batch, &EncodeOptions::default()).expect("encode sum states");
+    server.insert_native_into(AGG_SUM_TABLE, &bytes);
+
+    let native = server.select(&format!(
+        "SELECT id, finalizeAggregation(i), finalizeAggregation(d), \
+         finalizeAggregation(w), finalizeAggregation(e) \
+         FROM {AGG_SUM_TABLE} ORDER BY id FORMAT Native"
+    ));
+    let decoded =
+        decode_all_bytes(&native, &DecodeOptions::default()).expect("decode finalized sum states");
+    server.ddl(&format!("DROP TABLE IF EXISTS {AGG_SUM_TABLE}"));
+
+    assert_eq!(decoded.num_rows(), 3);
+    let block = &decoded.chunks[0];
+    match block.column(1) {
+        Column::Int64(c) => assert_eq!(c.values, vec![-13, 0, 79]),
+        other => panic!("expected finalized Int64 sums, got {other:?}"),
+    }
+    match block.column(2) {
+        Column::Decimal(c) => {
+            assert_eq!((c.precision, c.scale, c.width), (38, 2, 16));
+            let expected: Vec<u8> = [1300i128, 0, -7900]
+                .into_iter()
+                .flat_map(i128::to_le_bytes)
+                .collect();
+            assert_eq!(c.data, expected);
+        }
+        other => panic!("expected finalized Decimal sums, got {other:?}"),
+    }
+    match block.column(3) {
+        Column::UInt256(c) => {
+            assert_eq!(c.width, 32);
+            let expected: Vec<u8> = [13u64, 79, 258]
+                .into_iter()
+                .flat_map(|value| {
+                    let mut bytes = [0u8; 32];
+                    bytes[..8].copy_from_slice(&value.to_le_bytes());
+                    bytes
+                })
+                .collect();
+            assert_eq!(c.data, expected);
+        }
+        other => panic!("expected finalized UInt256 sums, got {other:?}"),
+    }
+    match block.column(4) {
+        Column::Int64(c) => assert_eq!(c.values, vec![0, 4, 14]),
+        other => panic!("expected finalized Enum Int64 sums, got {other:?}"),
     }
 }
 

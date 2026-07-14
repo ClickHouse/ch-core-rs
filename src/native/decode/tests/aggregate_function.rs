@@ -287,9 +287,170 @@ fn decode_nothing_uint64_truncated_body_is_unexpected_eof() {
 }
 
 #[test]
+fn decode_sum_state_widths_preserve_bytes_and_next_column_boundary() {
+    // The full accepted argument set, grouped by the server-selected
+    // accumulator width. Two arbitrary states plus a trailing UInt8 column prove
+    // materialization and block_end stop at the same fixed boundary.
+    for (case, (argument, width)) in [
+        ("Bool", 8),
+        ("UInt8", 8),
+        ("UInt16", 8),
+        ("UInt32", 8),
+        ("UInt64", 8),
+        ("Int8", 8),
+        ("Int16", 8),
+        ("Int32", 8),
+        ("Int64", 8),
+        ("UInt128", 16),
+        ("Int128", 16),
+        ("UInt256", 32),
+        ("Int256", 32),
+        ("BFloat16", 8),
+        ("Float32", 8),
+        ("Float64", 8),
+        ("Decimal(9, 4)", 16),
+        ("Decimal(18, 4)", 16),
+        ("Decimal(38, 4)", 16),
+        ("Decimal(76, 4)", 32),
+        ("Enum8('debit' = -3, 'credit' = 7)", 8),
+        ("Enum16('debit' = -300, 'credit' = 700)", 8),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let type_name = format!("AggregateFunction(sum, {argument})");
+        // Base sum's deserializer accepts any complete accumulator bit pattern,
+        // so distinct nonzero bytes make exact passthrough easy to assert.
+        let states = vec![(case + 1) as u8; width * 2];
+        let data = BlockBuilder::new()
+            .header(2, 2)
+            .column_header("s", &type_name)
+            .raw_bytes(&states)
+            .column_header("u", "UInt8")
+            .raw_bytes(&[13, 79])
+            .build();
+
+        let decoded = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+        match decoded.chunks[0].column(0) {
+            Column::AggregateState(c) => {
+                assert_eq!(c.offsets, vec![0, width as i64, (width * 2) as i64]);
+                assert_eq!(c.data, states, "state bytes for {type_name}");
+            }
+            other => panic!("expected AggregateState for {type_name}, got {other:?}"),
+        }
+        match decoded.chunks[0].column(1) {
+            Column::UInt8(c) => assert_eq!(c.values, vec![13, 79]),
+            other => panic!("expected trailing UInt8 for {type_name}, got {other:?}"),
+        }
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len()),
+            "block end for {type_name}"
+        );
+    }
+}
+
+#[test]
+fn decode_array_sum_states_composes_with_container_offsets() {
+    let mut states = Vec::new();
+    for value in [13i64, -79, 258] {
+        states.extend_from_slice(&value.to_le_bytes());
+    }
+    let data = BlockBuilder::new()
+        .header(1, 3)
+        .column_header("a", "Array(AggregateFunction(sum, Int32))")
+        .array_offsets(&[2, 2, 3])
+        .raw_bytes(&states)
+        .build();
+
+    let decoded = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+    match decoded.chunks[0].column(0) {
+        Column::Array(c) => {
+            assert_eq!(c.offsets, vec![0, 2, 2, 3]);
+            match c.values.as_ref() {
+                Column::AggregateState(s) => {
+                    assert_eq!(s.offsets, vec![0, 8, 16, 24]);
+                    assert_eq!(s.data, states);
+                }
+                other => panic!("expected aggregate array values, got {other:?}"),
+            }
+        }
+        other => panic!("expected Array, got {other:?}"),
+    }
+}
+
+#[test]
+fn decode_sum_zero_rows_keeps_schema_without_a_chunk() {
+    let data = BlockBuilder::new()
+        .header(1, 0)
+        .column_header("s", "AggregateFunction(sum, Decimal(9, 2))")
+        .build();
+
+    let decoded = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+    assert_eq!(decoded.num_chunks(), 0);
+    assert_eq!(
+        decoded.schema.fields[0].ch_type,
+        parse_ch_type("AggregateFunction(sum, Decimal(9, 2))").unwrap()
+    );
+    assert_eq!(
+        block_end(&data, &DecodeOptions::default()).unwrap(),
+        Some(data.len())
+    );
+}
+
+#[test]
+fn decode_sum_multi_block_keeps_state_buffers_separate() {
+    let mut data = BlockBuilder::new()
+        .header(1, 2)
+        .column_header("s", "AggregateFunction(sum, UInt128)")
+        .raw_bytes(&[0x0d; 32])
+        .build();
+    data.extend_from_slice(
+        &BlockBuilder::new()
+            .header(1, 1)
+            .column_header("s", "AggregateFunction(sum, UInt128)")
+            .raw_bytes(&[0x4f; 16])
+            .build(),
+    );
+
+    let decoded = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+    assert_eq!(decoded.num_chunks(), 2);
+    match decoded.chunks[0].column(0) {
+        Column::AggregateState(c) => assert_eq!(c.data, vec![0x0d; 32]),
+        other => panic!("expected AggregateState, got {other:?}"),
+    }
+    match decoded.chunks[1].column(0) {
+        Column::AggregateState(c) => assert_eq!(c.data, vec![0x4f; 16]),
+        other => panic!("expected AggregateState, got {other:?}"),
+    }
+}
+
+#[test]
+fn decode_sum_truncated_fixed_width_state_is_unexpected_eof() {
+    let data = BlockBuilder::new()
+        .header(1, 2)
+        .column_header("s", "AggregateFunction(sum, UInt256)")
+        .raw_bytes(&[0x0d; 63])
+        .build();
+
+    assert!(matches!(
+        decode_all_bytes(&data, &DecodeOptions::default()),
+        Err(DecodeError::Io(ref error)) if error.kind() == io::ErrorKind::UnexpectedEof
+    ));
+    assert!(matches!(
+        block_end(&data, &DecodeOptions::default()),
+        Err(DecodeError::Io(ref error)) if error.kind() == io::ErrorKind::UnexpectedEof
+    ));
+}
+
+#[test]
 fn unsupported_aggregate_layouts_and_wrappers_are_rejected_at_zero_rows() {
     for type_name in [
-        "AggregateFunction(sum, UInt64)",
+        "AggregateFunction(avg, UInt64)",
+        "AggregateFunction(sum)",
+        "AggregateFunction(sum, Nullable(UInt64))",
+        "AggregateFunction(sum, String)",
+        "AggregateFunction(sum, UInt8, UInt16)",
         "AggregateFunction(count, UInt8, UInt16)",
         "AggregateFunction(1, count)",
         // count(Nullable(Nothing)) canonicalizes to nothingUInt64 on the wire, so
