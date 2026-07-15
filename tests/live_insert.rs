@@ -31,6 +31,7 @@ use ch_core_rs::bitmap::Bitmap;
 use ch_core_rs::column::{
     AggregateStateColumn, ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn,
     FixedBinaryColumn, MapColumn, NothingColumn, PrimitiveColumn, TupleColumn, Utf8Column,
+    VariantColumn,
 };
 use ch_core_rs::native::decode::{decode_all_bytes, DecodeOptions};
 use ch_core_rs::native::encode::{encode_block, EncodeOptions};
@@ -307,6 +308,7 @@ fn sample_batch() -> ColBatch {
             "tn",
             ChType::Tuple(vec![(None, ChType::Nullable(Box::new(ChType::Nothing)))]),
         ),
+        ("v", ChType::Variant(vec![ChType::String, ChType::UInt64])),
     ]
     .into_iter()
     .map(|(name, ch_type)| Field {
@@ -732,6 +734,18 @@ fn sample_batch() -> ColBatch {
             ))],
             4,
         )),
+        // Variant(String, UInt64): intrinsic NULL, String, UInt64, String.
+        // Children are dense and follow canonical alternative order.
+        Column::Variant(
+            VariantColumn::try_new(
+                &[u8::MAX, 0, 1, 0],
+                vec![
+                    Column::Utf8(utf8_column(&[b"user_1", b"user_2"])),
+                    Column::UInt64(PrimitiveColumn::new(vec![13])),
+                ],
+            )
+            .expect("valid Variant test column"),
+        ),
     ];
 
     ColBatch::new(Schema::new(fields), columns, 4)
@@ -1197,6 +1211,22 @@ fn raw_column_repr(column: &Column) -> Vec<String> {
                 })
                 .collect()
         }
+        // Variant stores dense child columns. Render the selected child and
+        // its canonical alternative index so equal physical values in two
+        // alternatives remain distinguishable.
+        Column::Variant(c) => {
+            let variants: Vec<Vec<String>> = c.variants.iter().map(raw_column_repr).collect();
+            (0..c.len())
+                .map(|row| match c.value_position(row) {
+                    Some((u8::MAX, _)) => "NULL".to_string(),
+                    Some((variant, offset)) => format!(
+                        "Variant({variant}, {})",
+                        variants[usize::from(variant)][offset as usize]
+                    ),
+                    None => "INVALID".to_string(),
+                })
+                .collect()
+        }
     }
 }
 
@@ -1272,7 +1302,8 @@ fn insert_roundtrips_through_server() {
          nid Nullable(IntervalDay), lc_ih LowCardinality(IntervalHour), \
          bf BFloat16, nbf Nullable(BFloat16), \
          lc_bf LowCardinality(BFloat16), \
-         tn Tuple(Nullable(Nothing))) ENGINE = Memory"
+         tn Tuple(Nullable(Nothing)), \
+         v Variant(String, UInt64)) ENGINE = Memory"
         ),
         // LowCardinality(Int256) is a suspicious LC inner (a numeric), gated at
         // CREATE time by allow_suspicious_low_cardinality_types (a creation-time
@@ -1305,7 +1336,7 @@ fn insert_roundtrips_through_server() {
          m, m_lc, m_nv, m_arr, arr_m, m_empty, \
          t, t64, nt, nt64, lc_time, \
          iy, iq, imo, iw, id, ih, imi, isecond, ims, ius, ins, nid, lc_ih, \
-         bf, nbf, lc_bf, tn \
+         bf, nbf, lc_bf, tn, v \
          FROM {TABLE} ORDER BY i32 FORMAT Native"
     ));
     let decoded = decode_all_bytes(

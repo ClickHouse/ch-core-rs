@@ -517,6 +517,10 @@ fn assert_all_types(batch: &ChunkedBatch) {
                     arguments: vec![ChType::Nullable(Box::new(ChType::Nothing))],
                 },
             ),
+            Expected::Exact(
+                "variant",
+                ChType::Variant(vec![ChType::String, ChType::UInt64]),
+            ),
         ],
     );
 
@@ -1702,6 +1706,29 @@ fn assert_all_types(batch: &ChunkedBatch) {
             assert_eq!(c.null_count(), 0);
         }
         other => panic!("expected AggregateState, got {other:?}"),
+    }
+
+    // Variant(String, UInt64) (col 104): the server canonicalizes alternatives
+    // by type name, writes BASIC mode 0, then discriminators [NULL, String,
+    // UInt64, String] and dense child bodies. The Arrow-shaped routing buffers
+    // preserve that selection without row materialization.
+    match block.column(104) {
+        Column::Variant(c) => {
+            assert_eq!(c.len(), 4);
+            assert_eq!(c.null_count(), 1);
+            assert_eq!(c.value_position(0), Some((u8::MAX, 0)));
+            assert_eq!(c.value_position(1), Some((0, 0)));
+            assert_eq!(c.value_position(2), Some((1, 0)));
+            assert_eq!(c.value_position(3), Some((0, 1)));
+            match (&c.variants[0], &c.variants[1]) {
+                (Column::Utf8(strings), Column::UInt64(integers)) => {
+                    assert_utf8_column(strings, &[b"user_1" as &[u8], b"user_2"]);
+                    assert_eq!(integers.values, vec![13]);
+                }
+                other => panic!("expected (Utf8, UInt64) Variant children, got {other:?}"),
+            }
+        }
+        other => panic!("expected Variant, got {other:?}"),
     }
 }
 

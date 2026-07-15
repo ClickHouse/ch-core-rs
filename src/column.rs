@@ -581,6 +581,356 @@ impl MapColumn {
     }
 }
 
+/// Maximum number of child type codes in one Arrow union node.
+///
+/// Arrow union type codes are signed Int8 values restricted to `0..=127`.
+/// ClickHouse Variant supports 255 alternatives plus its implicit NULL, so a
+/// Variant with 128 or more alternatives uses a two-level dense-union tree.
+pub const ARROW_UNION_MAX_CHILDREN: usize = 128;
+
+/// One inner Arrow dense-union node for a Variant with 128 or more alternatives.
+///
+/// `first_variant` is the global ClickHouse discriminator represented by local
+/// type id 0. `type_ids` and `offsets` contain only the rows routed to this
+/// group by the outer union node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VariantGroup {
+    pub first_variant: usize,
+    pub type_ids: Vec<i8>,
+    pub offsets: Vec<i32>,
+}
+
+/// Arrow Dense Union routing buffers for a ClickHouse Variant column.
+///
+/// Up to 127 ClickHouse alternatives fit in one union node together with the
+/// implicit NULL child. At 128 through 255 alternatives, `Nested` uses an outer
+/// union whose children are groups of at most 128 alternatives plus the NULL
+/// child. This is the Arrow-prescribed union-of-unions representation for more
+/// than 128 possible types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VariantLayout {
+    Flat {
+        type_ids: Vec<i8>,
+        offsets: Vec<i32>,
+    },
+    Nested {
+        type_ids: Vec<i8>,
+        offsets: Vec<i32>,
+        groups: Vec<VariantGroup>,
+    },
+}
+
+impl VariantLayout {
+    pub fn len(&self) -> usize {
+        match self {
+            VariantLayout::Flat { type_ids, .. } | VariantLayout::Nested { type_ids, .. } => {
+                type_ids.len()
+            }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Invalid input to [`VariantColumn::try_new`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VariantColumnError {
+    InvalidAlternativeCount {
+        count: usize,
+    },
+    InvalidDiscriminator {
+        row: usize,
+        discriminator: u8,
+        alternatives: usize,
+    },
+    ChildOffsetOverflow {
+        row: usize,
+    },
+    ChildLength {
+        alternative: usize,
+        expected: usize,
+        actual: usize,
+    },
+}
+
+impl std::fmt::Display for VariantColumnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VariantColumnError::InvalidAlternativeCount { count } => write!(
+                f,
+                "Variant must have between 1 and 255 alternatives, got {count}"
+            ),
+            VariantColumnError::InvalidDiscriminator {
+                row,
+                discriminator,
+                alternatives,
+            } => write!(
+                f,
+                "Variant row {row} has discriminator {discriminator}, but only {alternatives} alternatives exist"
+            ),
+            VariantColumnError::ChildOffsetOverflow { row } => write!(
+                f,
+                "Variant row {row} exceeds Arrow Dense Union's i32 child-offset range"
+            ),
+            VariantColumnError::ChildLength {
+                alternative,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "Variant alternative {alternative} has {actual} values, expected {expected} from the discriminators"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VariantColumnError {}
+
+/// A ClickHouse `Variant(T1, ...)` column in Arrow Dense Union layout.
+///
+/// ClickHouse writes one global UInt8 discriminator per row, then one compact
+/// child column per alternative. The decoder derives Arrow's signed Int8 type
+/// ids and i32 dense offsets while counting those discriminators. NULL uses the
+/// server's reserved discriminator 255 and is represented by an Arrow Null
+/// child (`nulls`), because Arrow unions have no top-level validity bitmap.
+///
+/// `variants` stays in the canonical ClickHouse alternative order stored by
+/// `ChType::Variant`. Each child contains only its selected rows. `layout` is
+/// flat for at most 127 alternatives and a two-level union for 128 through 255,
+/// preserving both ClickHouse's full range and Arrow's 128-code-per-node limit.
+#[derive(Debug, Clone)]
+pub struct VariantColumn {
+    pub layout: VariantLayout,
+    pub variants: Vec<Column>,
+    pub nulls: NothingColumn,
+}
+
+impl VariantColumn {
+    /// Build a Variant column from ClickHouse global discriminator bytes and
+    /// already-dense alternative columns.
+    ///
+    /// `255` denotes NULL; every other byte must index `variants`. Child lengths
+    /// must equal their discriminator counts. The resulting routing buffers are
+    /// immediately suitable for Arrow Dense Union export.
+    pub fn try_new(
+        discriminators: &[u8],
+        variants: Vec<Column>,
+    ) -> Result<Self, VariantColumnError> {
+        let (layout, counts, null_count) =
+            variant_layout_from_discriminators(discriminators, variants.len())?;
+        for (alternative, (column, expected)) in variants.iter().zip(counts).enumerate() {
+            let actual = column.len();
+            if actual != expected {
+                return Err(VariantColumnError::ChildLength {
+                    alternative,
+                    expected,
+                    actual,
+                });
+            }
+        }
+        Ok(Self::from_parts(layout, variants, null_count))
+    }
+
+    pub(crate) fn from_parts(
+        layout: VariantLayout,
+        variants: Vec<Column>,
+        null_count: usize,
+    ) -> Self {
+        Self {
+            layout,
+            variants,
+            nulls: NothingColumn::new(null_count),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.layout.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.layout.is_empty()
+    }
+
+    /// Number of rows carrying Variant's intrinsic NULL discriminator.
+    pub fn null_count(&self) -> usize {
+        self.nulls.len
+    }
+
+    /// Resolve one row to its global ClickHouse discriminator and dense child
+    /// offset. NULL is returned as discriminator 255.
+    ///
+    /// Returns `None` for a malformed hand-built layout. Every returned offset
+    /// is bounds-checked in O(1): it must be non-negative and index a real row
+    /// of the child it routes to (the selected alternative column, or the NULL
+    /// child for discriminator 255). Decoded columns always satisfy this shape;
+    /// encode validation rejects a malformed layout before the writer calls
+    /// this method.
+    pub fn value_position(&self, row: usize) -> Option<(u8, i32)> {
+        match &self.layout {
+            VariantLayout::Flat { type_ids, offsets } => {
+                let type_id = usize::try_from(*type_ids.get(row)?).ok()?;
+                let offset = *offsets.get(row)?;
+                // A dense offset is an occurrence ordinal, so it must be
+                // non-negative and inside the child it selects.
+                if offset < 0 {
+                    return None;
+                }
+                if type_id < self.variants.len() {
+                    ((offset as usize) < self.variants[type_id].len())
+                        .then_some((type_id as u8, offset))
+                } else if type_id == self.variants.len() {
+                    ((offset as usize) < self.nulls.len).then_some((u8::MAX, offset))
+                } else {
+                    None
+                }
+            }
+            VariantLayout::Nested {
+                type_ids,
+                offsets,
+                groups,
+            } => {
+                let outer_id = usize::try_from(*type_ids.get(row)?).ok()?;
+                let outer_offset = usize::try_from(*offsets.get(row)?).ok()?;
+                if outer_id == groups.len() {
+                    // Outer NULL: the outer offset indexes the NULL child.
+                    if outer_offset >= self.nulls.len {
+                        return None;
+                    }
+                    return Some((u8::MAX, i32::try_from(outer_offset).ok()?));
+                }
+                let group = groups.get(outer_id)?;
+                let local_id = usize::try_from(*group.type_ids.get(outer_offset)?).ok()?;
+                let discriminator = group.first_variant.checked_add(local_id)?;
+                if discriminator >= self.variants.len() {
+                    return None;
+                }
+                // The group offset indexes the selected dense child; it must be
+                // non-negative and inside that child.
+                let child_offset = *group.offsets.get(outer_offset)?;
+                if child_offset < 0 || (child_offset as usize) >= self.variants[discriminator].len()
+                {
+                    return None;
+                }
+                Some((u8::try_from(discriminator).ok()?, child_offset))
+            }
+        }
+    }
+}
+
+/// Derive Arrow Dense Union routing buffers and child counts from ClickHouse's
+/// one-byte global discriminator stream.
+pub(crate) fn variant_layout_from_discriminators(
+    discriminators: &[u8],
+    num_variants: usize,
+) -> Result<(VariantLayout, Vec<usize>, usize), VariantColumnError> {
+    if !(1..=u8::MAX as usize).contains(&num_variants) {
+        return Err(VariantColumnError::InvalidAlternativeCount {
+            count: num_variants,
+        });
+    }
+
+    // Every dense offset (per child and the NULL child) is a monotonic counter
+    // that each row advances by exactly one, so no counter ever exceeds the row
+    // count. Guarding the row count against `i32::MAX` once here establishes the
+    // invariant that every `as i32` in the loops below is non-negative and
+    // lossless, so those hot per-row conversions need no fallible check.
+    if discriminators.len() > i32::MAX as usize {
+        return Err(VariantColumnError::ChildOffsetOverflow {
+            row: i32::MAX as usize,
+        });
+    }
+
+    let mut counts = vec![0usize; num_variants];
+    let mut null_count = 0usize;
+
+    if num_variants < ARROW_UNION_MAX_CHILDREN {
+        let mut type_ids = Vec::with_capacity(discriminators.len());
+        let mut offsets = Vec::with_capacity(discriminators.len());
+        for (row, &discriminator) in discriminators.iter().enumerate() {
+            if discriminator == u8::MAX {
+                type_ids.push(num_variants as i8);
+                // `null_count <= discriminators.len() <= i32::MAX` (guarded
+                // above), so this `as i32` is non-negative and lossless.
+                offsets.push(null_count as i32);
+                null_count += 1;
+                continue;
+            }
+
+            let alternative = discriminator as usize;
+            if alternative >= num_variants {
+                return Err(VariantColumnError::InvalidDiscriminator {
+                    row,
+                    discriminator,
+                    alternatives: num_variants,
+                });
+            }
+            type_ids.push(discriminator as i8);
+            // `counts[alternative] <= row < i32::MAX` (guarded above).
+            offsets.push(counts[alternative] as i32);
+            counts[alternative] += 1;
+        }
+        return Ok((
+            VariantLayout::Flat { type_ids, offsets },
+            counts,
+            null_count,
+        ));
+    }
+
+    let num_groups = num_variants.div_ceil(ARROW_UNION_MAX_CHILDREN);
+    let mut groups = (0..num_groups)
+        .map(|group| VariantGroup {
+            first_variant: group * ARROW_UNION_MAX_CHILDREN,
+            type_ids: Vec::new(),
+            offsets: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let mut group_counts = vec![0usize; num_groups];
+    let mut type_ids = Vec::with_capacity(discriminators.len());
+    let mut offsets = Vec::with_capacity(discriminators.len());
+
+    for (row, &discriminator) in discriminators.iter().enumerate() {
+        if discriminator == u8::MAX {
+            type_ids.push(num_groups as i8);
+            // Guarded above: every counter stays within `i32::MAX`, so the
+            // `as i32` casts in this loop are non-negative and lossless.
+            offsets.push(null_count as i32);
+            null_count += 1;
+            continue;
+        }
+
+        let alternative = discriminator as usize;
+        if alternative >= num_variants {
+            return Err(VariantColumnError::InvalidDiscriminator {
+                row,
+                discriminator,
+                alternatives: num_variants,
+            });
+        }
+        let group_index = alternative / ARROW_UNION_MAX_CHILDREN;
+        let local_id = alternative % ARROW_UNION_MAX_CHILDREN;
+        type_ids.push(group_index as i8);
+        offsets.push(group_counts[group_index] as i32);
+        group_counts[group_index] += 1;
+
+        let group = &mut groups[group_index];
+        group.type_ids.push(local_id as i8);
+        group.offsets.push(counts[alternative] as i32);
+        counts[alternative] += 1;
+    }
+
+    Ok((
+        VariantLayout::Nested {
+            type_ids,
+            offsets,
+            groups,
+        },
+        counts,
+        null_count,
+    ))
+}
+
 /// Enum over all supported column types.
 #[derive(Debug, Clone)]
 pub enum Column {
@@ -658,6 +1008,9 @@ pub enum Column {
     // Map(K, V): Arrow list-of-struct layout (Array offsets over a two-field
     // Tuple entries column), matching the wire's Array(Tuple(keys, values)).
     Map(MapColumn),
+    // Variant(T1, ...): Arrow Dense Union routing buffers plus one compact child
+    // column per alternative and an implicit Arrow Null child.
+    Variant(VariantColumn),
 }
 
 impl Column {
@@ -699,6 +1052,7 @@ impl Column {
             Column::Array(c) => c.len(),
             Column::Tuple(c) => c.len(),
             Column::Map(c) => c.len(),
+            Column::Variant(c) => c.len(),
         }
     }
 
@@ -744,6 +1098,7 @@ impl Column {
             Column::Array(c) => c.null_count(),
             Column::Tuple(c) => c.null_count(),
             Column::Map(c) => c.null_count(),
+            Column::Variant(c) => c.null_count(),
         }
     }
 
@@ -790,6 +1145,9 @@ impl Column {
             // Maps are never nullable at the map level; value nulls live on the
             // values column inside `entries`.
             Column::Map(_) => None,
+            // Arrow unions have no validity bitmap. Variant's intrinsic NULL is
+            // represented by its Arrow Null child.
+            Column::Variant(_) => None,
         }
     }
 }
@@ -867,5 +1225,77 @@ mod tests {
             Column::BFloat16(PrimitiveColumn::new(vec![[0x80, 0x3f]])).len(),
             1
         );
+    }
+
+    #[test]
+    fn test_value_position_rejects_malformed_layout() {
+        // Flat: an offset that points past the selected child's only row. A
+        // hand-built layout can express this; decode never produces it.
+        let column = VariantColumn::from_parts(
+            VariantLayout::Flat {
+                type_ids: vec![0],
+                offsets: vec![1],
+            },
+            vec![
+                Column::UInt8(PrimitiveColumn::new(vec![13u8])),
+                Column::UInt8(PrimitiveColumn::new(Vec::new())),
+            ],
+            0,
+        );
+        assert_eq!(column.value_position(0), None);
+
+        // Flat: a negative offset is out of range for any child.
+        let column = VariantColumn::from_parts(
+            VariantLayout::Flat {
+                type_ids: vec![0],
+                offsets: vec![-1],
+            },
+            vec![Column::UInt8(PrimitiveColumn::new(vec![13u8]))],
+            0,
+        );
+        assert_eq!(column.value_position(0), None);
+
+        // Flat: a NULL offset past the NULL child's length.
+        let column = VariantColumn::from_parts(
+            VariantLayout::Flat {
+                type_ids: vec![1],
+                offsets: vec![0],
+            },
+            vec![Column::UInt8(PrimitiveColumn::new(Vec::new()))],
+            0,
+        );
+        assert_eq!(column.value_position(0), None);
+
+        // Nested: a group offset past the selected child's only row.
+        let column = VariantColumn::from_parts(
+            VariantLayout::Nested {
+                type_ids: vec![0],
+                offsets: vec![0],
+                groups: vec![VariantGroup {
+                    first_variant: 0,
+                    type_ids: vec![0],
+                    offsets: vec![5],
+                }],
+            },
+            vec![Column::UInt8(PrimitiveColumn::new(vec![13u8]))],
+            0,
+        );
+        assert_eq!(column.value_position(0), None);
+
+        // Nested: an outer NULL offset past the NULL child's length.
+        let column = VariantColumn::from_parts(
+            VariantLayout::Nested {
+                type_ids: vec![1],
+                offsets: vec![3],
+                groups: vec![VariantGroup {
+                    first_variant: 0,
+                    type_ids: Vec::new(),
+                    offsets: Vec::new(),
+                }],
+            },
+            vec![Column::UInt8(PrimitiveColumn::new(Vec::new()))],
+            0,
+        );
+        assert_eq!(column.value_position(0), None);
     }
 }

@@ -124,6 +124,16 @@ pub enum ChType {
     // (`DataTypeMap::isValidKeyType`); the value type is unrestricted. The map
     // itself is never inside `Nullable` or `LowCardinality`.
     Map(Box<ChType>, Box<ChType>),
+    // `Variant(T1, ...)`: alternatives are stored in the server's canonical
+    // order, lexicographically by each type's full canonical name. The Native
+    // body carries one UInt8 global discriminator per row (`0..=254`), with 255
+    // reserved for Variant's intrinsic NULL, followed by one dense body per
+    // alternative. A Variant therefore must contain 1..=255 distinct, normalized
+    // alternatives. Direct Nothing alternatives are dropped by the server;
+    // direct Nullable, LowCardinality(Nullable), Variant, and Dynamic alternatives
+    // are forbidden. Variant itself cannot sit in Nullable or LowCardinality,
+    // but it composes inside Array/Tuple and as either Map key or value.
+    Variant(Vec<ChType>),
 
     // Name-decoration aliases over existing machinery. Each of these three is a
     // custom `getName()` attached to an underlying type instance whose
@@ -394,6 +404,16 @@ impl std::fmt::Display for ChType {
             // The canonical server form (`DataTypeMap::doGetName`): the two
             // type arguments only, comma-space separated, no element names.
             ChType::Map(key, value) => write!(f, "Map({key}, {value})"),
+            ChType::Variant(alternatives) => {
+                write!(f, "Variant(")?;
+                for (i, alternative) in alternatives.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{alternative}")?;
+                }
+                write!(f, ")")
+            }
             // `func` already carries any parenthesized params, so this renders
             // the exact spelling the server emits and round-trips through the
             // parser.

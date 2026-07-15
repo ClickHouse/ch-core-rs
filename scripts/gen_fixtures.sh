@@ -410,7 +410,18 @@ SELECT
     -- name when sum collapses over an only-null argument. Direct sumState(NULL)
     -- collapses to a finalized Nullable(Nothing), so CAST from the exact one-zero-
     -- byte state is the reliable construction for a Native fixture.
-    CAST(unhex('00'), 'AggregateFunction(nothingNull, Nullable(Nothing))') AS agg_nothing_null
+    CAST(unhex('00'), 'AggregateFunction(nothingNull, Nullable(Nothing))') AS agg_nothing_null,
+    -- Variant BASIC serialization: one UInt64 mode prefix, then the complete
+    -- UInt8 discriminator run, then one dense body per canonical alternative.
+    -- Discriminator 255 is intrinsic NULL and consumes no alternative value.
+    -- Canonical alternative order is String = 0, UInt64 = 1. Rows are
+    -- NULL, user_1, 13, user_2.
+    multiIf(
+        n = 0, CAST(CAST(NULL, 'Nullable(Nothing)'), 'Variant(String, UInt64)'),
+        n = 1, CAST(CAST('user_1', 'String'), 'Variant(String, UInt64)'),
+        n = 2, CAST(toUInt64(13), 'Variant(String, UInt64)'),
+        CAST(CAST('user_2', 'String'), 'Variant(String, UInt64)')
+    ) AS variant
 FROM numbers(4)
 SETTINGS allow_suspicious_low_cardinality_types = 1, enable_nullable_tuple_type = 1, enable_time_time64_type = 1, flatten_nested = 0
 FORMAT Native

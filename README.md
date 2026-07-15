@@ -113,15 +113,15 @@ Implemented:
   in Arrow-compatible layouts.
 - Export decoded chunks as an Arrow C Data stream.
 - Malformed-input hardening: untrusted wire bytes return errors, never panic.
-- Encode supported scalar and `LowCardinality` columns back to Native block bytes
-  for `INSERT` (`native::encode`); accepted by a live server over HTTP.
+- Encode every supported column back to Native block bytes for `INSERT`
+  (`native::encode`); accepted by a live server over HTTP.
 
 Not implemented yet:
 
 - TCP/native protocol packet framing.
 - Compression framing.
 - Binary-encoded Native type headers.
-- Array, Tuple, Map, or wide integer types.
+- `Dynamic`, `JSON`, `Geometry`, and `QBit` types.
 - Language-specific materialization policy (bindings own this, by design).
 
 ## Supported types
@@ -141,6 +141,9 @@ Not implemented yet:
 - `Decimal(P, S)`
 - `UUID`, `IPv4`, `IPv6`
 - `Enum8(...)`, `Enum16(...)`
+- `Int128`, `UInt128`, `Int256`, `UInt256`
+- `Array(T)`, `Tuple(T1, ...)`, `Map(K, V)`, and `Variant(T1, ...)`
+- `SimpleAggregateFunction(func, T)`, the six geo aliases, and `Nested(...)`
 - Exact `AggregateFunction` state codecs for `count`, canonical
   `nothingUInt64` and `nothingNull`, and base `sum` over plain or Nullable
   numeric and Enum arguments
@@ -153,13 +156,12 @@ Unsupported types raise a decode error rather than guessing.
 
 In rough priority order:
 
-1. Type coverage: `Array`, `Tuple`, `Map`, `Int128`/`Int256` and unsigned
-   variants.
+1. Type coverage: `Dynamic`, `JSON`, `Geometry`, and `QBit`.
 2. Compression framing: LZ4, then ZSTD.
 3. Per-runtime zero-copy adapters: JS `TypedArray` over an external
    `ArrayBuffer`, NumPy export that does not route through Arrow.
-4. Insert-path completion: a streaming/sink encode API and remaining type
-   parity (scalar and `LowCardinality` encode already land over HTTP).
+4. Insert-path completion: a streaming/sink encode API. Type parity is kept as
+   each decoder type lands.
 5. Native TCP protocol engine: handshake, query/data/progress/exception
    packets, revision negotiation.
 

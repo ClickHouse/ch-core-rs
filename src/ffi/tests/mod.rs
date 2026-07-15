@@ -15,6 +15,7 @@ mod nothing;
 mod saf_geo_nested;
 mod scalar;
 mod stream;
+mod variant;
 
 fn make_test_batch() -> Arc<ColBatch> {
     let schema = Schema::new(vec![

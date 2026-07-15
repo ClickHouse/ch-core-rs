@@ -24,6 +24,7 @@ mod special;
 mod string;
 mod temporal;
 mod validation;
+mod variant;
 mod wide_int;
 
 /// Build a `Utf8Column` from raw byte values, computing the Arrow offsets the
@@ -173,6 +174,18 @@ fn assert_columns_eq(left: &Column, right: &Column, label: &str) {
             assert_eq!(x.offsets, y.offsets, "{label} map offsets differ");
             let entries_label = format!("{label} map entries");
             assert_columns_eq(x.entries.as_ref(), y.entries.as_ref(), &entries_label);
+        }
+        (Column::Variant(x), Column::Variant(y)) => {
+            assert_eq!(x.layout, y.layout, "{label} variant layout differs");
+            assert_eq!(
+                x.variants.len(),
+                y.variants.len(),
+                "{label} variant child count differs"
+            );
+            assert_eq!(x.nulls.len, y.nulls.len, "{label} null count differs");
+            for (i, (a, b)) in x.variants.iter().zip(&y.variants).enumerate() {
+                assert_columns_eq(a, b, &format!("{label} variant child {i}"));
+            }
         }
         (other_a, other_b) => panic!("{label}: unexpected {other_a:?} vs {other_b:?}"),
     }

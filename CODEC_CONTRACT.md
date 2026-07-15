@@ -285,6 +285,7 @@ than an error.
 | `Point`                                                                                | `Geo(GeoKind::Point)`                  | `Tuple`           | `+s` (struct of two `g` Float64 children)                          | validity (two Float64 children)            | yes (`Nullable(Point)` is legal)                         |
 | `Ring`, `LineString`, `MultiLineString`, `Polygon`, `MultiPolygon`                     | `Geo(GeoKind::*)`                       | `Array`           | `+L` (LargeList chain over a Point `+s` struct)                     | validity, i64 offsets (+ item child)       | no (they expand to `Array`)                              |
 | `Nested(name1 T1, ...)` for supported field types                                      | `Nested(Vec<(String, ChType)>)`        | `Array`           | `+L` (LargeList of a `+s` struct with the field names)             | validity, i64 offsets (+ item struct child) | no (it is an `Array`)                                    |
+| `Variant(T1, ...)` for 1 through 255 legal alternatives                               | `Variant(Vec<ChType>)`                 | `Variant`         | `+ud:...` Dense Union, nested for 128+ alternatives                | i8 type ids, i32 offsets (+ dense children) | intrinsic NULL child; no top-level validity              |
 
 Any type not in this matrix is rejected. See "Unsupported types" below.
 
@@ -1975,6 +1976,94 @@ name with `backQuoteIfNeed` exactly like `DataTypeTuple`, and the runtime type i
 
 ---
 
+### Variant(T1, ...)
+
+**Type string(s):** `Variant(T1, ...)` with 1 through 255 distinct legal
+alternatives after normalization. `DataTypeVariant` canonicalizes alternatives
+lexicographically by their complete canonical `getName()`, removes duplicate
+names, and drops any alternative whose PHYSICAL type is `Nothing` (via
+`isNothing`), so a name-decorated `SimpleAggregateFunction(..., Nothing)` is
+dropped too even though its `getName()` is not literally `Nothing`. The parser
+also rejects a header spelling more than 255 top-level alternatives before
+parsing any part, since a canonical `getName()` never exceeds that count. A
+direct alternative cannot be `Nullable`,
+`LowCardinality(Nullable(...))`, `Variant`, or `Dynamic`; a legal nested type
+such as `Array(Nullable(String))` remains valid. `Nullable(Variant(...))` and
+`LowCardinality(Variant(...))` are illegal because Variant already has intrinsic
+NULL.
+
+**Logical type:** `ChType::Variant(Vec<ChType>)`, with alternatives stored in
+the server's canonical order. The alternative index in this vector is the
+global ClickHouse discriminator.
+
+**Wire payload:** direct `FORMAT Native` always uses BASIC Variant
+serialization at the pinned server tag. For a block with rows, the complete
+column payload is:
+
+```text
+UInt64 LE mode = 0
+state prefix for T0, then T1, ...
+num_rows UInt8 discriminators
+dense body for T0, then T1, ...
+state suffix for T0, then T1, ...
+```
+
+Discriminators `0..alternatives.len()-1` select the corresponding canonical
+alternative. `255` is intrinsic NULL and consumes no alternative value. Each
+alternative body contains exactly the number of values selected by that
+discriminator, in row occurrence order. There are no child counts, byte
+lengths, or offset arrays on the wire. The decoder derives counts and dense
+offsets in one pass over the discriminator bytes, then decodes each compact
+child body. Mode 1 is the COMPACT on-disk form supported by
+`SerializationVariant`, but `NativeWriter` does not emit it; this core rejects
+it as `DecodeError::InvalidVariant` instead of guessing.
+
+**Arrow export:** Arrow Dense Union with sequential type codes. A Variant with
+at most 127 alternatives exports as one `+ud:0,1,...` node whose children are
+the alternative columns followed by an Arrow Null child. Its two buffers are
+signed Int8 type ids and i32 dense child offsets; unions have no validity
+buffer or top-level null count. The ClickHouse NULL discriminator routes to the
+final Null child. Arrow permits only 128 type codes in one union node, while
+ClickHouse permits 255 alternatives, so 128 through 255 alternatives export as
+an outer Dense Union over inner groups of at most 128 alternatives, followed by
+the outer Null child. This preserves the full ClickHouse range without copying
+the decoded buffers.
+
+**Rust buffer:** `Column::Variant(VariantColumn)`. `VariantColumn::variants`
+contains one dense `Column` per canonical alternative. `VariantLayout::Flat`
+stores the top-level `{ type_ids: Vec<i8>, offsets: Vec<i32> }`; the nested form
+adds deterministic `VariantGroup` routing buffers. `nulls: NothingColumn`
+provides the explicit Arrow Null child length. `value_position(row)` resolves a
+row to its global discriminator and child offset; discriminator 255 denotes
+NULL.
+
+**Notes:**
+
+- Native writes no Variant payload at all for a zero-row block, including no
+  mode word or alternative prefixes, because `NativeWriter` gates the complete
+  data step on `rows > 0`.
+- An out-of-range non-255 discriminator is malformed. The server bulk path does
+  not provide a clean range error at this point. Its exact process behavior is
+  therefore INFERRED to be undefined for such corrupt input; this core
+  deliberately returns `DecodeError::InvalidVariant` before indexing a child.
+- Variant first appeared experimentally in `v24.1.1.2048-stable`; the mode word
+  was added in `v24.7.1.2915-stable`, it became beta in
+  `v24.12.1.1614-stable`, production-ready in 25.3, and GA at the pinned 26.6
+  release. This implementation targets the mode-bearing layout at
+  `v26.6.1.1193-stable`.
+
+**Server reference:** `NativeWriter::writeData` and `NativeWriter::write` in
+`src/Formats/NativeWriter.cpp`; `SerializationVariant` state prefix, bulk body,
+and state suffix methods in
+`src/DataTypes/Serializations/SerializationVariant.cpp`;
+`DataTypeVariant::DataTypeVariant`, `doGetName`, and `canBeInsideNullable` in
+`src/DataTypes/DataTypeVariant.{h,cpp}`; and `ColumnVariant` discriminator
+constants and validation in `src/Columns/ColumnVariant.{h,cpp}`. The BASIC
+layout, canonical ordering, legality rules, NULL discriminator, and direct
+Native mode choice are CONFIRMED at `v26.6.1.1193-stable`.
+
+---
+
 ## Encoding
 
 `src/native/encode/mod.rs` is the inverse of the decode path: it turns a `ColBatch`
@@ -2041,7 +2130,8 @@ inner types decode accepts, `Array(T)` over any encodable element type
 `Tuple(T1, ...)` over encodable element types (named or unnamed, the
 zero-element `Tuple()` included, composing inside `Array` and inside
 `Nullable`), and `Map(K, V)` for a legal key type over encodable key/value
-types (composing inside `Array` and `Tuple`), the non-wrapper types and
+types (composing inside `Array` and `Tuple`), `Variant(T1, ...)` when every
+alternative is encodable, the non-wrapper types and
 `Tuple` each optionally wrapped in `Nullable`. The name-decoration aliases
 `SimpleAggregateFunction(func, T)` (encodable when its inner `T` is, at any
 nesting position), the six geo types (`Point`, `Ring`, `LineString`,
@@ -2262,6 +2352,13 @@ one valid wire form, and encode commits to these:
   recursion (key first, then value), so a `LowCardinality` key's version lands
   at the very front of the column, before the offsets. An all-empty-maps block
   with rows writes the all-zero offsets and nothing else.
+- **Variant.** Encode always writes direct Native BASIC mode 0, then each
+  alternative's state prefix, the complete global discriminator run, and each
+  dense alternative body in canonical order. The input must use the exact flat
+  or nested Arrow routing layout derived by `VariantColumn::try_new`; validation
+  checks every type id, occurrence offset, child length, and NULL child before
+  writing. Alternative state suffixes are traversed in the same order after the
+  bodies. A zero-row block writes no mode word or child prefix.
 
 ### Round-trip guarantees
 
@@ -2327,6 +2424,8 @@ directly (`empty_column` in `src/native/decode/mod.rs`), the empty shapes are:
 - `Map(K, V)`: offsets `[0]` (the leading zero only) over an empty two-field
   entries tuple (an empty keys column and an empty values column, built
   recursively).
+- `Variant(T1, ...)`: an empty flat or nested Dense Union layout, one recursively
+  empty dense child per alternative, and an empty Null child.
 - Any registered `AggregateFunction` codec: offsets `[0]` and empty state data.
 
 In all cases length is 0 and `null_count` is 0.
@@ -2385,6 +2484,9 @@ index, or a row count that disagrees with the block header) fails with
 `DecodeError::InvalidArray` rather than `UnsupportedType`. `Tuple` has the
 analogous `DecodeError::InvalidTuple` (unequal element lengths), a defensive
 mirror of the server's check that its row-count-driven decode cannot reach.
+A malformed `Variant` payload (a nonzero direct-Native mode or a non-255
+discriminator outside the alternative range) fails with
+`DecodeError::InvalidVariant`.
 
 When one of these is implemented, move it into the support matrix and add a type
 section here.

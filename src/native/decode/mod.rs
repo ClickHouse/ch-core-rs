@@ -4,8 +4,9 @@ use std::sync::Arc;
 use crate::batch::{ChunkedBatch, ColBatch};
 use crate::bitmap::Bitmap;
 use crate::column::{
-    AggregateStateColumn, ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn,
-    FixedBinaryColumn, MapColumn, NothingColumn, PrimitiveColumn, TupleColumn, Utf8Column,
+    variant_layout_from_discriminators, AggregateStateColumn, ArrayColumn, BoolColumn, Column,
+    DecimalColumn, DictionaryColumn, FixedBinaryColumn, MapColumn, NothingColumn, PrimitiveColumn,
+    TupleColumn, Utf8Column, VariantColumn,
 };
 use crate::native::aggregate_function::{
     decode_aggregate_states, decode_state_codec, scan_aggregate_states,
@@ -73,6 +74,12 @@ pub enum DecodeError {
         column: String,
         reason: &'static str,
     },
+    /// A `Variant` column carried a discriminator mode, discriminator byte, or
+    /// dense child layout that is invalid for direct Native serialization.
+    InvalidVariant {
+        column: String,
+        reason: String,
+    },
 }
 
 impl From<io::Error> for DecodeError {
@@ -117,6 +124,9 @@ impl std::fmt::Display for DecodeError {
             }
             DecodeError::InvalidTuple { column, reason } => {
                 write!(f, "Invalid Tuple layout for column '{column}': {reason}")
+            }
+            DecodeError::InvalidVariant { column, reason } => {
+                write!(f, "Invalid Variant layout for column '{column}': {reason}")
             }
         }
     }
@@ -389,6 +399,27 @@ fn read_state_prefix(
             read_state_prefix(reader, key, column)?;
             read_state_prefix(reader, value, column)
         }
+        // Direct FORMAT Native always uses BASIC Variant discriminators at the
+        // pinned server tag. The prefix starts with one fixed-width LE UInt64
+        // mode word (0 = BASIC, 1 = COMPACT), followed by every alternative's
+        // state prefix in canonical/global discriminator order. COMPACT is a
+        // MergeTree serialization and is not emitted by NativeWriter, so reject
+        // it rather than misreading its granule framing as one byte per row.
+        ChType::Variant(alternatives) => {
+            let mode = reader.read_u64_le()?;
+            if mode != 0 {
+                return Err(DecodeError::InvalidVariant {
+                    column: column.to_string(),
+                    reason: format!(
+                        "discriminator mode {mode} is not BASIC mode 0 emitted by FORMAT Native"
+                    ),
+                });
+            }
+            for alternative in alternatives {
+                read_state_prefix(reader, alternative, column)?;
+            }
+            Ok(None)
+        }
         // Nullable writes no prefix of its own either;
         // `SerializationNullable::deserializeBinaryBulkStatePrefix` delegates to
         // the nested type (confirmed at v26.6.1.1193-stable,
@@ -398,6 +429,48 @@ fn read_state_prefix(
         // faithful to the server for any future nullable-wrappable container.
         ChType::Nullable(inner) => read_state_prefix(reader, inner, column),
         _ => Ok(None),
+    }
+}
+
+/// Consume a column's `deserializeBinaryBulkStateSuffix` bytes after its body.
+///
+/// Variant owns no suffix bytes, but delegates to every alternative in canonical
+/// order. None of the types currently supported by this crate emits suffix bytes;
+/// keeping the recursive traversal explicit mirrors the server and gives the
+/// first future suffix-bearing type one correct integration point.
+fn read_state_suffix(
+    reader: &mut ByteReader,
+    ch_type: &ChType,
+    column: &str,
+) -> Result<(), DecodeError> {
+    if let Some(under) = ch_type.physical_delegate() {
+        return read_state_suffix(reader, &under, column);
+    }
+    match ch_type {
+        ChType::Array(inner) | ChType::Nullable(inner) => read_state_suffix(reader, inner, column),
+        ChType::Tuple(elements) => {
+            for (_, element_type) in elements {
+                read_state_suffix(reader, element_type, column)?;
+            }
+            Ok(())
+        }
+        ChType::Map(key, value) => {
+            read_state_suffix(reader, key, column)?;
+            read_state_suffix(reader, value, column)
+        }
+        ChType::Variant(alternatives) => {
+            for alternative in alternatives {
+                read_state_suffix(reader, alternative, column)?;
+            }
+            Ok(())
+        }
+        _ => {
+            // Intentionally a no-op: no type this crate currently supports emits
+            // suffix bytes. The arm exists only to keep this traversal symmetric
+            // with the server's prefix/body/suffix serialization contract.
+            let _ = (reader, column);
+            Ok(())
+        }
     }
 }
 
@@ -640,7 +713,9 @@ fn decode_column(
     // element type's prefix (so a leaf LowCardinality key version is consumed
     // here, before the offsets).
     read_state_prefix(reader, ch_type, column)?;
-    decode_values(reader, ch_type, num_rows, column)
+    let decoded = decode_values(reader, ch_type, num_rows, column)?;
+    read_state_suffix(reader, ch_type, column)?;
+    Ok(decoded)
 }
 
 /// Decode a column's value payload once its per-column state prefix has been
@@ -674,10 +749,11 @@ fn decode_values(
         // early-returns whenever limit == 0, before writing the index-type word,
         // dictionary, row count, or indexes (confirmed at v26.6.1.1193-stable).
         // That early return is universal, not tied to any particular wrapper:
-        // today the only zero-count entry point is an Array whose arrays are all
-        // empty (a zero-row block skips column data entirely and never reaches
-        // here), but any future one (Map values, Tuple elements) gets the same
-        // absent body and takes this same gate.
+        // today the zero-count entry points are an Array whose arrays are all
+        // empty and a Variant alternative that occurs in zero rows (a zero-row
+        // block skips column data entirely and never reaches here), but any
+        // future one (Map values, Tuple elements) gets the same absent body and
+        // takes this same gate.
         if num_rows == 0 {
             return Ok(empty_column(ch_type));
         }
@@ -697,6 +773,13 @@ fn decode_values(
     // `read_state_prefix`.
     if let ChType::Map(key, value) = ch_type {
         return decode_map(reader, key, value, num_rows, column);
+    }
+
+    // Variant is one discriminator byte per row followed by dense alternative
+    // bodies. It has intrinsic NULL semantics and cannot be wrapped in Nullable,
+    // so dispatch it before the ordinary Nullable unwrap.
+    if let ChType::Variant(alternatives) = ch_type {
+        return decode_variant(reader, alternatives, num_rows, column);
     }
 
     let (nullable, inner) = match ch_type {
@@ -726,6 +809,42 @@ fn decode_values(
     }
 
     decode_column_body(reader, inner, num_rows, validity)
+}
+
+/// Decode one `Variant(T1, ...)` body into Arrow Dense Union buffers.
+///
+/// At v26.6.1.1193-stable, `SerializationVariant` in
+/// `src/DataTypes/Serializations/SerializationVariant.cpp` writes BASIC Native
+/// bodies as exactly `num_rows` global UInt8 discriminators followed by every
+/// alternative's dense body in canonical type-name order. Discriminator 255 is
+/// NULL and consumes no child value; every other byte indexes `alternatives`.
+/// Child counts and Arrow i32 offsets are derived in one discriminator pass,
+/// with no per-row allocation. The mode word and child state prefixes were
+/// already consumed by [`read_state_prefix`].
+fn decode_variant(
+    reader: &mut ByteReader,
+    alternatives: &[ChType],
+    num_rows: usize,
+    column: &str,
+) -> Result<Column, DecodeError> {
+    let (layout, counts, null_count) = {
+        let discriminators = reader.read_slice(num_rows)?;
+        variant_layout_from_discriminators(discriminators, alternatives.len()).map_err(|err| {
+            DecodeError::InvalidVariant {
+                column: column.to_string(),
+                reason: err.to_string(),
+            }
+        })?
+    };
+
+    let mut variants = Vec::with_capacity(alternatives.len());
+    for (alternative, count) in alternatives.iter().zip(counts) {
+        variants.push(decode_values(reader, alternative, count, column)?);
+    }
+
+    Ok(Column::Variant(VariantColumn::from_parts(
+        layout, variants, null_count,
+    )))
 }
 
 /// Decode one `Tuple(T1, ...)` column body into an Arrow struct `Column`.
@@ -1300,6 +1419,7 @@ fn decode_column_body(
         | ChType::Array(_)
         | ChType::Tuple(_)
         | ChType::Map(..)
+        | ChType::Variant(_)
         | ChType::SimpleAggregateFunction { .. }
         | ChType::Geo(_)
         | ChType::Nested(_) => {
@@ -1547,6 +1667,21 @@ fn empty_column(ch_type: &ChType) -> Column {
             vec![0i64],
             build_tuple_column(vec![empty_column(key), empty_column(value)], 0, None),
         )),
+        // A zero-row Native block skips Variant's mode prefix and every child
+        // body. Build the same Arrow union tree a populated decode would, over
+        // one empty child column per canonical alternative and an empty Null
+        // child. Header validation already proved 1..=255 alternatives, so the
+        // layout constructor cannot fail here.
+        ChType::Variant(alternatives) => {
+            let layout = match variant_layout_from_discriminators(&[], alternatives.len()) {
+                Ok((layout, _, _)) => layout,
+                Err(_) => unreachable!(
+                    "validated Variant header always has between 1 and 255 alternatives"
+                ),
+            };
+            let variants = alternatives.iter().map(empty_column).collect();
+            Column::Variant(VariantColumn::from_parts(layout, variants, 0))
+        }
         // The outer `Nullable` was unwrapped above, `parse_ch_type` never
         // produces a `Nullable` directly inside a `Nullable`, and any
         // name-decoration alias was expanded to its physical delegate above, so
@@ -1872,7 +2007,8 @@ fn skip_column_data(
     // bytes for every type except LowCardinality; Array, Tuple, and Nullable
     // recurse into their element/inner prefixes.
     read_state_prefix(reader, ch_type, column)?;
-    skip_values(reader, ch_type, num_rows, column)
+    skip_values(reader, ch_type, num_rows, column)?;
+    read_state_suffix(reader, ch_type, column)
 }
 
 /// Advance `reader` past one column's value payload once its per-column state
@@ -1910,6 +2046,10 @@ fn skip_values(
         return skip_map_data(reader, key, value, num_rows, column);
     }
 
+    if let ChType::Variant(alternatives) = ch_type {
+        return skip_variant_data(reader, alternatives, num_rows, column);
+    }
+
     let inner = match ch_type {
         ChType::Nullable(inner) => {
             reader.skip(num_rows)?; // null map: 1 byte per row
@@ -1931,6 +2071,37 @@ fn skip_values(
     }
 
     skip_column_body(reader, inner, num_rows)
+}
+
+/// Walk one BASIC Variant body without allocating its Arrow routing buffers.
+fn skip_variant_data(
+    reader: &mut ByteReader,
+    alternatives: &[ChType],
+    num_rows: usize,
+    column: &str,
+) -> Result<(), DecodeError> {
+    let mut counts = vec![0usize; alternatives.len()];
+    let discriminators = reader.read_slice(num_rows)?;
+    for &discriminator in discriminators {
+        if discriminator == u8::MAX {
+            continue;
+        }
+        let alternative = discriminator as usize;
+        let Some(count) = counts.get_mut(alternative) else {
+            return Err(DecodeError::InvalidVariant {
+                column: column.to_string(),
+                reason: format!(
+                    "discriminator {discriminator} does not name one of {} alternatives",
+                    alternatives.len()
+                ),
+            });
+        };
+        *count += 1;
+    }
+    for (alternative, count) in alternatives.iter().zip(counts) {
+        skip_values(reader, alternative, count, column)?;
+    }
+    Ok(())
 }
 
 /// Walk one `Tuple(T1, ...)` column body (after its element state prefixes and
@@ -2071,6 +2242,7 @@ fn skip_column_body(
         | ChType::Array(_)
         | ChType::Tuple(_)
         | ChType::Map(..)
+        | ChType::Variant(_)
         | ChType::SimpleAggregateFunction { .. }
         | ChType::Geo(_)
         | ChType::Nested(_) => {

@@ -8,7 +8,7 @@ use std::ptr;
 use std::sync::Arc;
 
 use crate::batch::ColBatch;
-use crate::column::Column;
+use crate::column::{Column, VariantColumn, VariantGroup, VariantLayout, ARROW_UNION_MAX_CHILDREN};
 use crate::native::decode::low_cardinality_dict_value_type;
 use crate::schema::{ChType, IntervalKind, Schema};
 
@@ -354,6 +354,18 @@ fn arrow_format(ch_type: &ChType) -> String {
         // the offset width, so bindings can cast cheaply.
         // `ARROW_FLAG_MAP_KEYS_SORTED` is never set (it is `+m`-only).
         ChType::Map(..) => "+L".into(),
+        // Variant exports as Arrow Dense Union. Up to 127 alternatives plus the
+        // implicit NULL child fit in one node. ClickHouse permits 255
+        // alternatives, so 128+ use an outer union over groups of at most 128
+        // alternatives plus NULL, the Arrow-prescribed union-of-unions shape.
+        ChType::Variant(alternatives) => {
+            let children = if alternatives.len() < ARROW_UNION_MAX_CHILDREN {
+                alternatives.len() + 1
+            } else {
+                alternatives.len().div_ceil(ARROW_UNION_MAX_CHILDREN) + 1
+            };
+            dense_union_format(children)
+        }
         // Name-decoration aliases export with the Arrow shape of the physical
         // type they delegate to (`SimpleAggregateFunction` -> its inner, a geo
         // alias -> its Tuple/Array nesting, `Nested` -> the LargeList over an
@@ -402,8 +414,24 @@ fn field_is_nullable(ch_type: &ChType) -> bool {
         // Arrow requires Null-type fields to be nullable: every row is null.
         ChType::Nothing => true,
         ChType::LowCardinality(inner) => low_cardinality_dict_value_type(inner).0,
+        // Variant has intrinsic NULL through a Null union child. Arrow unions
+        // have no top-level validity bitmap, but the field can still be nullable.
+        ChType::Variant(_) => true,
         _ => false,
     }
+}
+
+/// Arrow C Data format string for one dense union node with sequential type
+/// codes `0..num_children`.
+fn dense_union_format(num_children: usize) -> String {
+    let mut format = String::from("+ud:");
+    for type_id in 0..num_children {
+        if type_id > 0 {
+            format.push(',');
+        }
+        format.push_str(&type_id.to_string());
+    }
+    format
 }
 
 /// Build a C string from a Rust string, dropping any interior NUL bytes.
@@ -439,6 +467,23 @@ unsafe fn write_field_schema(out: *mut ArrowSchema, name: &str, ch_type: &ChType
     // while `arrow_format` and `field_is_nullable` handle the Nullable wrapper.
     if let Some(under) = ch_type.physical_delegate() {
         write_field_schema(out, name, &under);
+        return;
+    }
+    // Variant carries its own intrinsic NULL through a dedicated Arrow Null
+    // union child, and the union field is already flagged nullable, so a
+    // `Nullable(Variant)` wrapper adds nothing physical: treat it exactly as a
+    // bare Variant. ClickHouse forbids `Nullable(Variant)`
+    // (`DataTypeVariant::canBeInsideNullable()` is false, confirmed
+    // v26.6.1.1193-stable) and this crate's type parser rejects it, so this only
+    // arises from a hand-built `ChType`. Unwrapping the `Nullable` here (exactly
+    // as the container children match below does) keeps the schema path from
+    // falling through to the generic branch, where `arrow_format` would emit a
+    // `+ud` union format string while the children match emitted zero children,
+    // a malformed union that strict consumers (pyarrow, arrow-rs) reject. The
+    // array path dispatches on `Column::Variant` and is identical for both
+    // wrappers, so this keeps the schema and array shapes in agreement.
+    if let ChType::Variant(alternatives) = ch_type.inner() {
+        write_variant_schema(out, name, alternatives);
         return;
     }
 
@@ -556,6 +601,78 @@ unsafe fn write_field_schema(out: *mut ArrowSchema, name: &str, ch_type: &ChType
     schema.private_data = Box::into_raw(pd) as *mut c_void;
 }
 
+/// Write a Variant field as one Arrow Dense Union or, for 128+ alternatives, a
+/// two-level union-of-unions. Each alternative child keeps its canonical
+/// ClickHouse type name; the final child is Arrow Null and represents Variant's
+/// intrinsic discriminator 255.
+unsafe fn write_variant_schema(out: *mut ArrowSchema, name: &str, alternatives: &[ChType]) {
+    let mut children = Vec::new();
+    if alternatives.len() < ARROW_UNION_MAX_CHILDREN {
+        for alternative in alternatives {
+            let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+            write_field_schema(child, &alternative.to_string(), alternative);
+            children.push(child);
+        }
+    } else {
+        for (group_index, group) in alternatives.chunks(ARROW_UNION_MAX_CHILDREN).enumerate() {
+            let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+            write_variant_group_schema(child, &format!("variants_{}", group_index + 1), group);
+            children.push(child);
+        }
+    }
+
+    let null_child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+    write_field_schema(null_child, "NULL", &ChType::Nothing);
+    children.push(null_child);
+
+    write_union_schema_node(out, name, children, true);
+}
+
+/// Write one non-null inner group for a large Variant's Arrow union tree.
+unsafe fn write_variant_group_schema(out: *mut ArrowSchema, name: &str, alternatives: &[ChType]) {
+    let mut children = Vec::with_capacity(alternatives.len());
+    for alternative in alternatives {
+        let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+        write_field_schema(child, &alternative.to_string(), alternative);
+        children.push(child);
+    }
+    write_union_schema_node(out, name, children, false);
+}
+
+/// Finish one Arrow Dense Union schema node and transfer child ownership to its
+/// release private data.
+unsafe fn write_union_schema_node(
+    out: *mut ArrowSchema,
+    name: &str,
+    children: Vec<*mut ArrowSchema>,
+    nullable: bool,
+) {
+    let format = cstring_lossy(&dense_union_format(children.len()));
+    let name = cstring_lossy(name);
+    let n_children = children.len() as i64;
+    let pd = Box::new(SchemaPrivateData {
+        format,
+        name,
+        children,
+        dictionary: ptr::null_mut(),
+    });
+
+    let schema = &mut *out;
+    schema.format = pd.format.as_ptr();
+    schema.name = pd.name.as_ptr();
+    schema.metadata = ptr::null();
+    schema.flags = if nullable { 2 } else { 0 };
+    schema.n_children = n_children;
+    schema.children = if pd.children.is_empty() {
+        ptr::null_mut()
+    } else {
+        pd.children.as_ptr() as *mut *mut ArrowSchema
+    };
+    schema.dictionary = ptr::null_mut();
+    schema.release = Some(release_schema);
+    schema.private_data = Box::into_raw(pd) as *mut c_void;
+}
+
 /// # Safety
 ///
 /// `out` must be a valid, writable pointer to an `ArrowSchema`, normally a
@@ -615,6 +732,9 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
     // column reports its structural null count.
     let null_count = match col {
         Column::Nothing(c) => c.len() as i64,
+        // Arrow unions have no top-level validity bitmap or null count. Variant
+        // NULL rows route to the explicit Null child instead.
+        Column::Variant(_) => 0,
         _ => col.null_count() as i64,
     };
 
@@ -799,10 +919,114 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
             export_one_column(batch, &c.entries, child);
             children.push(child);
         }
+        // Arrow Dense Union: exactly two buffers, signed Int8 type ids then i32
+        // child offsets, with no validity buffer. The decoder built these buffers
+        // directly, so export is zero-copy. A large Variant's outer children are
+        // inner union groups; a small Variant's children are the dense alternative
+        // columns directly. The final child is always Arrow Null.
+        //
+        // Dispatch is on the `Column`, not the schema `ChType`, so a
+        // `Nullable(Variant)` wrapper (impossible from parsed input; ClickHouse
+        // forbids it via `canBeInsideNullable() == false`, and the type parser
+        // rejects it) produces this identical union with no top-level validity.
+        // That matches the schema path, which unwraps the same `Nullable` and
+        // emits a bare Variant union, so the two shapes can never disagree.
+        Column::Variant(c) => {
+            match &c.layout {
+                VariantLayout::Flat { type_ids, offsets } => {
+                    buffers.push(type_ids.as_ptr() as *const c_void);
+                    buffers.push(offsets.as_ptr() as *const c_void);
+                    for variant in &c.variants {
+                        let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+                        export_one_column(batch, variant, child);
+                        children.push(child);
+                    }
+                }
+                VariantLayout::Nested {
+                    type_ids,
+                    offsets,
+                    groups,
+                } => {
+                    buffers.push(type_ids.as_ptr() as *const c_void);
+                    buffers.push(offsets.as_ptr() as *const c_void);
+                    for group in groups {
+                        let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+                        export_variant_group_array(batch, c, group, child);
+                        children.push(child);
+                    }
+                }
+            }
+
+            let null_child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+            export_variant_null_array(batch, c, null_child);
+            children.push(null_child);
+        }
     }
+    write_array_node(
+        batch, out, length, null_count, buffers, children, dictionary,
+    );
+}
 
+/// Export one non-null inner union group of a 128+ alternative Variant.
+unsafe fn export_variant_group_array(
+    batch: &Arc<ColBatch>,
+    variant: &VariantColumn,
+    group: &VariantGroup,
+    out: *mut ArrowArray,
+) {
+    let buffers = vec![
+        group.type_ids.as_ptr() as *const c_void,
+        group.offsets.as_ptr() as *const c_void,
+    ];
+    let end = group
+        .first_variant
+        .saturating_add(ARROW_UNION_MAX_CHILDREN)
+        .min(variant.variants.len());
+    let child_columns = variant
+        .variants
+        .get(group.first_variant..end)
+        .unwrap_or_default();
+    let mut children = Vec::with_capacity(child_columns.len());
+    for child_column in child_columns {
+        let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+        export_one_column(batch, child_column, child);
+        children.push(child);
+    }
+    write_array_node(
+        batch,
+        out,
+        group.type_ids.len() as i64,
+        0,
+        buffers,
+        children,
+        ptr::null_mut(),
+    );
+}
+
+/// Export Variant's intrinsic NULL rows as the final Arrow Null child.
+unsafe fn export_variant_null_array(
+    batch: &Arc<ColBatch>,
+    variant: &VariantColumn,
+    out: *mut ArrowArray,
+) {
+    // Arrow Null has no borrowed buffers, so this temporary wrapper can be
+    // dropped after `export_one_column` copies its length into ArrowArray.
+    let null_column = Column::Nothing(variant.nulls.clone());
+    export_one_column(batch, &null_column, out);
+}
+
+/// Finish one Arrow array node and transfer its buffer/child ownership to the
+/// existing release private data.
+unsafe fn write_array_node(
+    batch: &Arc<ColBatch>,
+    out: *mut ArrowArray,
+    length: i64,
+    null_count: i64,
+    buffers: Vec<*const c_void>,
+    children: Vec<*mut ArrowArray>,
+    dictionary: *mut ArrowArray,
+) {
     let n_children = children.len() as i64;
-
     let pd = Box::new(ArrayPrivateData {
         buffers,
         children,
@@ -815,16 +1039,14 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
     array.null_count = null_count;
     array.offset = 0;
     array.n_buffers = pd.buffers.len() as i64;
+    // Moving the Box into raw ownership below does not move either Vec's heap
+    // allocation. These pointer arrays therefore stay stable until release.
     array.buffers = if pd.buffers.is_empty() {
         ptr::null_mut()
     } else {
         pd.buffers.as_ptr() as *mut *const c_void
     };
     array.n_children = n_children;
-    // `pd.children` heap buffer is stable across the `Box::into_raw(pd)` move
-    // below, so this pointer stays valid until release. Null when there are no
-    // children (every arm except the container arms `Array`, `Tuple` with
-    // elements, and `Map`).
     array.children = if pd.children.is_empty() {
         ptr::null_mut()
     } else {

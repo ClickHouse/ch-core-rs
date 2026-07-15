@@ -47,7 +47,12 @@ point-in-time snapshot for the next agent, not a changelog. Keep it short. Alway
 include a "Recommended next" with a one-line reason, so the next agent has a
 default; the user may override it.
 
-- **Last updated:** 2026-07-15. Two project decisions today. First, further
+- **Last updated:** 2026-07-15. `Variant(...)` is complete at decode/encode
+  parity against `v26.6.1.1193-stable`, including BASIC-mode Native framing,
+  intrinsic NULL, malformed-input rejection, flat and two-level Arrow Dense
+  Union export across the full 255-alternative ClickHouse range, unit and
+  multi-block tests, captured real-server fixtures, and a live INSERT round
+  trip. Two project decisions still govern sequencing. First, further
   `AggregateFunction(...)` work is paused. The format has no generic state
   framing, so completing the long tail requires a separately confirmed boundary
   codec, fixtures, and tests for each function signature. That cost is not
@@ -77,14 +82,20 @@ default; the user may override it.
   not as an open-ended completeness exercise.
 - **Scope:** frame compression and its unwired files also remain untouched and
   out of scope. Completeness still means uncompressed HTTP `FORMAT Native`.
-- **Recommended next:** `Variant(...)`. It is the dependency root of the
-  remaining Tier 3 family: `Dynamic` is built on Variant's discriminator
-  machinery, `JSON` is built on Dynamic subcolumns, and `Geometry` is a
-  `Variant(...)` of the six already-done geo aliases, so it falls out nearly
-  free once Variant lands. These are the version-sensitive types with in-band
-  version/structure headers, so the server-reader confirmation step matters
-  most here; start with a dedicated `SerializationVariant` read at the pin.
-- **After that:** `Dynamic`, then `JSON`, then `Geometry` (mostly free), with
+- **Variant checkpoint:** direct Native uses the fixed UInt64 BASIC mode 0,
+  then the full UInt8 discriminator stream, then dense child bodies in the
+  server's canonical lexicographic type-name order. Discriminator 255 is NULL.
+  COMPACT mode is an on-disk form and is rejected here. Up to 127 alternatives
+  plus NULL export as one Arrow Dense Union; 128 through 255 use an outer union
+  over groups of at most 128 alternatives plus NULL. See the dedicated section
+  in `CODEC_CONTRACT.md` for confirmed server paths and the one explicitly
+  inferred malformed-server behavior.
+- **Recommended next:** `Dynamic`. Its Native layout builds directly on the
+  discriminator and dense-child machinery now implemented for Variant, and it
+  is the next dependency for `JSON`. Start with a dedicated server-reader pass
+  over `SerializationDynamic` at the pin before choosing the Rust/Arrow model.
+- **After that:** `JSON`, then `Geometry` (mostly free now that Variant and the
+  geo aliases are done), with
   `QBit(T, N)` last or on demand. QBit is small and isolated but niche, so it
   buys little for real-workload POC testing compared to the
   Variant/Dynamic/JSON family. Before opening the POC to outside users, also
@@ -92,10 +103,12 @@ default; the user may override it.
   default-on server-side since 23.7 and reaches any client that negotiates
   `client_protocol_version >= 54454`, and the decoder currently rejects its
   marker.
-- **Key references:** the aggregate checkpoint and paused boundary are recorded
-  in the Tier 3 item below and in `CODEC_CONTRACT.md`. The deferred sink
-  assessment is in "Streaming encode and the encode-push overlap" below. The
-  docs-sourced sparse wire notes are in "Wire / protocol features".
+- **Key references:** the Variant wire, buffer, Arrow, encode, and version
+  contract is in `CODEC_CONTRACT.md`; its implementation is in `src/column.rs`,
+  `src/native/{type_parser,decode,encode}`, and `src/ffi/mod.rs`. The aggregate
+  checkpoint and paused boundary are recorded in the Tier 3 item below. The
+  deferred sink assessment is in "Streaming encode and the encode-push overlap"
+  below. The docs-sourced sparse wire notes are in "Wire / protocol features".
 
 ---
 
@@ -608,12 +621,16 @@ where the across-release churn lives.
       live-server coverage. Do not resume this as an open-ended parity effort.
       Resume only when a concrete binding or workload requires a specific
       missing signature.
-- [ ] `Variant(...)` - discriminator stream plus per-variant columns. NEXT UP
-      per the 2026-07-15 path decision: it is the dependency root for
-      `Dynamic`, `JSON`, and `Geometry`, so it unblocks the rest of this tier.
+- [x] `Variant(...)` - complete at decode/encode parity. Direct Native BASIC
+      mode 0, canonical alternative ordering, intrinsic NULL discriminator 255,
+      dense child columns, streaming boundary scans, malformed discriminator
+      rejection, flat and two-level Arrow Dense Union export through all 255
+      alternatives, synthetic plain/zero-row/multi-block/round-trip tests,
+      real-server fixture capture, and live INSERT are covered at
+      `v26.6.1.1193-stable`. COMPACT mode 1 remains intentionally rejected
+      because direct `NativeWriter` never emits it.
 - [ ] `Dynamic` - self-describing, carries its own type info; optional
-      `Dynamic(max_types=N)` form. Second in the 2026-07-15 ordering, after
-      `Variant` and before `JSON`.
+      `Dynamic(max_types=N)` form. NEXT UP after Variant and before JSON.
 - [ ] `JSON` (new object type) - dynamic subcolumns, carries its own structure
       header; highest effort. Confirmed registered (case-insensitive) and GA at
       v26.6.1.1193-stable. The legacy `Object('json')` spelling is **not registered

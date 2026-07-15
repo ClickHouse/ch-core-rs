@@ -19,7 +19,8 @@
 //! encodable element type (including nested arrays), `Tuple(T1, ...)`
 //! (named or unnamed, including the zero-element `Tuple()`) over encodable
 //! element types, and `Map(K, V)` for a legal key type and any encodable
-//! key/value types, plus the registered exact `AggregateFunction` state codecs:
+//! key/value types, `Variant(T1, ...)` when every alternative is encodable,
+//! plus the registered exact `AggregateFunction` state codecs:
 //! `count`, canonical `nothingUInt64` and `nothingNull`, and base `sum` over one
 //! plain or Nullable numeric or Enum argument. The plain types and `Tuple` also
 //! compose inside a `Nullable(T)` wrapper (a per-row null map precedes the inner
@@ -30,7 +31,7 @@
 use crate::batch::{ChunkedBatch, ColBatch};
 use crate::column::{
     ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn, MapColumn,
-    TupleColumn, Utf8Column,
+    TupleColumn, Utf8Column, VariantColumn, VariantLayout,
 };
 use crate::native::aggregate_function::aggregate_state_codec;
 use crate::schema::{ChType, Field};
@@ -276,7 +277,9 @@ fn encode_column_data(
     column: &Column,
 ) -> Result<(), EncodeError> {
     write_state_prefix(buf, &field.ch_type);
-    encode_column_values(buf, field, &field.ch_type, column)
+    encode_column_values(buf, field, &field.ch_type, column)?;
+    write_state_suffix(buf, &field.ch_type);
+    Ok(())
 }
 
 /// Write the per-column bulk-state prefix, the inverse of
@@ -323,11 +326,56 @@ fn write_state_prefix(buf: &mut Vec<u8>, ch_type: &ChType) {
             write_state_prefix(buf, key);
             write_state_prefix(buf, value);
         }
+        // Variant's own prefix is one fixed-width LE UInt64 discriminator mode.
+        // Direct FORMAT Native always uses BASIC mode 0, then delegates to every
+        // alternative's prefix in canonical/global discriminator order.
+        ChType::Variant(alternatives) => {
+            buf.extend_from_slice(&0u64.to_le_bytes());
+            for alternative in alternatives {
+                write_state_prefix(buf, alternative);
+            }
+        }
         // `SerializationNullable::serializeBinaryBulkStatePrefix` delegates to
         // the nested type (confirmed at v26.6.1.1193-stable); only a
         // `Nullable(Tuple(...))` can nest a prefix-bearing type today.
         ChType::Nullable(inner) => write_state_prefix(buf, inner),
         _ => {}
+    }
+}
+
+/// Write the per-column bulk-state suffix after the value body.
+///
+/// Variant owns no suffix bytes and delegates to every alternative in canonical
+/// order. No currently supported type writes suffix bytes, but keeping this
+/// traversal symmetric with decode and the server preserves the correct
+/// insertion point for a future suffix-bearing type.
+fn write_state_suffix(buf: &mut Vec<u8>, ch_type: &ChType) {
+    if let Some(under) = ch_type.physical_delegate() {
+        write_state_suffix(buf, &under);
+        return;
+    }
+    match ch_type {
+        ChType::Array(inner) | ChType::Nullable(inner) => write_state_suffix(buf, inner),
+        ChType::Tuple(elements) => {
+            for (_, element_type) in elements {
+                write_state_suffix(buf, element_type);
+            }
+        }
+        ChType::Map(key, value) => {
+            write_state_suffix(buf, key);
+            write_state_suffix(buf, value);
+        }
+        ChType::Variant(alternatives) => {
+            for alternative in alternatives {
+                write_state_suffix(buf, alternative);
+            }
+        }
+        _ => {
+            // Intentionally a no-op: no type this crate currently supports writes
+            // suffix bytes. The arm exists only to keep this traversal symmetric
+            // with the server's prefix/body/suffix serialization contract.
+            let _ = buf;
+        }
     }
 }
 
@@ -383,6 +431,12 @@ fn encode_column_values(
         }
         return Err(column_error(field, ch_type));
     }
+    if let ChType::Variant(alternatives) = ch_type {
+        if let Column::Variant(c) = column {
+            return encode_variant_data(buf, field, alternatives, c);
+        }
+        return Err(column_error(field, ch_type));
+    }
     let value_type = if let ChType::Nullable(inner) = ch_type {
         encode_null_map(buf, column);
         inner.as_ref()
@@ -403,6 +457,85 @@ fn encode_column_values(
         return Err(column_error(field, value_type));
     }
     encode_column_body(buf, field, value_type, column)
+}
+
+/// Encode one BASIC `Variant(T1, ...)` body.
+///
+/// The mode word and every alternative's state prefix were written by
+/// [`write_state_prefix`]. The body is one global UInt8 discriminator per row,
+/// followed by each alternative's dense child body in canonical order. NULL is
+/// discriminator 255 and has no child body. Arrow routing offsets are not on the
+/// wire. Validation has already proved the union tree is canonical and each
+/// child length matches its discriminator count, so this performs one row walk
+/// over the routing bytes and one bulk child write per alternative, with no
+/// allocation.
+fn encode_variant_data(
+    buf: &mut Vec<u8>,
+    field: &Field,
+    alternatives: &[ChType],
+    col: &VariantColumn,
+) -> Result<(), EncodeError> {
+    // Only the discriminator byte is on the wire; the Arrow dense offsets are
+    // routing state Native never carries. So walk the layout's type ids
+    // directly and reconstruct each global discriminator, without reading the
+    // offset buffers `value_position` would (it exists for other callers). One
+    // reserve, then one push per row, matching the LowCardinality index idiom.
+    let num_variants = col.variants.len();
+    buf.reserve(col.len());
+    match &col.layout {
+        // Flat: a type id below `num_variants` is the global discriminator
+        // verbatim; the NULL child id (== num_variants) remaps to 255.
+        VariantLayout::Flat { type_ids, .. } => {
+            for &type_id in type_ids {
+                let discriminator = match usize::try_from(type_id).ok() {
+                    Some(id) if id < num_variants => id as u8,
+                    Some(id) if id == num_variants => u8::MAX,
+                    _ => return Err(column_error(field, &field.ch_type)),
+                };
+                buf.push(discriminator);
+            }
+        }
+        // Nested: the outer id selects a group (or the NULL child at
+        // `groups.len()`, remapped to 255); inside a group the global
+        // discriminator is `first_variant + local_id`, read from the group's
+        // own type ids at the outer offset. This mirrors `value_position`'s
+        // reconstruction but touches only the outer offset needed to index the
+        // group, never the child offsets.
+        VariantLayout::Nested {
+            type_ids,
+            offsets,
+            groups,
+        } => {
+            for (&outer_id, &outer_offset) in type_ids.iter().zip(offsets) {
+                let (Some(outer_id), Some(outer_offset)) = (
+                    usize::try_from(outer_id).ok(),
+                    usize::try_from(outer_offset).ok(),
+                ) else {
+                    return Err(column_error(field, &field.ch_type));
+                };
+                if outer_id == groups.len() {
+                    buf.push(u8::MAX);
+                    continue;
+                }
+                let discriminator = groups
+                    .get(outer_id)
+                    .and_then(|group| {
+                        let local_id = usize::try_from(*group.type_ids.get(outer_offset)?).ok()?;
+                        let discriminator = group.first_variant.checked_add(local_id)?;
+                        (discriminator < num_variants).then_some(discriminator)
+                    })
+                    .and_then(|d| u8::try_from(d).ok());
+                let Some(discriminator) = discriminator else {
+                    return Err(column_error(field, &field.ch_type));
+                };
+                buf.push(discriminator);
+            }
+        }
+    }
+    for (alternative, child) in alternatives.iter().zip(&col.variants) {
+        encode_column_values(buf, field, alternative, child)?;
+    }
+    Ok(())
 }
 
 /// Encode one `Map(K, V)` column body: the Array offsets run, then the
@@ -952,6 +1085,9 @@ fn is_encodable(ch_type: &ChType) -> bool {
         ChType::Map(key, value) => {
             is_valid_map_key_type(key) && is_encodable(key) && is_encodable(value.inner())
         }
+        // Variant writes one discriminator run around dense child bodies, so it
+        // is encodable exactly when every canonical alternative is encodable.
+        ChType::Variant(alternatives) => alternatives.iter().all(is_encodable),
         ChType::AggregateFunction { .. } => aggregate_state_codec(ch_type).is_some(),
         // Name-decoration aliases are encodable exactly when their physical
         // delegate is: `SimpleAggregateFunction` over its inner, a geo alias over

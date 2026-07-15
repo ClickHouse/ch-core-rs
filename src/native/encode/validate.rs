@@ -5,7 +5,7 @@
 use crate::batch::ColBatch;
 use crate::column::{
     AggregateStateColumn, ArrayColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn,
-    MapColumn, TupleColumn, Utf8Column,
+    MapColumn, TupleColumn, Utf8Column, VariantColumn, VariantLayout, ARROW_UNION_MAX_CHILDREN,
 };
 use crate::native::aggregate_function::{
     aggregate_state_codec, is_valid_aggregate_state, AggregateStateCodec,
@@ -203,7 +203,7 @@ fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<()
     // around the removeNullable `Nullable`, so
     // `LowCardinality(SAF(anyLast, Nullable(String)))` is correctly nullable and a
     // null row is not rejected as an `InconsistentBatch`.
-    let nullable_at_this_level = matches!(physical_type, ChType::Nullable(_))
+    let nullable_at_this_level = matches!(physical_type, ChType::Nullable(_) | ChType::Variant(_))
         || matches!(physical_type, ChType::LowCardinality(inner) if low_cardinality_dict_value_type(inner).0);
     if nullable_at_this_level {
         if let Some(validity) = column.validity() {
@@ -241,6 +241,10 @@ fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<()
 
     if let (ChType::Map(key, value), Column::Map(c)) = (value_type, column) {
         validate_map(field, key, value, c, num_rows)?;
+    }
+
+    if let (ChType::Variant(alternatives), Column::Variant(c)) = (value_type, column) {
+        validate_variant(field, alternatives, c, num_rows)?;
     }
 
     // A `Bool` column is unpacked from its packed bitmap positionally, so the
@@ -380,6 +384,12 @@ fn validate_saf_func_spellings(field: &Field, ch_type: &ChType) -> Result<(), En
             validate_saf_func_spellings(field, key)?;
             validate_saf_func_spellings(field, value)
         }
+        ChType::Variant(alternatives) => {
+            for alternative in alternatives {
+                validate_saf_func_spellings(field, alternative)?;
+            }
+            Ok(())
+        }
         ChType::AggregateFunction { arguments, .. } => {
             for argument in arguments {
                 validate_saf_func_spellings(field, argument)?;
@@ -415,6 +425,11 @@ pub(super) fn type_depth(ch_type: &ChType) -> usize {
             ChType::Map(key, value) => {
                 work.push((key, depth + 1));
                 work.push((value, depth + 1));
+            }
+            ChType::Variant(alternatives) => {
+                for alternative in alternatives {
+                    work.push((alternative, depth + 1));
+                }
             }
             ChType::AggregateFunction { arguments, .. } => {
                 for argument in arguments {
@@ -942,6 +957,260 @@ fn validate_map(
     validate_column(&value_field, &entries.fields[1], entry_rows)
 }
 
+/// Validate a Variant's Arrow Dense Union tree and dense child columns.
+///
+/// The routing buffers must be the deterministic layout produced by decode:
+/// one flat union for at most 127 alternatives plus NULL, otherwise an outer
+/// union over groups of at most 128 alternatives plus NULL. Every offset is the
+/// occurrence ordinal for that child, because Native carries no offsets and
+/// associates dense child values with discriminator occurrences in order.
+fn validate_variant(
+    field: &Field,
+    alternatives: &[ChType],
+    col: &VariantColumn,
+    num_rows: usize,
+) -> Result<(), EncodeError> {
+    let reject = |detail: String| Err(EncodeError::InconsistentBatch { detail });
+
+    if alternatives.len() != col.variants.len() {
+        return reject(format!(
+            "column {:?} declares {} Variant alternatives but the buffer carries {} child columns",
+            field.name,
+            alternatives.len(),
+            col.variants.len()
+        ));
+    }
+
+    let mut counts = vec![0usize; alternatives.len()];
+    let mut null_count = 0usize;
+
+    match &col.layout {
+        VariantLayout::Flat { type_ids, offsets } => {
+            if alternatives.len() >= ARROW_UNION_MAX_CHILDREN {
+                return reject(format!(
+                    "column {:?} has {} Variant alternatives and therefore requires a two-level Arrow union layout",
+                    field.name,
+                    alternatives.len()
+                ));
+            }
+            if type_ids.len() != num_rows || offsets.len() != num_rows {
+                return reject(format!(
+                    "column {:?} declares {num_rows} Variant rows but carries {} type ids and {} offsets",
+                    field.name,
+                    type_ids.len(),
+                    offsets.len()
+                ));
+            }
+            for (row, (&type_id, &offset)) in type_ids.iter().zip(offsets).enumerate() {
+                let type_id =
+                    usize::try_from(type_id).map_err(|_| EncodeError::InconsistentBatch {
+                        detail: format!(
+                            "column {:?} Variant row {row} has negative Arrow type id {type_id}",
+                            field.name
+                        ),
+                    })?;
+                let offset =
+                    usize::try_from(offset).map_err(|_| EncodeError::InconsistentBatch {
+                        detail: format!(
+                            "column {:?} Variant row {row} has negative child offset {offset}",
+                            field.name
+                        ),
+                    })?;
+                if type_id < alternatives.len() {
+                    if offset != counts[type_id] {
+                        return reject(format!(
+                            "column {:?} Variant row {row} points to alternative {type_id} offset {offset}, expected {}",
+                            field.name,
+                            counts[type_id]
+                        ));
+                    }
+                    counts[type_id] += 1;
+                } else if type_id == alternatives.len() {
+                    if offset != null_count {
+                        return reject(format!(
+                            "column {:?} Variant NULL row {row} has offset {offset}, expected {null_count}",
+                            field.name
+                        ));
+                    }
+                    null_count += 1;
+                } else {
+                    return reject(format!(
+                        "column {:?} Variant row {row} has Arrow type id {type_id}, but only {} alternatives plus NULL exist",
+                        field.name,
+                        alternatives.len()
+                    ));
+                }
+            }
+        }
+        VariantLayout::Nested {
+            type_ids,
+            offsets,
+            groups,
+        } => {
+            if alternatives.len() < ARROW_UNION_MAX_CHILDREN {
+                return reject(format!(
+                    "column {:?} has {} Variant alternatives and therefore requires a flat Arrow union layout",
+                    field.name,
+                    alternatives.len()
+                ));
+            }
+            let expected_groups = alternatives.len().div_ceil(ARROW_UNION_MAX_CHILDREN);
+            if groups.len() != expected_groups {
+                return reject(format!(
+                    "column {:?} Variant needs {expected_groups} Arrow union groups but carries {}",
+                    field.name,
+                    groups.len()
+                ));
+            }
+            for (group_index, group) in groups.iter().enumerate() {
+                let expected_first = group_index * ARROW_UNION_MAX_CHILDREN;
+                if group.first_variant != expected_first {
+                    return reject(format!(
+                        "column {:?} Variant group {group_index} starts at alternative {}, expected {expected_first}",
+                        field.name,
+                        group.first_variant
+                    ));
+                }
+            }
+            if type_ids.len() != num_rows || offsets.len() != num_rows {
+                return reject(format!(
+                    "column {:?} declares {num_rows} Variant rows but its outer union carries {} type ids and {} offsets",
+                    field.name,
+                    type_ids.len(),
+                    offsets.len()
+                ));
+            }
+
+            let mut group_counts = vec![0usize; groups.len()];
+            for (row, (&outer_id, &outer_offset)) in type_ids.iter().zip(offsets).enumerate() {
+                let outer_id =
+                    usize::try_from(outer_id).map_err(|_| EncodeError::InconsistentBatch {
+                        detail: format!(
+                            "column {:?} Variant row {row} has negative outer type id {outer_id}",
+                            field.name
+                        ),
+                    })?;
+                let outer_offset = usize::try_from(outer_offset).map_err(|_| {
+                    EncodeError::InconsistentBatch {
+                        detail: format!(
+                            "column {:?} Variant row {row} has negative outer offset {outer_offset}",
+                            field.name
+                        ),
+                    }
+                })?;
+                if outer_id == groups.len() {
+                    if outer_offset != null_count {
+                        return reject(format!(
+                            "column {:?} Variant NULL row {row} has outer offset {outer_offset}, expected {null_count}",
+                            field.name
+                        ));
+                    }
+                    null_count += 1;
+                    continue;
+                }
+                let Some(group) = groups.get(outer_id) else {
+                    return reject(format!(
+                        "column {:?} Variant row {row} has outer type id {outer_id}, but only {} groups plus NULL exist",
+                        field.name,
+                        groups.len()
+                    ));
+                };
+                if outer_offset != group_counts[outer_id] {
+                    return reject(format!(
+                        "column {:?} Variant row {row} points to group {outer_id} offset {outer_offset}, expected {}",
+                        field.name,
+                        group_counts[outer_id]
+                    ));
+                }
+                let Some((&local_id, &child_offset)) = group
+                    .type_ids
+                    .get(outer_offset)
+                    .zip(group.offsets.get(outer_offset))
+                else {
+                    return reject(format!(
+                        "column {:?} Variant group {outer_id} is shorter than its outer routing buffers",
+                        field.name
+                    ));
+                };
+                let local_id = usize::try_from(local_id).map_err(|_| {
+                    EncodeError::InconsistentBatch {
+                        detail: format!(
+                            "column {:?} Variant group {outer_id} row {outer_offset} has negative type id {local_id}",
+                            field.name
+                        ),
+                    }
+                })?;
+                let alternative = group.first_variant + local_id;
+                let group_end =
+                    (group.first_variant + ARROW_UNION_MAX_CHILDREN).min(alternatives.len());
+                if alternative >= group_end {
+                    return reject(format!(
+                        "column {:?} Variant group {outer_id} type id {local_id} exceeds its alternative range",
+                        field.name
+                    ));
+                }
+                let child_offset = usize::try_from(child_offset).map_err(|_| {
+                    EncodeError::InconsistentBatch {
+                        detail: format!(
+                            "column {:?} Variant alternative {alternative} has negative child offset {child_offset}",
+                            field.name
+                        ),
+                    }
+                })?;
+                if child_offset != counts[alternative] {
+                    return reject(format!(
+                        "column {:?} Variant row {row} points to alternative {alternative} offset {child_offset}, expected {}",
+                        field.name,
+                        counts[alternative]
+                    ));
+                }
+                counts[alternative] += 1;
+                group_counts[outer_id] += 1;
+            }
+            for (group_index, (group, expected)) in groups.iter().zip(group_counts).enumerate() {
+                if group.type_ids.len() != expected || group.offsets.len() != expected {
+                    return reject(format!(
+                        "column {:?} Variant group {group_index} has {} type ids and {} offsets, expected {expected} routed rows",
+                        field.name,
+                        group.type_ids.len(),
+                        group.offsets.len()
+                    ));
+                }
+            }
+        }
+    }
+
+    if col.nulls.len != null_count || col.nulls.validity.is_some() {
+        return reject(format!(
+            "column {:?} Variant Null child has length {} and validity={}, expected {null_count} rows with no bitmap",
+            field.name,
+            col.nulls.len,
+            col.nulls.validity.is_some()
+        ));
+    }
+
+    for (alternative, ((ch_type, child), expected)) in alternatives
+        .iter()
+        .zip(&col.variants)
+        .zip(counts)
+        .enumerate()
+    {
+        if child.len() != expected {
+            return reject(format!(
+                "column {:?} Variant alternative {alternative} has {} values, expected {expected} from the routing buffers",
+                field.name,
+                child.len()
+            ));
+        }
+        let child_field = Field {
+            name: format!("{} alternative {alternative}", field.name),
+            ch_type: ch_type.clone(),
+        };
+        validate_column(&child_field, child, expected)?;
+    }
+    Ok(())
+}
+
 /// Whether `value_type` (the unwrapped inner value type) and `column` form a
 /// supported, matching pair this encoder can write.
 ///
@@ -999,6 +1268,13 @@ fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
             }
             _ => false,
         };
+    }
+    if let (ChType::Variant(alternatives), Column::Variant(c)) = (value_type, column) {
+        return alternatives.len() == c.variants.len()
+            && alternatives
+                .iter()
+                .zip(&c.variants)
+                .all(|(t, child)| column_variant_matches(t.inner(), child));
     }
     matches!(
         (value_type, column),

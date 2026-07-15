@@ -18,6 +18,7 @@ mod saf_geo;
 mod special;
 mod string;
 mod temporal;
+mod variant;
 
 struct BlockBuilder {
     buf: Vec<u8>,

@@ -41,10 +41,10 @@ fn test_block_end_zero_rows() {
 fn test_block_end_rejects_unsupported_type() {
     // An unsupported type inside an otherwise-complete block must surface as
     // a DecodeError from the scan, not be silently skipped or reported as
-    // incomplete. `Variant` is not decoded yet, so it serves as the example.
+    // incomplete. `Dynamic` is not decoded yet, so it serves as the example.
     let data = BlockBuilder::new()
         .header(1, 1)
-        .column_header("id", "Variant(UInt8, String)")
+        .column_header("id", "Dynamic")
         .build();
     assert!(matches!(
         block_end(&data, &DecodeOptions::default()),
@@ -60,10 +60,10 @@ fn test_block_end_no_block_at_clean_boundary() {
 
 #[test]
 fn test_unsupported_type() {
-    // `Variant` is not decoded yet, so it serves as the unsupported example.
+    // `Dynamic` is not decoded yet, so it serves as the unsupported example.
     let data = BlockBuilder::new()
         .header(1, 1)
-        .column_header("id", "Variant(UInt8, String)")
+        .column_header("id", "Dynamic")
         .build();
     assert!(matches!(
         decode_all_bytes(&data, &DecodeOptions::default()),

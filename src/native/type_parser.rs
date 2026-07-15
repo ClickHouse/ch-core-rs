@@ -15,7 +15,8 @@ use crate::schema::{ChType, GeoKind, IntervalKind};
 /// Parse a ClickHouse type name string into a [`crate::schema::ChType`].
 ///
 /// Accepts the canonical spellings the server writes in Native block headers,
-/// including the `Nullable`, `LowCardinality`, `Array`, `Tuple`, and `Map`
+/// including the `Nullable`, `LowCardinality`, `Array`, `Tuple`, `Map`, and
+/// `Variant`
 /// container forms. Returns `None` for an unsupported or malformed name. The
 /// input is treated as untrusted wire data: parsing is depth-bounded (see
 /// `MAX_TYPE_DEPTH`) and never panics. Also used by the encoder to confirm a
@@ -91,6 +92,41 @@ fn parse_ch_type_depth(type_name: &str, depth: usize) -> Option<ChType> {
         if let Some(inner) = inner.strip_suffix(')') {
             let inner_type = parse_ch_type_depth(inner, depth + 1)?;
             return Some(ChType::Array(Box::new(inner_type)));
+        }
+    }
+
+    // Variant(T1, ...). The server canonicalizes alternatives by their full
+    // type name through a std::map, drops Nothing, and collapses duplicates
+    // before assigning global UInt8 discriminators. Mirror that normalization
+    // here so every parsed ChType is already in the exact order used by the
+    // wire body and Display emits the canonical header. The normalized list
+    // must contain 1..=255 alternatives because 255 is the reserved NULL
+    // discriminator. Direct Nullable, LowCardinality(Nullable), and Variant
+    // alternatives are rejected by `normalize_variant_alternatives`; nested
+    // occurrences inside Array/Tuple/Map remain legal.
+    if let Some(inner) = type_name.strip_prefix("Variant(") {
+        if let Some(inner) = inner.strip_suffix(')') {
+            let parts = split_top_level_commas(inner.trim_matches(' '))?;
+            // Reject an over-long list before parsing any part. A canonical
+            // server header spells its alternatives from the already-deduped,
+            // Nothing-dropped `DataTypeVariant` map, so `getName()` never emits
+            // more than 255 (u8::MAX, the reserved NULL discriminator) top-level
+            // parts. Rejecting a longer list up front is faithful and bounds a
+            // hostile header like `Variant(Int8,Int8,...)`: without this gate a
+            // caller could force a `&str` slice plus a ~48-byte `ChType` per raw
+            // part (~30x amplification of the attacker's bytes) before the same
+            // 255 cap in `normalize_variant_alternatives` collapses the
+            // duplicates, consistent with the crate's hostile-header discipline.
+            // Tuple is deliberately not capped this way: its element count is
+            // unbounded server-side.
+            if parts.len() > u8::MAX as usize {
+                return None;
+            }
+            let mut alternatives = Vec::with_capacity(parts.len());
+            for part in parts {
+                alternatives.push(parse_ch_type_depth(part.trim_matches(' '), depth + 1)?);
+            }
+            return normalize_variant_alternatives(alternatives).map(ChType::Variant);
         }
     }
 
@@ -451,6 +487,7 @@ fn can_be_inside_nullable(inner: &ChType) -> bool {
             | ChType::LowCardinality(_)
             | ChType::Array(_)
             | ChType::Map(..)
+            | ChType::Variant(_)
             | ChType::AggregateFunction { .. }
     )
 }
@@ -506,6 +543,14 @@ pub(crate) fn unsupported_header_type_name(ch_type: &ChType) -> Option<String> {
                 unsupported_header_type_name(key).or_else(|| unsupported_header_type_name(value))
             }
         }
+        ChType::Variant(alternatives) => {
+            let normalized = normalize_variant_alternatives(alternatives.iter().cloned());
+            if normalized.as_ref() != Some(alternatives) {
+                Some(ch_type.to_string())
+            } else {
+                alternatives.iter().find_map(unsupported_header_type_name)
+            }
+        }
         ChType::AggregateFunction { arguments, .. } => {
             if aggregate_state_codec(ch_type).is_none() {
                 Some(ch_type.to_string())
@@ -514,6 +559,73 @@ pub(crate) fn unsupported_header_type_name(ch_type: &ChType) -> Option<String> {
             }
         }
         _ => None,
+    }
+}
+
+/// Normalize Variant alternatives exactly as `DataTypeVariant` does before it
+/// assigns global discriminators.
+///
+/// Full canonical type names are the sort/dedup keys. Direct `Nothing` is
+/// discarded; direct `Nullable`, `LowCardinality(Nullable)`, and `Variant` are
+/// invalid. The remaining canonical list must have 1..=255 entries. This is
+/// shared by the decoder parser and encode's semantic type validation so a
+/// caller-built noncanonical `ChType::Variant` cannot put child bodies under a
+/// discriminator order different from the server's.
+fn normalize_variant_alternatives(
+    alternatives: impl IntoIterator<Item = ChType>,
+) -> Option<Vec<ChType>> {
+    let mut canonical = std::collections::BTreeMap::<String, ChType>::new();
+    for alternative in alternatives {
+        // The server's `DataTypeVariant` constructor drops an alternative via
+        // `isNothing(type)`, which tests the PHYSICAL type id, not the decorated
+        // name. `SimpleAggregateFunction` is a pure name decoration
+        // (`DataTypeCustomSimpleAggregateFunction`), so `SAF(anyLast, Nothing)`
+        // is physically `Nothing` and is dropped here too. Resolving the
+        // `physical_delegate` chain to its physical root before the check
+        // (mirroring how `is_valid_variant_alternative` recurses through
+        // delegates) keeps our discriminator order in agreement with the
+        // server's. The dedup/sort key below stays the DECORATED full name
+        // (`alternative.to_string()`) because the server's map key is
+        // `getName()`, which keeps the decoration; only this drop test resolves
+        // the delegate.
+        if resolves_to_nothing(&alternative) {
+            continue;
+        }
+        if !is_valid_variant_alternative(&alternative) {
+            return None;
+        }
+        canonical.insert(alternative.to_string(), alternative);
+    }
+    if !(1..=u8::MAX as usize).contains(&canonical.len()) {
+        return None;
+    }
+    Some(canonical.into_values().collect())
+}
+
+/// Whether `alternative`'s physical type is `Nothing` after resolving every
+/// name-decoration delegate ([`ChType::physical_delegate`]).
+///
+/// This is the drop test the server's `DataTypeVariant` applies via
+/// `isNothing(type)` on the physical type id, so `SimpleAggregateFunction`
+/// (and any chained decoration) over `Nothing` resolves to `true`. The
+/// recursion is bounded by the parsed type depth, so it cannot run away on
+/// untrusted input.
+fn resolves_to_nothing(alternative: &ChType) -> bool {
+    match alternative.physical_delegate() {
+        Some(under) => resolves_to_nothing(&under),
+        None => matches!(alternative, ChType::Nothing),
+    }
+}
+
+/// Whether one immediate Variant alternative satisfies the server constructor.
+fn is_valid_variant_alternative(alternative: &ChType) -> bool {
+    if let Some(under) = alternative.physical_delegate() {
+        return is_valid_variant_alternative(&under);
+    }
+    match alternative {
+        ChType::Nullable(_) | ChType::Variant(_) => false,
+        ChType::LowCardinality(inner) => !low_cardinality_dict_value_type(inner).0,
+        _ => true,
     }
 }
 
