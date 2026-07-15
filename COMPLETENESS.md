@@ -47,80 +47,42 @@ point-in-time snapshot for the next agent, not a changelog. Keep it short. Alway
 include a "Recommended next" with a one-line reason, so the next agent has a
 default; the user may override it.
 
-- **Last updated:** 2026-07-14. Tier 3 `AggregateFunction(...)` now supports the
-  exact canonical `AggregateFunction(nothingNull, Nullable(Nothing))` signature
-  at decode/encode parity, alongside exact `count`, canonical `nothingUInt64`,
-  and base `sum` over every accepted plain or Nullable numeric, Decimal, and
-  Enum argument. The broad item remains open because Native supplies no generic
-  aggregate state framing.
-- **Implementation shape:** the private registry in
-  `src/native/aggregate_function.rs` now maps both canonical `nothingUInt64` and
-  `nothingNull` signatures to one `FixedZeroByte` physical codec. Decode does
-  one whole-run bounds check, one linear zero validation, arithmetic i64 offsets,
-  and one contiguous data copy. Encode reuses the existing exact row-slice
-  validation and one contiguous write. Public output remains
-  `Column::AggregateState(AggregateStateColumn { offsets: Vec<i64>, data })`
-  and non-null Arrow LargeBinary `Z`; there is no new public variant or FFI path.
-- **Pinned server:** `v26.6.1.1193-stable`, protocol revision 54485. Every wire,
-  canonicalization, and version claim is **CONFIRMED** in
-  `AggregateFunctions/AggregateFunctionFactory.cpp` (`get`/`getImpl`),
-  `AggregateFunctions/Combinators/AggregateFunctionNull.cpp`
-  (`transformAggregateFunction`),
-  `AggregateFunctions/Combinators/AggregateFunctionState.cpp`
-  (`transformAggregateFunction`),
-  `AggregateFunctions/AggregateFunctionNothing.{h,cpp}`
-  (`AggregateFunctionNothingImpl::serialize`/`deserialize`),
-  `DataTypes/DataTypeAggregateFunction.cpp` (`create`/`getNameImpl`),
-  `DataTypes/Serializations/SerializationAggregateFunction.cpp`,
-  `DataTypes/Serializations/ISerialization.h`, and
-  `AggregateFunctions/IAggregateFunction.h`. Each row is exactly `0x00`, any
-  nonzero byte is `INCORRECT_DATA`, states are adjacent with no framing, and the
-  codec is unversioned. The separate name is only **INFERRED** to have entered
-  the stable series in `v24.1.1.2048-stable` from that release's changelog.
-- **Coverage/status:** `cargo test` passes 619 unit tests plus 3 fixture
-  integration tests. `cargo build`, `cargo fmt -- --check`,
-  `cargo clippy --all-targets -- -D warnings`, and `git diff --check` pass. The
-  ignored live fixed-zero INSERT test passes against ClickHouse 26.6.1.1193 and
-  proves `nothingUInt64` finalizes to 0 while `nothingNull` finalizes to NULL.
-  Both all-types fixtures were recaptured at 104 columns, leading varint `0x68`,
-  for revisions 0 and 54485. Coverage includes the exact header, strict zero
-  validation, truncation, zero rows, multiple blocks, byte-by-byte streaming,
-  zero-copy Arrow export, encode validation, real server bytes, and live
-  semantic finalization.
-- **Scope:** frame compression and its unwired files remain untouched and out of
-  scope. Completeness still means uncompressed HTTP `FORMAT Native`.
-- **Recommended next:** expand `nothingNull` to the other server-valid argument
-  lists. The server source already confirms they share the same strict one-byte
-  zero `AggregateFunctionNothingImpl`, making this the smallest next registry
-  expansion before investigating a new state layout.
-- **Active gotchas:**
-  - Aggregate states are adjacent with no row length, column length, prefix,
-    suffix, or in-body version. Unknown signatures must remain unsupported even
-    for zero rows until one shared boundary codec is registered.
-  - Keep the noncanonical `sum(Nullable(Nothing))` spelling rejected. The server
-    prints `nothingNull` in the Native header. Direct `sumState(NULL)` returns
-    finalized `Nullable(Nothing)`, so fixtures must use CAST from `unhex('00')`.
-  - The server accepts `nothingNull` with other argument lists, but this change
-    intentionally registers only the canonical `Nullable(Nothing)` signature.
-    Do not broaden the registry without matching parser, legality, and fixture
-    tests.
-  - The Null suffix describes aggregate result semantics, not state nullability.
-    The opaque state is a non-null one-byte LargeBinary value with no null mask.
-    Outer `Nullable(AggregateFunction(...))` and LowCardinality wrappers remain
-    illegal; Array, Tuple, and Map values compose normally.
-  - Sum accumulator widths are 8 bytes for Bool, native integers up to 64 bits,
-    BFloat16/Float32/Float64, and Enums; 16 bytes for 128-bit integers and
-    Decimal32/64/128; and 32 bytes for 256-bit integers and Decimal256.
-  - The fixed-zero decode path still costs exactly two allocations per column,
-    one zero scan, one data copy, and no per-row allocations. Do not replace it
-    with per-row reads or reuse `Nothing`, whose wire placeholders are different.
-- **Key references:** the per-type workflow is in `AGENTS.md`. The exact
-  buffer and wire contract is in `CODEC_CONTRACT.md`. The implementation is in
-  `src/native/aggregate_function.rs`; focused tests are in
-  `src/native/decode/tests/aggregate_function.rs`,
-  `src/native/encode/tests/aggregate_function.rs`,
-  `src/ffi/tests/aggregate_function.rs`, `src/native/stream_decoder.rs`,
-  `tests/integration.rs`, and `tests/live_insert.rs`.
+- **Last updated:** 2026-07-15. Further `AggregateFunction(...)` work is paused
+  by project decision. The format has no generic state framing, so completing
+  the long tail requires a separately confirmed boundary codec, fixtures, and
+  tests for each function signature. That cost is not justified right now.
+  `SimpleAggregateFunction(func, T)` is complete and is not part of this pause.
+- **AggregateFunction checkpoint:** decode, encode, streaming, Arrow LargeBinary
+  export, real-server fixtures, and live INSERT coverage are complete for exact
+  base `count` with zero or one argument, canonical
+  `nothingUInt64(Nullable(Nothing))`, exact canonical
+  `nothingNull(Nullable(Nothing))`, and exact base `sum` over the supported plain
+  or Nullable numeric, Decimal, and Enum types. Unknown signatures remain
+  rejected even in zero-row blocks.
+- **AggregateFunction work left paused:** broader direct `nothingUInt64`
+  argument lists, every `nothingNull` argument family beyond the one canonical
+  `Nullable(Nothing)` signature, parameterized internal `nothingNull`, and every
+  other function-specific or combinator-specific state layout. This includes
+  their parser gates, row-boundary scanners, encode validation and writers,
+  Arrow contract decisions, synthetic tests, captured fixtures, and live-server
+  semantic checks. Resume only for a concrete binding or workload requirement,
+  not as an open-ended completeness exercise.
+- **Scope:** frame compression and its unwired files also remain untouched and
+  out of scope. Completeness still means uncompressed HTTP `FORMAT Native`.
+- **Recommended next:** expose a validated sink-based block encode API that
+  appends to a caller-provided `Vec<u8>`. The private
+  `encode_block_into(&mut Vec<u8>, ...)` path already validates before writing,
+  so this is bounded, non-compression, non-aggregate work that lets bindings
+  reuse transport buffers and avoid an otherwise unnecessary block allocation
+  or copy. Preserve the current owned-`Vec` API as the convenient default.
+- **After that:** investigate `QBit(T, N)` as the next standalone type. It is a
+  smaller and more isolated target than the interdependent
+  `Variant`/`Dynamic`/`JSON` family, but its layout must first be confirmed from
+  `SerializationQBit` at the pinned server tag through the required server-reader
+  workflow.
+- **Key references:** the aggregate checkpoint and paused boundary are recorded
+  in the Tier 3 item below and in `CODEC_CONTRACT.md`. The sink assessment is in
+  "Streaming encode and the encode-push overlap" below.
 
 ---
 
@@ -616,16 +578,23 @@ branch on the protocol revision, but the self-describing types (`Variant`,
 `Dynamic`, `JSON`) carry their own in-band version/structure headers, which is
 where the across-release churn lives.
 
-- [~] `AggregateFunction(...)` - function-specific coverage in progress. Exact
+- [~] `AggregateFunction(...)` - PAUSED by project decision on 2026-07-15. Exact
       unversioned base `count` with zero or one argument type is done at
       decode/encode parity, as are canonical `nothingUInt64`, exact canonical
       `nothingNull` for `Nullable(Nothing)`, and exact base `sum` for every plain
-      or Nullable numeric and Enum argument. States are stored as raw bytes with
-      i64 row offsets and exported as Arrow LargeBinary. The generic item stays
-      open because Native has no state/column length framing; each additional
-      signature needs a confirmed boundary codec. Recommended next: expand
-      `nothingNull` to its other server-valid argument lists, which the pinned
-      source confirms use the same strict fixed-zero state implementation.
+      or Nullable numeric and Enum argument. The two canonical `nothing*` states
+      use the strict fixed-zero codec.
+      States are stored as raw bytes with i64 row offsets and exported as Arrow
+      LargeBinary. The generic item stays open because Native has no state/column
+      length framing; each additional signature needs a confirmed boundary
+      codec. Work still left includes the broader direct `nothingUInt64`
+      argument family, every `nothingNull` argument family beyond the canonical
+      `Nullable(Nothing)` signature, parameterized internal `nothingNull`, and
+      all other function-specific and combinator-specific state layouts, with
+      matching parser, scanner, decode, encode, fixture, FFI-contract, and
+      live-server coverage. Do not resume this as an open-ended parity effort.
+      Resume only when a concrete binding or workload requires a specific
+      missing signature.
 - [ ] `Variant(...)` - discriminator stream plus per-variant columns.
 - [ ] `Dynamic` - self-describing, carries its own type info; optional
       `Dynamic(max_types=N)` form.
@@ -963,7 +932,8 @@ source into `ColBatch`es, exactly as the server chooses it on the query side via
 
 Potential future work, in value order. None of it is required for the overlap:
 
-- [ ] **Sink-based encode** (the one modest, real win for the overlap path): write
+- [ ] **Sink-based encode (RECOMMENDED NEXT)** (the one modest, real win for the
+      overlap path): write
       a block straight into a caller-provided `&mut Vec<u8>` / `impl io::Write`
       instead of returning an owned `Vec`, so a binding can encode directly into
       its transport send buffer and skip an allocation plus copy per block. The
