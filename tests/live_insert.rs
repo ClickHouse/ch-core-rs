@@ -1445,7 +1445,7 @@ fn aggregate_function_count_roundtrips_through_server() {
 
 #[test]
 #[ignore = "requires a live ClickHouse server matching .server-ref; run with --ignored"]
-fn aggregate_function_nothing_uint64_roundtrips_through_server() {
+fn aggregate_function_fixed_zero_states_roundtrip_through_server() {
     let server = Server::from_env();
     let batch = ColBatch::new(
         Schema::new(vec![
@@ -1460,11 +1460,22 @@ fn aggregate_function_nothing_uint64_roundtrips_through_server() {
                     arguments: vec![ChType::Nullable(Box::new(ChType::Nothing))],
                 },
             },
+            Field {
+                name: "cn".into(),
+                ch_type: ChType::AggregateFunction {
+                    function: "nothingNull".into(),
+                    arguments: vec![ChType::Nullable(Box::new(ChType::Nothing))],
+                },
+            },
         ]),
         vec![
             Column::UInt8(PrimitiveColumn::new(vec![0, 1, 2])),
             // One 0x00 placeholder byte per row; the server rejects any nonzero
             // byte as INCORRECT_DATA on read.
+            Column::AggregateState(AggregateStateColumn::new(
+                vec![0, 1, 2, 3],
+                vec![0x00, 0x00, 0x00],
+            )),
             Column::AggregateState(AggregateStateColumn::new(
                 vec![0, 1, 2, 3],
                 vec![0x00, 0x00, 0x00],
@@ -1476,27 +1487,35 @@ fn aggregate_function_nothing_uint64_roundtrips_through_server() {
     server.ddl(&format!("DROP TABLE IF EXISTS {AGG_NOTHING_TABLE}"));
     server.ddl(&format!(
         "CREATE TABLE {AGG_NOTHING_TABLE} \
-         (id UInt8, c AggregateFunction(nothingUInt64, Nullable(Nothing))) ENGINE = Memory"
+         (id UInt8, \
+         c AggregateFunction(nothingUInt64, Nullable(Nothing)), \
+         cn AggregateFunction(nothingNull, Nullable(Nothing))) ENGINE = Memory"
     ));
 
-    let bytes =
-        encode_block(&batch, &EncodeOptions::default()).expect("encode nothingUInt64 states");
+    let bytes = encode_block(&batch, &EncodeOptions::default())
+        .expect("encode fixed-zero aggregate states");
     server.insert_native_into(AGG_NOTHING_TABLE, &bytes);
 
     // Finalize on the server so this checks the raw states were accepted and
-    // interpreted as an only-null count (every row resolves to 0), not merely
-    // replayed as opaque bytes.
+    // interpreted as an only-null count and sum, not merely replayed as opaque
+    // bytes. nothingUInt64 finalizes to 0; nothingNull finalizes to NULL.
     let native = server.select(&format!(
-        "SELECT id, finalizeAggregation(c) AS count FROM {AGG_NOTHING_TABLE} ORDER BY id FORMAT Native"
+        "SELECT id, finalizeAggregation(c) AS count, \
+         isNull(finalizeAggregation(cn)) AS is_null \
+         FROM {AGG_NOTHING_TABLE} ORDER BY id FORMAT Native"
     ));
     let decoded = decode_all_bytes(&native, &DecodeOptions::default())
-        .expect("decode finalized nothingUInt64 states");
+        .expect("decode finalized fixed-zero states");
     server.ddl(&format!("DROP TABLE IF EXISTS {AGG_NOTHING_TABLE}"));
 
     assert_eq!(decoded.num_rows(), 3);
     match decoded.chunks[0].column(1) {
         Column::UInt64(c) => assert_eq!(c.values, vec![0, 0, 0]),
         other => panic!("expected finalized UInt64 counts, got {other:?}"),
+    }
+    match decoded.chunks[0].column(2) {
+        Column::UInt8(c) => assert_eq!(c.values, vec![1, 1, 1]),
+        other => panic!("expected nothingNull finalization markers, got {other:?}"),
     }
 }
 

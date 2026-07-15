@@ -1002,6 +1002,24 @@ fn parse_aggregate_function_nothing_uint64_signature_and_display() {
 }
 
 #[test]
+fn parse_aggregate_function_nothing_null_signature_and_display() {
+    // sum(Nullable(Nothing)) collapses to this canonical name on the wire, so
+    // this is the spelling a Native header actually carries.
+    let nothing_null = ChType::AggregateFunction {
+        function: "nothingNull".into(),
+        arguments: vec![ChType::Nullable(Box::new(ChType::Nothing))],
+    };
+    assert_eq!(
+        parse_ch_type("AggregateFunction(nothingNull, Nullable(Nothing))"),
+        Some(nothing_null.clone())
+    );
+    assert_eq!(
+        nothing_null.to_string(),
+        "AggregateFunction(nothingNull, Nullable(Nothing))"
+    );
+}
+
+#[test]
 fn parse_aggregate_function_sum_signatures_and_display() {
     // Every exact base sum argument accepted by the server is registered in
     // both its plain and Nullable form. The list covers every accumulator
@@ -1058,13 +1076,17 @@ fn parse_aggregate_function_rejects_unregistered_state_layouts() {
         "AggregateFunction(nothingUInt64)",
         "AggregateFunction(nothingUInt64, UInt64)",
         "AggregateFunction(nothingUInt64, Nothing)",
+        // This item registers only the canonical Nullable(Nothing) signature.
+        "AggregateFunction(nothingNull)",
+        "AggregateFunction(nothingNull, UInt64)",
+        "AggregateFunction(nothingNull, Nothing)",
+        "AggregateFunction(nothingNull, Nullable(Nothing), UInt64)",
         // Exact base sum is unary and excludes non-numeric Nullable inners and
         // every other sum-family function name. Nullable(Nothing) canonicalizes
         // to nothingNull, not to the nullable sum adapter.
         "AggregateFunction(sum)",
         "AggregateFunction(sum, UInt8, UInt16)",
         "AggregateFunction(sum, Nullable(Nothing))",
-        "AggregateFunction(nothingNull, Nullable(Nothing))",
         "AggregateFunction(sum, Nullable(String))",
         "AggregateFunction(sum, LowCardinality(UInt64))",
         "AggregateFunction(sum, String)",

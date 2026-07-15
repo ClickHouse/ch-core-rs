@@ -20,9 +20,10 @@
 //! (named or unnamed, including the zero-element `Tuple()`) over encodable
 //! element types, and `Map(K, V)` for a legal key type and any encodable
 //! key/value types, plus the registered exact `AggregateFunction` state codecs:
-//! `count`, canonical `nothingUInt64`, and base `sum` over one plain or Nullable
-//! numeric or Enum argument. The plain types and `Tuple` also compose inside a
-//! `Nullable(T)` wrapper (a per-row null map precedes the inner values). Every
+//! `count`, canonical `nothingUInt64` and `nothingNull`, and base `sum` over one
+//! plain or Nullable numeric or Enum argument. The plain types and `Tuple` also
+//! compose inside a `Nullable(T)` wrapper (a per-row null map precedes the inner
+//! values). Every
 //! other column type returns [`EncodeError::UnsupportedType`] until its encoder
 //! lands, the same one-type-at-a-time growth the decode path follows.
 

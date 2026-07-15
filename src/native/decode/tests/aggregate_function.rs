@@ -14,7 +14,15 @@ fn nothing_uint64_type() -> ChType {
     }
 }
 
+fn nothing_null_type() -> ChType {
+    ChType::AggregateFunction {
+        function: "nothingNull".into(),
+        arguments: vec![ChType::Nullable(Box::new(ChType::Nothing))],
+    }
+}
+
 const NOTHING_UINT64: &str = "AggregateFunction(nothingUInt64, Nullable(Nothing))";
+const NOTHING_NULL: &str = "AggregateFunction(nothingNull, Nullable(Nothing))";
 
 #[test]
 fn decode_count_states_preserves_exact_varuint_rows_and_next_column_boundary() {
@@ -273,6 +281,122 @@ fn decode_nothing_uint64_truncated_body_is_unexpected_eof() {
     let data = BlockBuilder::new()
         .header(1, 3)
         .column_header("c", NOTHING_UINT64)
+        .raw_bytes(&[0x00, 0x00])
+        .build();
+
+    assert!(matches!(
+        decode_all_bytes(&data, &DecodeOptions::default()),
+        Err(DecodeError::Io(ref error)) if error.kind() == io::ErrorKind::UnexpectedEof
+    ));
+    assert!(matches!(
+        block_end(&data, &DecodeOptions::default()),
+        Err(DecodeError::Io(ref error)) if error.kind() == io::ErrorKind::UnexpectedEof
+    ));
+}
+
+#[test]
+fn decode_nothing_null_states_are_one_zero_byte_per_row() {
+    // Four all-zero states, then a trailing UInt8 column so materialization and
+    // block_end must stop at the same byte after the fixed-width states.
+    let data = BlockBuilder::new()
+        .header(2, 4)
+        .column_header("c", NOTHING_NULL)
+        .raw_bytes(&[0x00, 0x00, 0x00, 0x00])
+        .column_header("u", "UInt8")
+        .raw_bytes(&[13, 79, 5, 11])
+        .build();
+
+    let decoded = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+    assert_eq!(decoded.schema.fields[0].ch_type, nothing_null_type());
+    match decoded.chunks[0].column(0) {
+        Column::AggregateState(c) => {
+            assert_eq!(c.offsets, vec![0, 1, 2, 3, 4]);
+            assert_eq!(c.data, vec![0x00, 0x00, 0x00, 0x00]);
+        }
+        other => panic!("expected AggregateState, got {other:?}"),
+    }
+    match decoded.chunks[0].column(1) {
+        Column::UInt8(c) => assert_eq!(c.values, vec![13, 79, 5, 11]),
+        other => panic!("expected trailing UInt8, got {other:?}"),
+    }
+    assert_eq!(
+        block_end(&data, &DecodeOptions::default()).unwrap(),
+        Some(data.len())
+    );
+}
+
+#[test]
+fn decode_nothing_null_zero_rows_keeps_schema_without_a_chunk() {
+    let data = BlockBuilder::new()
+        .header(1, 0)
+        .column_header("c", NOTHING_NULL)
+        .build();
+
+    let decoded = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+    assert_eq!(decoded.num_chunks(), 0);
+    assert_eq!(decoded.schema.fields[0].ch_type, nothing_null_type());
+    assert_eq!(
+        block_end(&data, &DecodeOptions::default()).unwrap(),
+        Some(data.len())
+    );
+}
+
+#[test]
+fn decode_nothing_null_multi_block_keeps_state_buffers_separate() {
+    let mut data = BlockBuilder::new()
+        .header(1, 2)
+        .column_header("c", NOTHING_NULL)
+        .raw_bytes(&[0x00, 0x00])
+        .build();
+    data.extend_from_slice(
+        &BlockBuilder::new()
+            .header(1, 1)
+            .column_header("c", NOTHING_NULL)
+            .raw_bytes(&[0x00])
+            .build(),
+    );
+
+    let decoded = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+    assert_eq!(decoded.num_chunks(), 2);
+    match decoded.chunks[0].column(0) {
+        Column::AggregateState(c) => {
+            assert_eq!(c.offsets, vec![0, 1, 2]);
+            assert_eq!(c.data, vec![0x00, 0x00]);
+        }
+        other => panic!("expected AggregateState, got {other:?}"),
+    }
+    match decoded.chunks[1].column(0) {
+        Column::AggregateState(c) => {
+            assert_eq!(c.offsets, vec![0, 1]);
+            assert_eq!(c.data, vec![0x00]);
+        }
+        other => panic!("expected AggregateState, got {other:?}"),
+    }
+}
+
+#[test]
+fn decode_nothing_null_nonzero_state_byte_is_invalid_data() {
+    let data = BlockBuilder::new()
+        .header(1, 2)
+        .column_header("c", NOTHING_NULL)
+        .raw_bytes(&[0x00, 0x01])
+        .build();
+
+    assert!(matches!(
+        decode_all_bytes(&data, &DecodeOptions::default()),
+        Err(DecodeError::Io(ref error)) if error.kind() == io::ErrorKind::InvalidData
+    ));
+    assert!(matches!(
+        block_end(&data, &DecodeOptions::default()),
+        Err(DecodeError::Io(ref error)) if error.kind() == io::ErrorKind::InvalidData
+    ));
+}
+
+#[test]
+fn decode_nothing_null_truncated_body_is_unexpected_eof() {
+    let data = BlockBuilder::new()
+        .header(1, 3)
+        .column_header("c", NOTHING_NULL)
         .raw_bytes(&[0x00, 0x00])
         .build();
 

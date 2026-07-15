@@ -19,12 +19,12 @@ pub(crate) enum AggregateStateCodec {
     /// `AggregateFunction(count)` and `AggregateFunction(count, T)` (with
     /// `T != Nullable(Nothing)`) serialize one unsigned VarUInt64 count per row.
     Count,
-    /// `AggregateFunction(nothingUInt64, Nullable(Nothing))` serializes exactly
-    /// one `0x00` byte per row. This is the canonical name the server assigns
-    /// when `count` collapses over an only-null argument (see
-    /// [`aggregate_state_codec`]); the state is a fixed-width 1-byte placeholder,
-    /// and any nonzero byte is `INCORRECT_DATA` on the server.
-    NothingUInt64,
+    /// Canonical `nothingUInt64` and `nothingNull` each serialize exactly one
+    /// `0x00` byte per row. They are the names the server assigns when `count`
+    /// and `sum` collapse over an only-null argument, respectively (see
+    /// [`aggregate_state_codec`]). Any nonzero byte is `INCORRECT_DATA` on the
+    /// server.
+    FixedZeroByte,
     /// `AggregateFunction(sum, T)` for one supported plain numeric or Enum
     /// argument serializes one fixed-width accumulator per row. The width is
     /// selected from `T` by [`sum_state_width`].
@@ -38,16 +38,16 @@ pub(crate) enum AggregateStateCodec {
 impl AggregateStateCodec {
     /// Fewest wire bytes one serialized state can occupy.
     ///
-    /// A `Count` VarUInt64 and a `nothingUInt64` placeholder are each at least
-    /// one byte; a `NullableSum` state is at least its one presence-flag byte
-    /// (a false state is exactly that byte); a `Sum` accumulator is exactly
+    /// A `Count` VarUInt64 and a fixed-zero placeholder are each one byte at
+    /// minimum; a `NullableSum` state is at least its one presence-flag byte (a
+    /// false state is exactly that byte); a `Sum` accumulator is exactly
     /// `state_width`. Used to cap the speculative offsets reservation in
     /// [`decode_aggregate_states`] at the rows the remaining input could
     /// actually hold.
     pub(crate) fn min_state_bytes(self) -> usize {
         match self {
             AggregateStateCodec::Count
-            | AggregateStateCodec::NothingUInt64
+            | AggregateStateCodec::FixedZeroByte
             | AggregateStateCodec::NullableSum { .. } => 1,
             AggregateStateCodec::Sum { state_width } => state_width,
         }
@@ -55,7 +55,7 @@ impl AggregateStateCodec {
 }
 
 /// Whether `arg` is exactly `Nullable(Nothing)`, the only-null argument shape
-/// that makes `count` collapse to `nothingUInt64` on the wire.
+/// that makes `count` and `sum` collapse to their canonical `nothing*` functions.
 fn is_nullable_nothing(arg: &ChType) -> bool {
     matches!(arg, ChType::Nullable(inner) if matches!(**inner, ChType::Nothing))
 }
@@ -119,13 +119,14 @@ fn sum_state_width(arg: &ChType) -> Option<usize> {
 /// opaque bytes: aggregate states have function-specific serialization and no
 /// generic length framing, so an unknown function must stay `UnsupportedType`
 /// (returning `None` here) or the streaming scan could not locate the next
-/// column. Three exact base signatures are registered:
+/// column. These exact signature families are registered:
 ///
 /// - `count`, unversioned, with zero or one argument type, writes one VarUInt64
 ///   per row (`AggregateFunctionCount::serialize`). `count` is strictly unary,
 ///   so `createAggregateFunctionCount` throws for more than one argument.
-/// - `nothingUInt64` with a single `Nullable(Nothing)` argument writes one
-///   `0x00` byte per row (`AggregateFunctionNothingImpl::serialize`).
+/// - `nothingUInt64` and `nothingNull`, each with a single `Nullable(Nothing)`
+///   argument, write one `0x00` byte per row
+///   (`AggregateFunctionNothingImpl::serialize`).
 /// - `sum` with exactly one numeric or Enum argument writes one fixed-width
 ///   accumulator per row (`AggregateFunctionSumData::write`). With a
 ///   `Nullable(T)` argument, `AggregateFunctionNullBase::serialize` first writes
@@ -145,23 +146,25 @@ fn sum_state_width(arg: &ChType) -> Option<usize> {
 /// that header would be a wire-format mismatch, since a server that parses the
 /// name resolves the one-zero-byte `nothingUInt64` codec, so it is rejected here.
 ///
-/// The `nothingUInt64` gate is deliberately restricted to the confirmed
-/// `Nullable(Nothing)` argument shape rather than any argument list. That name is
-/// synthesized only by the count collapse at this tag, and that collapse only
-/// happens for `Nullable(Nothing)`, so it is the only spelling the server emits.
-/// Accepting other argument lists would fabricate headers the server never
-/// writes and, on encode, that it could not parse back to `nothingUInt64`. The
-/// analogous parameterized `nothing*` forms exist for other functions, but only
-/// the confirmed shape is implemented.
+/// The `nothingUInt64` and `nothingNull` gates are deliberately restricted to
+/// the canonical `Nullable(Nothing)` signatures in this tracker item. The server
+/// can construct `nothingNull` with other argument lists, but those exact header
+/// shapes remain unsupported until they are added deliberately. The
+/// `AggregateFunction(sum, Nullable(Nothing))` spelling is also rejected: the
+/// server canonicalizes it to
+/// `AggregateFunction(nothingNull, Nullable(Nothing))`, which is the header
+/// Native actually writes.
 ///
 /// All confirmed against the server source at `v26.6.1.1193-stable`:
 /// `AggregateFunctionCount::serialize`,
+/// `AggregateFunctionFactory::get`/`getImpl`,
 /// `AggregateFunctionCombinatorNull::transformAggregateFunction` in
 /// `AggregateFunctions/Combinators/AggregateFunctionNull.cpp`,
 /// `AggregateFunctionNothingImpl::serialize`/`deserialize` in
 /// `AggregateFunctions/AggregateFunctionNothing.h`, and
-/// `DataTypeAggregateFunction::getNameImpl`, plus the sum references on
-/// [`sum_state_width`].
+/// `DataTypeAggregateFunction::create`/`getNameImpl`, plus the sum references on
+/// [`sum_state_width`]. `nothingNull` accepts other argument lists at the server,
+/// but only the exact canonical signature above is registered here.
 pub(crate) fn aggregate_state_codec(ch_type: &ChType) -> Option<AggregateStateCodec> {
     let ChType::AggregateFunction {
         function,
@@ -174,8 +177,10 @@ pub(crate) fn aggregate_state_codec(ch_type: &ChType) -> Option<AggregateStateCo
         "count" if arguments.len() <= 1 && !arguments.iter().any(is_nullable_nothing) => {
             Some(AggregateStateCodec::Count)
         }
-        "nothingUInt64" if arguments.len() == 1 && is_nullable_nothing(&arguments[0]) => {
-            Some(AggregateStateCodec::NothingUInt64)
+        "nothingUInt64" | "nothingNull"
+            if arguments.len() == 1 && is_nullable_nothing(&arguments[0]) =>
+        {
+            Some(AggregateStateCodec::FixedZeroByte)
         }
         "sum" if arguments.len() == 1 => match &arguments[0] {
             ChType::Nullable(inner) => sum_state_width(inner)
@@ -205,12 +210,12 @@ pub(crate) fn decode_state_codec(ch_type: &ChType) -> Result<AggregateStateCodec
 ///
 /// `AggregateFunction(count[, T])` uses one unsigned VarUInt64 per state
 /// (`AggregateFunctionCount::serialize` / `deserialize` at
-/// `v26.6.1.1193-stable`); `AggregateFunction(nothingUInt64, Nullable(Nothing))`
-/// uses one `0x00` byte per state; exact base `sum` uses the fixed accumulator
-/// width selected by its argument, with a leading flag and conditional
-/// accumulator for `Nullable(T)`. The walk records row ends while validating each
-/// state, then copies the complete contiguous run once. There is one offsets
-/// allocation and one data allocation per column, with no per-row allocation.
+/// `v26.6.1.1193-stable`); canonical `nothingUInt64` and `nothingNull` use one
+/// `0x00` byte per state; exact base `sum` uses the fixed accumulator width
+/// selected by its argument, with a leading flag and conditional accumulator for
+/// `Nullable(T)`. The walk records row ends while validating each state, then
+/// copies the complete contiguous run once. There is one offsets allocation and
+/// one data allocation per column, with no per-row allocation.
 ///
 /// The offsets vector holds 8-byte i64 end offsets, so a hostile `num_rows`
 /// (which the block header only bounds at one byte per row) could otherwise
@@ -280,20 +285,21 @@ pub(crate) fn scan_aggregate_states(
                 }
             }
         },
-        // `nothingUInt64` is a fixed-width 1-byte state: one `0x00` per row
+        // Canonical `nothingUInt64` and `nothingNull` are fixed-width 1-byte
+        // states: one `0x00` per row
         // (`AggregateFunctionNothingImpl::serialize` writes one '\0', and
         // `deserialize` throws INCORRECT_DATA if the byte is nonzero, at
-        // `v26.6.1.1193-stable`). The boundary walk is trivial: bounds-check the
-        // whole `num_rows`-byte run once, reject any nonzero byte as InvalidData
-        // (mirroring the server), then record offsets i -> i.
-        AggregateStateCodec::NothingUInt64 => {
+        // `v26.6.1.1193-stable`). Bounds-check the whole `num_rows`-byte run
+        // once, reject any nonzero byte as InvalidData, then record offsets
+        // i -> i.
+        AggregateStateCodec::FixedZeroByte => {
             let states = bytes.get(..num_rows).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::UnexpectedEof, "failed to fill whole buffer")
             })?;
-            if states.iter().any(|&b| b != 0) {
+            if states.iter().fold(0u8, |acc, &b| acc | b) != 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "AggregateFunction(nothingUInt64) state byte must be zero",
+                    "registered AggregateFunction(nothing*) state byte must be zero",
                 ));
             }
             pos = num_rows;
@@ -307,9 +313,7 @@ pub(crate) fn scan_aggregate_states(
                         "aggregate state data exceeds Arrow LargeBinary offset range",
                     )
                 })?;
-                for i in 1..=num_rows {
-                    offsets.push(i as i64);
-                }
+                offsets.extend((1..=num_rows).map(|i| i as i64));
             }
         }
         // Exact base `sum` is a fixed-width POD accumulator with no semantic
@@ -415,9 +419,10 @@ pub(crate) fn is_valid_aggregate_state(bytes: &[u8], codec: AggregateStateCodec)
         AggregateStateCodec::Count => {
             matches!(skip_varint(bytes, 0), Ok(end) if end == bytes.len())
         }
-        // Exactly one `0x00` byte: the server's `nothingUInt64` placeholder. A
-        // nonzero byte, an empty slice, or trailing bytes are all invalid.
-        AggregateStateCodec::NothingUInt64 => bytes == [0x00],
+        // Exactly one `0x00` byte: the server's canonical `nothing*`
+        // placeholder. A nonzero byte, an empty slice, or trailing bytes are all
+        // invalid.
+        AggregateStateCodec::FixedZeroByte => bytes == [0x00],
         // The server reads one raw accumulator and performs no value-level
         // validation. Exact width is the entire row-boundary contract.
         AggregateStateCodec::Sum { state_width } => bytes.len() == state_width,

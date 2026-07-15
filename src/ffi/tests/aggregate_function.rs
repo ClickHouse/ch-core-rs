@@ -69,47 +69,49 @@ fn export_count_state_as_large_binary_zero_copy() {
 }
 
 #[test]
-fn export_nothing_uint64_state_as_large_binary_zero_copy() {
-    // nothingUInt64 decodes into the same AggregateStateColumn/LargeBinary shape
-    // as count, so the export needs no type-specific handling: the states are one
-    // 0x00 byte each and export zero-copy under format `Z`.
-    let batch = Arc::new(ColBatch::new(
-        Schema::new(vec![Field {
-            name: "c".into(),
-            ch_type: ChType::AggregateFunction {
-                function: "nothingUInt64".into(),
-                arguments: vec![ChType::Nullable(Box::new(ChType::Nothing))],
-            },
-        }]),
-        vec![Column::AggregateState(AggregateStateColumn::new(
-            vec![0, 1, 2, 3],
-            vec![0x00, 0x00, 0x00],
-        ))],
-        3,
-    ));
+fn export_fixed_zero_states_as_large_binary_zero_copy() {
+    // Both canonical nothing functions decode into the same AggregateStateColumn
+    // shape as count. The `Null` suffix is aggregate function semantics, not
+    // Arrow nullability: every row remains a non-null one-byte state under `Z`.
+    for function in ["nothingUInt64", "nothingNull"] {
+        let batch = Arc::new(ColBatch::new(
+            Schema::new(vec![Field {
+                name: "c".into(),
+                ch_type: ChType::AggregateFunction {
+                    function: function.into(),
+                    arguments: vec![ChType::Nullable(Box::new(ChType::Nothing))],
+                },
+            }]),
+            vec![Column::AggregateState(AggregateStateColumn::new(
+                vec![0, 1, 2, 3],
+                vec![0x00, 0x00, 0x00],
+            ))],
+            3,
+        ));
 
-    // Safety: both outputs are writable zeroed C Data structs. The batch owns the
-    // offsets and state data until both release callbacks run.
-    unsafe {
-        let mut schema: ArrowSchema = std::mem::zeroed();
-        export_schema(&batch.schema, &mut schema);
-        let field = &**schema.children.add(0);
-        assert_eq!(CStr::from_ptr(field.format).to_str().unwrap(), "Z");
-        (schema.release.unwrap())(&mut schema);
+        // Safety: both outputs are writable zeroed C Data structs. The batch
+        // owns the offsets and state data until both release callbacks run.
+        unsafe {
+            let mut schema: ArrowSchema = std::mem::zeroed();
+            export_schema(&batch.schema, &mut schema);
+            let field = &**schema.children.add(0);
+            assert_eq!(CStr::from_ptr(field.format).to_str().unwrap(), "Z");
+            (schema.release.unwrap())(&mut schema);
 
-        let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
-        let child = &**array.children.add(0);
-        assert_eq!(child.length, 3);
-        assert_eq!(child.null_count, 0);
-        assert_eq!(child.n_buffers, 3);
-        assert!((*child.buffers.add(0)).is_null());
-        let offsets = *child.buffers.add(1) as *const i64;
-        assert_eq!(*offsets.add(0), 0);
-        assert_eq!(*offsets.add(3), 3);
-        let data = *child.buffers.add(2) as *const u8;
-        assert_eq!(std::slice::from_raw_parts(data, 3), &[0x00, 0x00, 0x00]);
-        (array.release.unwrap())(&mut array);
+            let mut array: ArrowArray = std::mem::zeroed();
+            export_batch_array(&batch, &mut array);
+            let child = &**array.children.add(0);
+            assert_eq!(child.length, 3);
+            assert_eq!(child.null_count, 0);
+            assert_eq!(child.n_buffers, 3);
+            assert!((*child.buffers.add(0)).is_null());
+            let offsets = *child.buffers.add(1) as *const i64;
+            assert_eq!(*offsets.add(0), 0);
+            assert_eq!(*offsets.add(3), 3);
+            let data = *child.buffers.add(2) as *const u8;
+            assert_eq!(std::slice::from_raw_parts(data, 3), &[0x00, 0x00, 0x00]);
+            (array.release.unwrap())(&mut array);
+        }
     }
 }
 

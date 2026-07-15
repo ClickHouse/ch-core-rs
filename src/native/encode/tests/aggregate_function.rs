@@ -346,6 +346,20 @@ fn nothing_uint64_batch() -> ColBatch {
     )
 }
 
+fn nothing_null_batch() -> ColBatch {
+    ColBatch::new(
+        Schema::new(vec![Field {
+            name: "c".into(),
+            ch_type: parse_ch_type("AggregateFunction(nothingNull, Nullable(Nothing))").unwrap(),
+        }]),
+        vec![Column::AggregateState(AggregateStateColumn::new(
+            vec![0, 1, 2, 3],
+            vec![0x00, 0x00, 0x00],
+        ))],
+        3,
+    )
+}
+
 #[test]
 fn roundtrip_nothing_uint64_states_rev0() {
     roundtrip(&nothing_uint64_batch(), 0);
@@ -404,6 +418,69 @@ fn nothing_uint64_validation_rejects_nonzero_or_wrong_width_states() {
 }
 
 #[test]
+fn roundtrip_nothing_null_states_rev0() {
+    roundtrip(&nothing_null_batch(), 0);
+}
+
+#[test]
+fn roundtrip_nothing_null_states_tcp_revision() {
+    roundtrip(&nothing_null_batch(), DBMS_TCP_PROTOCOL_VERSION);
+}
+
+#[test]
+fn rev0_frames_nothing_null_state_bytes_verbatim() {
+    let batch = nothing_null_batch();
+    let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+    assert!(bytes.ends_with(&[0x00, 0x00, 0x00]));
+    let decoded = decode_all_bytes(&bytes, &DecodeOptions::default()).unwrap();
+    assert_batches_eq(&batch, &decoded.chunks[0]);
+}
+
+#[test]
+fn zero_row_nothing_null_state_encodes_schema_without_body() {
+    let batch = ColBatch::new(
+        Schema::new(vec![Field {
+            name: "c".into(),
+            ch_type: parse_ch_type("AggregateFunction(nothingNull, Nullable(Nothing))").unwrap(),
+        }]),
+        vec![Column::AggregateState(AggregateStateColumn::new(
+            vec![0],
+            vec![],
+        ))],
+        0,
+    );
+
+    let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+    let decoded = decode_all_bytes(&bytes, &DecodeOptions::default()).unwrap();
+    assert_eq!(decoded.num_chunks(), 0);
+    assert_eq!(decoded.schema, batch.schema);
+}
+
+#[test]
+fn nothing_null_validation_rejects_nonzero_or_wrong_width_states() {
+    for column in [
+        AggregateStateColumn::new(vec![0, 1, 2], vec![0x00, 0x01]),
+        AggregateStateColumn::new(vec![0, 2], vec![0x00, 0x00]),
+        AggregateStateColumn::new(vec![0, 0], vec![]),
+    ] {
+        let num_rows = column.offsets.len() - 1;
+        let batch = ColBatch {
+            schema: Schema::new(vec![Field {
+                name: "c".into(),
+                ch_type: parse_ch_type("AggregateFunction(nothingNull, Nullable(Nothing))")
+                    .unwrap(),
+            }]),
+            columns: vec![Column::AggregateState(column)],
+            num_rows,
+        };
+        assert!(matches!(
+            encode_block(&batch, &EncodeOptions::default()),
+            Err(EncodeError::InconsistentBatch { .. })
+        ));
+    }
+}
+
+#[test]
 fn count_nullable_nothing_spelling_is_not_encodable() {
     // The parser rejects this spelling (it canonicalizes to nothingUInt64 on the
     // wire), so it is constructed directly to prove encode validation also refuses
@@ -420,6 +497,31 @@ fn count_nullable_nothing_spelling_is_not_encodable() {
         columns: vec![Column::AggregateState(AggregateStateColumn::new(
             vec![0, 1],
             vec![0x0d],
+        ))],
+        num_rows: 1,
+    };
+    assert!(matches!(
+        encode_block(&batch, &EncodeOptions::default()),
+        Err(EncodeError::UnsupportedType { .. })
+    ));
+}
+
+#[test]
+fn sum_nullable_nothing_spelling_is_not_encodable() {
+    // The server canonicalizes this spelling to nothingNull. Only the canonical
+    // Native header is registered, so a caller-built noncanonical type must not
+    // be written even though the row state has the same one-zero-byte layout.
+    let batch = ColBatch {
+        schema: Schema::new(vec![Field {
+            name: "s".into(),
+            ch_type: ChType::AggregateFunction {
+                function: "sum".into(),
+                arguments: vec![ChType::Nullable(Box::new(ChType::Nothing))],
+            },
+        }]),
+        columns: vec![Column::AggregateState(AggregateStateColumn::new(
+            vec![0, 1],
+            vec![0x00],
         ))],
         num_rows: 1,
     };

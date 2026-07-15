@@ -510,6 +510,13 @@ fn assert_all_types(batch: &ChunkedBatch) {
                     }],
                 },
             ),
+            Expected::Exact(
+                "agg_nothing_null",
+                ChType::AggregateFunction {
+                    function: "nothingNull".to_string(),
+                    arguments: vec![ChType::Nullable(Box::new(ChType::Nothing))],
+                },
+            ),
         ],
     );
 
@@ -1681,6 +1688,18 @@ fn assert_all_types(batch: &ChunkedBatch) {
                 .flat_map(i64::to_le_bytes)
                 .collect();
             assert_eq!(c.data, expected);
+        }
+        other => panic!("expected AggregateState, got {other:?}"),
+    }
+
+    // AggregateFunction(nothingNull, Nullable(Nothing)) (col 103): the canonical
+    // name for sum over an only-null argument. Each opaque state is one strict
+    // 0x00 byte; the function's Null suffix does not create Arrow nullability.
+    match block.column(103) {
+        Column::AggregateState(c) => {
+            assert_eq!(c.offsets, vec![0i64, 1, 2, 3, 4]);
+            assert_eq!(c.data, vec![0x00, 0x00, 0x00, 0x00]);
+            assert_eq!(c.null_count(), 0);
         }
         other => panic!("expected AggregateState, got {other:?}"),
     }

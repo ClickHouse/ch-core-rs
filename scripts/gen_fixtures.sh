@@ -405,7 +405,12 @@ SELECT
     arrayReduce('sumState', multiIf(n = 0, CAST([], 'Array(Nullable(UInt8))'), n = 1, CAST([NULL], 'Array(Nullable(UInt8))'), n = 2, CAST([13, NULL], 'Array(Nullable(UInt8))'), CAST([NULL, 79, 13], 'Array(Nullable(UInt8))'))) AS agg_sum_nu8,
     -- Enum8 and Enum16 both sum into signed Int64 states; one Enum8 fixture is
     -- enough to ground the explicit Enum dispatch against real server bytes.
-    arrayReduce('sumState', arrayMap(x -> CAST(x, 'Enum8(\'zero\' = 0, \'one\' = 1, \'two\' = 2)'), range(n))) AS agg_sum_e8
+    arrayReduce('sumState', arrayMap(x -> CAST(x, 'Enum8(\'zero\' = 0, \'one\' = 1, \'two\' = 2)'), range(n))) AS agg_sum_e8,
+    -- AggregateFunction(nothingNull, Nullable(Nothing)): the canonical function
+    -- name when sum collapses over an only-null argument. Direct sumState(NULL)
+    -- collapses to a finalized Nullable(Nothing), so CAST from the exact one-zero-
+    -- byte state is the reliable construction for a Native fixture.
+    CAST(unhex('00'), 'AggregateFunction(nothingNull, Nullable(Nothing))') AS agg_nothing_null
 FROM numbers(4)
 SETTINGS allow_suspicious_low_cardinality_types = 1, enable_nullable_tuple_type = 1, enable_time_time64_type = 1, flatten_nested = 0
 FORMAT Native
