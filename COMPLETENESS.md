@@ -47,11 +47,19 @@ point-in-time snapshot for the next agent, not a changelog. Keep it short. Alway
 include a "Recommended next" with a one-line reason, so the next agent has a
 default; the user may override it.
 
-- **Last updated:** 2026-07-15. Further `AggregateFunction(...)` work is paused
-  by project decision. The format has no generic state framing, so completing
-  the long tail requires a separately confirmed boundary codec, fixtures, and
-  tests for each function signature. That cost is not justified right now.
-  `SimpleAggregateFunction(func, T)` is complete and is not part of this pause.
+- **Last updated:** 2026-07-15. Two project decisions today. First, further
+  `AggregateFunction(...)` work is paused. The format has no generic state
+  framing, so completing the long tail requires a separately confirmed boundary
+  codec, fixtures, and tests for each function signature. That cost is not
+  justified right now. `SimpleAggregateFunction(func, T)` is complete and is
+  not part of this pause. Second, the path forward is type completeness, not
+  encode-API polish: the goal is to cover every major type so the Python
+  binding POC for clickhouse-connect can be opened to real workloads, where a
+  single unsupported column fails the whole query. The previously recommended
+  sink-based encode API is deferred as polish: `encode_block`'s owned `Vec`
+  already supports the encode/push overlap, the private `encode_block_into`
+  exists whenever a binding measures the extra allocation as mattering, and
+  the POC's pitch is decode-side anyway. Do not pick it up next.
 - **AggregateFunction checkpoint:** decode, encode, streaming, Arrow LargeBinary
   export, real-server fixtures, and live INSERT coverage are complete for exact
   base `count` with zero or one argument, canonical
@@ -69,20 +77,25 @@ default; the user may override it.
   not as an open-ended completeness exercise.
 - **Scope:** frame compression and its unwired files also remain untouched and
   out of scope. Completeness still means uncompressed HTTP `FORMAT Native`.
-- **Recommended next:** expose a validated sink-based block encode API that
-  appends to a caller-provided `Vec<u8>`. The private
-  `encode_block_into(&mut Vec<u8>, ...)` path already validates before writing,
-  so this is bounded, non-compression, non-aggregate work that lets bindings
-  reuse transport buffers and avoid an otherwise unnecessary block allocation
-  or copy. Preserve the current owned-`Vec` API as the convenient default.
-- **After that:** investigate `QBit(T, N)` as the next standalone type. It is a
-  smaller and more isolated target than the interdependent
-  `Variant`/`Dynamic`/`JSON` family, but its layout must first be confirmed from
-  `SerializationQBit` at the pinned server tag through the required server-reader
-  workflow.
+- **Recommended next:** `Variant(...)`. It is the dependency root of the
+  remaining Tier 3 family: `Dynamic` is built on Variant's discriminator
+  machinery, `JSON` is built on Dynamic subcolumns, and `Geometry` is a
+  `Variant(...)` of the six already-done geo aliases, so it falls out nearly
+  free once Variant lands. These are the version-sensitive types with in-band
+  version/structure headers, so the server-reader confirmation step matters
+  most here; start with a dedicated `SerializationVariant` read at the pin.
+- **After that:** `Dynamic`, then `JSON`, then `Geometry` (mostly free), with
+  `QBit(T, N)` last or on demand. QBit is small and isolated but niche, so it
+  buys little for real-workload POC testing compared to the
+  Variant/Dynamic/JSON family. Before opening the POC to outside users, also
+  resolve sparse column serialization (see "Wire / protocol features"): it is
+  default-on server-side since 23.7 and reaches any client that negotiates
+  `client_protocol_version >= 54454`, and the decoder currently rejects its
+  marker.
 - **Key references:** the aggregate checkpoint and paused boundary are recorded
-  in the Tier 3 item below and in `CODEC_CONTRACT.md`. The sink assessment is in
-  "Streaming encode and the encode-push overlap" below.
+  in the Tier 3 item below and in `CODEC_CONTRACT.md`. The deferred sink
+  assessment is in "Streaming encode and the encode-push overlap" below. The
+  docs-sourced sparse wire notes are in "Wire / protocol features".
 
 ---
 
@@ -595,9 +608,12 @@ where the across-release churn lives.
       live-server coverage. Do not resume this as an open-ended parity effort.
       Resume only when a concrete binding or workload requires a specific
       missing signature.
-- [ ] `Variant(...)` - discriminator stream plus per-variant columns.
+- [ ] `Variant(...)` - discriminator stream plus per-variant columns. NEXT UP
+      per the 2026-07-15 path decision: it is the dependency root for
+      `Dynamic`, `JSON`, and `Geometry`, so it unblocks the rest of this tier.
 - [ ] `Dynamic` - self-describing, carries its own type info; optional
-      `Dynamic(max_types=N)` form.
+      `Dynamic(max_types=N)` form. Second in the 2026-07-15 ordering, after
+      `Variant` and before `JSON`.
 - [ ] `JSON` (new object type) - dynamic subcolumns, carries its own structure
       header; highest effort. Confirmed registered (case-insensitive) and GA at
       v26.6.1.1193-stable. The legacy `Object('json')` spelling is **not registered
@@ -613,7 +629,9 @@ where the across-release churn lives.
       obsolete no-op; CHANGELOG confirms the GA transition). Wire layout
       (`SerializationQBit`) is NOT yet examined - needs a dedicated
       `clickhouse-server-reader` read of `SerializationQBit.cpp` before tiering it
-      for implementation.
+      for implementation. Deprioritized to last or on-demand per the 2026-07-15
+      path decision: small and isolated, but niche relative to the
+      Variant/Dynamic/JSON family for real-workload POC testing.
 
 ---
 
@@ -631,6 +649,28 @@ where the across-release churn lives.
       transport compression (gzip/zstd), which stays in the bindings.
 - [ ] Sparse column serialization - the nonzero custom-serialization marker the
       decoder currently rejects. Needed wherever the server emits sparse columns.
+      Resolve before opening the binding POC to outside workloads (2026-07-15
+      decision). Server-side sparse encoding has been default-on since 23.7
+      (`ratio_of_defaults_for_sparse_serialization = 0.9375`, introduced
+      experimental in 22.1), so real MergeTree tables commonly hold sparse
+      parts, and the per-part serialization kind can differ within one table.
+      Reach analysis: the custom-serialization marker byte only exists at
+      revision >= 54454, and plain HTTP `FORMAT Native` responds with rev 0
+      framing unless the client sends `client_protocol_version` (this is
+      exactly how `scripts/gen_fixtures.sh` captures the rev 54485 fixture), so
+      a rev 0 client presumably always receives full columns - INFERRED, since
+      without the marker the server has no way to signal sparse; confirm the
+      NativeWriter conversion at the pin. Wire layout per the official Native
+      format spec docs (docs-sourced 2026-07-15, NOT yet source-confirmed; run
+      the `clickhouse-server-reader` workflow before implementing): the marker
+      carries a kind_stack byte of 0x01 for SPARSE, then the column data is two
+      back-to-back streams - first a VarUInt offset stream where each value is
+      the number of default positions before the next non-default value and a
+      value with bit 62 set (`END_OF_GRANULE_FLAG`) terminates the stream, then
+      the non-default values densely packed in the inner type. Special case:
+      for `Nullable(T)` the null map is dropped entirely; the offset stream
+      identifies the non-NULL positions and every other position reconstructs
+      as NULL.
 - [x] Multiple-stream bulk-state prefix - the per-column read is generalized via
       `read_state_prefix` in `src/native/decode/mod.rs`, so a type with a real
       `deserializeBinaryBulkStatePrefix` declares its prefix in one place instead
@@ -932,13 +972,15 @@ source into `ColBatch`es, exactly as the server chooses it on the query side via
 
 Potential future work, in value order. None of it is required for the overlap:
 
-- [ ] **Sink-based encode (RECOMMENDED NEXT)** (the one modest, real win for the
-      overlap path): write
+- [ ] **Sink-based encode (deferred 2026-07-15; polish, not a blocker)** (the
+      one modest, real win for the overlap path): write
       a block straight into a caller-provided `&mut Vec<u8>` / `impl io::Write`
       instead of returning an owned `Vec`, so a binding can encode directly into
       its transport send buffer and skip an allocation plus copy per block. The
       private `encode_block_into(&mut Vec<u8>, ...)` already does exactly this
-      internally; exposing it (or an `io::Write` variant) is a few lines.
+      internally; exposing it (or an `io::Write` variant) is a few lines. Pick
+      it up when a binding measures the per-block allocation as mattering, not
+      before; Tier 3 type coverage comes first.
 - [ ] **`StreamEncoder` (ergonomics and safety, NOT overlap).** A thin feed/finish
       state machine over `encode_block`: pin the first fed batch's schema and
       reject a later mismatch (the mirror of `StreamDecoder`'s
