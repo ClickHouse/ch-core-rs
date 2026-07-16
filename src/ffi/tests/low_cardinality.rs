@@ -67,7 +67,7 @@ fn test_export_low_cardinality_array() {
     let batch = make_dictionary_batch(true);
     unsafe {
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
 
         let c0 = &**array.children.add(0);
         assert_eq!(c0.length, 4);
@@ -182,7 +182,7 @@ fn test_export_low_cardinality_uint32() {
         // Array: 2 index buffers (validity, i32 indices), dictionary child
         // holding 4 uint32 entries with 2 buffers (validity, values).
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let c0 = &**array.children.add(0);
         assert_eq!(c0.length, 3);
         assert_eq!(c0.n_buffers, 2);
@@ -234,7 +234,7 @@ fn test_export_low_cardinality_bfloat16_child_zero_copy() {
         (schema_out.release.unwrap())(&mut schema_out);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let field = &**array.children.add(0);
         assert!(!field.dictionary.is_null());
         let values = &*field.dictionary;
@@ -315,7 +315,7 @@ fn test_export_low_cardinality_interval_formats_and_buffers() {
         (schema_out.release.unwrap())(&mut schema_out);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
 
         let second = &**array.children.add(0);
         assert_eq!(second.length, 3);
@@ -372,7 +372,7 @@ fn test_export_low_cardinality_uuid_child_format() {
         (schema_out.release.unwrap())(&mut schema_out);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let c0 = &**array.children.add(0);
         assert!(!c0.dictionary.is_null(), "dictionary child array present");
         let dict_array = &*c0.dictionary;

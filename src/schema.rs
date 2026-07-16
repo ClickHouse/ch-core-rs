@@ -135,6 +135,17 @@ pub enum ChType {
     // but it composes inside Array/Tuple and as either Map key or value.
     Variant(Vec<ChType>),
 
+    // `Dynamic` is a self-describing Variant whose concrete alternatives are
+    // carried in each non-empty Native column prefix. `max_types` is the number
+    // of ordinary typed alternatives the server may keep before routing new
+    // runtime types through its binary `SharedVariant` child. The valid range is
+    // 0..=254; 32 is the default and renders as the bare `Dynamic` spelling.
+    // Unlike Variant, the runtime alternatives are column data rather than
+    // logical schema, so they live on `DynamicColumn`, not here.
+    Dynamic {
+        max_types: u8,
+    },
+
     // Name-decoration aliases over existing machinery. Each of these three is a
     // custom `getName()` attached to an underlying type instance whose
     // serialization slot stays null (confirmed at v26.6.1.1193-stable), so the
@@ -414,6 +425,8 @@ impl std::fmt::Display for ChType {
                 }
                 write!(f, ")")
             }
+            ChType::Dynamic { max_types: 32 } => write!(f, "Dynamic"),
+            ChType::Dynamic { max_types } => write!(f, "Dynamic(max_types={max_types})"),
             // `func` already carries any parenthesized params, so this renders
             // the exact spelling the server emits and round-trips through the
             // parser.

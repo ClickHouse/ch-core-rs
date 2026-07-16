@@ -8,7 +8,10 @@ use std::ptr;
 use std::sync::Arc;
 
 use crate::batch::ColBatch;
-use crate::column::{Column, VariantColumn, VariantGroup, VariantLayout, ARROW_UNION_MAX_CHILDREN};
+use crate::column::{
+    Column, DynamicChild, DynamicColumn, Utf8Column, VariantColumn, VariantGroup, VariantLayout,
+    ARROW_UNION_MAX_CHILDREN,
+};
 use crate::native::decode::low_cardinality_dict_value_type;
 use crate::schema::{ChType, IntervalKind, Schema};
 
@@ -89,6 +92,12 @@ struct SchemaPrivateData {
 struct ArrayPrivateData {
     buffers: Vec<*const c_void>,
     children: Vec<*mut ArrowArray>,
+    /// Routing buffers synthesized only when a Dynamic column's block-local
+    /// u32 child ids must be mapped into Arrow's signed Int8 union codes.
+    /// Ordinary columns and already-Arrow-shaped Variant columns leave these
+    /// empty and continue to borrow their buffers zero-copy.
+    _owned_type_ids: Vec<i8>,
+    _owned_offsets: Vec<i32>,
     _batch: Arc<ColBatch>,
     /// The dictionary values child array for a `LowCardinality(T)` column, owned
     /// here so it is freed when this column's array is released. Null for every
@@ -99,9 +108,276 @@ struct ArrayPrivateData {
 struct StreamPrivateData {
     /// Schema for `get_schema`; valid even when there are zero chunks.
     schema: Schema,
+    /// Recursive result-wide physical plans. Dynamic discovers its concrete
+    /// child types per block, so the stream pre-scans the already-supplied
+    /// chunks once and fixes one schema before the first batch is exported.
+    plans: Vec<FieldExportPlan>,
     /// Remaining chunks to hand out, one Arrow record batch per `get_next`.
     chunks: std::vec::IntoIter<Arc<ColBatch>>,
+    /// Set when the result-wide plan cannot be exported at all, currently only a
+    /// Dynamic child set beyond [`DYNAMIC_MAX_EXPORT_CHILDREN`]. While set,
+    /// `get_schema` and `get_next` return [`STREAM_INIT_ERROR`] without writing
+    /// their `out` struct, and `get_last_error` returns `error_msg`.
+    init_error: bool,
     error_msg: CString,
+}
+
+enum FieldExportPlan {
+    Plain,
+    Array(Box<FieldExportPlan>),
+    Tuple(Vec<FieldExportPlan>),
+    Map {
+        key: Box<FieldExportPlan>,
+        value: Box<FieldExportPlan>,
+    },
+    Variant(Vec<FieldExportPlan>),
+    Dynamic(DynamicExportPlan),
+}
+
+struct DynamicExportPlan {
+    children: Vec<DynamicPlanChild>,
+}
+
+enum DynamicPlanChild {
+    Typed {
+        ch_type: ChType,
+        plan: Box<FieldExportPlan>,
+    },
+    Shared,
+}
+
+impl DynamicPlanChild {
+    fn name(&self) -> String {
+        match self {
+            DynamicPlanChild::Typed { ch_type, .. } => ch_type.to_string(),
+            DynamicPlanChild::Shared => "SharedVariant".to_string(),
+        }
+    }
+}
+
+/// Largest Dynamic child set the Arrow export can represent. A Dynamic exports
+/// as a two-level dense union whose type codes are signed `i8`. The outer node
+/// spends its final code on the intrinsic NULL child, leaving at most
+/// `ARROW_UNION_MAX_CHILDREN - 1` non-null groups of `ARROW_UNION_MAX_CHILDREN`
+/// typed children. A larger set cannot be routed within the code space, so the
+/// stream planner rejects it (127 * 128 = 16,256 children).
+const DYNAMIC_MAX_EXPORT_CHILDREN: usize =
+    (ARROW_UNION_MAX_CHILDREN - 1) * ARROW_UNION_MAX_CHILDREN;
+
+/// An error from a standalone Arrow C Data export entry point
+/// ([`export_batch`], [`export_batch_schema`], [`export_batch_array`]). The
+/// Arrow C Stream export ([`export_chunks_to_stream`]) reports the same
+/// condition through the stream's `get_last_error` contract instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportError {
+    /// A `Dynamic` column's block-local child set is too wide to route within
+    /// Arrow's signed Int8 dense-union type-code space. Carries the offending
+    /// child count and the export limit ([`DYNAMIC_MAX_EXPORT_CHILDREN`]). This
+    /// is reachable from a legitimate server: a FLATTENED Dynamic block
+    /// (structure word 3) bounds its runtime type count only by the row count,
+    /// not by `max_types`, so a single block can carry more than the limit.
+    DynamicUnionTooWide { children: usize, limit: usize },
+}
+
+impl std::fmt::Display for ExportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExportError::DynamicUnionTooWide { children, limit } => write!(
+                f,
+                "Dynamic column has {children} distinct types, exceeding the \
+                 Arrow union export limit of {limit}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExportError {}
+
+/// The distinct child count of the first Dynamic node in `plan` that exceeds
+/// [`DYNAMIC_MAX_EXPORT_CHILDREN`], searching recursively through containers and
+/// nested Dynamic children. `None` when every Dynamic node fits Arrow's signed
+/// Int8 dense-union code space.
+fn dynamic_plan_over_limit(plan: &FieldExportPlan) -> Option<usize> {
+    match plan {
+        FieldExportPlan::Plain => None,
+        FieldExportPlan::Array(inner) => dynamic_plan_over_limit(inner),
+        FieldExportPlan::Tuple(plans) | FieldExportPlan::Variant(plans) => {
+            plans.iter().find_map(dynamic_plan_over_limit)
+        }
+        FieldExportPlan::Map { key, value } => {
+            dynamic_plan_over_limit(key).or_else(|| dynamic_plan_over_limit(value))
+        }
+        FieldExportPlan::Dynamic(dynamic) => {
+            if dynamic.children.len() > DYNAMIC_MAX_EXPORT_CHILDREN {
+                return Some(dynamic.children.len());
+            }
+            dynamic.children.iter().find_map(|child| match child {
+                DynamicPlanChild::Typed { plan, .. } => dynamic_plan_over_limit(plan),
+                DynamicPlanChild::Shared => None,
+            })
+        }
+    }
+}
+
+/// The block-local child count of the first Dynamic node in `col` that exceeds
+/// [`DYNAMIC_MAX_EXPORT_CHILDREN`], searching recursively through every place
+/// the standalone array/schema export descends: dictionary values, list/map
+/// elements, tuple fields, Variant alternatives, and Dynamic typed children
+/// (including Dynamic nested in Dynamic). `None` when every Dynamic node fits
+/// Arrow's signed Int8 dense-union code space. This is the column-side twin of
+/// [`dynamic_plan_over_limit`], which walks the stream's plan tree instead.
+fn dynamic_column_over_limit(col: &Column) -> Option<usize> {
+    match col {
+        Column::Dynamic(c) => {
+            if c.children.len() > DYNAMIC_MAX_EXPORT_CHILDREN {
+                return Some(c.children.len());
+            }
+            c.children.iter().find_map(|child| match child {
+                DynamicChild::Typed { values, .. } => dynamic_column_over_limit(values),
+                DynamicChild::Shared(_) => None,
+            })
+        }
+        Column::Array(c) => dynamic_column_over_limit(&c.values),
+        Column::Tuple(c) => c.fields.iter().find_map(dynamic_column_over_limit),
+        Column::Map(c) => dynamic_column_over_limit(&c.entries),
+        Column::Variant(c) => c.variants.iter().find_map(dynamic_column_over_limit),
+        Column::Dictionary(c) => dynamic_column_over_limit(&c.values),
+        _ => None,
+    }
+}
+
+/// Reject a batch whose Arrow export would emit a malformed Dynamic union. A
+/// FLATTENED Dynamic block can legitimately carry more distinct runtime types
+/// than the two-level union can route within Arrow's signed Int8 type-code
+/// space, so the standalone export entry points fail loudly here rather than
+/// emit a schema and array that both reference type codes outside i8.
+fn check_dynamic_export_limit(batch: &ColBatch) -> Result<(), ExportError> {
+    for column in &batch.columns {
+        if let Some(children) = dynamic_column_over_limit(column) {
+            return Err(ExportError::DynamicUnionTooWide {
+                children,
+                limit: DYNAMIC_MAX_EXPORT_CHILDREN,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn build_export_plan(ch_type: &ChType, columns: &[&Column]) -> FieldExportPlan {
+    if let Some(under) = ch_type.physical_delegate() {
+        return build_export_plan(&under, columns);
+    }
+    match ch_type {
+        ChType::Nullable(inner) => build_export_plan(inner, columns),
+        ChType::Array(inner) => {
+            let children = columns
+                .iter()
+                .filter_map(|column| match column {
+                    Column::Array(column) => Some(column.values.as_ref()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            FieldExportPlan::Array(Box::new(build_export_plan(inner, &children)))
+        }
+        ChType::Tuple(elements) => {
+            let plans = elements
+                .iter()
+                .enumerate()
+                .map(|(index, (_, element_type))| {
+                    let children = columns
+                        .iter()
+                        .filter_map(|column| match column {
+                            Column::Tuple(column) => column.fields.get(index),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    build_export_plan(element_type, &children)
+                })
+                .collect();
+            FieldExportPlan::Tuple(plans)
+        }
+        ChType::Map(key, value) => {
+            let mut keys = Vec::new();
+            let mut values = Vec::new();
+            for column in columns {
+                if let Column::Map(column) = column {
+                    if let Column::Tuple(entries) = column.entries.as_ref() {
+                        if let [key_column, value_column] = entries.fields.as_slice() {
+                            keys.push(key_column);
+                            values.push(value_column);
+                        }
+                    }
+                }
+            }
+            FieldExportPlan::Map {
+                key: Box::new(build_export_plan(key, &keys)),
+                value: Box::new(build_export_plan(value, &values)),
+            }
+        }
+        ChType::Variant(alternatives) => {
+            let plans = alternatives
+                .iter()
+                .enumerate()
+                .map(|(index, alternative)| {
+                    let children = columns
+                        .iter()
+                        .filter_map(|column| match column {
+                            Column::Variant(column) => column.variants.get(index),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    build_export_plan(alternative, &children)
+                })
+                .collect();
+            FieldExportPlan::Variant(plans)
+        }
+        ChType::Dynamic { .. } => {
+            // Discover the result-wide child set in one pass, mapping each
+            // canonical child name to its concrete `ChType` (absent for
+            // SharedVariant) and the block-local value columns that feed it.
+            // Collecting the value columns here rather than re-scanning per
+            // discovered name keeps this linear in the number of children; a
+            // result-wide Dynamic can reach tens of thousands of distinct types.
+            let mut discovered =
+                std::collections::BTreeMap::<String, (Option<ChType>, Vec<&Column>)>::new();
+            for column in columns {
+                if let Column::Dynamic(column) = column {
+                    for child in &column.children {
+                        match child {
+                            DynamicChild::Typed { ch_type, values } => {
+                                discovered
+                                    .entry(ch_type.to_string())
+                                    .or_insert_with(|| (Some(ch_type.clone()), Vec::new()))
+                                    .1
+                                    .push(values);
+                            }
+                            DynamicChild::Shared(_) => {
+                                discovered
+                                    .entry("SharedVariant".to_string())
+                                    .or_insert((None, Vec::new()));
+                            }
+                        }
+                    }
+                }
+            }
+
+            let children = discovered
+                .into_values()
+                .map(|(ch_type, values)| match ch_type {
+                    Some(ch_type) => {
+                        let plan = build_export_plan(&ch_type, &values);
+                        DynamicPlanChild::Typed {
+                            ch_type,
+                            plan: Box::new(plan),
+                        }
+                    }
+                    None => DynamicPlanChild::Shared,
+                })
+                .collect();
+            FieldExportPlan::Dynamic(DynamicExportPlan { children })
+        }
+        _ => FieldExportPlan::Plain,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +642,11 @@ fn arrow_format(ch_type: &ChType) -> String {
             };
             dense_union_format(children)
         }
+        // Dynamic's child set is block-local and therefore is supplied by the
+        // column-aware schema path. A schema with no batch data has only its
+        // intrinsic Null child; `export_batch_schema` and Arrow C Stream export
+        // replace this with the discovered result-wide union shape.
+        ChType::Dynamic { .. } => dense_union_format(1),
         // Name-decoration aliases export with the Arrow shape of the physical
         // type they delegate to (`SimpleAggregateFunction` -> its inner, a geo
         // alias -> its Tuple/Array nesting, `Nested` -> the LargeList over an
@@ -417,6 +698,7 @@ fn field_is_nullable(ch_type: &ChType) -> bool {
         // Variant has intrinsic NULL through a Null union child. Arrow unions
         // have no top-level validity bitmap, but the field can still be nullable.
         ChType::Variant(_) => true,
+        ChType::Dynamic { .. } => true,
         _ => false,
     }
 }
@@ -460,13 +742,26 @@ fn cstring_lossy(s: &str) -> CString {
 // ---------------------------------------------------------------------------
 
 unsafe fn write_field_schema(out: *mut ArrowSchema, name: &str, ch_type: &ChType) {
+    write_field_schema_for_column(out, name, ch_type, None);
+}
+
+/// Column-aware schema export. Dynamic has a block-local child set that is not
+/// present in its logical `ChType`, so callers that also have a concrete batch
+/// pass the matching column here. All other types retain the ordinary schema
+/// path, with the column used only to find a nested Dynamic below a container.
+unsafe fn write_field_schema_for_column(
+    out: *mut ArrowSchema,
+    name: &str,
+    ch_type: &ChType,
+    column: Option<&Column>,
+) {
     // A top-level name-decoration alias (SimpleAggregateFunction, geo, Nested)
     // exports exactly as the physical type it delegates to, so expand and recurse
     // once here. A `Nullable(Point)` is NOT caught here (Nullable has no
     // delegate); its inner geo alias is expanded in the children match below,
     // while `arrow_format` and `field_is_nullable` handle the Nullable wrapper.
     if let Some(under) = ch_type.physical_delegate() {
-        write_field_schema(out, name, &under);
+        write_field_schema_for_column(out, name, &under, column);
         return;
     }
     // Variant carries its own intrinsic NULL through a dedicated Arrow Null
@@ -483,7 +778,19 @@ unsafe fn write_field_schema(out: *mut ArrowSchema, name: &str, ch_type: &ChType
     // array path dispatches on `Column::Variant` and is identical for both
     // wrappers, so this keeps the schema and array shapes in agreement.
     if let ChType::Variant(alternatives) = ch_type.inner() {
-        write_variant_schema(out, name, alternatives);
+        let variant = match column {
+            Some(Column::Variant(col)) => Some(col),
+            _ => None,
+        };
+        write_variant_schema(out, name, alternatives, variant);
+        return;
+    }
+    if let ChType::Dynamic { .. } = ch_type.inner() {
+        let dynamic = match column {
+            Some(Column::Dynamic(col)) => Some(col),
+            _ => None,
+        };
+        write_dynamic_schema(out, name, dynamic);
         return;
     }
 
@@ -499,7 +806,7 @@ unsafe fn write_field_schema(out: *mut ArrowSchema, name: &str, ch_type: &ChType
         // and `write_field_schema` overwrites every field before any consumer
         // observes it.
         let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
-        write_field_schema(child, "", dictionary_value_type(ch_type));
+        write_field_schema_for_column(child, "", dictionary_value_type(ch_type), None);
         child
     } else {
         ptr::null_mut()
@@ -529,7 +836,11 @@ unsafe fn write_field_schema(out: *mut ArrowSchema, name: &str, ch_type: &ChType
             // niche argument as the dictionary child above; `write_field_schema`
             // overwrites every field before any consumer observes it.
             let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
-            write_field_schema(child, "item", inner);
+            let values = match column {
+                Some(Column::Array(col)) => Some(col.values.as_ref()),
+                _ => None,
+            };
+            write_field_schema_for_column(child, "item", inner, values);
             children.push(child);
         }
         // A `Tuple(T1, ...)` struct field: one child per element, in declaration
@@ -544,9 +855,20 @@ unsafe fn write_field_schema(out: *mut ArrowSchema, name: &str, ch_type: &ChType
                 // `write_field_schema` overwrites every field before any consumer
                 // observes it.
                 let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+                let element_column = match column {
+                    Some(Column::Tuple(col)) => col.fields.get(i),
+                    _ => None,
+                };
                 match element_name {
-                    Some(n) => write_field_schema(child, n, element_type),
-                    None => write_field_schema(child, &(i + 1).to_string(), element_type),
+                    Some(n) => {
+                        write_field_schema_for_column(child, n, element_type, element_column)
+                    }
+                    None => write_field_schema_for_column(
+                        child,
+                        &(i + 1).to_string(),
+                        element_type,
+                        element_column,
+                    ),
                 }
                 children.push(child);
             }
@@ -568,7 +890,11 @@ unsafe fn write_field_schema(out: *mut ArrowSchema, name: &str, ch_type: &ChType
             // `write_field_schema` overwrites every field before any consumer
             // observes it.
             let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
-            write_field_schema(child, "entries", &entries_type);
+            let entries = match column {
+                Some(Column::Map(col)) => Some(col.entries.as_ref()),
+                _ => None,
+            };
+            write_field_schema_for_column(child, "entries", &entries_type, entries);
             children.push(child);
         }
         _ => {}
@@ -605,18 +931,34 @@ unsafe fn write_field_schema(out: *mut ArrowSchema, name: &str, ch_type: &ChType
 /// two-level union-of-unions. Each alternative child keeps its canonical
 /// ClickHouse type name; the final child is Arrow Null and represents Variant's
 /// intrinsic discriminator 255.
-unsafe fn write_variant_schema(out: *mut ArrowSchema, name: &str, alternatives: &[ChType]) {
+unsafe fn write_variant_schema(
+    out: *mut ArrowSchema,
+    name: &str,
+    alternatives: &[ChType],
+    column: Option<&VariantColumn>,
+) {
     let mut children = Vec::new();
     if alternatives.len() < ARROW_UNION_MAX_CHILDREN {
-        for alternative in alternatives {
+        for (index, alternative) in alternatives.iter().enumerate() {
             let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
-            write_field_schema(child, &alternative.to_string(), alternative);
+            write_field_schema_for_column(
+                child,
+                &alternative.to_string(),
+                alternative,
+                column.and_then(|col| col.variants.get(index)),
+            );
             children.push(child);
         }
     } else {
         for (group_index, group) in alternatives.chunks(ARROW_UNION_MAX_CHILDREN).enumerate() {
             let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
-            write_variant_group_schema(child, &format!("variants_{}", group_index + 1), group);
+            let first = group_index * ARROW_UNION_MAX_CHILDREN;
+            write_variant_group_schema_with_columns(
+                child,
+                &format!("variants_{}", group_index + 1),
+                group,
+                column.map(|col| &col.variants[first..first + group.len()]),
+            );
             children.push(child);
         }
     }
@@ -629,14 +971,293 @@ unsafe fn write_variant_schema(out: *mut ArrowSchema, name: &str, alternatives: 
 }
 
 /// Write one non-null inner group for a large Variant's Arrow union tree.
-unsafe fn write_variant_group_schema(out: *mut ArrowSchema, name: &str, alternatives: &[ChType]) {
+unsafe fn write_variant_group_schema_with_columns(
+    out: *mut ArrowSchema,
+    name: &str,
+    alternatives: &[ChType],
+    columns: Option<&[Column]>,
+) {
     let mut children = Vec::with_capacity(alternatives.len());
-    for alternative in alternatives {
+    for (index, alternative) in alternatives.iter().enumerate() {
         let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
-        write_field_schema(child, &alternative.to_string(), alternative);
+        write_field_schema_for_column(
+            child,
+            &alternative.to_string(),
+            alternative,
+            columns.and_then(|cols| cols.get(index)),
+        );
         children.push(child);
     }
     write_union_schema_node(out, name, children, false);
+}
+
+/// Write one concrete block-local Dynamic schema. Typed children retain their
+/// native Arrow layouts recursively, SharedVariant is honest Arrow Binary (its
+/// cells are arbitrary descriptor+payload bytes, not UTF-8), and the final
+/// child is Arrow Null. Large child sets use the same union-of-unions shape as
+/// Variant so every node stays within Arrow's signed Int8 type-code space.
+unsafe fn write_dynamic_schema(out: *mut ArrowSchema, name: &str, column: Option<&DynamicColumn>) {
+    let Some(column) = column else {
+        let null_child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+        write_field_schema(null_child, "NULL", &ChType::Nothing);
+        write_union_schema_node(out, name, vec![null_child], true);
+        return;
+    };
+    let mut write_leaf = |index: usize| write_dynamic_child_schema(&column.children[index]);
+    write_dynamic_schema_tree(out, name, column.children.len(), &mut write_leaf);
+}
+
+/// Write the block-local Dynamic schema as an Arrow Dense Union, in the same
+/// two-level shape the array side builds in [`export_dynamic_array`] /
+/// [`export_dynamic_array_with_plan`]. A child set that fits one node becomes a
+/// flat union of typed children plus the trailing intrinsic-NULL child. A larger
+/// set becomes an outer union over non-null groups of at most
+/// `ARROW_UNION_MAX_CHILDREN` children (each named `dynamic_i_j` for its 1-based
+/// inclusive child range) plus the NULL child.
+///
+/// The outer union reserves its final type code for NULL, so it holds at most
+/// `ARROW_UNION_MAX_CHILDREN - 1` groups and the tree tops out at
+/// `DYNAMIC_MAX_EXPORT_CHILDREN` typed children. A block-local Dynamic child set
+/// is NOT bounded below that: only the promoted Variant wire form is capped at
+/// 254, while a FLATTENED block (structure word 3) bounds its runtime type count
+/// only by the row count, so a legitimate server can emit more than the limit in
+/// one block. Callers must therefore reject an over-limit child set before
+/// reaching this function: the stream path guards its plan in
+/// [`export_chunks_to_stream`], and the standalone batch path guards its columns
+/// via `check_dynamic_export_limit` in [`export_batch`] / [`export_batch_schema`]
+/// / [`export_batch_array`].
+unsafe fn write_dynamic_schema_tree<F>(
+    out: *mut ArrowSchema,
+    name: &str,
+    num_children: usize,
+    write_leaf: &mut F,
+) where
+    F: FnMut(usize) -> *mut ArrowSchema,
+{
+    let mut children = Vec::new();
+    if num_children < ARROW_UNION_MAX_CHILDREN {
+        children.extend((0..num_children).map(&mut *write_leaf));
+    } else {
+        let mut start = 0;
+        while start < num_children {
+            let end = (start + ARROW_UNION_MAX_CHILDREN).min(num_children);
+            let group_children = (start..end).map(&mut *write_leaf).collect::<Vec<_>>();
+            let group = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+            write_union_schema_node(
+                group,
+                &format!("dynamic_{}_{}", start + 1, end),
+                group_children,
+                false,
+            );
+            children.push(group);
+            start = end;
+        }
+    }
+    let null_child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+    write_field_schema(null_child, "NULL", &ChType::Nothing);
+    children.push(null_child);
+    write_union_schema_node(out, name, children, true);
+}
+
+unsafe fn write_dynamic_child_schema(child: &DynamicChild) -> *mut ArrowSchema {
+    let out = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+    match child {
+        DynamicChild::Typed { ch_type, values } => {
+            write_field_schema_for_column(out, &ch_type.to_string(), ch_type, Some(values));
+        }
+        DynamicChild::Shared(_) => write_binary_schema(out, "SharedVariant"),
+    }
+    out
+}
+
+unsafe fn write_binary_schema(out: *mut ArrowSchema, name: &str) {
+    let pd = Box::new(SchemaPrivateData {
+        format: cstring_lossy("z"),
+        name: cstring_lossy(name),
+        children: Vec::new(),
+        dictionary: ptr::null_mut(),
+    });
+    let schema = &mut *out;
+    schema.format = pd.format.as_ptr();
+    schema.name = pd.name.as_ptr();
+    schema.metadata = ptr::null();
+    schema.flags = 0;
+    schema.n_children = 0;
+    schema.children = ptr::null_mut();
+    schema.dictionary = ptr::null_mut();
+    schema.release = Some(release_schema);
+    schema.private_data = Box::into_raw(pd) as *mut c_void;
+}
+
+unsafe fn write_field_schema_with_plan(
+    out: *mut ArrowSchema,
+    name: &str,
+    ch_type: &ChType,
+    plan: &FieldExportPlan,
+) {
+    if let Some(under) = ch_type.physical_delegate() {
+        write_field_schema_with_plan(out, name, &under, plan);
+        return;
+    }
+    if let (ChType::Variant(alternatives), FieldExportPlan::Variant(children)) =
+        (ch_type.inner(), plan)
+    {
+        write_variant_schema_with_plan(out, name, alternatives, children);
+        return;
+    }
+    if let (ChType::Dynamic { .. }, FieldExportPlan::Dynamic(dynamic)) = (ch_type.inner(), plan) {
+        write_dynamic_schema_with_plan(out, name, dynamic);
+        return;
+    }
+
+    let dictionary = if is_dictionary(ch_type) {
+        let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+        write_field_schema(child, "", dictionary_value_type(ch_type));
+        child
+    } else {
+        ptr::null_mut()
+    };
+    let mut children = Vec::new();
+    let inner_delegate = ch_type.inner().physical_delegate();
+    let inner_type = inner_delegate.as_ref().unwrap_or_else(|| ch_type.inner());
+    match (inner_type, plan) {
+        (ChType::Array(inner), FieldExportPlan::Array(item_plan)) => {
+            let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+            write_field_schema_with_plan(child, "item", inner, item_plan);
+            children.push(child);
+        }
+        (ChType::Tuple(elements), FieldExportPlan::Tuple(element_plans)) => {
+            for (index, ((element_name, element_type), element_plan)) in
+                elements.iter().zip(element_plans).enumerate()
+            {
+                let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+                let child_name = element_name
+                    .as_deref()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| (index + 1).to_string());
+                write_field_schema_with_plan(child, &child_name, element_type, element_plan);
+                children.push(child);
+            }
+        }
+        (ChType::Map(key, value), FieldExportPlan::Map { key: kp, value: vp }) => {
+            let entries = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+            let key_schema = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+            write_field_schema_with_plan(key_schema, "key", key, kp);
+            let value_schema = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+            write_field_schema_with_plan(value_schema, "value", value, vp);
+            write_struct_schema_node(entries, "entries", vec![key_schema, value_schema], false);
+            children.push(entries);
+        }
+        _ => {}
+    }
+
+    write_schema_node(
+        out,
+        name,
+        &arrow_format(ch_type),
+        field_is_nullable(ch_type),
+        children,
+        dictionary,
+    );
+}
+
+unsafe fn write_variant_schema_with_plan(
+    out: *mut ArrowSchema,
+    name: &str,
+    alternatives: &[ChType],
+    plans: &[FieldExportPlan],
+) {
+    let mut children = Vec::new();
+    if alternatives.len() < ARROW_UNION_MAX_CHILDREN {
+        for (alternative, plan) in alternatives.iter().zip(plans) {
+            let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+            write_field_schema_with_plan(child, &alternative.to_string(), alternative, plan);
+            children.push(child);
+        }
+    } else {
+        for (group_index, (types, child_plans)) in alternatives
+            .chunks(ARROW_UNION_MAX_CHILDREN)
+            .zip(plans.chunks(ARROW_UNION_MAX_CHILDREN))
+            .enumerate()
+        {
+            let group = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+            let mut group_children = Vec::with_capacity(types.len());
+            for (alternative, plan) in types.iter().zip(child_plans) {
+                let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+                write_field_schema_with_plan(child, &alternative.to_string(), alternative, plan);
+                group_children.push(child);
+            }
+            write_union_schema_node(
+                group,
+                &format!("variants_{}", group_index + 1),
+                group_children,
+                false,
+            );
+            children.push(group);
+        }
+    }
+    let null_child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+    write_field_schema(null_child, "NULL", &ChType::Nothing);
+    children.push(null_child);
+    write_union_schema_node(out, name, children, true);
+}
+
+unsafe fn write_dynamic_schema_with_plan(
+    out: *mut ArrowSchema,
+    name: &str,
+    dynamic: &DynamicExportPlan,
+) {
+    let mut write_leaf = |index: usize| {
+        let child = &dynamic.children[index];
+        let out = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+        match child {
+            DynamicPlanChild::Typed { ch_type, plan } => {
+                write_field_schema_with_plan(out, &ch_type.to_string(), ch_type, plan)
+            }
+            DynamicPlanChild::Shared => write_binary_schema(out, "SharedVariant"),
+        }
+        out
+    };
+    write_dynamic_schema_tree(out, name, dynamic.children.len(), &mut write_leaf);
+}
+
+unsafe fn write_struct_schema_node(
+    out: *mut ArrowSchema,
+    name: &str,
+    children: Vec<*mut ArrowSchema>,
+    nullable: bool,
+) {
+    write_schema_node(out, name, "+s", nullable, children, ptr::null_mut());
+}
+
+unsafe fn write_schema_node(
+    out: *mut ArrowSchema,
+    name: &str,
+    format: &str,
+    nullable: bool,
+    children: Vec<*mut ArrowSchema>,
+    dictionary: *mut ArrowSchema,
+) {
+    let pd = Box::new(SchemaPrivateData {
+        format: cstring_lossy(format),
+        name: cstring_lossy(name),
+        children,
+        dictionary,
+    });
+    let schema = &mut *out;
+    schema.format = pd.format.as_ptr();
+    schema.name = pd.name.as_ptr();
+    schema.metadata = ptr::null();
+    schema.flags = if nullable { 2 } else { 0 };
+    schema.n_children = pd.children.len() as i64;
+    schema.children = if pd.children.is_empty() {
+        ptr::null_mut()
+    } else {
+        pd.children.as_ptr() as *mut *mut ArrowSchema
+    };
+    schema.dictionary = pd.dictionary;
+    schema.release = Some(release_schema);
+    schema.private_data = Box::into_raw(pd) as *mut c_void;
 }
 
 /// Finish one Arrow Dense Union schema node and transfer child ownership to its
@@ -678,6 +1299,12 @@ unsafe fn write_union_schema_node(
 /// `out` must be a valid, writable pointer to an `ArrowSchema`, normally a
 /// zeroed struct. On return `out` owns its data and must be freed through its
 /// `release` callback per the Arrow C Data Interface.
+///
+/// This logical-schema-only API cannot discover `Dynamic`'s block-local child
+/// set. A schema containing Dynamic therefore exposes only its intrinsic Null
+/// child here and must not be paired with [`export_batch_array`]. Use
+/// [`export_batch`] or [`export_batch_schema`] for a concrete batch, or the
+/// Arrow C Stream API for multiple chunks.
 pub unsafe fn export_schema(schema_in: &Schema, out: *mut ArrowSchema) {
     let n_children = schema_in.num_fields() as i64;
 
@@ -714,6 +1341,100 @@ pub unsafe fn export_schema(schema_in: &Schema, out: *mut ArrowSchema) {
     schema.private_data = Box::into_raw(pd) as *mut c_void;
 }
 
+/// Export the Arrow schema for a concrete record batch. Unlike [`export_schema`],
+/// this can describe Dynamic's block-local child union, including a Dynamic
+/// nested inside a container. Pair this with [`export_batch_array`] when using
+/// the standalone C Data Interface. Arrow C Stream export resolves one common
+/// schema across all supplied chunks separately.
+///
+/// Returns [`ExportError::DynamicUnionTooWide`] without touching `out` when a
+/// Dynamic column's block-local child set exceeds [`DYNAMIC_MAX_EXPORT_CHILDREN`]
+/// (reachable from a legitimate FLATTENED block); `out` is then left as the
+/// caller passed it so its release stays a no-op.
+///
+/// # Safety
+///
+/// `out` must be a valid writable `ArrowSchema`, normally zero-initialized, and
+/// the caller must invoke its release callback.
+pub unsafe fn export_batch_schema(
+    batch: &ColBatch,
+    out: *mut ArrowSchema,
+) -> Result<(), ExportError> {
+    check_dynamic_export_limit(batch)?;
+    let mut child_schemas = Vec::with_capacity(batch.schema.num_fields());
+    for (field, column) in batch.schema.fields.iter().zip(&batch.columns) {
+        let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+        write_field_schema_for_column(child, &field.name, &field.ch_type, Some(column));
+        child_schemas.push(child);
+    }
+
+    let pd = Box::new(SchemaPrivateData {
+        format: cstring_lossy("+s"),
+        name: cstring_lossy(""),
+        children: child_schemas,
+        dictionary: ptr::null_mut(),
+    });
+    let schema = &mut *out;
+    schema.format = pd.format.as_ptr();
+    schema.name = pd.name.as_ptr();
+    schema.metadata = ptr::null();
+    schema.flags = 0;
+    schema.n_children = pd.children.len() as i64;
+    schema.children = if pd.children.is_empty() {
+        ptr::null_mut()
+    } else {
+        pd.children.as_ptr() as *mut *mut ArrowSchema
+    };
+    schema.dictionary = ptr::null_mut();
+    schema.release = Some(release_schema);
+    schema.private_data = Box::into_raw(pd) as *mut c_void;
+    Ok(())
+}
+
+/// Export one concrete batch's Arrow schema and array as an inseparable pair.
+/// This is the preferred standalone C Data entry point because the schema and
+/// array are derived from the same block-local Dynamic child set.
+///
+/// Returns [`ExportError::DynamicUnionTooWide`] when a Dynamic column's
+/// block-local child set exceeds [`DYNAMIC_MAX_EXPORT_CHILDREN`]. The check runs
+/// before anything is written, so on error BOTH `schema_out` and `array_out` are
+/// left exactly as the caller passed them (release stays None/zeroed, so caller
+/// cleanup is a no-op) and no degenerate all-NULL column is emitted. A block-local
+/// Dynamic child set is unbounded only for the FLATTENED wire form; the promoted
+/// Variant form is capped at 254 by the decoder and never trips this.
+///
+/// # Safety
+///
+/// `schema_out` and `array_out` must be distinct valid writable pointers to
+/// zero-initialized Arrow C Data structs. The caller must invoke both release
+/// callbacks. `batch` must have one physical column matching every schema field,
+/// as required by all Arrow export entry points in this module.
+pub unsafe fn export_batch(
+    batch: &Arc<ColBatch>,
+    schema_out: *mut ArrowSchema,
+    array_out: *mut ArrowArray,
+) -> Result<(), ExportError> {
+    // Check once up front so a violation leaves both out-structs untouched.
+    check_dynamic_export_limit(batch)?;
+    export_batch_schema(batch, schema_out)?;
+    export_batch_array(batch, array_out)?;
+    Ok(())
+}
+
+unsafe fn export_schema_with_plans(
+    schema_in: &Schema,
+    plans: &[FieldExportPlan],
+    out: *mut ArrowSchema,
+) {
+    let mut children = Vec::with_capacity(schema_in.num_fields());
+    for (field, plan) in schema_in.fields.iter().zip(plans) {
+        let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+        write_field_schema_with_plan(child, &field.name, &field.ch_type, plan);
+        children.push(child);
+    }
+    write_struct_schema_node(out, "", children, false);
+}
+
 // ---------------------------------------------------------------------------
 // Array export
 // ---------------------------------------------------------------------------
@@ -734,7 +1455,7 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
         Column::Nothing(c) => c.len() as i64,
         // Arrow unions have no top-level validity bitmap or null count. Variant
         // NULL rows route to the explicit Null child instead.
-        Column::Variant(_) => 0,
+        Column::Variant(_) | Column::Dynamic(_) => 0,
         _ => col.null_count() as i64,
     };
 
@@ -961,10 +1682,583 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
             export_variant_null_array(batch, c, null_child);
             children.push(null_child);
         }
+        Column::Dynamic(c) => {
+            export_dynamic_array(batch, c, out);
+            return;
+        }
     }
     write_array_node(
         batch, out, length, null_count, buffers, children, dictionary,
     );
+}
+
+/// Export one block-local Dynamic column as an Arrow Dense Union. Its u32 local
+/// ids are remapped once into Arrow signed Int8 routing. Typed child buffers and
+/// flat-layout offsets remain borrowed zero-copy; 128+ child sets synthesize the
+/// small outer/group routing needed by the union-of-unions representation.
+unsafe fn export_dynamic_array(
+    batch: &Arc<ColBatch>,
+    dynamic: &DynamicColumn,
+    out: *mut ArrowArray,
+) {
+    if dynamic.children.len() < ARROW_UNION_MAX_CHILDREN {
+        let mut type_ids = Vec::with_capacity(dynamic.len());
+        for &type_id in &dynamic.type_ids {
+            let arrow_id = if type_id == u32::MAX {
+                dynamic.children.len()
+            } else {
+                type_id as usize
+            };
+            type_ids.push(arrow_id as i8);
+        }
+        let mut children = dynamic
+            .children
+            .iter()
+            .map(|child| export_dynamic_child_array(batch, child))
+            .collect::<Vec<_>>();
+        children.push(export_dynamic_null_array(batch, dynamic));
+        write_owned_union_array_node(
+            batch,
+            out,
+            dynamic.len(),
+            type_ids,
+            dynamic.offsets.as_ptr(),
+            Vec::new(),
+            children,
+        );
+        return;
+    }
+
+    let num_groups = dynamic.children.len().div_ceil(ARROW_UNION_MAX_CHILDREN);
+    let mut outer_ids = Vec::with_capacity(dynamic.len());
+    let mut outer_offsets = Vec::with_capacity(dynamic.len());
+    let mut group_ids = (0..num_groups).map(|_| Vec::new()).collect::<Vec<_>>();
+    let mut group_offsets = (0..num_groups).map(|_| Vec::new()).collect::<Vec<_>>();
+    let mut group_counts = vec![0i32; num_groups];
+    let mut null_count = 0i32;
+
+    for (&type_id, &child_offset) in dynamic.type_ids.iter().zip(&dynamic.offsets) {
+        if type_id == u32::MAX {
+            outer_ids.push(num_groups as i8);
+            outer_offsets.push(null_count);
+            null_count += 1;
+            continue;
+        }
+        let child = type_id as usize;
+        let group = child / ARROW_UNION_MAX_CHILDREN;
+        outer_ids.push(group as i8);
+        outer_offsets.push(group_counts[group]);
+        group_counts[group] += 1;
+        group_ids[group].push((child % ARROW_UNION_MAX_CHILDREN) as i8);
+        group_offsets[group].push(child_offset);
+    }
+
+    let mut children = Vec::with_capacity(num_groups + 1);
+    for group in 0..num_groups {
+        let first = group * ARROW_UNION_MAX_CHILDREN;
+        let end = (first + ARROW_UNION_MAX_CHILDREN).min(dynamic.children.len());
+        let group_children = dynamic.children[first..end]
+            .iter()
+            .map(|child| export_dynamic_child_array(batch, child))
+            .collect();
+        let group_array = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+        let ids = std::mem::take(&mut group_ids[group]);
+        let offsets = std::mem::take(&mut group_offsets[group]);
+        write_owned_union_array_node(
+            batch,
+            group_array,
+            ids.len(),
+            ids,
+            ptr::null(),
+            offsets,
+            group_children,
+        );
+        children.push(group_array);
+    }
+    children.push(export_dynamic_null_array(batch, dynamic));
+    write_owned_union_array_node(
+        batch,
+        out,
+        dynamic.len(),
+        outer_ids,
+        ptr::null(),
+        outer_offsets,
+        children,
+    );
+}
+
+unsafe fn export_dynamic_array_with_plan(
+    batch: &Arc<ColBatch>,
+    dynamic: &DynamicColumn,
+    plan: &DynamicExportPlan,
+    out: *mut ArrowArray,
+) {
+    let mut global_by_name = std::collections::HashMap::with_capacity(plan.children.len());
+    for (index, child) in plan.children.iter().enumerate() {
+        global_by_name.insert(child.name(), index);
+    }
+    let mut local_to_global = Vec::with_capacity(dynamic.children.len());
+    let mut global_to_local = vec![None; plan.children.len()];
+    for (local, child) in dynamic.children.iter().enumerate() {
+        let name = match child {
+            DynamicChild::Typed { ch_type, .. } => ch_type.to_string(),
+            DynamicChild::Shared(_) => "SharedVariant".to_string(),
+        };
+        let global = global_by_name.get(&name).copied();
+        local_to_global.push(global);
+        if let Some(global) = global {
+            global_to_local[global] = Some(local);
+        }
+    }
+
+    // Resolve one block-local id to its result-wide (global) child index, or
+    // u32::MAX for NULL and for an unplanned id (see the fallback note below).
+    // Kept as a shared closure so each width branch walks `dynamic.type_ids`
+    // exactly once, without materializing an intermediate global-id run for the
+    // common <128-child branch. This mirrors the sibling `export_dynamic_array`,
+    // which likewise builds its Arrow type-id run in a single pass.
+    let resolve_global = |local_id: u32| -> u32 {
+        if local_id == u32::MAX {
+            return u32::MAX;
+        }
+        match local_to_global
+            .get(local_id as usize)
+            .and_then(|global| *global)
+        {
+            Some(global) => global as u32,
+            None => {
+                // Well-formed Arrow export requires every block-local id to
+                // resolve to a planned child, and it always does for decoded
+                // columns and encode-validated input because the plan is the
+                // union of every chunk's child set. A caller that mutates
+                // Dynamic's public routing buffers (`type_ids`, `children`) after
+                // the plan was fixed can break that. Route the unresolved row to
+                // the NULL child so this unsafe FFI path stays panic-free and
+                // memory-safe.
+                //
+                // The dense-union offset for this row still comes from
+                // `dynamic.offsets` (borrowed zero-copy in the <128 branch below),
+                // so it indexes the NULL child rather than a valid slot: the
+                // result is memory-safe but semantically invalid Arrow. Valid
+                // routing is an unsafe precondition of Dynamic export (see
+                // `export_chunks_to_stream`); we flag the violation in debug builds
+                // instead of copying the offsets buffer on the well-formed
+                // zero-copy path.
+                //
+                // This callback is reachable from `extern "C"` stream callbacks.
+                // A panic across that boundary is UB, but a `debug_assert!` panic
+                // in a `panic = "abort"`-agnostic sense is fine here: the crate is
+                // compiled with the default unwind runtime, and a panic that would
+                // cross an `extern "C"` frame aborts the process rather than
+                // unwinding into the host (Rust makes `extern "C"` frames abort on
+                // unwind). So in debug builds this is a deliberate hard tripwire
+                // (defined process abort) for an embedding host that mutated the
+                // routing buffers; release builds silently take the safe fallback.
+                debug_assert!(
+                    false,
+                    "Dynamic local id {local_id} has no planned export child; \
+                     routing buffers were mutated after the export plan was built"
+                );
+                u32::MAX
+            }
+        }
+    };
+
+    let export_children = |range: std::ops::Range<usize>| {
+        range
+            .map(|global| {
+                export_dynamic_plan_child_array(
+                    batch,
+                    &plan.children[global],
+                    global_to_local[global].map(|local| &dynamic.children[local]),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    if plan.children.len() < ARROW_UNION_MAX_CHILDREN {
+        // Common case: map each block-local id straight to its signed Arrow type
+        // id in one pass. NULL and any unresolved row route to the trailing Null
+        // child. No intermediate u32 global-id buffer is built.
+        let null_id = plan.children.len() as i8;
+        let type_ids = dynamic
+            .type_ids
+            .iter()
+            .map(|&local_id| {
+                let global = resolve_global(local_id);
+                if global == u32::MAX {
+                    null_id
+                } else {
+                    global as i8
+                }
+            })
+            .collect();
+        let mut children = export_children(0..plan.children.len());
+        children.push(export_dynamic_null_array(batch, dynamic));
+        write_owned_union_array_node(
+            batch,
+            out,
+            dynamic.len(),
+            type_ids,
+            dynamic.offsets.as_ptr(),
+            Vec::new(),
+            children,
+        );
+        return;
+    }
+
+    // 128+ planned children need the union-of-unions remap, which reads the full
+    // u32 global-id run below; build it once here.
+    let global_ids: Vec<u32> = dynamic
+        .type_ids
+        .iter()
+        .map(|&local_id| resolve_global(local_id))
+        .collect();
+
+    let num_groups = plan.children.len().div_ceil(ARROW_UNION_MAX_CHILDREN);
+    let mut outer_ids = Vec::with_capacity(dynamic.len());
+    let mut outer_offsets = Vec::with_capacity(dynamic.len());
+    let mut group_ids = (0..num_groups).map(|_| Vec::new()).collect::<Vec<_>>();
+    let mut group_offsets = (0..num_groups).map(|_| Vec::new()).collect::<Vec<_>>();
+    let mut group_counts = vec![0i32; num_groups];
+    let mut null_count = 0i32;
+    for (&global_id, &child_offset) in global_ids.iter().zip(&dynamic.offsets) {
+        if global_id == u32::MAX {
+            outer_ids.push(num_groups as i8);
+            outer_offsets.push(null_count);
+            null_count += 1;
+            continue;
+        }
+        let child = global_id as usize;
+        let group = child / ARROW_UNION_MAX_CHILDREN;
+        outer_ids.push(group as i8);
+        outer_offsets.push(group_counts[group]);
+        group_counts[group] += 1;
+        group_ids[group].push((child % ARROW_UNION_MAX_CHILDREN) as i8);
+        group_offsets[group].push(child_offset);
+    }
+
+    let mut children = Vec::with_capacity(num_groups + 1);
+    for group in 0..num_groups {
+        let first = group * ARROW_UNION_MAX_CHILDREN;
+        let end = (first + ARROW_UNION_MAX_CHILDREN).min(plan.children.len());
+        let group_children = export_children(first..end);
+        let group_array = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+        let ids = std::mem::take(&mut group_ids[group]);
+        let offsets = std::mem::take(&mut group_offsets[group]);
+        write_owned_union_array_node(
+            batch,
+            group_array,
+            ids.len(),
+            ids,
+            ptr::null(),
+            offsets,
+            group_children,
+        );
+        children.push(group_array);
+    }
+    children.push(export_dynamic_null_array(batch, dynamic));
+    write_owned_union_array_node(
+        batch,
+        out,
+        dynamic.len(),
+        outer_ids,
+        ptr::null(),
+        outer_offsets,
+        children,
+    );
+}
+
+unsafe fn export_dynamic_plan_child_array(
+    batch: &Arc<ColBatch>,
+    plan: &DynamicPlanChild,
+    local: Option<&DynamicChild>,
+) -> *mut ArrowArray {
+    let out = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+    match (plan, local) {
+        (DynamicPlanChild::Typed { plan, .. }, Some(DynamicChild::Typed { values, .. })) => {
+            export_one_column_with_plan(batch, values, plan, out)
+        }
+        (DynamicPlanChild::Shared, Some(DynamicChild::Shared(values))) => {
+            export_binary_array(batch, values, out)
+        }
+        (DynamicPlanChild::Typed { ch_type, plan }, None) => {
+            export_empty_column_with_plan(batch, ch_type, plan, out)
+        }
+        (DynamicPlanChild::Shared, None) => export_empty_binary_array(batch, out),
+        _ => export_empty_binary_array(batch, out),
+    }
+    out
+}
+
+unsafe fn export_empty_binary_array(batch: &Arc<ColBatch>, out: *mut ArrowArray) {
+    write_array_node(
+        batch,
+        out,
+        0,
+        0,
+        vec![
+            ptr::null(),
+            EMPTY_OFFSETS_I32.as_ptr() as *const c_void,
+            ptr::null(),
+        ],
+        Vec::new(),
+        ptr::null_mut(),
+    );
+}
+
+unsafe fn export_empty_column_with_plan(
+    batch: &Arc<ColBatch>,
+    ch_type: &ChType,
+    plan: &FieldExportPlan,
+    out: *mut ArrowArray,
+) {
+    if let Some(under) = ch_type.physical_delegate() {
+        export_empty_column_with_plan(batch, &under, plan, out);
+        return;
+    }
+    if let ChType::Nullable(inner) = ch_type {
+        export_empty_column_with_plan(batch, inner, plan, out);
+        return;
+    }
+    match (ch_type, plan) {
+        (ChType::Array(inner), FieldExportPlan::Array(item_plan)) => {
+            let item = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+            export_empty_column_with_plan(batch, inner, item_plan, item);
+            write_array_node(
+                batch,
+                out,
+                0,
+                0,
+                vec![ptr::null(), EMPTY_OFFSETS_I64.as_ptr() as *const c_void],
+                vec![item],
+                ptr::null_mut(),
+            );
+        }
+        (ChType::Tuple(elements), FieldExportPlan::Tuple(plans)) => {
+            let mut children = Vec::with_capacity(elements.len());
+            for ((_, element_type), element_plan) in elements.iter().zip(plans) {
+                let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+                export_empty_column_with_plan(batch, element_type, element_plan, child);
+                children.push(child);
+            }
+            write_array_node(
+                batch,
+                out,
+                0,
+                0,
+                vec![ptr::null()],
+                children,
+                ptr::null_mut(),
+            );
+        }
+        (ChType::Map(key, value), FieldExportPlan::Map { key: kp, value: vp }) => {
+            let key_array = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+            export_empty_column_with_plan(batch, key, kp, key_array);
+            let value_array = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+            export_empty_column_with_plan(batch, value, vp, value_array);
+            let entries = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+            write_array_node(
+                batch,
+                entries,
+                0,
+                0,
+                vec![ptr::null()],
+                vec![key_array, value_array],
+                ptr::null_mut(),
+            );
+            write_array_node(
+                batch,
+                out,
+                0,
+                0,
+                vec![ptr::null(), EMPTY_OFFSETS_I64.as_ptr() as *const c_void],
+                vec![entries],
+                ptr::null_mut(),
+            );
+        }
+        (ChType::Variant(alternatives), FieldExportPlan::Variant(plans)) => {
+            export_empty_variant_with_plan(batch, alternatives, plans, out);
+        }
+        (ChType::Dynamic { .. }, FieldExportPlan::Dynamic(dynamic)) => {
+            export_empty_dynamic_with_plan(batch, dynamic, out);
+        }
+        (ChType::LowCardinality(inner), _) => {
+            let dictionary = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+            export_empty_column_with_plan(
+                batch,
+                low_cardinality_dict_value_type(inner).1,
+                &FieldExportPlan::Plain,
+                dictionary,
+            );
+            write_array_node(
+                batch,
+                out,
+                0,
+                0,
+                vec![ptr::null(), ptr::null()],
+                Vec::new(),
+                dictionary,
+            );
+        }
+        (ChType::Nothing, _) => {
+            write_array_node(batch, out, 0, 0, Vec::new(), Vec::new(), ptr::null_mut())
+        }
+        (ChType::String, _) => export_empty_binary_array(batch, out),
+        (ChType::AggregateFunction { .. }, _) => write_array_node(
+            batch,
+            out,
+            0,
+            0,
+            vec![
+                ptr::null(),
+                EMPTY_OFFSETS_I64.as_ptr() as *const c_void,
+                ptr::null(),
+            ],
+            Vec::new(),
+            ptr::null_mut(),
+        ),
+        _ => write_array_node(
+            batch,
+            out,
+            0,
+            0,
+            vec![ptr::null(), ptr::null()],
+            Vec::new(),
+            ptr::null_mut(),
+        ),
+    }
+}
+
+unsafe fn export_empty_variant_with_plan(
+    batch: &Arc<ColBatch>,
+    alternatives: &[ChType],
+    plans: &[FieldExportPlan],
+    out: *mut ArrowArray,
+) {
+    let child_arrays = || {
+        alternatives
+            .iter()
+            .zip(plans)
+            .map(|(ch_type, plan)| {
+                let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+                export_empty_column_with_plan(batch, ch_type, plan, child);
+                child
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut children = if alternatives.len() < ARROW_UNION_MAX_CHILDREN {
+        child_arrays()
+    } else {
+        let all = child_arrays();
+        let mut groups = Vec::new();
+        for child_group in all.chunks(ARROW_UNION_MAX_CHILDREN) {
+            let group = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+            write_array_node(
+                batch,
+                group,
+                0,
+                0,
+                vec![ptr::null(), ptr::null()],
+                child_group.to_vec(),
+                ptr::null_mut(),
+            );
+            groups.push(group);
+        }
+        groups
+    };
+    let null = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+    write_array_node(batch, null, 0, 0, Vec::new(), Vec::new(), ptr::null_mut());
+    children.push(null);
+    write_array_node(
+        batch,
+        out,
+        0,
+        0,
+        vec![ptr::null(), ptr::null()],
+        children,
+        ptr::null_mut(),
+    );
+}
+
+unsafe fn export_empty_dynamic_with_plan(
+    batch: &Arc<ColBatch>,
+    dynamic: &DynamicExportPlan,
+    out: *mut ArrowArray,
+) {
+    let all = dynamic
+        .children
+        .iter()
+        .map(|child| export_dynamic_plan_child_array(batch, child, None))
+        .collect::<Vec<_>>();
+    let mut children = if dynamic.children.len() < ARROW_UNION_MAX_CHILDREN {
+        all
+    } else {
+        let mut groups = Vec::new();
+        for child_group in all.chunks(ARROW_UNION_MAX_CHILDREN) {
+            let group = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+            write_array_node(
+                batch,
+                group,
+                0,
+                0,
+                vec![ptr::null(), ptr::null()],
+                child_group.to_vec(),
+                ptr::null_mut(),
+            );
+            groups.push(group);
+        }
+        groups
+    };
+    let null = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+    write_array_node(batch, null, 0, 0, Vec::new(), Vec::new(), ptr::null_mut());
+    children.push(null);
+    write_array_node(
+        batch,
+        out,
+        0,
+        0,
+        vec![ptr::null(), ptr::null()],
+        children,
+        ptr::null_mut(),
+    );
+}
+
+unsafe fn export_dynamic_child_array(
+    batch: &Arc<ColBatch>,
+    child: &DynamicChild,
+) -> *mut ArrowArray {
+    let out = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+    match child {
+        DynamicChild::Typed { values, .. } => export_one_column(batch, values, out),
+        DynamicChild::Shared(values) => export_binary_array(batch, values, out),
+    }
+    out
+}
+
+unsafe fn export_binary_array(batch: &Arc<ColBatch>, values: &Utf8Column, out: *mut ArrowArray) {
+    let mut buffers = vec![ptr::null()];
+    push_offsets(&mut buffers, &values.offsets, EMPTY_OFFSETS_I32.as_ptr());
+    buffers.push(values.data.as_ptr() as *const c_void);
+    write_array_node(
+        batch,
+        out,
+        values.len() as i64,
+        0,
+        buffers,
+        Vec::new(),
+        ptr::null_mut(),
+    );
+}
+
+unsafe fn export_dynamic_null_array(
+    batch: &Arc<ColBatch>,
+    dynamic: &DynamicColumn,
+) -> *mut ArrowArray {
+    let out = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+    let null_column = Column::Nothing(dynamic.nulls.clone());
+    export_one_column(batch, &null_column, out);
+    out
 }
 
 /// Export one non-null inner union group of a 128+ alternative Variant.
@@ -1030,6 +2324,8 @@ unsafe fn write_array_node(
     let pd = Box::new(ArrayPrivateData {
         buffers,
         children,
+        _owned_type_ids: Vec::new(),
+        _owned_offsets: Vec::new(),
         _batch: Arc::clone(batch),
         dictionary,
     });
@@ -1053,6 +2349,58 @@ unsafe fn write_array_node(
         pd.children.as_ptr() as *mut *mut ArrowArray
     };
     array.dictionary = pd.dictionary;
+    array.release = Some(release_array);
+    array.private_data = Box::into_raw(pd) as *mut c_void;
+}
+
+/// Finish a synthesized Dynamic union node. `type_ids` is always owned here.
+/// Flat Dynamic borrows its existing i32 offsets through `borrowed_offsets`;
+/// nested outer/group nodes pass newly synthesized `owned_offsets` instead.
+unsafe fn write_owned_union_array_node(
+    batch: &Arc<ColBatch>,
+    out: *mut ArrowArray,
+    length: usize,
+    type_ids: Vec<i8>,
+    borrowed_offsets: *const i32,
+    owned_offsets: Vec<i32>,
+    children: Vec<*mut ArrowArray>,
+) {
+    let mut pd = Box::new(ArrayPrivateData {
+        buffers: Vec::with_capacity(2),
+        children,
+        _owned_type_ids: type_ids,
+        _owned_offsets: owned_offsets,
+        _batch: Arc::clone(batch),
+        dictionary: ptr::null_mut(),
+    });
+    let offsets = if length == 0 {
+        ptr::null()
+    } else if pd._owned_offsets.is_empty() {
+        borrowed_offsets
+    } else {
+        pd._owned_offsets.as_ptr()
+    };
+    let type_ids = if length == 0 {
+        ptr::null()
+    } else {
+        pd._owned_type_ids.as_ptr()
+    };
+    pd.buffers.push(type_ids as *const c_void);
+    pd.buffers.push(offsets as *const c_void);
+
+    let array = &mut *out;
+    array.length = length as i64;
+    array.null_count = 0;
+    array.offset = 0;
+    array.n_buffers = 2;
+    array.buffers = pd.buffers.as_ptr() as *mut *const c_void;
+    array.n_children = pd.children.len() as i64;
+    array.children = if pd.children.is_empty() {
+        ptr::null_mut()
+    } else {
+        pd.children.as_ptr() as *mut *mut ArrowArray
+    };
+    array.dictionary = ptr::null_mut();
     array.release = Some(release_array);
     array.private_data = Box::into_raw(pd) as *mut c_void;
 }
@@ -1101,12 +2449,24 @@ fn push_offsets<T>(buffers: &mut Vec<*const c_void>, offsets: &[T], empty: *cons
     buffers.push(ptr as *const c_void);
 }
 
+/// Returns [`ExportError::DynamicUnionTooWide`] without touching `out` when a
+/// Dynamic column's block-local child set exceeds [`DYNAMIC_MAX_EXPORT_CHILDREN`],
+/// so it must be paired with the matching (also-checked) [`export_batch_schema`],
+/// preferably through [`export_batch`], which checks once for both.
+///
 /// # Safety
 ///
 /// `out` must be a valid, writable pointer to an `ArrowArray`, normally a
 /// zeroed struct. The exported array borrows the batch buffers and keeps the
 /// `Arc<ColBatch>` alive until `out` is freed through its `release` callback.
-pub unsafe fn export_batch_array(batch: &Arc<ColBatch>, out: *mut ArrowArray) {
+/// If the batch schema contains Dynamic, pair this only with
+/// [`export_batch_schema`], preferably through [`export_batch`]; the logical
+/// [`export_schema`] API cannot describe Dynamic's block-local children.
+pub unsafe fn export_batch_array(
+    batch: &Arc<ColBatch>,
+    out: *mut ArrowArray,
+) -> Result<(), ExportError> {
+    check_dynamic_export_limit(batch)?;
     let num_rows = batch.num_rows as i64;
     let n_children = batch.num_columns() as i64;
 
@@ -1123,6 +2483,8 @@ pub unsafe fn export_batch_array(batch: &Arc<ColBatch>, out: *mut ArrowArray) {
     let pd = Box::new(ArrayPrivateData {
         buffers: vec![ptr::null()],
         children: child_arrays.clone(),
+        _owned_type_ids: Vec::new(),
+        _owned_offsets: Vec::new(),
         _batch: Arc::clone(batch),
         dictionary: ptr::null_mut(),
     });
@@ -1138,11 +2500,207 @@ pub unsafe fn export_batch_array(batch: &Arc<ColBatch>, out: *mut ArrowArray) {
     array.dictionary = ptr::null_mut();
     array.release = Some(release_array);
     array.private_data = Box::into_raw(pd) as *mut c_void;
+    Ok(())
+}
+
+unsafe fn export_batch_array_with_plans(
+    batch: &Arc<ColBatch>,
+    plans: &[FieldExportPlan],
+    out: *mut ArrowArray,
+) {
+    let mut children = Vec::with_capacity(batch.num_columns());
+    for (column, plan) in batch.columns.iter().zip(plans) {
+        let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+        export_one_column_with_plan(batch, column, plan, child);
+        children.push(child);
+    }
+    write_array_node(
+        batch,
+        out,
+        batch.num_rows as i64,
+        0,
+        vec![ptr::null()],
+        children,
+        ptr::null_mut(),
+    );
+}
+
+unsafe fn export_one_column_with_plan(
+    batch: &Arc<ColBatch>,
+    column: &Column,
+    plan: &FieldExportPlan,
+    out: *mut ArrowArray,
+) {
+    match (plan, column) {
+        (FieldExportPlan::Array(item_plan), Column::Array(column)) => {
+            let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+            export_one_column_with_plan(batch, column.values.as_ref(), item_plan, child);
+            let mut buffers = vec![ptr::null()];
+            push_offsets(&mut buffers, &column.offsets, EMPTY_OFFSETS_I64.as_ptr());
+            write_array_node(
+                batch,
+                out,
+                column.len() as i64,
+                0,
+                buffers,
+                vec![child],
+                ptr::null_mut(),
+            );
+        }
+        (FieldExportPlan::Tuple(element_plans), Column::Tuple(column)) => {
+            let mut children = Vec::with_capacity(column.fields.len());
+            for (field, child_plan) in column.fields.iter().zip(element_plans) {
+                let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+                export_one_column_with_plan(batch, field, child_plan, child);
+                children.push(child);
+            }
+            let validity = column.validity.as_ref().map_or(ptr::null(), |bitmap| {
+                bitmap.as_bytes().as_ptr() as *const c_void
+            });
+            write_array_node(
+                batch,
+                out,
+                column.len as i64,
+                column.null_count() as i64,
+                vec![validity],
+                children,
+                ptr::null_mut(),
+            );
+        }
+        (FieldExportPlan::Map { key, value }, Column::Map(column)) => {
+            let entries = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+            export_map_entries_with_plan(batch, column.entries.as_ref(), key, value, entries);
+            let mut buffers = vec![ptr::null()];
+            push_offsets(&mut buffers, &column.offsets, EMPTY_OFFSETS_I64.as_ptr());
+            write_array_node(
+                batch,
+                out,
+                column.len() as i64,
+                0,
+                buffers,
+                vec![entries],
+                ptr::null_mut(),
+            );
+        }
+        (FieldExportPlan::Variant(child_plans), Column::Variant(column)) => {
+            export_variant_array_with_plans(batch, column, child_plans, out);
+        }
+        (FieldExportPlan::Dynamic(dynamic_plan), Column::Dynamic(column)) => {
+            export_dynamic_array_with_plan(batch, column, dynamic_plan, out);
+        }
+        _ => export_one_column(batch, column, out),
+    }
+}
+
+unsafe fn export_map_entries_with_plan(
+    batch: &Arc<ColBatch>,
+    entries: &Column,
+    key_plan: &FieldExportPlan,
+    value_plan: &FieldExportPlan,
+    out: *mut ArrowArray,
+) {
+    let Column::Tuple(entries) = entries else {
+        export_one_column(batch, entries, out);
+        return;
+    };
+    let mut children = Vec::with_capacity(2);
+    if let [keys, values] = entries.fields.as_slice() {
+        let key = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+        export_one_column_with_plan(batch, keys, key_plan, key);
+        children.push(key);
+        let value = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+        export_one_column_with_plan(batch, values, value_plan, value);
+        children.push(value);
+    }
+    write_array_node(
+        batch,
+        out,
+        entries.len as i64,
+        0,
+        vec![ptr::null()],
+        children,
+        ptr::null_mut(),
+    );
+}
+
+unsafe fn export_variant_array_with_plans(
+    batch: &Arc<ColBatch>,
+    variant: &VariantColumn,
+    plans: &[FieldExportPlan],
+    out: *mut ArrowArray,
+) {
+    let mut children = Vec::new();
+    let buffers = match &variant.layout {
+        VariantLayout::Flat { type_ids, offsets } => {
+            for (column, plan) in variant.variants.iter().zip(plans) {
+                let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+                export_one_column_with_plan(batch, column, plan, child);
+                children.push(child);
+            }
+            vec![
+                type_ids.as_ptr() as *const c_void,
+                offsets.as_ptr() as *const c_void,
+            ]
+        }
+        VariantLayout::Nested {
+            type_ids,
+            offsets,
+            groups,
+        } => {
+            for (group_index, group) in groups.iter().enumerate() {
+                let first = group_index * ARROW_UNION_MAX_CHILDREN;
+                let end = (first + ARROW_UNION_MAX_CHILDREN).min(variant.variants.len());
+                let mut group_children = Vec::with_capacity(end - first);
+                for (column, plan) in variant.variants[first..end].iter().zip(&plans[first..end]) {
+                    let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+                    export_one_column_with_plan(batch, column, plan, child);
+                    group_children.push(child);
+                }
+                let group_array = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+                write_array_node(
+                    batch,
+                    group_array,
+                    group.type_ids.len() as i64,
+                    0,
+                    vec![
+                        group.type_ids.as_ptr() as *const c_void,
+                        group.offsets.as_ptr() as *const c_void,
+                    ],
+                    group_children,
+                    ptr::null_mut(),
+                );
+                children.push(group_array);
+            }
+            vec![
+                type_ids.as_ptr() as *const c_void,
+                offsets.as_ptr() as *const c_void,
+            ]
+        }
+    };
+    let null = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+    let null_column = Column::Nothing(variant.nulls.clone());
+    export_one_column(batch, &null_column, null);
+    children.push(null);
+    write_array_node(
+        batch,
+        out,
+        variant.len() as i64,
+        0,
+        buffers,
+        children,
+        ptr::null_mut(),
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Stream export
 // ---------------------------------------------------------------------------
+
+/// errno-compatible code the stream callbacks return when the stream failed to
+/// initialize (see [`StreamPrivateData::init_error`]). The Arrow C Stream
+/// contract asks for a nonzero errno-style code on error; `EINVAL` marks the
+/// supplied result as unexportable.
+const STREAM_INIT_ERROR: i32 = 22; // EINVAL
 
 unsafe extern "C" fn stream_get_schema(
     stream: *mut ArrowArrayStream,
@@ -1150,16 +2708,27 @@ unsafe extern "C" fn stream_get_schema(
 ) -> i32 {
     let s = &mut *stream;
     let pd = &*(s.private_data as *const StreamPrivateData);
-    export_schema(&pd.schema, out);
+    if pd.init_error {
+        // Do not emit a schema the per-chunk arrays could never match. Clear the
+        // consumer's release slot so nothing half-written is left behind; the
+        // reason is available through `get_last_error`.
+        (*out).release = None;
+        return STREAM_INIT_ERROR;
+    }
+    export_schema_with_plans(&pd.schema, &pd.plans, out);
     0
 }
 
 unsafe extern "C" fn stream_get_next(stream: *mut ArrowArrayStream, out: *mut ArrowArray) -> i32 {
     let s = &mut *stream;
     let pd = &mut *(s.private_data as *mut StreamPrivateData);
+    if pd.init_error {
+        (*out).release = None;
+        return STREAM_INIT_ERROR;
+    }
     match pd.chunks.next() {
         Some(batch) => {
-            export_batch_array(&batch, out);
+            export_batch_array_with_plans(&batch, &pd.plans, out);
             0
         }
         None => {
@@ -1181,20 +2750,76 @@ unsafe extern "C" fn stream_get_last_error(stream: *mut ArrowArrayStream) -> *co
 /// per chunk. `schema` is used for `get_schema` and remains valid even when
 /// `chunks` is empty (a zero-row result still advertises its columns).
 ///
+/// A result-wide Dynamic child set can outgrow Arrow's signed Int8 union code
+/// space (see [`DYNAMIC_MAX_EXPORT_CHILDREN`]). When it does, the stream is
+/// still constructed but flagged failed: `get_schema` and `get_next` return a
+/// nonzero code and `get_last_error` reports the reason, rather than emitting a
+/// schema and arrays that would disagree above the limit.
+///
 /// # Safety
 ///
 /// `out` must be a valid, writable pointer to an `ArrowArrayStream`, normally a
 /// zeroed struct. On return `out` owns its data and must be freed through its
 /// `release` callback per the Arrow C Data Interface.
+///
+/// Every exported Dynamic column's routing buffers (`type_ids` indexing
+/// `children`, `u32::MAX` for NULL) must be internally consistent, as the
+/// decoder and encode validation produce them. A column whose public buffers
+/// were mutated into an inconsistent state exports as memory-safe but
+/// semantically invalid Arrow: an unresolved id is routed to the NULL child
+/// while its borrowed dense-union offset still indexes the child it originally
+/// named (see the fallback in [`export_dynamic_array_with_plan`]).
 pub unsafe fn export_chunks_to_stream(
     schema: Schema,
     chunks: Vec<Arc<ColBatch>>,
     out: *mut ArrowArrayStream,
 ) {
+    let plans: Vec<FieldExportPlan> = schema
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            let columns = chunks
+                .iter()
+                .filter_map(|chunk| chunk.columns.get(index))
+                .collect::<Vec<_>>();
+            build_export_plan(&field.ch_type, &columns)
+        })
+        .collect();
+
+    // Refuse the whole stream up front when any Dynamic node exceeds the union
+    // code space rather than let the schema tree and array tree disagree. The
+    // message reuses the same `ExportError` the standalone batch path returns.
+    // The column-side walk backs up the plan walk for parity with the
+    // standalone guard: a hand-built column whose Dynamic hides under a node
+    // the plan collapses to `Plain` (e.g. an illegal LowCardinality(Dynamic))
+    // is invisible to `dynamic_plan_over_limit` but still descended by the
+    // `export_one_column` fallback.
+    let over_limit = plans.iter().find_map(dynamic_plan_over_limit).or_else(|| {
+        chunks
+            .iter()
+            .find_map(|chunk| chunk.columns.iter().find_map(dynamic_column_over_limit))
+    });
+    let (init_error, error_msg) = match over_limit {
+        Some(children) => (
+            true,
+            cstring_lossy(
+                &ExportError::DynamicUnionTooWide {
+                    children,
+                    limit: DYNAMIC_MAX_EXPORT_CHILDREN,
+                }
+                .to_string(),
+            ),
+        ),
+        None => (false, cstring_lossy("")),
+    };
+
     let pd = Box::new(StreamPrivateData {
         schema,
+        plans,
         chunks: chunks.into_iter(),
-        error_msg: CString::new("").unwrap(),
+        init_error,
+        error_msg,
     });
 
     let s = &mut *out;

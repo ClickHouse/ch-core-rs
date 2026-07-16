@@ -30,11 +30,11 @@ use ch_core_rs::batch::ColBatch;
 use ch_core_rs::bitmap::Bitmap;
 use ch_core_rs::column::{
     AggregateStateColumn, ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn,
-    FixedBinaryColumn, MapColumn, NothingColumn, PrimitiveColumn, TupleColumn, Utf8Column,
-    VariantColumn,
+    DynamicChild, DynamicColumn, FixedBinaryColumn, MapColumn, NothingColumn, PrimitiveColumn,
+    TupleColumn, Utf8Column, VariantColumn,
 };
-use ch_core_rs::native::decode::{decode_all_bytes, DecodeOptions};
-use ch_core_rs::native::encode::{encode_block, EncodeOptions};
+use ch_core_rs::native::decode::{decode_all_bytes, decode_all_bytes_binary_types, DecodeOptions};
+use ch_core_rs::native::encode::{encode_block, encode_block_binary_types, EncodeOptions};
 use ch_core_rs::schema::{ChType, Field, GeoKind, IntervalKind, Schema};
 
 const TABLE: &str = "ch_core_rs_encode_test";
@@ -43,6 +43,8 @@ const GSN_TABLE: &str = "ch_core_rs_encode_gsn_test";
 const AGG_COUNT_TABLE: &str = "ch_core_rs_encode_agg_count_test";
 const AGG_NOTHING_TABLE: &str = "ch_core_rs_encode_agg_nothing_test";
 const AGG_SUM_TABLE: &str = "ch_core_rs_encode_agg_sum_test";
+const DYNAMIC_TABLE: &str = "ch_core_rs_encode_dynamic_test";
+const DYNAMIC_BINARY_TABLE: &str = "ch_core_rs_encode_dynamic_binary_test";
 
 /// Build a `Utf8Column` from raw byte values, computing Arrow offsets the same
 /// way the decoder does.
@@ -55,6 +57,42 @@ fn utf8_column(values: &[&[u8]]) -> Utf8Column {
         offsets.push(data.len() as i32);
     }
     Utf8Column::new(offsets, data)
+}
+
+fn dynamic_batch() -> ColBatch {
+    let mut uint64_blob = vec![0x04];
+    uint64_blob.extend_from_slice(&13u64.to_le_bytes());
+    let mut array_blob = vec![0x1e, 0x09, 0x02];
+    array_blob.extend_from_slice(&79i32.to_le_bytes());
+    array_blob.extend_from_slice(&(-13i32).to_le_bytes());
+    let dynamic = DynamicColumn::try_new(
+        &[1, 1, 0, 0],
+        vec![
+            DynamicChild::Shared(utf8_column(&[&uint64_blob, &array_blob])),
+            DynamicChild::Typed {
+                ch_type: ChType::String,
+                values: Column::Utf8(utf8_column(&[b"user_1", b"user_2"])),
+            },
+        ],
+    )
+    .unwrap();
+    ColBatch::new(
+        Schema::new(vec![
+            Field {
+                name: "id".into(),
+                ch_type: ChType::UInt8,
+            },
+            Field {
+                name: "v".into(),
+                ch_type: ChType::Dynamic { max_types: 1 },
+            },
+        ]),
+        vec![
+            Column::UInt8(PrimitiveColumn::new(vec![0, 1, 2, 3])),
+            Column::Dynamic(dynamic),
+        ],
+        4,
+    )
 }
 
 /// Build a `FixedBinaryColumn` of the given width from equal-width byte values.
@@ -1094,10 +1132,22 @@ impl Server {
         self.exec_empty(&url, &["--data-binary", "@-"], Some(bytes), "INSERT");
     }
 
+    fn insert_native_binary_types_into(&self, table: &str, bytes: &[u8]) {
+        let url = format!(
+            "{}?input_format_native_decode_types_in_binary_format=1&query=INSERT%20INTO%20{table}%20FORMAT%20Native",
+            self.base_url
+        );
+        self.exec_empty(&url, &["--data-binary", "@-"], Some(bytes), "INSERT");
+    }
+
     /// Run a SELECT and return the raw response body bytes. The query is the raw
     /// POST body, so a `FORMAT Native` response comes back as binary.
     fn select(&self, sql: &str) -> Vec<u8> {
-        let url = self.base_url.clone();
+        self.select_with_params(sql, "")
+    }
+
+    fn select_with_params(&self, sql: &str, params: &str) -> Vec<u8> {
+        let url = format!("{}{params}", self.base_url);
         let (ok, stdout, stderr) = self.curl(&url, &["--data-binary", sql], None);
         assert!(
             ok,
@@ -1222,6 +1272,28 @@ fn raw_column_repr(column: &Column) -> Vec<String> {
                     Some((variant, offset)) => format!(
                         "Variant({variant}, {})",
                         variants[usize::from(variant)][offset as usize]
+                    ),
+                    None => "INVALID".to_string(),
+                })
+                .collect()
+        }
+        Column::Dynamic(c) => {
+            let children = c
+                .children
+                .iter()
+                .map(|child| match child {
+                    DynamicChild::Typed { values, .. } => raw_column_repr(values),
+                    DynamicChild::Shared(values) => (0..values.len())
+                        .map(|row| format!("{:?}", values.value(row)))
+                        .collect(),
+                })
+                .collect::<Vec<Vec<String>>>();
+            (0..c.len())
+                .map(|row| match c.value_position(row) {
+                    Some((u32::MAX, _)) => "NULL".to_string(),
+                    Some((child, offset)) => format!(
+                        "Dynamic({child}, {})",
+                        children[child as usize][offset as usize]
                     ),
                     None => "INVALID".to_string(),
                 })
@@ -1712,6 +1784,58 @@ fn aggregate_function_sum_roundtrips_through_server() {
         Column::Int64(c) => assert_eq!(c.values, vec![0, 4, 14]),
         other => panic!("expected finalized Enum Int64 sums, got {other:?}"),
     }
+}
+
+#[test]
+#[ignore = "requires a live ClickHouse server matching .server-ref; run with --ignored"]
+fn dynamic_roundtrips_through_server() {
+    let server = Server::from_env();
+    let batch = dynamic_batch();
+
+    server.ddl(&format!("DROP TABLE IF EXISTS {DYNAMIC_TABLE}"));
+    server.ddl(&format!(
+        "CREATE TABLE {DYNAMIC_TABLE} (id UInt8, v Dynamic(max_types=1)) ENGINE = Memory"
+    ));
+    let bytes = encode_block(&batch, &EncodeOptions::default()).expect("encode Dynamic batch");
+    server.insert_native_into(DYNAMIC_TABLE, &bytes);
+
+    let native = server.select(&format!(
+        "SELECT id, v FROM {DYNAMIC_TABLE} ORDER BY id FORMAT Native"
+    ));
+    let decoded = decode_all_bytes(&native, &DecodeOptions::default())
+        .expect("decode server Dynamic response");
+    server.ddl(&format!("DROP TABLE IF EXISTS {DYNAMIC_TABLE}"));
+
+    let sent = single_block(&batch);
+    assert_eq!(column_repr(&decoded, 0), column_repr(&sent, 0));
+    assert_eq!(column_repr(&decoded, 1), column_repr(&sent, 1));
+}
+
+#[test]
+#[ignore = "requires a live ClickHouse server matching .server-ref; run with --ignored"]
+fn dynamic_binary_type_headers_roundtrip_through_server() {
+    let server = Server::from_env();
+    let batch = dynamic_batch();
+
+    server.ddl(&format!("DROP TABLE IF EXISTS {DYNAMIC_BINARY_TABLE}"));
+    server.ddl(&format!(
+        "CREATE TABLE {DYNAMIC_BINARY_TABLE} (id UInt8, v Dynamic(max_types=1)) ENGINE = Memory"
+    ));
+    let bytes = encode_block_binary_types(&batch, &EncodeOptions::default())
+        .expect("encode Dynamic batch with binary type headers");
+    server.insert_native_binary_types_into(DYNAMIC_BINARY_TABLE, &bytes);
+
+    let native = server.select_with_params(
+        &format!("SELECT id, v FROM {DYNAMIC_BINARY_TABLE} ORDER BY id FORMAT Native"),
+        "?output_format_native_encode_types_in_binary_format=1",
+    );
+    let decoded = decode_all_bytes_binary_types(&native, &DecodeOptions::default())
+        .expect("decode server Dynamic binary-type response");
+    server.ddl(&format!("DROP TABLE IF EXISTS {DYNAMIC_BINARY_TABLE}"));
+
+    let sent = single_block(&batch);
+    assert_eq!(column_repr(&decoded, 0), column_repr(&sent, 0));
+    assert_eq!(column_repr(&decoded, 1), column_repr(&sent, 1));
 }
 
 #[test]

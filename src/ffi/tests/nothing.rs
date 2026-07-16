@@ -42,7 +42,7 @@ fn assert_nothing_export(batch: &Arc<ColBatch>, expected_flags: i64, expected_le
         (schema.release.unwrap())(&mut schema);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(batch, &mut array);
+        export_batch_array(batch, &mut array).unwrap();
         let child = &**array.children.add(0);
         assert_eq!(child.length, expected_len);
         assert_eq!(child.null_count, expected_len);
@@ -111,7 +111,7 @@ fn export_array_nothing_child_is_zero_buffer_null() {
         (schema_out.release.unwrap())(&mut schema_out);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let c0 = &**array.children.add(0);
         assert_eq!(c0.length, 2, "2 rows, all empty");
         assert_eq!(c0.null_count, 0);

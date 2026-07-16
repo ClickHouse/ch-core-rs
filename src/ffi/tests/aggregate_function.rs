@@ -34,7 +34,7 @@ fn export_count_state_as_large_binary_zero_copy() {
         (schema.release.unwrap())(&mut schema);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let child = &**array.children.add(0);
         assert_eq!(child.length, 3);
         assert_eq!(child.null_count, 0);
@@ -99,7 +99,7 @@ fn export_fixed_zero_states_as_large_binary_zero_copy() {
             (schema.release.unwrap())(&mut schema);
 
             let mut array: ArrowArray = std::mem::zeroed();
-            export_batch_array(&batch, &mut array);
+            export_batch_array(&batch, &mut array).unwrap();
             let child = &**array.children.add(0);
             assert_eq!(child.length, 3);
             assert_eq!(child.null_count, 0);
@@ -145,7 +145,7 @@ fn export_sum_state_as_large_binary_zero_copy() {
         (schema.release.unwrap())(&mut schema);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let child = &**array.children.add(0);
         assert_eq!(child.length, 2);
         assert_eq!(child.null_count, 0);
@@ -201,7 +201,7 @@ fn export_nullable_sum_state_as_variable_large_binary_zero_copy() {
         (schema.release.unwrap())(&mut schema);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let child = &**array.children.add(0);
         assert_eq!(child.length, 3);
         assert_eq!(child.null_count, 0);
@@ -242,7 +242,7 @@ fn export_zero_row_count_state_has_large_binary_offsets() {
     // Safety: output is a writable zeroed C Data array and is released below.
     unsafe {
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let child = &**array.children.add(0);
         assert_eq!(child.length, 0);
         assert_eq!(child.n_buffers, 3);
@@ -276,7 +276,7 @@ fn export_empty_offsets_aggregate_state_has_valid_leading_zero_offset() {
     // Safety: output is a writable zeroed C Data array, released below.
     unsafe {
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let child = &**array.children.add(0);
         assert_eq!(child.length, 0);
         assert_eq!(child.null_count, 0);

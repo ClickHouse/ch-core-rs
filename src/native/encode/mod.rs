@@ -20,6 +20,7 @@
 //! (named or unnamed, including the zero-element `Tuple()`) over encodable
 //! element types, and `Map(K, V)` for a legal key type and any encodable
 //! key/value types, `Variant(T1, ...)` when every alternative is encodable,
+//! `Dynamic` with block-local typed children and optional SharedVariant,
 //! plus the registered exact `AggregateFunction` state codecs:
 //! `count`, canonical `nothingUInt64` and `nothingNull`, and base `sum` over one
 //! plain or Nullable numeric or Enum argument. The plain types and `Tuple` also
@@ -30,16 +31,18 @@
 
 use crate::batch::{ChunkedBatch, ColBatch};
 use crate::column::{
-    ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn, FixedBinaryColumn, MapColumn,
-    TupleColumn, Utf8Column, VariantColumn, VariantLayout,
+    ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn, DynamicChild, DynamicColumn,
+    FixedBinaryColumn, MapColumn, TupleColumn, Utf8Column, VariantColumn,
 };
 use crate::native::aggregate_function::aggregate_state_codec;
 use crate::schema::{ChType, Field};
 
 use super::protocol::{
     DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION, DBMS_MIN_REVISION_WITH_OUT_OF_ORDER_BUCKETS,
-    LC_HAS_ADDITIONAL_KEYS_BIT, LC_NEED_UPDATE_DICTIONARY_BIT, LOW_CARDINALITY_KEY_VERSION,
+    DBMS_MIN_REVISION_WITH_V2_DYNAMIC_AND_JSON_SERIALIZATION, LC_HAS_ADDITIONAL_KEYS_BIT,
+    LC_NEED_UPDATE_DICTIONARY_BIT, LOW_CARDINALITY_KEY_VERSION,
 };
+use super::type_binary::write_binary_type;
 use super::type_parser::{
     is_low_cardinality_inner, is_valid_map_key_type, low_cardinality_dict_value_type,
 };
@@ -115,7 +118,20 @@ impl std::error::Error for EncodeError {}
 /// than emitting a header for a type it cannot write rows of.
 pub fn encode_block(batch: &ColBatch, options: &EncodeOptions) -> Result<Vec<u8>, EncodeError> {
     let mut buf = Vec::new();
-    encode_block_into(&mut buf, batch, options)?;
+    encode_block_into(&mut buf, batch, options, false)?;
+    Ok(buf)
+}
+
+/// Encode one block using the server's binary data-type descriptors for outer
+/// type headers and Dynamic runtime type tables. This mirrors the out-of-band
+/// `output_format_native_encode_types_in_binary_format` setting without adding
+/// a field to the backward-compatible [`EncodeOptions`] struct.
+pub fn encode_block_binary_types(
+    batch: &ColBatch,
+    options: &EncodeOptions,
+) -> Result<Vec<u8>, EncodeError> {
+    let mut buf = Vec::new();
+    encode_block_into(&mut buf, batch, options, true)?;
     Ok(buf)
 }
 
@@ -147,7 +163,28 @@ pub fn encode_chunked(
     }
     let mut buf = Vec::new();
     for chunk in &batch.chunks {
-        write_block_into(&mut buf, chunk, options)?;
+        write_block_into(&mut buf, chunk, options, false)?;
+    }
+    Ok(buf)
+}
+
+/// Encode all chunks with binary data-type descriptors. See
+/// [`encode_block_binary_types`].
+pub fn encode_chunked_binary_types(
+    batch: &ChunkedBatch,
+    options: &EncodeOptions,
+) -> Result<Vec<u8>, EncodeError> {
+    for (i, chunk) in batch.chunks.iter().enumerate() {
+        if chunk.schema != batch.schema {
+            return Err(EncodeError::InconsistentBatch {
+                detail: format!("chunk {i} schema differs from the batch schema"),
+            });
+        }
+        validate_block(chunk)?;
+    }
+    let mut buf = Vec::new();
+    for chunk in &batch.chunks {
+        write_block_into(&mut buf, chunk, options, true)?;
     }
     Ok(buf)
 }
@@ -161,9 +198,10 @@ fn encode_block_into(
     buf: &mut Vec<u8>,
     batch: &ColBatch,
     options: &EncodeOptions,
+    types_in_binary_format: bool,
 ) -> Result<(), EncodeError> {
     validate_block(batch)?;
-    write_block_into(buf, batch, options)
+    write_block_into(buf, batch, options, types_in_binary_format)
 }
 
 /// Write one framed Native block for `batch` to `buf`.
@@ -178,6 +216,7 @@ fn write_block_into(
     buf: &mut Vec<u8>,
     batch: &ColBatch,
     options: &EncodeOptions,
+    types_in_binary_format: bool,
 ) -> Result<(), EncodeError> {
     // BlockInfo preamble, only at revision > 0 (server `NativeWriter::write` gates
     // `block.info.write` on `client_revision > 0`).
@@ -192,7 +231,11 @@ fn write_block_into(
         // The type string is the canonical name `ChType::Display` renders, the same
         // string `parse_ch_type` accepts on decode; `validate_block` confirmed it
         // round-trips.
-        write_string(buf, field.ch_type.to_string().as_bytes());
+        if types_in_binary_format {
+            write_binary_type(buf, &field.ch_type);
+        } else {
+            write_string(buf, field.ch_type.to_string().as_bytes());
+        }
         // Custom-serialization marker: one byte, 0 = default serialization,
         // written for every column even at zero rows, present only at
         // revision >= 54454 (server gates it the same way on read).
@@ -204,7 +247,7 @@ fn write_block_into(
         // LowCardinality key version) on `rows > 0`, and `NativeReader::read`
         // skips symmetrically (confirmed at v26.6.1.1193-stable).
         if batch.num_rows > 0 {
-            encode_column_data(buf, field, column)?;
+            encode_column_data(buf, field, column, options, types_in_binary_format)?;
         }
     }
     Ok(())
@@ -275,10 +318,12 @@ fn encode_column_data(
     buf: &mut Vec<u8>,
     field: &Field,
     column: &Column,
+    options: &EncodeOptions,
+    types_in_binary_format: bool,
 ) -> Result<(), EncodeError> {
-    write_state_prefix(buf, &field.ch_type);
+    write_state_prefix(buf, &field.ch_type, column, options, types_in_binary_format)?;
     encode_column_values(buf, field, &field.ch_type, column)?;
-    write_state_suffix(buf, &field.ch_type);
+    write_state_suffix(buf, &field.ch_type, column)?;
     Ok(())
 }
 
@@ -294,27 +339,50 @@ fn encode_column_data(
 /// `SerializationLowCardinality::serializeBinaryBulkStatePrefix` writes that one
 /// UInt64 LE key version (`SharedDictionariesWithAdditionalKeys` = 1); every
 /// other supported type writes a zero-byte prefix.
-fn write_state_prefix(buf: &mut Vec<u8>, ch_type: &ChType) {
+fn write_state_prefix(
+    buf: &mut Vec<u8>,
+    ch_type: &ChType,
+    column: &Column,
+    options: &EncodeOptions,
+    types_in_binary_format: bool,
+) -> Result<(), EncodeError> {
     // A name-decoration alias (SimpleAggregateFunction, geo, Nested) writes the
     // exact state prefix of the type it delegates to, so expand and recurse, the
     // encode-side mirror of `decode::read_state_prefix`.
     if let Some(under) = ch_type.physical_delegate() {
-        write_state_prefix(buf, &under);
-        return;
+        return write_state_prefix(buf, &under, column, options, types_in_binary_format);
     }
     match ch_type {
         ChType::LowCardinality(_) => {
             buf.extend_from_slice(&LOW_CARDINALITY_KEY_VERSION.to_le_bytes());
         }
-        ChType::Array(inner) => write_state_prefix(buf, inner),
+        ChType::Array(inner) => {
+            if let Column::Array(col) = column {
+                write_state_prefix(
+                    buf,
+                    inner,
+                    col.values.as_ref(),
+                    options,
+                    types_in_binary_format,
+                )?;
+            }
+        }
         // `SerializationTuple::serializeBinaryBulkStatePrefix` writes nothing of
         // its own and delegates to every element in declaration order (confirmed
         // at v26.6.1.1193-stable), so a LowCardinality element's key version is
         // hoisted to the front of the whole Tuple column, before any element
         // bodies, in element order.
         ChType::Tuple(elements) => {
-            for (_, element_type) in elements {
-                write_state_prefix(buf, element_type);
+            if let Column::Tuple(col) = column {
+                for ((_, element_type), element) in elements.iter().zip(&col.fields) {
+                    write_state_prefix(
+                        buf,
+                        element_type,
+                        element,
+                        options,
+                        types_in_binary_format,
+                    )?;
+                }
             }
         }
         // `SerializationMap` delegates through its nested Array(Tuple(...)),
@@ -323,23 +391,106 @@ fn write_state_prefix(buf: &mut Vec<u8>, ch_type: &ChType) {
         // Map(LowCardinality(String), V) therefore hoists the LC key version
         // to the very front of the whole column, before the offsets.
         ChType::Map(key, value) => {
-            write_state_prefix(buf, key);
-            write_state_prefix(buf, value);
+            if let Column::Map(col) = column {
+                if let Column::Tuple(entries) = col.entries.as_ref() {
+                    if let [keys, values] = entries.fields.as_slice() {
+                        write_state_prefix(buf, key, keys, options, types_in_binary_format)?;
+                        write_state_prefix(buf, value, values, options, types_in_binary_format)?;
+                    }
+                }
+            }
         }
         // Variant's own prefix is one fixed-width LE UInt64 discriminator mode.
         // Direct FORMAT Native always uses BASIC mode 0, then delegates to every
         // alternative's prefix in canonical/global discriminator order.
         ChType::Variant(alternatives) => {
             buf.extend_from_slice(&0u64.to_le_bytes());
-            for alternative in alternatives {
-                write_state_prefix(buf, alternative);
+            if let Column::Variant(col) = column {
+                for (alternative, child) in alternatives.iter().zip(&col.variants) {
+                    write_state_prefix(buf, alternative, child, options, types_in_binary_format)?;
+                }
+            }
+        }
+        ChType::Dynamic { .. } => {
+            if let Column::Dynamic(col) = column {
+                write_dynamic_state_prefix(buf, col, options, types_in_binary_format)?;
             }
         }
         // `SerializationNullable::serializeBinaryBulkStatePrefix` delegates to
         // the nested type (confirmed at v26.6.1.1193-stable); only a
         // `Nullable(Tuple(...))` can nest a prefix-bearing type today.
-        ChType::Nullable(inner) => write_state_prefix(buf, inner),
+        ChType::Nullable(inner) => {
+            write_state_prefix(buf, inner, column, options, types_in_binary_format)?
+        }
         _ => {}
+    }
+    Ok(())
+}
+
+/// Write Dynamic's self-describing bulk-state prefix and every discovered
+/// child's prefix. Direct V1/V2 uses the protocol-revision-selected structure
+/// word and includes the implicit `SharedVariant` child. A column without a
+/// shared child uses FLATTENED word 3, whose table order is the physical child
+/// order. The child bodies remain bulk columns, so only the small type table is
+/// visited here and no per-row work is introduced.
+fn write_dynamic_state_prefix(
+    buf: &mut Vec<u8>,
+    col: &DynamicColumn,
+    options: &EncodeOptions,
+    types_in_binary_format: bool,
+) -> Result<(), EncodeError> {
+    let has_shared = col.shared_child_index().is_some();
+    if has_shared {
+        let structure = if options.protocol_revision
+            < DBMS_MIN_REVISION_WITH_V2_DYNAMIC_AND_JSON_SERIALIZATION
+        {
+            1u64
+        } else {
+            2u64
+        };
+        buf.extend_from_slice(&structure.to_le_bytes());
+
+        let direct_count = col
+            .children
+            .iter()
+            .filter(|child| matches!(child, DynamicChild::Typed { .. }))
+            .count();
+        if structure == 1 {
+            // V1's first count is a legacy ignored slot. The current server
+            // writes the direct-type count into both positions.
+            write_varint(buf, direct_count as u64);
+        }
+        write_varint(buf, direct_count as u64);
+        for child in &col.children {
+            if let DynamicChild::Typed { ch_type, .. } = child {
+                write_dynamic_type_entry(buf, ch_type, types_in_binary_format);
+            }
+        }
+        // Direct Native Dynamic always uses Variant BASIC mode.
+        buf.extend_from_slice(&0u64.to_le_bytes());
+    } else {
+        buf.extend_from_slice(&3u64.to_le_bytes());
+        write_varint(buf, col.children.len() as u64);
+        for child in &col.children {
+            if let DynamicChild::Typed { ch_type, .. } = child {
+                write_dynamic_type_entry(buf, ch_type, types_in_binary_format);
+            }
+        }
+    }
+
+    for child in &col.children {
+        if let DynamicChild::Typed { ch_type, values } = child {
+            write_state_prefix(buf, ch_type, values, options, types_in_binary_format)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_dynamic_type_entry(buf: &mut Vec<u8>, ch_type: &ChType, types_in_binary_format: bool) {
+    if types_in_binary_format {
+        write_binary_type(buf, ch_type);
+    } else {
+        write_string(buf, ch_type.to_string().as_bytes());
     }
 }
 
@@ -349,25 +500,52 @@ fn write_state_prefix(buf: &mut Vec<u8>, ch_type: &ChType) {
 /// order. No currently supported type writes suffix bytes, but keeping this
 /// traversal symmetric with decode and the server preserves the correct
 /// insertion point for a future suffix-bearing type.
-fn write_state_suffix(buf: &mut Vec<u8>, ch_type: &ChType) {
+fn write_state_suffix(
+    buf: &mut Vec<u8>,
+    ch_type: &ChType,
+    column: &Column,
+) -> Result<(), EncodeError> {
     if let Some(under) = ch_type.physical_delegate() {
-        write_state_suffix(buf, &under);
-        return;
+        return write_state_suffix(buf, &under, column);
     }
     match ch_type {
-        ChType::Array(inner) | ChType::Nullable(inner) => write_state_suffix(buf, inner),
+        ChType::Array(inner) => {
+            if let Column::Array(col) = column {
+                write_state_suffix(buf, inner, col.values.as_ref())?;
+            }
+        }
+        ChType::Nullable(inner) => write_state_suffix(buf, inner, column)?,
         ChType::Tuple(elements) => {
-            for (_, element_type) in elements {
-                write_state_suffix(buf, element_type);
+            if let Column::Tuple(col) = column {
+                for ((_, element_type), element) in elements.iter().zip(&col.fields) {
+                    write_state_suffix(buf, element_type, element)?;
+                }
             }
         }
         ChType::Map(key, value) => {
-            write_state_suffix(buf, key);
-            write_state_suffix(buf, value);
+            if let Column::Map(col) = column {
+                if let Column::Tuple(entries) = col.entries.as_ref() {
+                    if let [keys, values] = entries.fields.as_slice() {
+                        write_state_suffix(buf, key, keys)?;
+                        write_state_suffix(buf, value, values)?;
+                    }
+                }
+            }
         }
         ChType::Variant(alternatives) => {
-            for alternative in alternatives {
-                write_state_suffix(buf, alternative);
+            if let Column::Variant(col) = column {
+                for (alternative, child) in alternatives.iter().zip(&col.variants) {
+                    write_state_suffix(buf, alternative, child)?;
+                }
+            }
+        }
+        ChType::Dynamic { .. } => {
+            if let Column::Dynamic(col) = column {
+                for child in &col.children {
+                    if let DynamicChild::Typed { ch_type, values } = child {
+                        write_state_suffix(buf, ch_type, values)?;
+                    }
+                }
             }
         }
         _ => {
@@ -377,6 +555,7 @@ fn write_state_suffix(buf: &mut Vec<u8>, ch_type: &ChType) {
             let _ = buf;
         }
     }
+    Ok(())
 }
 
 /// Encode one column's value payload once its state prefix has been written,
@@ -437,6 +616,12 @@ fn encode_column_values(
         }
         return Err(column_error(field, ch_type));
     }
+    if let ChType::Dynamic { .. } = ch_type {
+        if let Column::Dynamic(c) = column {
+            return encode_dynamic_data(buf, field, c);
+        }
+        return Err(column_error(field, ch_type));
+    }
     let value_type = if let ChType::Nullable(inner) = ch_type {
         encode_null_map(buf, column);
         inner.as_ref()
@@ -459,79 +644,93 @@ fn encode_column_values(
     encode_column_body(buf, field, value_type, column)
 }
 
+/// Encode one Dynamic body after [`write_dynamic_state_prefix`] has emitted its
+/// block-local type table. V1/V2 writes one UInt8 discriminator per row, then
+/// dense child bodies in global order. FLATTENED writes its smallest fixed-width
+/// index run, then the dense typed bodies. The stored offsets are routing-only
+/// and validation has already proved they are occurrence ordinals, so encoding
+/// touches only `type_ids` once and performs one bulk write per child.
+fn encode_dynamic_data(
+    buf: &mut Vec<u8>,
+    field: &Field,
+    col: &DynamicColumn,
+) -> Result<(), EncodeError> {
+    if col.shared_child_index().is_some() {
+        buf.reserve(col.type_ids.len());
+        for &type_id in &col.type_ids {
+            if type_id == u32::MAX {
+                buf.push(u8::MAX);
+            } else {
+                let discriminator =
+                    u8::try_from(type_id).map_err(|_| column_error(field, &field.ch_type))?;
+                buf.push(discriminator);
+            }
+        }
+    } else {
+        let null_index = col.children.len() as u64;
+        let width = dynamic_flat_index_width(col.children.len());
+        buf.reserve(col.type_ids.len().saturating_mul(width));
+        for &type_id in &col.type_ids {
+            let index = if type_id == u32::MAX {
+                null_index
+            } else {
+                u64::from(type_id)
+            };
+            match width {
+                1 => buf.push(index as u8),
+                2 => buf.extend_from_slice(&(index as u16).to_le_bytes()),
+                4 => buf.extend_from_slice(&(index as u32).to_le_bytes()),
+                8 => buf.extend_from_slice(&index.to_le_bytes()),
+                _ => unreachable!("Dynamic index width is selected from 1/2/4/8"),
+            }
+        }
+    }
+
+    for child in &col.children {
+        match child {
+            DynamicChild::Typed { ch_type, values } => {
+                encode_column_values(buf, field, ch_type, values)?;
+            }
+            DynamicChild::Shared(values) => encode_string_data(buf, values),
+        }
+    }
+    Ok(())
+}
+
+fn dynamic_flat_index_width(num_children: usize) -> usize {
+    if num_children <= u8::MAX as usize {
+        1
+    } else if num_children <= u16::MAX as usize {
+        2
+    } else if num_children <= u32::MAX as usize {
+        4
+    } else {
+        8
+    }
+}
+
 /// Encode one BASIC `Variant(T1, ...)` body.
 ///
 /// The mode word and every alternative's state prefix were written by
 /// [`write_state_prefix`]. The body is one global UInt8 discriminator per row,
 /// followed by each alternative's dense child body in canonical order. NULL is
 /// discriminator 255 and has no child body. Arrow routing offsets are not on the
-/// wire. Validation has already proved the union tree is canonical and each
-/// child length matches its discriminator count, so this performs one row walk
-/// over the routing bytes and one bulk child write per alternative, with no
-/// allocation.
+/// wire.
+///
+/// [`VariantColumn::discriminators`] is exactly that wire run (one byte per
+/// logical row, 255 = NULL), so the discriminator body is a single
+/// `extend_from_slice` with no per-row reconstruction from the Arrow routing
+/// buffers. `validate_variant` has already proved those routing buffers are the
+/// canonical layout derived from these discriminators and that each child length
+/// matches its discriminator count, so this then performs one bulk child write
+/// per alternative in canonical order, with no allocation.
 fn encode_variant_data(
     buf: &mut Vec<u8>,
     field: &Field,
     alternatives: &[ChType],
     col: &VariantColumn,
 ) -> Result<(), EncodeError> {
-    // Only the discriminator byte is on the wire; the Arrow dense offsets are
-    // routing state Native never carries. So walk the layout's type ids
-    // directly and reconstruct each global discriminator, without reading the
-    // offset buffers `value_position` would (it exists for other callers). One
-    // reserve, then one push per row, matching the LowCardinality index idiom.
-    let num_variants = col.variants.len();
-    buf.reserve(col.len());
-    match &col.layout {
-        // Flat: a type id below `num_variants` is the global discriminator
-        // verbatim; the NULL child id (== num_variants) remaps to 255.
-        VariantLayout::Flat { type_ids, .. } => {
-            for &type_id in type_ids {
-                let discriminator = match usize::try_from(type_id).ok() {
-                    Some(id) if id < num_variants => id as u8,
-                    Some(id) if id == num_variants => u8::MAX,
-                    _ => return Err(column_error(field, &field.ch_type)),
-                };
-                buf.push(discriminator);
-            }
-        }
-        // Nested: the outer id selects a group (or the NULL child at
-        // `groups.len()`, remapped to 255); inside a group the global
-        // discriminator is `first_variant + local_id`, read from the group's
-        // own type ids at the outer offset. This mirrors `value_position`'s
-        // reconstruction but touches only the outer offset needed to index the
-        // group, never the child offsets.
-        VariantLayout::Nested {
-            type_ids,
-            offsets,
-            groups,
-        } => {
-            for (&outer_id, &outer_offset) in type_ids.iter().zip(offsets) {
-                let (Some(outer_id), Some(outer_offset)) = (
-                    usize::try_from(outer_id).ok(),
-                    usize::try_from(outer_offset).ok(),
-                ) else {
-                    return Err(column_error(field, &field.ch_type));
-                };
-                if outer_id == groups.len() {
-                    buf.push(u8::MAX);
-                    continue;
-                }
-                let discriminator = groups
-                    .get(outer_id)
-                    .and_then(|group| {
-                        let local_id = usize::try_from(*group.type_ids.get(outer_offset)?).ok()?;
-                        let discriminator = group.first_variant.checked_add(local_id)?;
-                        (discriminator < num_variants).then_some(discriminator)
-                    })
-                    .and_then(|d| u8::try_from(d).ok());
-                let Some(discriminator) = discriminator else {
-                    return Err(column_error(field, &field.ch_type));
-                };
-                buf.push(discriminator);
-            }
-        }
-    }
+    buf.extend_from_slice(col.discriminators());
     for (alternative, child) in alternatives.iter().zip(&col.variants) {
         encode_column_values(buf, field, alternative, child)?;
     }
@@ -1088,6 +1287,10 @@ fn is_encodable(ch_type: &ChType) -> bool {
         // Variant writes one discriminator run around dense child bodies, so it
         // is encodable exactly when every canonical alternative is encodable.
         ChType::Variant(alternatives) => alternatives.iter().all(is_encodable),
+        // Dynamic's direct child types are carried by each block rather than by
+        // the logical schema. Their recursive encodability is checked against
+        // the concrete DynamicColumn during validation.
+        ChType::Dynamic { .. } => true,
         ChType::AggregateFunction { .. } => aggregate_state_codec(ch_type).is_some(),
         // Name-decoration aliases are encodable exactly when their physical
         // delegate is: `SimpleAggregateFunction` over its inner, a geo alias over

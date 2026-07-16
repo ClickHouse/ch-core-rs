@@ -187,8 +187,8 @@ Server layout of one block, in order:
 3. `num_rows` as a varint.
 4. For each column, in order:
    - column name, a varint-length-prefixed string,
-   - type name, a varint-length-prefixed string in the default Native type-header
-     mode,
+   - type header, either a varint-length-prefixed name in the default mode or a
+     `DataTypesBinaryEncoding` descriptor when a `*_binary_types` API is used,
    - a custom-serialization marker, 1 byte: 0 for default, nonzero for custom.
      Present at protocol revision >= 54454, for every column regardless of row
      count. When nonzero, serialization-kind bytes follow before the payload. At
@@ -208,12 +208,15 @@ null map first, then the inner type's payload. The null map is `num_rows` bytes,
 one per row, 0x00 for present and nonzero for null. See the `Nullable(T)`
 section.
 
-This contract describes the default string-encoded type-header mode. ClickHouse
-also has an `output_format_native_encode_types_in_binary_format` setting that
-causes the server to write binary type tags instead of the varint-length-prefixed
-type name string. The current core does not decode that header mode. Bindings
-must not enable that setting when routing results through this decoder unless
-binary type-header support is added.
+ClickHouse selects binary type headers with
+`output_format_native_encode_types_in_binary_format`. Callers must select the
+matching explicit `decode_*_binary_types` API for that stream. Binary output
+from an `encode_*_binary_types` API requires the receiving INSERT to set
+`input_format_native_decode_types_in_binary_format=1`; the default APIs retain
+the textual header contract. The binary descriptor parser is bounded by nesting
+depth, node count, and container count, applies the same type-construction rules
+as textual headers, and rejects unsupported or reserved tags before decoding a
+payload.
 
 ### How the decoder reads this
 
@@ -286,6 +289,7 @@ than an error.
 | `Ring`, `LineString`, `MultiLineString`, `Polygon`, `MultiPolygon`                     | `Geo(GeoKind::*)`                       | `Array`           | `+L` (LargeList chain over a Point `+s` struct)                     | validity, i64 offsets (+ item child)       | no (they expand to `Array`)                              |
 | `Nested(name1 T1, ...)` for supported field types                                      | `Nested(Vec<(String, ChType)>)`        | `Array`           | `+L` (LargeList of a `+s` struct with the field names)             | validity, i64 offsets (+ item struct child) | no (it is an `Array`)                                    |
 | `Variant(T1, ...)` for 1 through 255 legal alternatives                               | `Variant(Vec<ChType>)`                 | `Variant`         | `+ud:...` Dense Union, nested for 128+ alternatives                | i8 type ids, i32 offsets (+ dense children) | intrinsic NULL child; no top-level validity              |
+| `Dynamic`, `Dynamic(max_types=N)`                                                     | `Dynamic { max_types }`                | `Dynamic`         | `+ud:...` result-wide Dense Union; SharedVariant child is `z`      | remapped i8 type ids, i32 offsets (+ dense children) | intrinsic NULL child; no top-level validity              |
 
 Any type not in this matrix is rejected. See "Unsupported types" below.
 
@@ -1962,8 +1966,8 @@ would use, without the `n.` prefix). Reached through `ChType::physical_delegate`
 - Depth accounting: `Nested` charges +2 physical levels (`Array` + `Tuple`) on
   both the parse and encode sides.
 - Binary-encoded type headers give `Nested` a distinct `0x2F` tag
-  (`DataTypesBinaryEncoding`); binary type headers remain out of scope (tracked
-  in FINDINGS.md).
+  (`DataTypesBinaryEncoding`), which the explicit `*_binary_types` APIs preserve
+  as `ChType::Nested`.
 
 **Introduction version:** undetermined from the shallow `.server-src` checkout.
 Stable at `v26.6.1.1193-stable`.
@@ -2032,10 +2036,10 @@ the decoded buffers.
 **Rust buffer:** `Column::Variant(VariantColumn)`. `VariantColumn::variants`
 contains one dense `Column` per canonical alternative. `VariantLayout::Flat`
 stores the top-level `{ type_ids: Vec<i8>, offsets: Vec<i32> }`; the nested form
-adds deterministic `VariantGroup` routing buffers. `nulls: NothingColumn`
-provides the explicit Arrow Null child length. `value_position(row)` resolves a
-row to its global discriminator and child offset; discriminator 255 denotes
-NULL.
+adds deterministic `VariantGroup` routing buffers.
+`nulls: NothingColumn` provides the explicit Arrow Null child length.
+`value_position(row)` resolves a row to its global discriminator and child
+offset; discriminator 255 denotes NULL.
 
 **Notes:**
 
@@ -2062,6 +2066,142 @@ constants and validation in `src/Columns/ColumnVariant.{h,cpp}`. The BASIC
 layout, canonical ordering, legality rules, NULL discriminator, and direct
 Native mode choice are CONFIRMED at `v26.6.1.1193-stable`.
 
+### Dynamic
+
+**Type string(s):** `Dynamic` is the canonical spelling for the default
+`max_types=32`; `Dynamic(max_types=N)` is canonical for every other `N` in
+`0..=254`. The server also accepts `Dynamic()` and
+`Dynamic(max_types=32)` but renders both back as `Dynamic`. Parameter and type
+names are case-sensitive. `Nullable(Dynamic)`, `LowCardinality(Dynamic)`, and a
+direct `Variant(Dynamic, ...)` alternative are illegal because Dynamic already
+has intrinsic NULL and owns a Variant-like runtime type set. Dynamic is legal
+inside Array, Tuple, and Map key/value positions.
+
+**Logical type:** `ChType::Dynamic { max_types: u8 }`. The logical schema does
+not contain the value types. Those are discovered separately in every Native
+block and can differ across chunks of one result.
+
+**Wire payload:** a block with rows starts with one little-endian UInt64
+structure word. Direct NativeWriter selects V1 or V2 from the negotiated client
+revision; its opt-in flattened output setting selects word 3:
+
+```text
+V1, revision < 54473:
+  UInt64 LE 1
+  VarUInt M                 legacy ignored slot
+  VarUInt M                 direct type count
+  M type entries
+  UInt64 LE Variant mode 0
+  state prefixes for global children
+  num_rows UInt8 discriminators
+  dense child bodies in global order
+  state suffixes in global order
+
+V2, revision >= 54473:
+  UInt64 LE 2
+  VarUInt M                 direct type count
+  M type entries
+  UInt64 LE Variant mode 0
+  state prefixes, discriminators, dense bodies, state suffixes
+
+FLATTENED:
+  UInt64 LE 3
+  VarUInt K                 emitted typed child count
+  K type entries
+  state prefixes for the K children
+  num_rows fixed-width indexes
+  K sparse typed bodies in table order
+  state suffixes in table order
+```
+
+The V1/V2 table contains direct typed children only. The physical Variant also
+has one implicit `SharedVariant` String child; direct types plus SharedVariant
+are globally sorted by canonical type name before discriminators are assigned.
+`255` is NULL. SharedVariant cells are String-framed opaque blobs containing one
+binary data-type descriptor followed by exactly one value's `serializeBinary`
+payload. The core keeps each blob opaque instead of introducing a per-row type
+parse and value materialization into the bulk path.
+
+FLATTENED has no SharedVariant child and no Variant mode word. Index `K` is
+NULL; `0..K-1` select the table entries and values above K are malformed. The
+index width is the smallest of UInt8/UInt16/UInt32/UInt64 that can represent
+the K children plus NULL. FLATTENED may expose more types than the logical
+`max_types`, since it expands types previously stored in SharedVariant.
+
+Type entries are StringBinary canonical type names by default. With
+`output_format_native_encode_types_in_binary_format=1`, both outer Native type
+headers and Dynamic tables use `DataTypesBinaryEncoding` descriptors instead.
+The public `decode_*_binary_types` and `encode_*_binary_types` APIs select that
+out-of-band form while keeping `DecodeOptions` and `EncodeOptions` source
+compatible. The descriptor reader is bounded by `MAX_TYPE_DEPTH`, complexity
+1000, and list count 1,000,000, and rejects illegal wrappers, reserved tags, and
+unsupported descriptor forms before payload decode.
+
+A zero-row Native block carries only the logical column header. NativeWriter
+suppresses the structure word, type table, child prefixes, routing, and bodies.
+
+**Arrow export:** Dynamic exports as Arrow Dense Union with typed children, an
+Arrow Binary (`z`) SharedVariant child when present, and a final Arrow Null
+child. The block-local `u32` ids are remapped once into Arrow signed Int8 union
+codes; typed child value buffers stay zero-copy. Child sets of 128 or more use
+the same union-of-unions strategy as Variant. `export_chunks_to_stream`
+pre-scans the already-supplied chunks once, recursively through containers,
+and fixes one result-wide canonical child set before exposing the stream
+schema. Each record batch supplies zero-length arrays for children absent from
+that block and remaps routing to the result-wide ids. Child sets are capped at
+16,256 (127 groups of 128; the top union reserves one code for NULL) because a
+wider set cannot be represented in Arrow's signed Int8 type-code space. A
+FLATTENED block's type table is bounded only by its row count, so the cap is
+enforced at export, never at decode: the standalone batch entry points return
+`ExportError::DynamicUnionTooWide`, and the stream's `get_schema`/`get_next`
+return nonzero with the message available through `get_last_error`. For a
+standalone record
+batch, use `export_batch`, or pair `export_batch_schema` with
+`export_batch_array` (all three return `Result` for this reason); logical
+`export_schema` alone cannot invent block-local Dynamic children and therefore
+describes only the intrinsic Null child.
+
+**Rust buffer:** `Column::Dynamic(DynamicColumn)`. `type_ids: Vec<u32>` uses
+`u32::MAX` for NULL and a block-local child index otherwise.
+`offsets: Vec<i32>` stores the occurrence ordinal in the selected dense child.
+`children: Vec<DynamicChild>` contains either
+`Typed { ch_type, values: Column }` or `Shared(Utf8Column)`. Shared uses the
+existing offsets+bytes storage implementation, but its semantics and Arrow
+schema are Binary, never Utf8. `nulls: NothingColumn` provides the explicit
+Arrow Null child length.
+
+**Validation and performance:** the discriminator/index run is scanned once to
+derive child counts and offsets, then every typed child is decoded in bulk
+through the existing recursive column path. Allocation is per routing buffer
+and child column, never per value; direct typed payloads keep the primitive
+read-into-Vec fast path. Encode validation proves occurrence-ordinal offsets,
+child lengths, direct-type legality and uniqueness, V1/V2 canonical child
+order, the single-SharedVariant invariant, and `max_types` before writing.
+Unknown structure words, word 4 V3, direct Variant modes other than BASIC 0,
+out-of-range routing, duplicate/illegal types, and direct counts above 254 or
+`max_types` return `DecodeError::InvalidDynamic` or a precise unsupported-type
+error. Word 4 is rejected because NativeWriter does not emit it at the pin.
+
+**Version:** Dynamic first appeared experimentally in 24.5, became
+production-ready in 25.3, and is GA/stable at `v26.6.1.1193-stable`.
+
+**Server reference:** `NativeWriter::writeData`/`write` in
+`src/Formats/NativeWriter.cpp`, `NativeReader` in
+`src/Formats/NativeReader.cpp`, Native settings in
+`src/Processors/Formats/Impl/NativeFormat.cpp`, revision negotiation in
+`src/Server/TCPHandler.cpp` and `HTTPHandler.cpp`, canonical naming in
+`DataTypeDynamic::doGetName` (`src/DataTypes/DataTypeDynamic.cpp`), runtime
+children in `ColumnDynamic` and `ColumnVariant` (`src/Columns/`), the state and
+body layouts in `SerializationDynamic`, `SerializationDynamicHelpers`, and
+`SerializationVariant` (`src/DataTypes/Serializations/`), and descriptor tags
+in `DataTypesBinaryEncoding` (`src/DataTypes/`). The structure selection,
+tables, ordering, SharedVariant shape, NULL values, flattened indexes, and
+version history above are **CONFIRMED** at `v26.6.1.1193-stable`. Stricter Rust
+rejection of overlong/nonterminating VarUInt input, canonical enforcement of a
+V1/V2 table, and retaining SharedVariant blobs without parsing their trailing
+payload are deliberate core policies, not claims about additional server
+validation.
+
 ---
 
 ## Encoding
@@ -2087,6 +2227,9 @@ revision-0 read path in `NativeFormat.cpp` in `src/Processors/Formats/Impl/`.
   produces one block per chunk, in chunk order, concatenated. It validates every
   chunk (including that each chunk's schema equals the batch schema) before
   writing any bytes, so a rejected `ChunkedBatch` leaves no partial stream.
+- `encode_block_binary_types` and `encode_chunked_binary_types` are the same
+  operations with outer headers and Dynamic tables written as binary data-type
+  descriptors. Decode exposes the matching `decode_*_binary_types` functions.
 - `EncodeOptions { protocol_revision: u64 }` is the only knob, the mirror of
   `DecodeOptions.protocol_revision`. See "Encode framing" below.
 
@@ -2131,7 +2274,8 @@ inner types decode accepts, `Array(T)` over any encodable element type
 zero-element `Tuple()` included, composing inside `Array` and inside
 `Nullable`), and `Map(K, V)` for a legal key type over encodable key/value
 types (composing inside `Array` and `Tuple`), `Variant(T1, ...)` when every
-alternative is encodable, the non-wrapper types and
+alternative is encodable, and `Dynamic` with recursively encodable typed
+children plus an optional opaque SharedVariant child, the non-wrapper types and
 `Tuple` each optionally wrapped in `Nullable`. The name-decoration aliases
 `SimpleAggregateFunction(func, T)` (encodable when its inner `T` is, at any
 nesting position), the six geo types (`Point`, `Ring`, `LineString`,
@@ -2359,6 +2503,13 @@ one valid wire form, and encode commits to these:
   checks every type id, occurrence offset, child length, and NULL child before
   writing. Alternative state suffixes are traversed in the same order after the
   bodies. A zero-row block writes no mode word or child prefix.
+- **Dynamic.** A column with SharedVariant writes direct V1 below revision
+  54473 or V2 at and above it, the direct type table, BASIC mode 0, the complete
+  UInt8 discriminator run, then dense children in canonical global order. A
+  column without SharedVariant writes FLATTENED word 3, its typed child table,
+  the smallest fixed-width index run, then dense bodies. Validation checks the
+  table/order/max-types and every routing/child invariant before either form is
+  emitted. A zero-row block writes no Dynamic structure or child prefix.
 
 ### Round-trip guarantees
 
@@ -2426,6 +2577,8 @@ directly (`empty_column` in `src/native/decode/mod.rs`), the empty shapes are:
   recursively).
 - `Variant(T1, ...)`: an empty flat or nested Dense Union layout, one recursively
   empty dense child per alternative, and an empty Null child.
+- `Dynamic`: empty u32 type-id and i32 offset buffers, no discovered block-local
+  children, and an empty Null child. The logical `max_types` remains in schema.
 - Any registered `AggregateFunction` codec: offsets `[0]` and empty state data.
 
 In all cases length is 0 and `null_count` is 0.
@@ -2487,6 +2640,10 @@ mirror of the server's check that its row-count-driven decode cannot reach.
 A malformed `Variant` payload (a nonzero direct-Native mode or a non-255
 discriminator outside the alternative range) fails with
 `DecodeError::InvalidVariant`.
+A malformed `Dynamic` payload (unknown/V3 structure word, non-BASIC direct
+mode, illegal/duplicate runtime type, invalid count, or out-of-range index)
+fails with `DecodeError::InvalidDynamic` rather than indexing a child or
+silently desynchronizing the following column.
 
 When one of these is implemented, move it into the support matrix and add a type
 section here.

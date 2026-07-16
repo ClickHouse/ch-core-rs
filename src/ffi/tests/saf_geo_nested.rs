@@ -61,7 +61,7 @@ fn test_export_point_schema_and_array() {
         (schema_out.release.unwrap())(&mut schema_out);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let p = &**array.children.add(0);
         assert_eq!(p.length, 2);
         assert_eq!(p.n_children, 2);

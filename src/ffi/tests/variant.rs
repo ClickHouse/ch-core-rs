@@ -46,7 +46,7 @@ fn export_flat_variant_schema_and_buffers() {
         (schema.release.unwrap())(&mut schema);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let field = &**array.children.add(0);
         assert_eq!(field.length, 4);
         assert_eq!(field.null_count, 0, "unions have no top-level null count");
@@ -112,7 +112,7 @@ fn export_nullable_variant_matches_bare_variant() {
         (schema.release.unwrap())(&mut schema);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let field = &**array.children.add(0);
         // Array shape must match the schema: 3 children, 2 union buffers, no
         // top-level validity or null count.
@@ -173,7 +173,7 @@ fn export_128_alternatives_as_union_of_unions() {
         (schema.release.unwrap())(&mut schema);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let field = &**array.children.add(0);
         assert_eq!(field.length, 2);
         assert_eq!(field.n_children, 2);

@@ -18,7 +18,10 @@
 use std::io;
 
 use crate::batch::ColBatch;
-use crate::native::decode::{block_end, decode_next_block, DecodeError, DecodeOptions};
+use crate::native::decode::{
+    block_end, block_end_binary_types, decode_next_block, decode_next_block_binary_types,
+    DecodeError, DecodeOptions,
+};
 use crate::native::varint::ByteReader;
 use crate::schema::Schema;
 
@@ -44,6 +47,7 @@ pub struct StreamDecoder {
     /// coordinates: compaction lowers it by the number of bytes drained.
     scanned: usize,
     options: DecodeOptions,
+    binary_types: bool,
     finished: bool,
     /// First block's schema; later blocks must match it.
     schema: Option<Schema>,
@@ -58,9 +62,19 @@ impl StreamDecoder {
             pos: 0,
             scanned: 0,
             options,
+            binary_types: false,
             finished: false,
             schema: None,
             blocks_seen: 0,
+        }
+    }
+
+    /// Construct a streaming decoder for Native data whose type headers and
+    /// Dynamic runtime tables use binary data-type descriptors.
+    pub fn new_binary_types(options: DecodeOptions) -> Self {
+        Self {
+            binary_types: true,
+            ..Self::new(options)
         }
     }
 
@@ -135,13 +149,23 @@ impl StreamDecoder {
                 break;
             }
 
-            match block_end(data, &self.options) {
+            let scanned_end = if self.binary_types {
+                block_end_binary_types(data, &self.options)
+            } else {
+                block_end(data, &self.options)
+            };
+            match scanned_end {
                 Ok(Some(end)) => {
                     // A full block is buffered. The allocating decode now reads
                     // exactly `data[..end]`; completeness was just verified with
                     // the same framing, so it cannot hit EOF.
                     let mut reader = ByteReader::new(&data[..end]);
-                    match decode_next_block(&mut reader, &self.options)? {
+                    let decoded = if self.binary_types {
+                        decode_next_block_binary_types(&mut reader, &self.options)
+                    } else {
+                        decode_next_block(&mut reader, &self.options)
+                    }?;
+                    match decoded {
                         Some(batch) => {
                             match &self.schema {
                                 None => self.schema = Some(batch.schema.clone()),
@@ -622,5 +646,26 @@ mod tests {
 
         let result = dec.feed(&data);
         assert!(matches!(result, Err(DecodeError::UnsupportedType { .. })));
+    }
+
+    #[test]
+    fn test_binary_type_header_streaming() {
+        let mut data = Vec::new();
+        write_varint(&mut data, 1);
+        write_varint(&mut data, 1);
+        write_varint(&mut data, 1);
+        data.push(b'v');
+        data.push(0x04); // DataTypesBinaryEncoding UInt64
+        data.extend_from_slice(&79u64.to_le_bytes());
+
+        let mut decoder = StreamDecoder::new_binary_types(DecodeOptions::default());
+        let split = data.len() - 1;
+        assert!(decoder.feed(&data[..split]).unwrap().is_empty());
+        let blocks = decoder.feed(&data[split..]).unwrap();
+        assert_eq!(blocks.len(), 1);
+        match blocks[0].column(0) {
+            Column::UInt64(column) => assert_eq!(column.values, vec![79]),
+            other => panic!("expected UInt64, got {other:?}"),
+        }
     }
 }

@@ -8,6 +8,7 @@ mod aggregate_function;
 mod bfloat16;
 mod containers;
 mod decimal;
+mod dynamic;
 mod framing;
 mod interval;
 mod low_cardinality;

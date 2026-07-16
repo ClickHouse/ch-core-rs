@@ -120,8 +120,7 @@ Not implemented yet:
 
 - TCP/native protocol packet framing.
 - Compression framing.
-- Binary-encoded Native type headers.
-- `Dynamic`, `JSON`, `Geometry`, and `QBit` types.
+- `JSON`, `Geometry`, and `QBit` types.
 - Language-specific materialization policy (bindings own this, by design).
 
 ## Supported types
@@ -142,7 +141,7 @@ Not implemented yet:
 - `UUID`, `IPv4`, `IPv6`
 - `Enum8(...)`, `Enum16(...)`
 - `Int128`, `UInt128`, `Int256`, `UInt256`
-- `Array(T)`, `Tuple(T1, ...)`, `Map(K, V)`, and `Variant(T1, ...)`
+- `Array(T)`, `Tuple(T1, ...)`, `Map(K, V)`, `Variant(T1, ...)`, and `Dynamic`
 - `SimpleAggregateFunction(func, T)`, the six geo aliases, and `Nested(...)`
 - Exact `AggregateFunction` state codecs for `count`, canonical
   `nothingUInt64` and `nothingNull`, and base `sum` over plain or Nullable
@@ -156,7 +155,7 @@ Unsupported types raise a decode error rather than guessing.
 
 In rough priority order:
 
-1. Type coverage: `Dynamic`, `JSON`, `Geometry`, and `QBit`.
+1. Type coverage: `JSON`, `Geometry`, and `QBit`.
 2. Compression framing: LZ4, then ZSTD.
 3. Per-runtime zero-copy adapters: JS `TypedArray` over an external
    `ArrayBuffer`, NumPy export that does not route through Arrow.
@@ -191,7 +190,10 @@ Decode a complete buffer with `native::decode::decode_all_bytes`, or stream
 with `native::stream_decoder::StreamDecoder`. Encode a batch back to Native
 block bytes for `INSERT` with `native::encode::encode_block` or
 `native::encode::encode_chunked` (the full scalar and `LowCardinality` set; see
-`COMPLETENESS.md` for the insert-path progress).
+`COMPLETENESS.md` for the insert-path progress). Server output configured with
+`output_format_native_encode_types_in_binary_format=1` uses the explicit
+`decode_*_binary_types` entry points. Bytes from `encode_*_binary_types` require
+`input_format_native_decode_types_in_binary_format=1` on the receiving INSERT.
 
 ## Repo layout
 

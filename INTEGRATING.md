@@ -93,7 +93,14 @@ A client can get bytes for this core by requesting `FORMAT Native` over the HTTP
 
 - HTTP response compression must be decompressed first.
 - Server exceptions, retries, cancellation, and connection lifecycle remain client responsibilities.
-- Do not enable `output_format_native_encode_types_in_binary_format`. The current core expects string-encoded column type headers, which is the default Native output mode.
+- The default decode APIs expect string-encoded column type headers. If the
+  request enables `output_format_native_encode_types_in_binary_format`, use the
+  corresponding `decode_*_binary_types` API or
+  `StreamDecoder::new_binary_types`; do not mix the two modes.
+
+For INSERT, the default encode APIs write textual headers. If a binding uses an
+`encode_*_binary_types` API, it must set
+`input_format_native_decode_types_in_binary_format=1` on the ClickHouse request.
 
 The same model applies over TCP. A TCP client must do the native protocol work first: handshake, revision negotiation, packet framing, compression framing, server packet dispatch, progress and exception handling, cancellation, and end-of-stream handling. Once it has the Native block payload bytes from server `Data` packets, it can feed those bytes to the core.
 

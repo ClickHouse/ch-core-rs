@@ -58,7 +58,7 @@ fn test_export_array_int32_buffers() {
 
     unsafe {
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
 
         let c0 = &**array.children.add(0);
         assert_eq!(c0.length, 3, "array length is the row count");
@@ -117,7 +117,7 @@ fn test_export_array_nullable_int32() {
         (schema_out.release.unwrap())(&mut schema_out);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let c0 = &**array.children.add(0);
         assert_eq!(c0.length, 2);
         assert_eq!(c0.null_count, 0, "array level has no nulls");
@@ -170,7 +170,7 @@ fn test_export_array_low_cardinality_string() {
         (schema_out.release.unwrap())(&mut schema_out);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let c0 = &**array.children.add(0);
         assert_eq!(c0.length, 2);
         let item = &**c0.children.add(0);
@@ -222,7 +222,7 @@ fn test_export_array_of_array_int32() {
         (schema_out.release.unwrap())(&mut schema_out);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let c0 = &**array.children.add(0);
         assert_eq!(c0.length, 2, "2 outer rows");
         let offsets = *c0.buffers.add(1) as *const i64;
@@ -257,7 +257,7 @@ fn test_export_empty_array_column() {
 
     unsafe {
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let c0 = &**array.children.add(0);
         assert_eq!(c0.length, 0);
         assert_eq!(c0.n_buffers, 2);
@@ -289,7 +289,7 @@ fn test_release_array_skips_moved_out_child() {
 
     unsafe {
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         // Drop our own Arc so the export's private-data clones are the only
         // owners of the buffers from here on.
         drop(batch);
@@ -351,7 +351,7 @@ fn test_export_array_all_rows_empty_low_cardinality() {
 
     unsafe {
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let c0 = &**array.children.add(0);
         assert_eq!(c0.length, 2, "2 rows, all empty");
         assert_eq!(c0.null_count, 0);
@@ -488,7 +488,7 @@ fn test_export_tuple_buffers() {
 
     unsafe {
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
 
         let t = &**array.children.add(0);
         assert_eq!(t.length, 2);
@@ -544,7 +544,7 @@ fn test_export_nullable_tuple() {
         (schema_out.release.unwrap())(&mut schema_out);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let c0 = &**array.children.add(0);
         assert_eq!(c0.length, 3);
         assert_eq!(c0.null_count, 1);
@@ -668,7 +668,7 @@ fn test_export_map_buffers() {
 
     unsafe {
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
 
         let c0 = &**array.children.add(0);
         assert_eq!(c0.length, 3, "map length is the row count");
@@ -718,7 +718,7 @@ fn export_empty_offsets_array_has_valid_leading_zero_offset() {
     // Safety: output is a writable zeroed C Data array, released below.
     unsafe {
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let c0 = &**array.children.add(0);
         assert_eq!(c0.length, 0);
         assert_eq!(c0.n_buffers, 2);

@@ -1,4 +1,5 @@
 use crate::bitmap::Bitmap;
+use crate::schema::ChType;
 
 /// A ClickHouse `Nothing` column.
 ///
@@ -696,15 +697,246 @@ impl std::error::Error for VariantColumnError {}
 /// server's reserved discriminator 255 and is represented by an Arrow Null
 /// child (`nulls`), because Arrow unions have no top-level validity bitmap.
 ///
-/// `variants` stays in the canonical ClickHouse alternative order stored by
-/// `ChType::Variant`. Each child contains only its selected rows. `layout` is
-/// flat for at most 127 alternatives and a two-level union for 128 through 255,
-/// preserving both ClickHouse's full range and Arrow's 128-code-per-node limit.
+/// `discriminators` is the exact Native wire run (one byte per logical row,
+/// 255 = NULL) and the single source of truth for routing; `layout` is the
+/// deterministic Arrow view derived from it. `variants` stays in the canonical
+/// ClickHouse alternative order stored by `ChType::Variant`. Each child
+/// contains only its selected rows. `layout` is flat for at most 127
+/// alternatives and a two-level union for 128 through 255, preserving both
+/// ClickHouse's full range and Arrow's 128-code-per-node limit.
 #[derive(Debug, Clone)]
 pub struct VariantColumn {
+    pub discriminators: Vec<u8>,
     pub layout: VariantLayout,
     pub variants: Vec<Column>,
     pub nulls: NothingColumn,
+}
+
+/// One physical child of a self-describing ClickHouse `Dynamic` column.
+///
+/// Typed children are decoded in bulk into the same [`Column`] buffers their
+/// standalone type uses. `SharedVariant` is the server's overflow child: every
+/// cell is an opaque binary blob containing a binary type descriptor followed
+/// by one value's `serializeBinary` payload. It deliberately stays binary here;
+/// parsing or materializing those row payloads is not part of the hot bulk path.
+#[derive(Debug, Clone)]
+pub enum DynamicChild {
+    Typed { ch_type: ChType, values: Column },
+    Shared(Utf8Column),
+}
+
+impl DynamicChild {
+    pub fn len(&self) -> usize {
+        match self {
+            DynamicChild::Typed { values, .. } => values.len(),
+            DynamicChild::Shared(values) => values.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn ch_type(&self) -> Option<&ChType> {
+        match self {
+            DynamicChild::Typed { ch_type, .. } => Some(ch_type),
+            DynamicChild::Shared(_) => None,
+        }
+    }
+}
+
+/// Invalid input to [`DynamicColumn::try_new`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DynamicColumnError {
+    DuplicateChild {
+        name: String,
+    },
+    ChildOffsetOverflow {
+        row: usize,
+    },
+    InvalidTypeId {
+        row: usize,
+        type_id: u32,
+        children: usize,
+    },
+    ChildLength {
+        child: usize,
+        expected: usize,
+        actual: usize,
+    },
+}
+
+impl std::fmt::Display for DynamicColumnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DynamicColumnError::DuplicateChild { name } => {
+                write!(f, "Dynamic has more than one child named {name}")
+            }
+            DynamicColumnError::ChildOffsetOverflow { row } => write!(
+                f,
+                "Dynamic row {row} exceeds Arrow Dense Union's i32 child-offset range"
+            ),
+            DynamicColumnError::InvalidTypeId {
+                row,
+                type_id,
+                children,
+            } => write!(
+                f,
+                "Dynamic row {row} has type id {type_id}, but only {children} children exist"
+            ),
+            DynamicColumnError::ChildLength {
+                child,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "Dynamic child {child} has {actual} values, expected {expected} from the type ids"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DynamicColumnError {}
+
+/// A block-local ClickHouse `Dynamic` column.
+///
+/// `type_ids` uses one `u32` per row. Values `0..children.len()` select a dense
+/// child and `u32::MAX` is intrinsic NULL. `offsets` is the zero-based occurrence
+/// index inside the selected child, already in Arrow's i32 Dense Union width.
+/// The server's wire ids are local to each block, so this structure intentionally
+/// does not pretend the child set is part of the logical [`ChType::Dynamic`]
+/// schema.
+///
+/// V1/V2 columns include exactly one [`DynamicChild::Shared`] in the server's
+/// canonical global discriminator order. FLATTENED word 3 has typed children
+/// only, in its transmitted list order. This distinction is enough for the
+/// encoder to preserve the accepted Native representation without storing a
+/// wire-version flag on the public buffer.
+#[derive(Debug, Clone)]
+pub struct DynamicColumn {
+    pub type_ids: Vec<u32>,
+    pub offsets: Vec<i32>,
+    pub children: Vec<DynamicChild>,
+    pub nulls: NothingColumn,
+}
+
+impl DynamicColumn {
+    /// Build a Dynamic column from block-local child ids and dense children.
+    /// `u32::MAX` denotes NULL; every other id must index `children`.
+    pub fn try_new(
+        type_ids: &[u32],
+        children: Vec<DynamicChild>,
+    ) -> Result<Self, DynamicColumnError> {
+        let mut child_names = std::collections::BTreeSet::new();
+        for child in &children {
+            let name = match child {
+                DynamicChild::Typed { ch_type, .. } => ch_type.to_string(),
+                DynamicChild::Shared(_) => "SharedVariant".to_string(),
+            };
+            if !child_names.insert(name.clone()) {
+                return Err(DynamicColumnError::DuplicateChild { name });
+            }
+        }
+        let (offsets, counts, null_count) =
+            dynamic_offsets_from_type_ids(type_ids, children.len())?;
+        for (child, (values, expected)) in children.iter().zip(counts).enumerate() {
+            let actual = values.len();
+            if actual != expected {
+                return Err(DynamicColumnError::ChildLength {
+                    child,
+                    expected,
+                    actual,
+                });
+            }
+        }
+        Ok(Self::from_parts(
+            type_ids.to_vec(),
+            offsets,
+            children,
+            null_count,
+        ))
+    }
+
+    pub(crate) fn from_parts(
+        type_ids: Vec<u32>,
+        offsets: Vec<i32>,
+        children: Vec<DynamicChild>,
+        null_count: usize,
+    ) -> Self {
+        Self {
+            type_ids,
+            offsets,
+            children,
+            nulls: NothingColumn::new(null_count),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.type_ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.type_ids.is_empty()
+    }
+
+    pub fn null_count(&self) -> usize {
+        self.nulls.len
+    }
+
+    pub fn shared_child_index(&self) -> Option<usize> {
+        self.children
+            .iter()
+            .position(|child| matches!(child, DynamicChild::Shared(_)))
+    }
+
+    /// Resolve one row to its local child and dense offset. NULL is returned as
+    /// `(u32::MAX, offset_in_null_child)`.
+    pub fn value_position(&self, row: usize) -> Option<(u32, i32)> {
+        let type_id = *self.type_ids.get(row)?;
+        let offset = *self.offsets.get(row)?;
+        if offset < 0 {
+            return None;
+        }
+        if type_id == u32::MAX {
+            return ((offset as usize) < self.nulls.len).then_some((type_id, offset));
+        }
+        let child = self.children.get(type_id as usize)?;
+        ((offset as usize) < child.len()).then_some((type_id, offset))
+    }
+}
+
+/// Derive dense child offsets and counts from block-local Dynamic type ids.
+pub(crate) fn dynamic_offsets_from_type_ids(
+    type_ids: &[u32],
+    num_children: usize,
+) -> Result<(Vec<i32>, Vec<usize>, usize), DynamicColumnError> {
+    if type_ids.len() > i32::MAX as usize {
+        return Err(DynamicColumnError::ChildOffsetOverflow {
+            row: i32::MAX as usize,
+        });
+    }
+
+    let mut counts = vec![0usize; num_children];
+    let mut null_count = 0usize;
+    let mut offsets = Vec::with_capacity(type_ids.len());
+    for (row, &type_id) in type_ids.iter().enumerate() {
+        if type_id == u32::MAX {
+            offsets.push(null_count as i32);
+            null_count += 1;
+            continue;
+        }
+        let child = type_id as usize;
+        if child >= num_children {
+            return Err(DynamicColumnError::InvalidTypeId {
+                row,
+                type_id,
+                children: num_children,
+            });
+        }
+        offsets.push(counts[child] as i32);
+        counts[child] += 1;
+    }
+    Ok((offsets, counts, null_count))
 }
 
 impl VariantColumn {
@@ -730,19 +962,31 @@ impl VariantColumn {
                 });
             }
         }
-        Ok(Self::from_parts(layout, variants, null_count))
+        Ok(Self::from_parts(
+            discriminators.to_vec(),
+            layout,
+            variants,
+            null_count,
+        ))
     }
 
     pub(crate) fn from_parts(
+        discriminators: Vec<u8>,
         layout: VariantLayout,
         variants: Vec<Column>,
         null_count: usize,
     ) -> Self {
         Self {
+            discriminators,
             layout,
             variants,
             nulls: NothingColumn::new(null_count),
         }
+    }
+
+    /// The Native wire discriminator run: one byte per logical row, 255 = NULL.
+    pub fn discriminators(&self) -> &[u8] {
+        &self.discriminators
     }
 
     pub fn len(&self) -> usize {
@@ -817,6 +1061,39 @@ impl VariantColumn {
             }
         }
     }
+}
+
+/// Count each alternative's dense rows and the NULL rows in one pass over
+/// ClickHouse's one-byte global discriminator run (255 = NULL).
+///
+/// Shared by the layout builder and the streaming skip scan so both paths
+/// reject an out-of-range discriminator with the same error.
+pub(crate) fn variant_child_counts(
+    discriminators: &[u8],
+    num_variants: usize,
+) -> Result<(Vec<usize>, usize), VariantColumnError> {
+    if !(1..=u8::MAX as usize).contains(&num_variants) {
+        return Err(VariantColumnError::InvalidAlternativeCount {
+            count: num_variants,
+        });
+    }
+
+    let mut counts = vec![0usize; num_variants];
+    let mut null_count = 0usize;
+    for (row, &discriminator) in discriminators.iter().enumerate() {
+        if discriminator == u8::MAX {
+            null_count += 1;
+        } else if let Some(count) = counts.get_mut(discriminator as usize) {
+            *count += 1;
+        } else {
+            return Err(VariantColumnError::InvalidDiscriminator {
+                row,
+                discriminator,
+                alternatives: num_variants,
+            });
+        }
+    }
+    Ok((counts, null_count))
 }
 
 /// Derive Arrow Dense Union routing buffers and child counts from ClickHouse's
@@ -1011,6 +1288,9 @@ pub enum Column {
     // Variant(T1, ...): Arrow Dense Union routing buffers plus one compact child
     // column per alternative and an implicit Arrow Null child.
     Variant(VariantColumn),
+    // Dynamic: block-local self-describing typed children, optional raw binary
+    // SharedVariant overflow child, and dense routing buffers.
+    Dynamic(DynamicColumn),
 }
 
 impl Column {
@@ -1053,6 +1333,7 @@ impl Column {
             Column::Tuple(c) => c.len(),
             Column::Map(c) => c.len(),
             Column::Variant(c) => c.len(),
+            Column::Dynamic(c) => c.len(),
         }
     }
 
@@ -1099,6 +1380,7 @@ impl Column {
             Column::Tuple(c) => c.null_count(),
             Column::Map(c) => c.null_count(),
             Column::Variant(c) => c.null_count(),
+            Column::Dynamic(c) => c.null_count(),
         }
     }
 
@@ -1148,6 +1430,8 @@ impl Column {
             // Arrow unions have no validity bitmap. Variant's intrinsic NULL is
             // represented by its Arrow Null child.
             Column::Variant(_) => None,
+            // Dynamic has the same intrinsic-NULL union semantics as Variant.
+            Column::Dynamic(_) => None,
         }
     }
 }
@@ -1232,6 +1516,7 @@ mod tests {
         // Flat: an offset that points past the selected child's only row. A
         // hand-built layout can express this; decode never produces it.
         let column = VariantColumn::from_parts(
+            vec![0],
             VariantLayout::Flat {
                 type_ids: vec![0],
                 offsets: vec![1],
@@ -1246,6 +1531,7 @@ mod tests {
 
         // Flat: a negative offset is out of range for any child.
         let column = VariantColumn::from_parts(
+            vec![0],
             VariantLayout::Flat {
                 type_ids: vec![0],
                 offsets: vec![-1],
@@ -1257,6 +1543,7 @@ mod tests {
 
         // Flat: a NULL offset past the NULL child's length.
         let column = VariantColumn::from_parts(
+            vec![u8::MAX],
             VariantLayout::Flat {
                 type_ids: vec![1],
                 offsets: vec![0],
@@ -1268,6 +1555,7 @@ mod tests {
 
         // Nested: a group offset past the selected child's only row.
         let column = VariantColumn::from_parts(
+            vec![0],
             VariantLayout::Nested {
                 type_ids: vec![0],
                 offsets: vec![0],
@@ -1284,6 +1572,7 @@ mod tests {
 
         // Nested: an outer NULL offset past the NULL child's length.
         let column = VariantColumn::from_parts(
+            vec![u8::MAX],
             VariantLayout::Nested {
                 type_ids: vec![1],
                 offsets: vec![3],

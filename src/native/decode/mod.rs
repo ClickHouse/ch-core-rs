@@ -4,9 +4,10 @@ use std::sync::Arc;
 use crate::batch::{ChunkedBatch, ColBatch};
 use crate::bitmap::Bitmap;
 use crate::column::{
-    variant_layout_from_discriminators, AggregateStateColumn, ArrayColumn, BoolColumn, Column,
-    DecimalColumn, DictionaryColumn, FixedBinaryColumn, MapColumn, NothingColumn, PrimitiveColumn,
-    TupleColumn, Utf8Column, VariantColumn,
+    variant_child_counts, variant_layout_from_discriminators, AggregateStateColumn, ArrayColumn,
+    BoolColumn, Column, DecimalColumn, DictionaryColumn, DynamicChild, DynamicColumn,
+    FixedBinaryColumn, MapColumn, NothingColumn, PrimitiveColumn, TupleColumn, Utf8Column,
+    VariantColumn,
 };
 use crate::native::aggregate_function::{
     decode_aggregate_states, decode_state_codec, scan_aggregate_states,
@@ -20,7 +21,11 @@ pub use crate::native::protocol::{
 use crate::native::protocol::{
     LC_HAS_ADDITIONAL_KEYS_BIT, LC_NEED_GLOBAL_DICTIONARY_BIT, LOW_CARDINALITY_KEY_VERSION,
 };
-use crate::native::type_parser::{is_low_cardinality_inner, unsupported_header_type_name};
+use crate::native::type_binary::{read_binary_type, BinaryTypeError};
+use crate::native::type_parser::{
+    is_low_cardinality_inner, is_valid_variant_alternative, resolves_to_nothing,
+    unsupported_header_type_name,
+};
 pub use crate::native::type_parser::{low_cardinality_dict_value_type, parse_ch_type};
 
 /// Errors that can occur during Native format decoding.
@@ -80,6 +85,12 @@ pub enum DecodeError {
         column: String,
         reason: String,
     },
+    /// A Dynamic column carried an invalid structure version, runtime type
+    /// table, discriminator/index, or child layout.
+    InvalidDynamic {
+        column: String,
+        reason: String,
+    },
 }
 
 impl From<io::Error> for DecodeError {
@@ -128,6 +139,9 @@ impl std::fmt::Display for DecodeError {
             DecodeError::InvalidVariant { column, reason } => {
                 write!(f, "Invalid Variant layout for column '{column}': {reason}")
             }
+            DecodeError::InvalidDynamic { column, reason } => {
+                write!(f, "Invalid Dynamic layout for column '{column}': {reason}")
+            }
         }
     }
 }
@@ -151,6 +165,46 @@ pub struct DecodeOptions {
     /// framing, for example HTTP `FORMAT Native` with no `client_protocol_version`
     /// set.
     pub protocol_revision: u64,
+}
+
+#[derive(Clone, Copy)]
+struct DecodeSettings {
+    protocol_revision: u64,
+    types_in_binary_format: bool,
+}
+
+impl DecodeSettings {
+    fn text(options: &DecodeOptions) -> Self {
+        Self {
+            protocol_revision: options.protocol_revision,
+            types_in_binary_format: false,
+        }
+    }
+
+    fn binary(options: &DecodeOptions) -> Self {
+        Self {
+            protocol_revision: options.protocol_revision,
+            types_in_binary_format: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum DynamicStateChild {
+    Typed(ChType),
+    Shared,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DynamicWireKind {
+    Variant,
+    Flattened,
+}
+
+#[derive(Debug, Clone)]
+struct DynamicState {
+    kind: DynamicWireKind,
+    children: Vec<DynamicStateChild>,
 }
 
 // ---------------------------------------------------------------------------
@@ -339,11 +393,11 @@ fn decode_bfloat16_data(reader: &mut ByteReader, num_rows: usize) -> io::Result<
 /// In the Native format the server runs `readData` once per column per block,
 /// which calls `deserializeBinaryBulkStatePrefix` immediately before the column
 /// payload, and only when the block has rows (`NativeReader::readData`, gated by
-/// `if (rows)`). Every currently supported type reads zero prefix bytes;
-/// `LowCardinality` is the first that reads a real prefix, the 8-byte key
-/// version. Centralizing it here means a later type with a real prefix (Array,
-/// Map, and so on) declares its prefix in one place rather than special-casing
-/// the per-column loop.
+/// `if (rows)`). Most supported types read zero prefix bytes.
+/// `LowCardinality` reads its 8-byte key version, while `Variant` and `Dynamic`
+/// read their discriminator mode or block-local structure and type table.
+/// Centralizing these bytes here keeps nested prefix order identical to the
+/// server instead of special-casing the per-column loop.
 ///
 /// Returns the parsed key version for `LowCardinality` (so the decoder does not
 /// re-read it), `None` for every other type.
@@ -351,6 +405,8 @@ fn read_state_prefix(
     reader: &mut ByteReader,
     ch_type: &ChType,
     column: &str,
+    options: &DecodeSettings,
+    dynamic_states: &mut Vec<DynamicState>,
 ) -> Result<Option<u64>, DecodeError> {
     // A name-decoration alias (SimpleAggregateFunction, geo, Nested) has the
     // exact state prefix of the type it delegates to, so expand and recurse. For
@@ -358,7 +414,7 @@ fn read_state_prefix(
     // 8-byte key version through the delegated Array(Tuple(...)) chain, hoisting
     // it to the very front of the whole column, before the offsets.
     if let Some(under) = ch_type.physical_delegate() {
-        return read_state_prefix(reader, &under, column);
+        return read_state_prefix(reader, &under, column, options, dynamic_states);
     }
     match ch_type {
         ChType::LowCardinality(_) => {
@@ -376,7 +432,7 @@ fn read_state_prefix(
         // prefix (confirmed at v26.6.1.1193-stable). This is how a leaf
         // `LowCardinality`'s 8-byte key version is consumed here, at the front of
         // the whole Array column, before the offsets.
-        ChType::Array(inner) => read_state_prefix(reader, inner, column),
+        ChType::Array(inner) => read_state_prefix(reader, inner, column, options, dynamic_states),
         // Tuple writes no prefix of its own; `SerializationTuple`'s
         // `deserializeBinaryBulkStatePrefix` loops over the elements in
         // declaration order and delegates to each (confirmed at
@@ -385,7 +441,7 @@ fn read_state_prefix(
         // and nothing for the Int32.
         ChType::Tuple(elements) => {
             for (_, element_type) in elements {
-                read_state_prefix(reader, element_type, column)?;
+                read_state_prefix(reader, element_type, column, options, dynamic_states)?;
             }
             Ok(None)
         }
@@ -396,8 +452,8 @@ fn read_state_prefix(
         // Map(LowCardinality(String), Int32) has the LC 8-byte key version at
         // the very front of the whole column, before the offsets.
         ChType::Map(key, value) => {
-            read_state_prefix(reader, key, column)?;
-            read_state_prefix(reader, value, column)
+            read_state_prefix(reader, key, column, options, dynamic_states)?;
+            read_state_prefix(reader, value, column, options, dynamic_states)
         }
         // Direct FORMAT Native always uses BASIC Variant discriminators at the
         // pinned server tag. The prefix starts with one fixed-width LE UInt64
@@ -416,8 +472,24 @@ fn read_state_prefix(
                 });
             }
             for alternative in alternatives {
-                read_state_prefix(reader, alternative, column)?;
+                read_state_prefix(reader, alternative, column, options, dynamic_states)?;
             }
+            Ok(None)
+        }
+        ChType::Dynamic { max_types } => {
+            let state = read_dynamic_state(reader, *max_types, column, options)?;
+            // Prefix and body traversals visit Dynamic nodes in the same
+            // preorder. Recurse while `state` is still local, then insert this
+            // parent ahead of the nested states. This avoids cloning the type
+            // table and its ChType trees just to satisfy Vec's mutable-borrow
+            // rules; the bounded insertion moves only small state records.
+            let state_index = dynamic_states.len();
+            for child in &state.children {
+                if let DynamicStateChild::Typed(ch_type) = child {
+                    read_state_prefix(reader, ch_type, column, options, dynamic_states)?;
+                }
+            }
+            dynamic_states.insert(state_index, state);
             Ok(None)
         }
         // Nullable writes no prefix of its own either;
@@ -427,7 +499,9 @@ fn read_state_prefix(
         // `Nullable(Tuple(...))` can nest a prefix-bearing type today (a
         // LowCardinality element), but recursing unconditionally keeps this
         // faithful to the server for any future nullable-wrappable container.
-        ChType::Nullable(inner) => read_state_prefix(reader, inner, column),
+        ChType::Nullable(inner) => {
+            read_state_prefix(reader, inner, column, options, dynamic_states)
+        }
         _ => Ok(None),
     }
 }
@@ -442,25 +516,38 @@ fn read_state_suffix(
     reader: &mut ByteReader,
     ch_type: &ChType,
     column: &str,
+    dynamic_states: &[DynamicState],
+    dynamic_index: &mut usize,
 ) -> Result<(), DecodeError> {
     if let Some(under) = ch_type.physical_delegate() {
-        return read_state_suffix(reader, &under, column);
+        return read_state_suffix(reader, &under, column, dynamic_states, dynamic_index);
     }
     match ch_type {
-        ChType::Array(inner) | ChType::Nullable(inner) => read_state_suffix(reader, inner, column),
+        ChType::Array(inner) | ChType::Nullable(inner) => {
+            read_state_suffix(reader, inner, column, dynamic_states, dynamic_index)
+        }
         ChType::Tuple(elements) => {
             for (_, element_type) in elements {
-                read_state_suffix(reader, element_type, column)?;
+                read_state_suffix(reader, element_type, column, dynamic_states, dynamic_index)?;
             }
             Ok(())
         }
         ChType::Map(key, value) => {
-            read_state_suffix(reader, key, column)?;
-            read_state_suffix(reader, value, column)
+            read_state_suffix(reader, key, column, dynamic_states, dynamic_index)?;
+            read_state_suffix(reader, value, column, dynamic_states, dynamic_index)
         }
         ChType::Variant(alternatives) => {
             for alternative in alternatives {
-                read_state_suffix(reader, alternative, column)?;
+                read_state_suffix(reader, alternative, column, dynamic_states, dynamic_index)?;
+            }
+            Ok(())
+        }
+        ChType::Dynamic { .. } => {
+            let state = next_dynamic_state(dynamic_states, dynamic_index, column)?;
+            for child in &state.children {
+                if let DynamicStateChild::Typed(ch_type) = child {
+                    read_state_suffix(reader, ch_type, column, dynamic_states, dynamic_index)?;
+                }
             }
             Ok(())
         }
@@ -471,6 +558,152 @@ fn read_state_suffix(
             let _ = (reader, column);
             Ok(())
         }
+    }
+}
+
+fn read_dynamic_state(
+    reader: &mut ByteReader,
+    max_types: u8,
+    column: &str,
+    options: &DecodeSettings,
+) -> Result<DynamicState, DecodeError> {
+    let version = reader.read_u64_le()?;
+    let kind = match version {
+        1 => {
+            // V1's first VarUInt was historically max_dynamic_types. The
+            // current writer puts the direct-type count there and the reader
+            // ignores it, so consume it without comparing it.
+            reader.read_varint()?;
+            DynamicWireKind::Variant
+        }
+        2 => DynamicWireKind::Variant,
+        3 => DynamicWireKind::Flattened,
+        4 => {
+            return Err(invalid_dynamic(
+                column,
+                "structure word 4 (V3) is not emitted by NativeWriter",
+            ))
+        }
+        other => {
+            return Err(invalid_dynamic(
+                column,
+                format!("unknown structure word {other}"),
+            ))
+        }
+    };
+
+    let count = varint_usize(reader.read_varint()?, "Dynamic runtime type count")?;
+    if kind == DynamicWireKind::Variant && count > 254 {
+        return Err(invalid_dynamic(
+            column,
+            format!("direct runtime type count {count} exceeds 254"),
+        ));
+    }
+    if kind == DynamicWireKind::Variant && count > max_types as usize {
+        return Err(invalid_dynamic(
+            column,
+            format!("direct runtime type count {count} exceeds max_types={max_types}"),
+        ));
+    }
+    if count >= u32::MAX as usize {
+        return Err(invalid_dynamic(
+            column,
+            "runtime type count exceeds the u32 block-local routing model",
+        ));
+    }
+
+    let mut typed = Vec::with_capacity(reader.capacity_for(count, 1));
+    let mut names = std::collections::BTreeSet::new();
+    for _ in 0..count {
+        let ch_type = read_dynamic_type_entry(reader, options, column)?;
+        let canonical = ch_type.to_string();
+        if resolves_to_nothing(&ch_type) || !is_valid_variant_alternative(&ch_type) {
+            return Err(invalid_dynamic(
+                column,
+                format!("runtime type {canonical} is not legal in Dynamic"),
+            ));
+        }
+        if let Some(unsupported) = unsupported_header_type_name(&ch_type) {
+            return Err(DecodeError::UnsupportedType {
+                column: column.to_string(),
+                type_name: unsupported,
+            });
+        }
+        if !names.insert(canonical.clone()) {
+            return Err(invalid_dynamic(
+                column,
+                format!("duplicate canonical runtime type {canonical}"),
+            ));
+        }
+        typed.push((canonical, ch_type));
+    }
+
+    let children = if kind == DynamicWireKind::Variant {
+        let mut global = typed
+            .into_iter()
+            .map(|(name, ch_type)| (name, DynamicStateChild::Typed(ch_type)))
+            .collect::<Vec<_>>();
+        global.push(("SharedVariant".to_string(), DynamicStateChild::Shared));
+        global.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+
+        let mode = reader.read_u64_le()?;
+        if mode != 0 {
+            return Err(invalid_dynamic(
+                column,
+                format!("Variant discriminator mode {mode} is not BASIC mode 0"),
+            ));
+        }
+        global.into_iter().map(|(_, child)| child).collect()
+    } else {
+        typed
+            .into_iter()
+            .map(|(_, ch_type)| DynamicStateChild::Typed(ch_type))
+            .collect()
+    };
+
+    Ok(DynamicState { kind, children })
+}
+
+fn read_dynamic_type_entry(
+    reader: &mut ByteReader,
+    options: &DecodeSettings,
+    column: &str,
+) -> Result<ChType, DecodeError> {
+    if options.types_in_binary_format {
+        return read_binary_type(reader).map_err(|error| match error {
+            BinaryTypeError::Io(error) => DecodeError::Io(error),
+            BinaryTypeError::Invalid(reason) | BinaryTypeError::Unsupported(reason) => {
+                invalid_dynamic(column, reason)
+            }
+        });
+    }
+
+    let type_name = reader.read_varint_string()?;
+    parse_ch_type(&type_name).ok_or_else(|| DecodeError::UnsupportedType {
+        column: column.to_string(),
+        type_name,
+    })
+}
+
+fn next_dynamic_state<'a>(
+    dynamic_states: &'a [DynamicState],
+    dynamic_index: &mut usize,
+    column: &str,
+) -> Result<&'a DynamicState, DecodeError> {
+    let state = dynamic_states.get(*dynamic_index).ok_or_else(|| {
+        invalid_dynamic(
+            column,
+            "internal Dynamic prefix traversal did not retain a body state",
+        )
+    })?;
+    *dynamic_index += 1;
+    Ok(state)
+}
+
+fn invalid_dynamic(column: &str, reason: impl Into<String>) -> DecodeError {
+    DecodeError::InvalidDynamic {
+        column: column.to_string(),
+        reason: reason.into(),
     }
 }
 
@@ -707,14 +940,31 @@ fn decode_column(
     ch_type: &ChType,
     num_rows: usize,
     column: &str,
+    options: &DecodeSettings,
 ) -> Result<Column, DecodeError> {
     // Per-column bulk-state prefix. Zero bytes for every type except
     // LowCardinality, which reads its key version here; Array recurses into its
     // element type's prefix (so a leaf LowCardinality key version is consumed
     // here, before the offsets).
-    read_state_prefix(reader, ch_type, column)?;
-    let decoded = decode_values(reader, ch_type, num_rows, column)?;
-    read_state_suffix(reader, ch_type, column)?;
+    let mut dynamic_states = Vec::new();
+    read_state_prefix(reader, ch_type, column, options, &mut dynamic_states)?;
+    let mut dynamic_index = 0usize;
+    let decoded = decode_values(
+        reader,
+        ch_type,
+        num_rows,
+        column,
+        &dynamic_states,
+        &mut dynamic_index,
+    )?;
+    if dynamic_index != dynamic_states.len() {
+        return Err(invalid_dynamic(
+            column,
+            "body traversal did not consume every Dynamic prefix state",
+        ));
+    }
+    let mut suffix_index = 0usize;
+    read_state_suffix(reader, ch_type, column, &dynamic_states, &mut suffix_index)?;
     Ok(decoded)
 }
 
@@ -730,6 +980,8 @@ fn decode_values(
     ch_type: &ChType,
     num_rows: usize,
     column: &str,
+    dynamic_states: &[DynamicState],
+    dynamic_index: &mut usize,
 ) -> Result<Column, DecodeError> {
     // A name-decoration alias (SimpleAggregateFunction, geo, Nested) decodes
     // exactly as the physical type it delegates to, producing the underlying
@@ -738,7 +990,14 @@ fn decode_values(
     // Array fast-path, and a SimpleAggregateFunction over any inner delegates to
     // that inner.
     if let Some(under) = ch_type.physical_delegate() {
-        return decode_values(reader, &under, num_rows, column);
+        return decode_values(
+            reader,
+            &under,
+            num_rows,
+            column,
+            dynamic_states,
+            dynamic_index,
+        );
     }
     // LowCardinality carries its own dictionary, indexes, and (for a Nullable
     // inner type) null handling, so it is decoded as a unit rather than going
@@ -764,7 +1023,14 @@ fn decode_values(
     // element type's prefix was already consumed by the caller's
     // `read_state_prefix`.
     if let ChType::Array(inner) = ch_type {
-        return decode_array(reader, inner, num_rows, column);
+        return decode_array(
+            reader,
+            inner,
+            num_rows,
+            column,
+            dynamic_states,
+            dynamic_index,
+        );
     }
 
     // Map is the Array(Tuple(keys, values)) wire layout decoded as a unit; like
@@ -772,14 +1038,41 @@ fn decode_values(
     // Nullable unwrap. The key/value prefixes were consumed by the caller's
     // `read_state_prefix`.
     if let ChType::Map(key, value) = ch_type {
-        return decode_map(reader, key, value, num_rows, column);
+        return decode_map(
+            reader,
+            key,
+            value,
+            num_rows,
+            column,
+            dynamic_states,
+            dynamic_index,
+        );
     }
 
     // Variant is one discriminator byte per row followed by dense alternative
     // bodies. It has intrinsic NULL semantics and cannot be wrapped in Nullable,
     // so dispatch it before the ordinary Nullable unwrap.
     if let ChType::Variant(alternatives) = ch_type {
-        return decode_variant(reader, alternatives, num_rows, column);
+        return decode_variant(
+            reader,
+            alternatives,
+            num_rows,
+            column,
+            dynamic_states,
+            dynamic_index,
+        );
+    }
+
+    if matches!(ch_type, ChType::Dynamic { .. }) {
+        let state = next_dynamic_state(dynamic_states, dynamic_index, column)?;
+        return decode_dynamic(
+            reader,
+            state,
+            num_rows,
+            column,
+            dynamic_states,
+            dynamic_index,
+        );
     }
 
     let (nullable, inner) = match ch_type {
@@ -805,7 +1098,15 @@ fn decode_values(
     // unwrap because `Nullable(Tuple(...))` is legal: its per-row null map
     // precedes the tuple body, the ordinary Nullable framing.
     if let ChType::Tuple(elements) = inner {
-        return decode_tuple(reader, elements, num_rows, column, validity);
+        return decode_tuple(
+            reader,
+            elements,
+            num_rows,
+            column,
+            validity,
+            dynamic_states,
+            dynamic_index,
+        );
     }
 
     decode_column_body(reader, inner, num_rows, validity)
@@ -826,24 +1127,166 @@ fn decode_variant(
     alternatives: &[ChType],
     num_rows: usize,
     column: &str,
+    dynamic_states: &[DynamicState],
+    dynamic_index: &mut usize,
 ) -> Result<Column, DecodeError> {
-    let (layout, counts, null_count) = {
-        let discriminators = reader.read_slice(num_rows)?;
+    let discriminators = reader.read_slice(num_rows)?;
+    let (layout, counts, null_count) =
         variant_layout_from_discriminators(discriminators, alternatives.len()).map_err(|err| {
             DecodeError::InvalidVariant {
                 column: column.to_string(),
                 reason: err.to_string(),
             }
-        })?
-    };
+        })?;
 
     let mut variants = Vec::with_capacity(alternatives.len());
     for (alternative, count) in alternatives.iter().zip(counts) {
-        variants.push(decode_values(reader, alternative, count, column)?);
+        variants.push(decode_values(
+            reader,
+            alternative,
+            count,
+            column,
+            dynamic_states,
+            dynamic_index,
+        )?);
     }
 
     Ok(Column::Variant(VariantColumn::from_parts(
-        layout, variants, null_count,
+        discriminators.to_vec(),
+        layout,
+        variants,
+        null_count,
+    )))
+}
+
+/// Decode one self-describing `Dynamic` body after its structure/type-table and
+/// child state prefixes were retained by [`read_state_prefix`].
+///
+/// At `v26.6.1.1193-stable`, V1/V2 are BASIC Variant bodies: one UInt8 local
+/// discriminator per row, then one dense body per block-local child in global
+/// canonical-name order. The implicit SharedVariant child is a String body whose
+/// cells are arbitrary binary descriptor+value blobs. FLATTENED word 3 instead
+/// writes the smallest fixed-width index for `children.len() + 1` values, where
+/// the final index is NULL, then dense typed child bodies in table order.
+fn decode_dynamic(
+    reader: &mut ByteReader,
+    state: &DynamicState,
+    num_rows: usize,
+    column: &str,
+    dynamic_states: &[DynamicState],
+    dynamic_index: &mut usize,
+) -> Result<Column, DecodeError> {
+    let num_children = state.children.len();
+    if num_rows > i32::MAX as usize {
+        return Err(invalid_dynamic(
+            column,
+            "row count exceeds Arrow Dense Union's i32 child-offset range",
+        ));
+    }
+    let mut type_ids = Vec::with_capacity(num_rows);
+    let mut offsets = Vec::with_capacity(num_rows);
+    let mut counts = vec![0usize; num_children];
+    let mut null_count = 0usize;
+    match state.kind {
+        DynamicWireKind::Variant => {
+            let raw = reader.read_slice(num_rows)?;
+            for (row, &discriminator) in raw.iter().enumerate() {
+                if discriminator == u8::MAX {
+                    type_ids.push(u32::MAX);
+                    offsets.push(null_count as i32);
+                    null_count += 1;
+                } else if (discriminator as usize) < num_children {
+                    let child = discriminator as usize;
+                    type_ids.push(child as u32);
+                    offsets.push(counts[child] as i32);
+                    counts[child] += 1;
+                } else {
+                    return Err(invalid_dynamic(
+                        column,
+                        format!(
+                            "row {row} has discriminator {discriminator}, but only {num_children} children exist"
+                        ),
+                    ));
+                }
+            }
+        }
+        DynamicWireKind::Flattened => {
+            let values = num_children
+                .checked_add(1)
+                .ok_or_else(|| invalid_dynamic(column, "flattened child count overflows usize"))?;
+            let width = if values <= u8::MAX as usize + 1 {
+                1
+            } else if values <= u16::MAX as usize + 1 {
+                2
+            } else if values <= u32::MAX as usize {
+                4
+            } else {
+                8
+            };
+            let byte_len = num_rows.checked_mul(width).ok_or_else(|| {
+                DecodeError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Dynamic flattened index byte length overflows usize",
+                ))
+            })?;
+            let raw = reader.read_slice(byte_len)?;
+            for (row, bytes) in raw.chunks_exact(width).enumerate() {
+                let index = match width {
+                    1 => bytes[0] as u64,
+                    2 => u16::from_le_bytes([bytes[0], bytes[1]]) as u64,
+                    4 => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64,
+                    8 => u64::from_le_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7],
+                    ]),
+                    _ => unreachable!("flattened width selected from 1/2/4/8"),
+                };
+                if index == num_children as u64 {
+                    type_ids.push(u32::MAX);
+                    offsets.push(null_count as i32);
+                    null_count += 1;
+                } else if index < num_children as u64 {
+                    let child = index as usize;
+                    type_ids.push(child as u32);
+                    offsets.push(counts[child] as i32);
+                    counts[child] += 1;
+                } else {
+                    return Err(invalid_dynamic(
+                        column,
+                        format!(
+                            "row {row} has flattened index {index}, greater than NULL index {num_children}"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    let mut children = Vec::with_capacity(num_children);
+    for (state_child, count) in state.children.iter().zip(counts) {
+        match state_child {
+            DynamicStateChild::Typed(ch_type) => {
+                let values = decode_values(
+                    reader,
+                    ch_type,
+                    count,
+                    column,
+                    dynamic_states,
+                    dynamic_index,
+                )?;
+                children.push(DynamicChild::Typed {
+                    ch_type: ch_type.clone(),
+                    values,
+                });
+            }
+            DynamicStateChild::Shared => {
+                let (offsets, data) = decode_string_data(reader, count)?;
+                children.push(DynamicChild::Shared(Utf8Column::new(offsets, data)));
+            }
+        }
+    }
+
+    Ok(Column::Dynamic(DynamicColumn::from_parts(
+        type_ids, offsets, children, null_count,
     )))
 }
 
@@ -884,6 +1327,8 @@ fn decode_tuple(
     num_rows: usize,
     column: &str,
     validity: Option<Bitmap>,
+    dynamic_states: &[DynamicState],
+    dynamic_index: &mut usize,
 ) -> Result<Column, DecodeError> {
     if elements.is_empty() {
         // Tuple(): one placeholder byte per row, values not validated (the
@@ -895,7 +1340,14 @@ fn decode_tuple(
 
     let mut fields = Vec::with_capacity(elements.len());
     for (_, element_type) in elements {
-        let element = decode_values(reader, element_type, num_rows, column)?;
+        let element = decode_values(
+            reader,
+            element_type,
+            num_rows,
+            column,
+            dynamic_states,
+            dynamic_index,
+        )?;
         // Mirror the server's equal-sizes assert. Unreachable in practice:
         // every element decode above is driven by the same num_rows.
         if element.len() != num_rows {
@@ -949,6 +1401,8 @@ fn decode_array(
     inner: &ChType,
     num_rows: usize,
     column: &str,
+    dynamic_states: &[DynamicState],
+    dynamic_index: &mut usize,
 ) -> Result<Column, DecodeError> {
     // Offsets: the shared walk reads and validates the run and builds the
     // Arrow-shaped offsets (leading 0, each wire offset widened to i64),
@@ -959,7 +1413,14 @@ fn decode_array(
 
     // Element body: the flattened element column. The state prefix was consumed
     // by the caller's `read_state_prefix`, so decode the values only.
-    let values = decode_values(reader, inner, total_elements, column)?;
+    let values = decode_values(
+        reader,
+        inner,
+        total_elements,
+        column,
+        dynamic_states,
+        dynamic_index,
+    )?;
     Ok(Column::Array(ArrayColumn::new(offsets, values)))
 }
 
@@ -991,6 +1452,8 @@ fn decode_map(
     value: &ChType,
     num_rows: usize,
     column: &str,
+    dynamic_states: &[DynamicState],
+    dynamic_index: &mut usize,
 ) -> Result<Column, DecodeError> {
     // Offsets: the shared Array walk (a Map's offsets are byte-identical to an
     // Array's), building the Arrow-shaped run with the leading 0 and bounding
@@ -1001,8 +1464,22 @@ fn decode_map(
     // Flattened entries: the keys' full run then the values' full run, the
     // Tuple(K, V) body with prefixes already consumed. Both decodes are driven
     // by the same total, so the two fields cannot come out ragged.
-    let keys = decode_values(reader, key, total_entries, column)?;
-    let values = decode_values(reader, value, total_entries, column)?;
+    let keys = decode_values(
+        reader,
+        key,
+        total_entries,
+        column,
+        dynamic_states,
+        dynamic_index,
+    )?;
+    let values = decode_values(
+        reader,
+        value,
+        total_entries,
+        column,
+        dynamic_states,
+        dynamic_index,
+    )?;
     // The entries tuple never carries validity: the wire has no null map here
     // (a map is never nullable at the entries level), so it goes through the
     // shared constructor with `None`.
@@ -1420,6 +1897,7 @@ fn decode_column_body(
         | ChType::Tuple(_)
         | ChType::Map(..)
         | ChType::Variant(_)
+        | ChType::Dynamic { .. }
         | ChType::SimpleAggregateFunction { .. }
         | ChType::Geo(_)
         | ChType::Nested(_) => {
@@ -1680,7 +2158,14 @@ fn empty_column(ch_type: &ChType) -> Column {
                 ),
             };
             let variants = alternatives.iter().map(empty_column).collect();
-            Column::Variant(VariantColumn::from_parts(layout, variants, 0))
+            Column::Variant(VariantColumn::from_parts(Vec::new(), layout, variants, 0))
+        }
+        // NativeWriter gates the entire Dynamic data step on rows > 0, so a
+        // zero-row block carries no structure word or runtime type table. The
+        // logical Dynamic schema remains in ChType; the physical column has no
+        // discovered children and empty routing/null buffers.
+        ChType::Dynamic { .. } => {
+            Column::Dynamic(DynamicColumn::from_parts(vec![], vec![], vec![], 0))
         }
         // The outer `Nullable` was unwrapped above, `parse_ch_type` never
         // produces a `Nullable` directly inside a `Nullable`, and any
@@ -1766,6 +2251,24 @@ pub fn decode_next_block(
     reader: &mut ByteReader,
     options: &DecodeOptions,
 ) -> Result<Option<ColBatch>, DecodeError> {
+    decode_next_block_with_settings(reader, &DecodeSettings::text(options))
+}
+
+/// Decode one block whose type headers and Dynamic runtime type tables use the
+/// server's binary data-type descriptor grammar. The framing revision remains
+/// supplied through [`DecodeOptions`]; only the out-of-band type encoding
+/// setting differs from [`decode_next_block`].
+pub fn decode_next_block_binary_types(
+    reader: &mut ByteReader,
+    options: &DecodeOptions,
+) -> Result<Option<ColBatch>, DecodeError> {
+    decode_next_block_with_settings(reader, &DecodeSettings::binary(options))
+}
+
+fn decode_next_block_with_settings(
+    reader: &mut ByteReader,
+    options: &DecodeSettings,
+) -> Result<Option<ColBatch>, DecodeError> {
     // A BlockInfo preamble precedes each block when the producer used a protocol
     // revision > 0. Its first byte is also where a clean end-of-stream boundary
     // falls, so `read_block_info` reports that case as `Ok(false)`.
@@ -1800,10 +2303,26 @@ pub fn decode_next_block(
 /// are accepted.
 fn read_column_header(
     reader: &mut ByteReader,
-    options: &DecodeOptions,
+    options: &DecodeSettings,
 ) -> Result<(String, ChType), DecodeError> {
     let col_name = reader.read_varint_string()?;
-    let type_name = reader.read_varint_string()?;
+    let ch_type = if options.types_in_binary_format {
+        read_binary_type(reader).map_err(|error| match error {
+            BinaryTypeError::Io(error) => DecodeError::Io(error),
+            BinaryTypeError::Invalid(reason) | BinaryTypeError::Unsupported(reason) => {
+                DecodeError::UnsupportedType {
+                    column: col_name.clone(),
+                    type_name: reason,
+                }
+            }
+        })?
+    } else {
+        let type_name = reader.read_varint_string()?;
+        parse_ch_type(&type_name).ok_or_else(|| DecodeError::UnsupportedType {
+            column: col_name.clone(),
+            type_name,
+        })?
+    };
 
     // Per-column custom-serialization marker, present at revision >= 54454, for
     // every column regardless of row count. One byte: 0 = default. A nonzero
@@ -1819,11 +2338,6 @@ fn read_column_header(
             });
         }
     }
-
-    let ch_type = parse_ch_type(&type_name).ok_or_else(|| DecodeError::UnsupportedType {
-        column: col_name.clone(),
-        type_name: type_name.clone(),
-    })?;
 
     validate_header_type(&col_name, &ch_type)?;
 
@@ -1907,7 +2421,7 @@ fn check_header_count(count: usize, what: &str, reader: &ByteReader) -> Result<(
 /// row counts have already been read.
 fn decode_block_body(
     reader: &mut ByteReader,
-    options: &DecodeOptions,
+    options: &DecodeSettings,
     num_cols: usize,
     num_rows: usize,
 ) -> Result<ColBatch, DecodeError> {
@@ -1932,7 +2446,9 @@ fn decode_block_body(
         if num_rows == 0 {
             columns.push(empty_column(&ch_type));
         } else {
-            columns.push(decode_column(reader, &ch_type, num_rows, &col_name)?);
+            columns.push(decode_column(
+                reader, &ch_type, num_rows, &col_name, options,
+            )?);
         }
 
         fields.push(Field {
@@ -1968,6 +2484,22 @@ fn decode_block_body(
 /// decode; only [`skip_column_data`] is scan specific, and it walks the exact
 /// same wire bytes the per-type decoders consume.
 pub fn block_end(data: &[u8], options: &DecodeOptions) -> Result<Option<usize>, DecodeError> {
+    block_end_with_settings(data, &DecodeSettings::text(options))
+}
+
+/// Allocation-free completeness scan for a block using binary data-type
+/// descriptors. This is the binary-header counterpart of [`block_end`].
+pub fn block_end_binary_types(
+    data: &[u8],
+    options: &DecodeOptions,
+) -> Result<Option<usize>, DecodeError> {
+    block_end_with_settings(data, &DecodeSettings::binary(options))
+}
+
+fn block_end_with_settings(
+    data: &[u8],
+    options: &DecodeSettings,
+) -> Result<Option<usize>, DecodeError> {
     let mut reader = ByteReader::new(data);
 
     if options.protocol_revision > 0 {
@@ -1984,7 +2516,7 @@ pub fn block_end(data: &[u8], options: &DecodeOptions) -> Result<Option<usize>, 
     for _ in 0..num_cols {
         let (name, ch_type) = read_column_header(&mut reader, options)?;
         if num_rows > 0 {
-            skip_column_data(&mut reader, &ch_type, num_rows, &name)?;
+            skip_column_data(&mut reader, &ch_type, num_rows, &name, options)?;
         }
     }
 
@@ -2002,13 +2534,24 @@ fn skip_column_data(
     ch_type: &ChType,
     num_rows: usize,
     column: &str,
+    options: &DecodeSettings,
 ) -> Result<(), DecodeError> {
     // Per-column bulk-state prefix, the same step `decode_column` runs. Zero
     // bytes for every type except LowCardinality; Array, Tuple, and Nullable
     // recurse into their element/inner prefixes.
-    read_state_prefix(reader, ch_type, column)?;
-    skip_values(reader, ch_type, num_rows, column)?;
-    read_state_suffix(reader, ch_type, column)
+    let mut dynamic_states = Vec::new();
+    read_state_prefix(reader, ch_type, column, options, &mut dynamic_states)?;
+    let mut dynamic_index = 0usize;
+    skip_values(
+        reader,
+        ch_type,
+        num_rows,
+        column,
+        &dynamic_states,
+        &mut dynamic_index,
+    )?;
+    let mut suffix_index = 0usize;
+    read_state_suffix(reader, ch_type, column, &dynamic_states, &mut suffix_index)
 }
 
 /// Advance `reader` past one column's value payload once its per-column state
@@ -2020,12 +2563,21 @@ fn skip_values(
     ch_type: &ChType,
     num_rows: usize,
     column: &str,
+    dynamic_states: &[DynamicState],
+    dynamic_index: &mut usize,
 ) -> Result<(), DecodeError> {
     // Expand a name-decoration alias to its physical delegate, the scan-side
     // mirror of `decode_values`, so a geo/Nested alias reaches the Array
     // fast-path and a SimpleAggregateFunction walks its inner.
     if let Some(under) = ch_type.physical_delegate() {
-        return skip_values(reader, &under, num_rows, column);
+        return skip_values(
+            reader,
+            &under,
+            num_rows,
+            column,
+            dynamic_states,
+            dynamic_index,
+        );
     }
     if let ChType::LowCardinality(inner) = ch_type {
         // A zero-length run has no LowCardinality body bytes at all (see the
@@ -2037,17 +2589,51 @@ fn skip_values(
     }
 
     if let ChType::Array(inner) = ch_type {
-        return skip_array_data(reader, inner, num_rows, column);
+        return skip_array_data(
+            reader,
+            inner,
+            num_rows,
+            column,
+            dynamic_states,
+            dynamic_index,
+        );
     }
 
     // Map before the Nullable unwrap, mirroring `decode_values`: a map is
     // never nullable at this level.
     if let ChType::Map(key, value) = ch_type {
-        return skip_map_data(reader, key, value, num_rows, column);
+        return skip_map_data(
+            reader,
+            key,
+            value,
+            num_rows,
+            column,
+            dynamic_states,
+            dynamic_index,
+        );
     }
 
     if let ChType::Variant(alternatives) = ch_type {
-        return skip_variant_data(reader, alternatives, num_rows, column);
+        return skip_variant_data(
+            reader,
+            alternatives,
+            num_rows,
+            column,
+            dynamic_states,
+            dynamic_index,
+        );
+    }
+
+    if matches!(ch_type, ChType::Dynamic { .. }) {
+        let state = next_dynamic_state(dynamic_states, dynamic_index, column)?;
+        return skip_dynamic_data(
+            reader,
+            state,
+            num_rows,
+            column,
+            dynamic_states,
+            dynamic_index,
+        );
     }
 
     let inner = match ch_type {
@@ -2067,7 +2653,14 @@ fn skip_values(
     // `Nullable(Tuple(...))` walks its per-row null map above, then the tuple
     // body.
     if let ChType::Tuple(elements) = inner {
-        return skip_tuple_data(reader, elements, num_rows, column);
+        return skip_tuple_data(
+            reader,
+            elements,
+            num_rows,
+            column,
+            dynamic_states,
+            dynamic_index,
+        );
     }
 
     skip_column_body(reader, inner, num_rows)
@@ -2079,27 +2672,126 @@ fn skip_variant_data(
     alternatives: &[ChType],
     num_rows: usize,
     column: &str,
+    dynamic_states: &[DynamicState],
+    dynamic_index: &mut usize,
 ) -> Result<(), DecodeError> {
-    let mut counts = vec![0usize; alternatives.len()];
     let discriminators = reader.read_slice(num_rows)?;
-    for &discriminator in discriminators {
-        if discriminator == u8::MAX {
-            continue;
-        }
-        let alternative = discriminator as usize;
-        let Some(count) = counts.get_mut(alternative) else {
-            return Err(DecodeError::InvalidVariant {
+    let (counts, _null_count) =
+        variant_child_counts(discriminators, alternatives.len()).map_err(|err| {
+            DecodeError::InvalidVariant {
                 column: column.to_string(),
-                reason: format!(
-                    "discriminator {discriminator} does not name one of {} alternatives",
-                    alternatives.len()
-                ),
-            });
-        };
-        *count += 1;
-    }
+                reason: err.to_string(),
+            }
+        })?;
     for (alternative, count) in alternatives.iter().zip(counts) {
-        skip_values(reader, alternative, count, column)?;
+        skip_values(
+            reader,
+            alternative,
+            count,
+            column,
+            dynamic_states,
+            dynamic_index,
+        )?;
+    }
+    Ok(())
+}
+
+/// Walk one Dynamic body without allocating routing or child buffers. The only
+/// allocation is one child-count vector, bounded by the already-read type table.
+fn skip_dynamic_data(
+    reader: &mut ByteReader,
+    state: &DynamicState,
+    num_rows: usize,
+    column: &str,
+    dynamic_states: &[DynamicState],
+    dynamic_index: &mut usize,
+) -> Result<(), DecodeError> {
+    let num_children = state.children.len();
+    let mut counts = vec![0usize; num_children];
+    match state.kind {
+        DynamicWireKind::Variant => {
+            let discriminators = reader.read_slice(num_rows)?;
+            for &discriminator in discriminators {
+                if discriminator == u8::MAX {
+                    continue;
+                }
+                let Some(count) = counts.get_mut(discriminator as usize) else {
+                    return Err(invalid_dynamic(
+                        column,
+                        format!(
+                            "discriminator {discriminator} does not name one of {num_children} children"
+                        ),
+                    ));
+                };
+                *count += 1;
+            }
+        }
+        DynamicWireKind::Flattened => {
+            let values = num_children
+                .checked_add(1)
+                .ok_or_else(|| invalid_dynamic(column, "flattened child count overflows usize"))?;
+            let width = if values <= u8::MAX as usize + 1 {
+                1
+            } else if values <= u16::MAX as usize + 1 {
+                2
+            } else if values <= u32::MAX as usize {
+                4
+            } else {
+                8
+            };
+            let byte_len = num_rows.checked_mul(width).ok_or_else(|| {
+                DecodeError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Dynamic flattened index byte length overflows usize",
+                ))
+            })?;
+            for bytes in reader.read_slice(byte_len)?.chunks_exact(width) {
+                let index = match width {
+                    1 => bytes[0] as u64,
+                    2 => u16::from_le_bytes([bytes[0], bytes[1]]) as u64,
+                    4 => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64,
+                    8 => u64::from_le_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7],
+                    ]),
+                    _ => unreachable!("flattened width selected from 1/2/4/8"),
+                };
+                if index == num_children as u64 {
+                    continue;
+                }
+                let Some(count) = usize::try_from(index)
+                    .ok()
+                    .and_then(|index| counts.get_mut(index))
+                else {
+                    return Err(invalid_dynamic(
+                        column,
+                        format!(
+                            "flattened index {index} is greater than NULL index {num_children}"
+                        ),
+                    ));
+                };
+                *count += 1;
+            }
+        }
+    }
+
+    for (child, count) in state.children.iter().zip(counts) {
+        match child {
+            DynamicStateChild::Typed(ch_type) => skip_values(
+                reader,
+                ch_type,
+                count,
+                column,
+                dynamic_states,
+                dynamic_index,
+            )?,
+            DynamicStateChild::Shared => {
+                for _ in 0..count {
+                    let len = varint_usize(reader.read_varint()?, "Dynamic shared value length")?;
+                    reader.skip(len)?;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -2114,13 +2806,22 @@ fn skip_tuple_data(
     elements: &[(Option<String>, ChType)],
     num_rows: usize,
     column: &str,
+    dynamic_states: &[DynamicState],
+    dynamic_index: &mut usize,
 ) -> Result<(), DecodeError> {
     if elements.is_empty() {
         reader.skip(num_rows)?;
         return Ok(());
     }
     for (_, element_type) in elements {
-        skip_values(reader, element_type, num_rows, column)?;
+        skip_values(
+            reader,
+            element_type,
+            num_rows,
+            column,
+            dynamic_states,
+            dynamic_index,
+        )?;
     }
     Ok(())
 }
@@ -2136,10 +2837,26 @@ fn skip_map_data(
     value: &ChType,
     num_rows: usize,
     column: &str,
+    dynamic_states: &[DynamicState],
+    dynamic_index: &mut usize,
 ) -> Result<(), DecodeError> {
     let total_entries = read_array_offsets(reader, num_rows, column, None)?;
-    skip_values(reader, key, total_entries, column)?;
-    skip_values(reader, value, total_entries, column)
+    skip_values(
+        reader,
+        key,
+        total_entries,
+        column,
+        dynamic_states,
+        dynamic_index,
+    )?;
+    skip_values(
+        reader,
+        value,
+        total_entries,
+        column,
+        dynamic_states,
+        dynamic_index,
+    )
 }
 
 /// Walk one `Array(T)` column block (after its element state prefix) in the
@@ -2158,9 +2875,18 @@ fn skip_array_data(
     inner: &ChType,
     num_rows: usize,
     column: &str,
+    dynamic_states: &[DynamicState],
+    dynamic_index: &mut usize,
 ) -> Result<(), DecodeError> {
     let total_elements = read_array_offsets(reader, num_rows, column, None)?;
-    skip_values(reader, inner, total_elements, column)
+    skip_values(
+        reader,
+        inner,
+        total_elements,
+        column,
+        dynamic_states,
+        dynamic_index,
+    )
 }
 
 /// Advance `reader` past one column's value payload for a concrete inner type,
@@ -2243,6 +2969,7 @@ fn skip_column_body(
         | ChType::Tuple(_)
         | ChType::Map(..)
         | ChType::Variant(_)
+        | ChType::Dynamic { .. }
         | ChType::SimpleAggregateFunction { .. }
         | ChType::Geo(_)
         | ChType::Nested(_) => {
@@ -2339,12 +3066,30 @@ fn skip_low_cardinality_data(
 /// schema but are dropped from the chunk list to keep the chunk stream free
 /// of empty batches.
 pub fn decode_all_bytes(data: &[u8], options: &DecodeOptions) -> Result<ChunkedBatch, DecodeError> {
+    decode_all_bytes_with_settings(data, &DecodeSettings::text(options))
+}
+
+/// Decode a complete Native stream whose type headers and Dynamic runtime type
+/// tables use binary data-type descriptors. This keeps [`DecodeOptions`]
+/// backward compatible while exposing the server's out-of-band
+/// `output_format_native_encode_types_in_binary_format` setting explicitly.
+pub fn decode_all_bytes_binary_types(
+    data: &[u8],
+    options: &DecodeOptions,
+) -> Result<ChunkedBatch, DecodeError> {
+    decode_all_bytes_with_settings(data, &DecodeSettings::binary(options))
+}
+
+fn decode_all_bytes_with_settings(
+    data: &[u8],
+    settings: &DecodeSettings,
+) -> Result<ChunkedBatch, DecodeError> {
     let mut reader = ByteReader::new(data);
     let mut schema: Option<Schema> = None;
     let mut chunks: Vec<Arc<ColBatch>> = Vec::new();
     let mut block_index: usize = 0;
 
-    while let Some(batch) = decode_next_block(&mut reader, options)? {
+    while let Some(batch) = decode_next_block_with_settings(&mut reader, settings)? {
         match &schema {
             None => schema = Some(batch.schema.clone()),
             Some(first) => {

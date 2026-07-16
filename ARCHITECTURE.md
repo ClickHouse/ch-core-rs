@@ -204,12 +204,15 @@ the pinned server tag, not a substitute for negotiation. Wire-format behavior is
 confirmed against the actual server C++ source at a pinned tag (cited in the doc
 comments), per the repo's "server behavior is authoritative" rule.
 
-**Type strings.** `parse_ch_type` parses the server's type name string
-(`Nullable(DateTime64(3, 'UTC'))`) into a `ChType`. Unsupported or malformed
-type names produce a clean `DecodeError::UnsupportedType`, never a wrong
-decode. This assumes the default string-encoded Native type-header mode;
-binary-encoded type headers are not implemented. One fidelity caveat: the type
-string the server emits is itself revision gated in one known case. Over
+**Type headers.** The default APIs read the server's type name string
+(`Nullable(DateTime64(3, 'UTC'))`) and `parse_ch_type` converts it into a
+`ChType`. The explicit `*_binary_types` APIs instead read or write the server's
+`DataTypesBinaryEncoding` descriptors, including the runtime type table inside
+`Dynamic`. Unsupported or malformed headers produce a clean decode or encode
+error, never a partial or guessed interpretation. `StreamDecoder` selects the
+same mode through `StreamDecoder::new_binary_types`. One fidelity caveat in the
+textual mode is that the type string the server emits is itself revision gated
+in one known case. Over
 revision 0 (bare HTTP `FORMAT Native`) a `DateTime('tz')` column arrives as
 plain `DateTime`; at the negotiated TCP revision it keeps its timezone. The data
 bytes (UInt32 seconds) are identical either way, so decode is correct
@@ -313,6 +316,10 @@ by hand, no Arrow library involved:
 - `export_chunks_to_stream` wraps a whole `ChunkedBatch` as an
   `ArrowArrayStream`: `get_schema` plus a `get_next` that yields one record
   batch per chunk. This is why chunks-as-blocks maps so cleanly onto Arrow.
+- Dynamic columns whose union would exceed Arrow's signed Int8 type-code
+  space (more than 16,256 children result-wide) are rejected at export —
+  `ExportError` from the batch entry points, a stream error through
+  `get_last_error` — never silently truncated.
 
 Ownership is the subtle part. Each exported array's private data holds an
 `Arc<ColBatch>`, so the decoded buffers stay alive for exactly as long as any

@@ -1,7 +1,8 @@
 use super::*;
 use crate::bitmap::Bitmap;
 use crate::column::{
-    AggregateStateColumn, DecimalColumn, DictionaryColumn, NothingColumn, PrimitiveColumn,
+    AggregateStateColumn, DecimalColumn, DictionaryColumn, DynamicChild, NothingColumn,
+    PrimitiveColumn,
 };
 use crate::native::decode::{decode_all_bytes, DecodeOptions, DBMS_TCP_PROTOCOL_VERSION};
 use crate::native::encode::validate::type_depth;
@@ -14,6 +15,7 @@ mod bfloat16;
 mod bool;
 mod containers;
 mod decimal;
+mod dynamic;
 mod interval;
 mod low_cardinality;
 mod nothing;
@@ -185,6 +187,42 @@ fn assert_columns_eq(left: &Column, right: &Column, label: &str) {
             assert_eq!(x.nulls.len, y.nulls.len, "{label} null count differs");
             for (i, (a, b)) in x.variants.iter().zip(&y.variants).enumerate() {
                 assert_columns_eq(a, b, &format!("{label} variant child {i}"));
+            }
+        }
+        (Column::Dynamic(x), Column::Dynamic(y)) => {
+            assert_eq!(x.type_ids, y.type_ids, "{label} Dynamic type ids differ");
+            assert_eq!(x.offsets, y.offsets, "{label} Dynamic offsets differ");
+            assert_eq!(x.nulls.len, y.nulls.len, "{label} null count differs");
+            assert_eq!(
+                x.children.len(),
+                y.children.len(),
+                "{label} Dynamic child count differs"
+            );
+            for (i, (a, b)) in x.children.iter().zip(&y.children).enumerate() {
+                match (a, b) {
+                    (
+                        DynamicChild::Typed {
+                            ch_type: a_type,
+                            values: a_values,
+                        },
+                        DynamicChild::Typed {
+                            ch_type: b_type,
+                            values: b_values,
+                        },
+                    ) => {
+                        assert_eq!(a_type, b_type, "{label} Dynamic child {i} type differs");
+                        assert_columns_eq(
+                            a_values,
+                            b_values,
+                            &format!("{label} Dynamic child {i}"),
+                        );
+                    }
+                    (DynamicChild::Shared(a), DynamicChild::Shared(b)) => {
+                        assert_eq!(a.offsets, b.offsets, "{label} shared offsets differ");
+                        assert_eq!(a.data, b.data, "{label} shared data differs");
+                    }
+                    _ => panic!("{label} Dynamic child {i} kind differs"),
+                }
             }
         }
         (other_a, other_b) => panic!("{label}: unexpected {other_a:?} vs {other_b:?}"),

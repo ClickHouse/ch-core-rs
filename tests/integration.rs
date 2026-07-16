@@ -1,5 +1,5 @@
 use ch_core_rs::batch::ChunkedBatch;
-use ch_core_rs::column::{Column, FixedBinaryColumn, Utf8Column};
+use ch_core_rs::column::{Column, DynamicChild, FixedBinaryColumn, Utf8Column};
 use ch_core_rs::native::decode::{decode_all_bytes, DecodeOptions, DBMS_TCP_PROTOCOL_VERSION};
 use ch_core_rs::schema::{ChType, GeoKind, IntervalKind};
 
@@ -521,6 +521,7 @@ fn assert_all_types(batch: &ChunkedBatch) {
                 "variant",
                 ChType::Variant(vec![ChType::String, ChType::UInt64]),
             ),
+            Expected::Exact("dynamic", ChType::Dynamic { max_types: 1 }),
         ],
     );
 
@@ -1729,6 +1730,34 @@ fn assert_all_types(batch: &ChunkedBatch) {
             }
         }
         other => panic!("expected Variant, got {other:?}"),
+    }
+
+    // Dynamic(max_types=1) (col 105): repeated String is the one direct type;
+    // UInt64 and Array(Int32) overflow into SharedVariant. Shared cells retain
+    // the exact binary type descriptor plus one serializeBinary value payload.
+    match block.column(105) {
+        Column::Dynamic(c) => {
+            assert_eq!(c.type_ids, vec![1, 1, 0, 0]);
+            assert_eq!(c.offsets, vec![0, 1, 0, 1]);
+            assert_eq!(c.null_count(), 0);
+            assert_eq!(c.children.len(), 2);
+            match (&c.children[0], &c.children[1]) {
+                (DynamicChild::Shared(shared), DynamicChild::Typed { ch_type, values }) => {
+                    assert_eq!(ch_type, &ChType::String);
+                    assert_utf8_values(values, &[b"user_1", b"user_2"]);
+
+                    let mut uint64_blob = vec![0x04];
+                    uint64_blob.extend_from_slice(&13u64.to_le_bytes());
+                    let mut array_blob = vec![0x1e, 0x09, 0x02];
+                    array_blob.extend_from_slice(&79i32.to_le_bytes());
+                    array_blob.extend_from_slice(&(-13i32).to_le_bytes());
+                    assert_eq!(shared.value(0), uint64_blob);
+                    assert_eq!(shared.value(1), array_blob);
+                }
+                other => panic!("expected (SharedVariant, String) Dynamic children, got {other:?}"),
+            }
+        }
+        other => panic!("expected Dynamic, got {other:?}"),
     }
 }
 

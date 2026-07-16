@@ -47,12 +47,17 @@ point-in-time snapshot for the next agent, not a changelog. Keep it short. Alway
 include a "Recommended next" with a one-line reason, so the next agent has a
 default; the user may override it.
 
-- **Last updated:** 2026-07-15. `Variant(...)` is complete at decode/encode
-  parity against `v26.6.1.1193-stable`, including BASIC-mode Native framing,
-  intrinsic NULL, malformed-input rejection, flat and two-level Arrow Dense
-  Union export across the full 255-alternative ClickHouse range, unit and
-  multi-block tests, captured real-server fixtures, and a live INSERT round
-  trip. Two project decisions still govern sequencing. First, further
+- **Last updated:** 2026-07-15. `Dynamic` is complete at decode/encode parity
+  against `v26.6.1.1193-stable`. The core accepts direct V1/V2 and FLATTENED
+  word 3 Native layouts, retains SharedVariant cells as opaque binary
+  descriptor+payload values, rejects malformed structure/mode/routing, and
+  supports textual or binary-encoded type headers through explicit APIs.
+  Arrow export uses typed Dense Union children plus Binary SharedVariant;
+  Arrow C Stream pre-scans supplied chunks and fixes one recursive result-wide
+  schema while remapping only union routing when block-local child sets differ.
+  Unit, zero-row, nested, multi-block, encode round-trip, Arrow, captured
+  real-server fixture, and live INSERT round-trip coverage are present. Two project
+  decisions still govern sequencing. First, further
   `AggregateFunction(...)` work is paused. The format has no generic state
   framing, so completing the long tail requires a separately confirmed boundary
   codec, fixtures, and tests for each function signature. That cost is not
@@ -82,19 +87,16 @@ default; the user may override it.
   not as an open-ended completeness exercise.
 - **Scope:** frame compression and its unwired files also remain untouched and
   out of scope. Completeness still means uncompressed HTTP `FORMAT Native`.
-- **Variant checkpoint:** direct Native uses the fixed UInt64 BASIC mode 0,
-  then the full UInt8 discriminator stream, then dense child bodies in the
-  server's canonical lexicographic type-name order. Discriminator 255 is NULL.
-  COMPACT mode is an on-disk form and is rejected here. Up to 127 alternatives
-  plus NULL export as one Arrow Dense Union; 128 through 255 use an outer union
-  over groups of at most 128 alternatives plus NULL. See the dedicated section
-  in `CODEC_CONTRACT.md` for confirmed server paths and the one explicitly
-  inferred malformed-server behavior.
-- **Recommended next:** `Dynamic`. Its Native layout builds directly on the
-  discriminator and dense-child machinery now implemented for Variant, and it
-  is the next dependency for `JSON`. Start with a dedicated server-reader pass
-  over `SerializationDynamic` at the pin before choosing the Rust/Arrow model.
-- **After that:** `JSON`, then `Geometry` (mostly free now that Variant and the
+- **Dynamic checkpoint:** V1 is selected below protocol revision 54473 and
+  carries a legacy ignored count; V2 removes it. Both carry direct type names,
+  BASIC Variant mode 0, a UInt8 discriminator run, dense typed children, and
+  implicit SharedVariant. FLATTENED word 3 carries its type table, the smallest
+  fixed-width indexes with index K as NULL, and sparse typed bodies. V3 word 4
+  and direct COMPACT mode are rejected because NativeWriter never emits them.
+- **Recommended next:** `JSON`. Dynamic supplies the runtime type-table,
+  SharedVariant, binary descriptor, and result-wide Arrow planning machinery
+  JSON needs, so JSON is now the highest-value remaining common type.
+- **After that:** `Geometry` (mostly free now that Variant and the
   geo aliases are done), with
   `QBit(T, N)` last or on demand. QBit is small and isolated but niche, so it
   buys little for real-workload POC testing compared to the
@@ -103,9 +105,10 @@ default; the user may override it.
   default-on server-side since 23.7 and reaches any client that negotiates
   `client_protocol_version >= 54454`, and the decoder currently rejects its
   marker.
-- **Key references:** the Variant wire, buffer, Arrow, encode, and version
-  contract is in `CODEC_CONTRACT.md`; its implementation is in `src/column.rs`,
-  `src/native/{type_parser,decode,encode}`, and `src/ffi/mod.rs`. The aggregate
+- **Key references:** the Dynamic wire, buffer, Arrow, encode, binary type, and
+  version contract is in `CODEC_CONTRACT.md`; its implementation is in
+  `src/column.rs`, `src/native/{type_binary,type_parser,decode,encode}`, and
+  `src/ffi/mod.rs`. The aggregate
   checkpoint and paused boundary are recorded in the Tier 3 item below. The
   deferred sink assessment is in "Streaming encode and the encode-push overlap"
   below. The docs-sourced sparse wire notes are in "Wire / protocol features".
@@ -399,8 +402,8 @@ is not done, and must not be checked off, until all of these hold:
         INFERRED from the delegation architecture, not test-confirmed. Arrow
         export is `+L` LargeList of a `+s` struct with the declared field names.
         Charges +2 physical levels (Array + Tuple) on both sides. Binary-encoded
-        type headers give `Nested` a distinct `0x2F` tag; binary type headers
-        remain out of scope. Confirmed against the server source (`DataTypeNested`,
+        type headers give `Nested` a distinct `0x2F` tag, supported by the
+        explicit `*_binary_types` APIs. Confirmed against the server source (`DataTypeNested`,
         v26.6.1.1193-stable) and verified with the `nst` live-server fixture
         column; encode runs green in the live INSERT test.
 - [x] `Nothing` (decode and encode)
@@ -629,8 +632,12 @@ where the across-release churn lives.
       real-server fixture capture, and live INSERT are covered at
       `v26.6.1.1193-stable`. COMPACT mode 1 remains intentionally rejected
       because direct `NativeWriter` never emits it.
-- [ ] `Dynamic` - self-describing, carries its own type info; optional
-      `Dynamic(max_types=N)` form. NEXT UP after Variant and before JSON.
+- [x] `Dynamic` - complete at decode/encode parity for direct V1/V2 and
+      FLATTENED word 3, including SharedVariant binary cells, textual and binary
+      type tables, recursive containers, result-wide Arrow Dense Union stream
+      schemas, malformed-input rejection, synthetic tests, and real-server
+      fixtures at `v26.6.1.1193-stable`. V3 word 4 is intentionally rejected
+      because direct NativeWriter does not emit it.
 - [ ] `JSON` (new object type) - dynamic subcolumns, carries its own structure
       header; highest effort. Confirmed registered (case-insensitive) and GA at
       v26.6.1.1193-stable. The legacy `Object('json')` spelling is **not registered
@@ -692,13 +699,17 @@ where the across-release churn lives.
       `read_state_prefix` in `src/native/decode/mod.rs`, so a type with a real
       `deserializeBinaryBulkStatePrefix` declares its prefix in one place instead
       of the old "prefix reads zero bytes" assumption. `LowCardinality` reads its
-      8-byte key version through it; every other type reads zero bytes. The
-      prefix runs per column per block, gated on the block having rows, matching
-      `NativeReader::readData`.
-- [ ] Binary-encoded type headers (`DataTypesBinaryEncoding`) - only emitted when
-      `output_format_native_encode_types_in_binary_format` is set. Conditional on
-      whether any target binding needs it; see `FINDINGS.md`. May stay a
-      documented constraint rather than a feature.
+      8-byte key version through it. `Variant` and `Dynamic` also read their mode
+      or block-local structure and type-table prefixes through the same
+      traversal. The prefix runs per column per block, gated on the block having
+      rows, matching `NativeReader::readData`.
+- [x] Binary-encoded type headers (`DataTypesBinaryEncoding`) - explicit
+      `*_binary_types` decode/encode APIs cover outer Native headers and Dynamic
+      runtime type tables without changing the existing options structs. The
+      zero-dependency descriptor parser is depth/complexity/count bounded and
+      rejects illegal semantic wrappers and unsupported/reserved tags rather
+      than partially consuming them. A live HTTP INSERT/SELECT test verifies the
+      paired server input/output settings against the pinned server.
 
 ---
 

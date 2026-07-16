@@ -15,8 +15,8 @@ use crate::schema::{ChType, GeoKind, IntervalKind};
 /// Parse a ClickHouse type name string into a [`crate::schema::ChType`].
 ///
 /// Accepts the canonical spellings the server writes in Native block headers,
-/// including the `Nullable`, `LowCardinality`, `Array`, `Tuple`, `Map`, and
-/// `Variant`
+/// including the `Nullable`, `LowCardinality`, `Array`, `Tuple`, `Map`,
+/// `Variant`, and `Dynamic`
 /// container forms. Returns `None` for an unsupported or malformed name. The
 /// input is treated as untrusted wire data: parsing is depth-bounded (see
 /// `MAX_TYPE_DEPTH`) and never panics. Also used by the encoder to confirm a
@@ -127,6 +127,25 @@ fn parse_ch_type_depth(type_name: &str, depth: usize) -> Option<ChType> {
                 alternatives.push(parse_ch_type_depth(part.trim_matches(' '), depth + 1)?);
             }
             return normalize_variant_alternatives(alternatives).map(ChType::Variant);
+        }
+    }
+
+    // Dynamic[(max_types=N)]. The server's default is 32 and its canonical
+    // name omits the parameter at that value. `Dynamic()` is accepted by the
+    // server factory and normalizes to the same bare spelling. The only named
+    // parameter is the exact lowercase `max_types`, with a valid range 0..=254
+    // because the implicit SharedVariant child occupies Variant's final slot.
+    if type_name == "Dynamic" || type_name == "Dynamic()" {
+        return Some(ChType::Dynamic { max_types: 32 });
+    }
+    if let Some(inner) = type_name.strip_prefix("Dynamic(") {
+        if let Some(inner) = inner.strip_suffix(')') {
+            let (name, value) = inner.split_once('=')?;
+            if name.trim() != "max_types" {
+                return None;
+            }
+            let max_types = value.trim().parse::<u8>().ok()?;
+            return (max_types <= 254).then_some(ChType::Dynamic { max_types });
         }
     }
 
@@ -488,6 +507,7 @@ fn can_be_inside_nullable(inner: &ChType) -> bool {
             | ChType::Array(_)
             | ChType::Map(..)
             | ChType::Variant(_)
+            | ChType::Dynamic { .. }
             | ChType::AggregateFunction { .. }
     )
 }
@@ -571,7 +591,7 @@ pub(crate) fn unsupported_header_type_name(ch_type: &ChType) -> Option<String> {
 /// shared by the decoder parser and encode's semantic type validation so a
 /// caller-built noncanonical `ChType::Variant` cannot put child bodies under a
 /// discriminator order different from the server's.
-fn normalize_variant_alternatives(
+pub(crate) fn normalize_variant_alternatives(
     alternatives: impl IntoIterator<Item = ChType>,
 ) -> Option<Vec<ChType>> {
     let mut canonical = std::collections::BTreeMap::<String, ChType>::new();
@@ -610,7 +630,7 @@ fn normalize_variant_alternatives(
 /// (and any chained decoration) over `Nothing` resolves to `true`. The
 /// recursion is bounded by the parsed type depth, so it cannot run away on
 /// untrusted input.
-fn resolves_to_nothing(alternative: &ChType) -> bool {
+pub(crate) fn resolves_to_nothing(alternative: &ChType) -> bool {
     match alternative.physical_delegate() {
         Some(under) => resolves_to_nothing(&under),
         None => matches!(alternative, ChType::Nothing),
@@ -618,12 +638,12 @@ fn resolves_to_nothing(alternative: &ChType) -> bool {
 }
 
 /// Whether one immediate Variant alternative satisfies the server constructor.
-fn is_valid_variant_alternative(alternative: &ChType) -> bool {
+pub(crate) fn is_valid_variant_alternative(alternative: &ChType) -> bool {
     if let Some(under) = alternative.physical_delegate() {
         return is_valid_variant_alternative(&under);
     }
     match alternative {
-        ChType::Nullable(_) | ChType::Variant(_) => false,
+        ChType::Nullable(_) | ChType::Variant(_) | ChType::Dynamic { .. } => false,
         ChType::LowCardinality(inner) => !low_cardinality_dict_value_type(inner).0,
         _ => true,
     }

@@ -421,7 +421,16 @@ SELECT
         n = 1, CAST(CAST('user_1', 'String'), 'Variant(String, UInt64)'),
         n = 2, CAST(toUInt64(13), 'Variant(String, UInt64)'),
         CAST(CAST('user_2', 'String'), 'Variant(String, UInt64)')
-    ) AS variant
+    ) AS variant,
+    -- Dynamic(max_types=1): block-local runtime types use String as the one
+    -- direct dense child because it occurs twice. UInt64 and Array(Int32)
+    -- overflow into SharedVariant as binary descriptor+single-value blobs.
+    -- Rows are user_1, user_2, 13, [79, -13].
+    multiIf(
+        n < 2, CAST(concat('user_', toString(n + 1)), 'Dynamic(max_types=1)'),
+        n = 2, CAST(toUInt64(13), 'Dynamic(max_types=1)'),
+        CAST([toInt32(79), toInt32(-13)], 'Dynamic(max_types=1)')
+    ) AS dynamic
 FROM numbers(4)
 SETTINGS allow_suspicious_low_cardinality_types = 1, enable_nullable_tuple_type = 1, enable_time_time64_type = 1, flatten_nested = 0
 FORMAT Native

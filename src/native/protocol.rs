@@ -22,6 +22,11 @@ pub const DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION: u64 = 54454;
 /// and [`super::encode`] re-emits, so both stay byte-identical to the server writer.
 pub(crate) const DBMS_MIN_REVISION_WITH_OUT_OF_ORDER_BUCKETS: u64 = 54480;
 
+/// Protocol revision at which NativeWriter switches Dynamic and JSON from the
+/// legacy V1 structure prefix to V2. V2 removes V1's ignored legacy count; the
+/// value body is otherwise unchanged.
+pub(crate) const DBMS_MIN_REVISION_WITH_V2_DYNAMIC_AND_JSON_SERIALIZATION: u64 = 54473;
+
 /// Maximum wrapper/container nesting depth the type-name parser accepts.
 ///
 /// The type string is attacker-controlled wire input, and every wrapper level

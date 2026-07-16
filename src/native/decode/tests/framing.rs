@@ -38,18 +38,33 @@ fn test_block_end_zero_rows() {
 }
 
 #[test]
+fn binary_header_rejects_illegal_nullable_before_zero_row_materialization() {
+    // One zero-row column named `v`, followed by the binary descriptor for
+    // Nullable(Nullable(UInt8)). This must return an error, not reach the
+    // impossible nested-Nullable arm in `empty_column` and panic.
+    let data = [1, 0, 1, b'v', 0x23, 0x23, 0x01];
+    assert!(matches!(
+        decode_all_bytes_binary_types(&data, &DecodeOptions::default()),
+        Err(DecodeError::UnsupportedType { .. })
+    ));
+}
+
+#[test]
 fn test_block_end_rejects_unsupported_type() {
     // An unsupported type inside an otherwise-complete block must surface as
     // a DecodeError from the scan, not be silently skipped or reported as
-    // incomplete. `Dynamic` is not decoded yet, so it serves as the example.
-    let data = BlockBuilder::new()
-        .header(1, 1)
-        .column_header("id", "Dynamic")
-        .build();
-    assert!(matches!(
-        block_end(&data, &DecodeOptions::default()),
-        Err(DecodeError::UnsupportedType { .. })
-    ));
+    // incomplete. Cover both a bare unknown name and an unknown parameterized
+    // header; neither `JSON` nor `QBit` is decoded.
+    for type_name in ["JSON", "QBit(Float32, 16)"] {
+        let data = BlockBuilder::new()
+            .header(1, 1)
+            .column_header("id", type_name)
+            .build();
+        assert!(matches!(
+            block_end(&data, &DecodeOptions::default()),
+            Err(DecodeError::UnsupportedType { .. })
+        ));
+    }
 }
 
 #[test]
@@ -60,15 +75,18 @@ fn test_block_end_no_block_at_clean_boundary() {
 
 #[test]
 fn test_unsupported_type() {
-    // `Dynamic` is not decoded yet, so it serves as the unsupported example.
-    let data = BlockBuilder::new()
-        .header(1, 1)
-        .column_header("id", "Dynamic")
-        .build();
-    assert!(matches!(
-        decode_all_bytes(&data, &DecodeOptions::default()),
-        Err(DecodeError::UnsupportedType { .. })
-    ));
+    // Cover both a bare unknown name and an unknown parameterized header;
+    // neither `JSON` nor `QBit` is decoded.
+    for type_name in ["JSON", "QBit(Float32, 16)"] {
+        let data = BlockBuilder::new()
+            .header(1, 1)
+            .column_header("id", type_name)
+            .build();
+        assert!(matches!(
+            decode_all_bytes(&data, &DecodeOptions::default()),
+            Err(DecodeError::UnsupportedType { .. })
+        ));
+    }
 }
 
 #[test]

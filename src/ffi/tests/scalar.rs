@@ -29,7 +29,7 @@ fn test_export_array_buffers() {
     let batch = make_test_batch();
     unsafe {
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
 
         assert_eq!(array.length, 2);
         assert_eq!(array.n_children, 3);
@@ -67,7 +67,7 @@ fn test_export_bool_column() {
         (schema.release.unwrap())(&mut schema);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
 
         let c0 = &**array.children.add(0);
         assert_eq!(c0.length, 3);
@@ -136,7 +136,7 @@ fn test_export_bfloat16_as_fixed_size_binary_zero_copy() {
         (schema_out.release.unwrap())(&mut schema_out);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let child = &**array.children.add(0);
         assert_eq!(child.length, 3);
         assert_eq!(child.null_count, 1);
@@ -166,7 +166,7 @@ fn test_export_zero_row_bfloat16_as_fixed_size_binary() {
     // until the matching release callback is invoked below.
     unsafe {
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let child = &**array.children.add(0);
         assert_eq!(child.length, 0);
         assert_eq!(child.null_count, 0);
@@ -235,7 +235,7 @@ fn test_export_uuid_ipv4_ipv6_schema_and_buffers() {
         (schema_out.release.unwrap())(&mut schema_out);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
 
         // IPv4: 2 buffers (validity, u32 values).
         let a0 = &**array.children.add(0);
@@ -298,7 +298,7 @@ fn test_arrow_format_and_export_enum() {
         (schema_out.release.unwrap())(&mut schema_out);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let a0 = &**array.children.add(0);
         assert_eq!(a0.length, 3);
         assert_eq!(a0.n_buffers, 2);
@@ -375,7 +375,7 @@ fn test_arrow_format_and_export_decimal() {
         (schema_out.release.unwrap())(&mut schema_out);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let a0 = &**array.children.add(0);
         assert_eq!(a0.length, 2);
         assert_eq!(a0.n_buffers, 2);
@@ -487,7 +487,7 @@ fn test_export_interval_buffers_zero_copy() {
         (schema_out.release.unwrap())(&mut schema_out);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let raw = &**array.children.add(0);
         assert_eq!(raw.length, 3);
         assert_eq!(raw.null_count, 0);
@@ -534,7 +534,7 @@ fn test_export_zero_row_interval() {
         (schema_out.release.unwrap())(&mut schema_out);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let child = &**array.children.add(0);
         assert_eq!(child.length, 0);
         assert_eq!(child.null_count, 0);
@@ -581,7 +581,7 @@ fn test_export_time_buffers() {
         (schema_out.release.unwrap())(&mut schema_out);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let t = &**array.children.add(0);
         let t64 = &**array.children.add(1);
         assert_eq!(t.length, 3);
@@ -636,7 +636,7 @@ fn test_export_nullable_time_buffers_zero_copy() {
         (schema_out.release.unwrap())(&mut schema_out);
 
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let t = &**array.children.add(0);
         let t64 = &**array.children.add(1);
         assert_eq!(t.null_count, 1);
@@ -701,7 +701,7 @@ fn export_empty_offsets_utf8_has_valid_leading_zero_offset() {
     // Safety: output is a writable zeroed C Data array, released below.
     unsafe {
         let mut array: ArrowArray = std::mem::zeroed();
-        export_batch_array(&batch, &mut array);
+        export_batch_array(&batch, &mut array).unwrap();
         let child = &**array.children.add(0);
         assert_eq!(child.length, 0);
         assert_eq!(child.null_count, 0);
