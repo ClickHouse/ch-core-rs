@@ -237,6 +237,33 @@ fn decode_dynamic_zero_rows_and_multi_block() {
 }
 
 #[test]
+fn deeply_nested_dynamic_stream_errors_instead_of_overflowing() {
+    // Dynamic's runtime types are column DATA, so each level restarts the
+    // header parser's per-type depth budget: a ~2.4 MB stream nesting
+    // Array(Dynamic) 100k levels deep would overflow the stack without the
+    // cumulative cap. Both the allocating decode and the allocation-free
+    // completeness scan must reject it as InvalidDynamic, not abort.
+    let mut body = Vec::new();
+    for _ in 0..100_000 {
+        body.extend_from_slice(&flattened_prefix(&["Array(Dynamic)"]));
+    }
+    body.extend_from_slice(&flattened_prefix(&["String"]));
+    let block = BlockBuilder::new()
+        .header(1, 1)
+        .column_header("v", "Dynamic")
+        .raw_bytes(&body)
+        .build();
+    assert!(matches!(
+        decode_all_bytes(&block, &DecodeOptions::default()),
+        Err(DecodeError::InvalidDynamic { .. })
+    ));
+    assert!(matches!(
+        block_end(&block, &DecodeOptions::default()),
+        Err(DecodeError::InvalidDynamic { .. })
+    ));
+}
+
+#[test]
 fn reject_malformed_dynamic_state() {
     let word_four = BlockBuilder::new()
         .header(1, 1)

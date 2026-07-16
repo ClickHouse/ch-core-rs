@@ -1389,6 +1389,7 @@ fn insert_roundtrips_through_server() {
         &batch,
         &EncodeOptions {
             protocol_revision: 0,
+            ..EncodeOptions::default()
         },
     )
     .expect("encode numeric batch");
@@ -1458,6 +1459,7 @@ fn low_cardinality_fixed_string_u16_dictionary_roundtrips_through_server() {
         &batch,
         &EncodeOptions {
             protocol_revision: 0,
+            ..EncodeOptions::default()
         },
     )
     .expect("encode LowCardinality FixedString batch");
@@ -1869,6 +1871,7 @@ fn geo_saf_nested_roundtrip_through_server() {
         &batch,
         &EncodeOptions {
             protocol_revision: 0,
+            ..EncodeOptions::default()
         },
     )
     .expect("encode geo/SAF/Nested batch");

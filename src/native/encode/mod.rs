@@ -69,6 +69,14 @@ pub struct EncodeOptions {
     /// marker byte, and the stream simply ends at EOF. Use the negotiated TCP
     /// revision for the native protocol path.
     pub protocol_revision: u64,
+    /// Opt in to Dynamic's FLATTENED serialization (structure word 3) for a
+    /// column with no `SharedVariant` child. Servers before ClickHouse 25.6 do
+    /// not know structure word 3 and reject it, so this defaults to `false`: a
+    /// shared-less column then encodes with the V1/V2 layout, emitting an
+    /// implicit empty `SharedVariant` child (its dense body is zero rows, so no
+    /// bytes). A column that carries a real `SharedVariant` child always uses
+    /// V1/V2 regardless of this flag, since FLATTENED cannot represent it.
+    pub flattened_dynamic: bool,
 }
 
 /// Error returned when a batch cannot be encoded to Native bytes.
@@ -159,7 +167,7 @@ pub fn encode_chunked(
                 detail: format!("chunk {i} schema differs from the batch schema"),
             });
         }
-        validate_block(chunk)?;
+        validate_block(chunk, options)?;
     }
     let mut buf = Vec::new();
     for chunk in &batch.chunks {
@@ -180,7 +188,7 @@ pub fn encode_chunked_binary_types(
                 detail: format!("chunk {i} schema differs from the batch schema"),
             });
         }
-        validate_block(chunk)?;
+        validate_block(chunk, options)?;
     }
     let mut buf = Vec::new();
     for chunk in &batch.chunks {
@@ -200,7 +208,7 @@ fn encode_block_into(
     options: &EncodeOptions,
     types_in_binary_format: bool,
 ) -> Result<(), EncodeError> {
-    validate_block(batch)?;
+    validate_block(batch, options)?;
     write_block_into(buf, batch, options, types_in_binary_format)
 }
 
@@ -322,7 +330,7 @@ fn encode_column_data(
     types_in_binary_format: bool,
 ) -> Result<(), EncodeError> {
     write_state_prefix(buf, &field.ch_type, column, options, types_in_binary_format)?;
-    encode_column_values(buf, field, &field.ch_type, column)?;
+    encode_column_values(buf, field, &field.ch_type, column, options)?;
     write_state_suffix(buf, &field.ch_type, column)?;
     Ok(())
 }
@@ -428,62 +436,126 @@ fn write_state_prefix(
 }
 
 /// Write Dynamic's self-describing bulk-state prefix and every discovered
-/// child's prefix. Direct V1/V2 uses the protocol-revision-selected structure
-/// word and includes the implicit `SharedVariant` child. A column without a
-/// shared child uses FLATTENED word 3, whose table order is the physical child
-/// order. The child bodies remain bulk columns, so only the small type table is
-/// visited here and no per-row work is introduced.
+/// child's prefix. A column with a real `SharedVariant` child uses direct V1/V2
+/// with the protocol-revision-selected structure word. A shared-less column
+/// uses FLATTENED word 3 (table order = physical child order) only when
+/// [`EncodeOptions::flattened_dynamic`] is set; otherwise it takes the V1/V2
+/// layout with an implicit empty `SharedVariant`, writing the type table and
+/// child prefixes in the canonical global order the decoder derives. The child
+/// bodies remain bulk columns, so only the small type table is visited here and
+/// no per-row work is introduced.
 fn write_dynamic_state_prefix(
     buf: &mut Vec<u8>,
     col: &DynamicColumn,
     options: &EncodeOptions,
     types_in_binary_format: bool,
 ) -> Result<(), EncodeError> {
-    let has_shared = col.shared_child_index().is_some();
-    if has_shared {
-        let structure = if options.protocol_revision
-            < DBMS_MIN_REVISION_WITH_V2_DYNAMIC_AND_JSON_SERIALIZATION
-        {
-            1u64
-        } else {
-            2u64
-        };
-        buf.extend_from_slice(&structure.to_le_bytes());
+    match dynamic_wire_shape(col, options) {
+        DynamicWireShape::Flattened => {
+            buf.extend_from_slice(&3u64.to_le_bytes());
+            write_varint(buf, col.children.len() as u64);
+            for child in &col.children {
+                if let DynamicChild::Typed { ch_type, .. } = child {
+                    write_dynamic_type_entry(buf, ch_type, types_in_binary_format);
+                }
+            }
+            for child in &col.children {
+                if let DynamicChild::Typed { ch_type, values } = child {
+                    write_state_prefix(buf, ch_type, values, options, types_in_binary_format)?;
+                }
+            }
+        }
+        DynamicWireShape::V1V2 => {
+            let structure = if options.protocol_revision
+                < DBMS_MIN_REVISION_WITH_V2_DYNAMIC_AND_JSON_SERIALIZATION
+            {
+                1u64
+            } else {
+                2u64
+            };
+            buf.extend_from_slice(&structure.to_le_bytes());
 
-        let direct_count = col
-            .children
-            .iter()
-            .filter(|child| matches!(child, DynamicChild::Typed { .. }))
-            .count();
-        if structure == 1 {
-            // V1's first count is a legacy ignored slot. The current server
-            // writes the direct-type count into both positions.
+            // For a real SharedVariant child, `validate_dynamic` proved the
+            // children are already in canonical global order, so the wire
+            // order is the memory order. For the implicit shared child, the
+            // order helper interleaves the virtual "SharedVariant" slot into
+            // the sorted typed names, the exact order the decoder rebuilds.
+            let order = dynamic_wire_order(col);
+            let direct_count = col
+                .children
+                .iter()
+                .filter(|child| matches!(child, DynamicChild::Typed { .. }))
+                .count();
+            if structure == 1 {
+                // V1's first count is a legacy ignored slot. The current server
+                // writes the direct-type count into both positions.
+                write_varint(buf, direct_count as u64);
+            }
             write_varint(buf, direct_count as u64);
-        }
-        write_varint(buf, direct_count as u64);
-        for child in &col.children {
-            if let DynamicChild::Typed { ch_type, .. } = child {
-                write_dynamic_type_entry(buf, ch_type, types_in_binary_format);
+            for slot in &order {
+                if let Some(DynamicChild::Typed { ch_type, .. }) =
+                    slot.map(|index| &col.children[index])
+                {
+                    write_dynamic_type_entry(buf, ch_type, types_in_binary_format);
+                }
             }
-        }
-        // Direct Native Dynamic always uses Variant BASIC mode.
-        buf.extend_from_slice(&0u64.to_le_bytes());
-    } else {
-        buf.extend_from_slice(&3u64.to_le_bytes());
-        write_varint(buf, col.children.len() as u64);
-        for child in &col.children {
-            if let DynamicChild::Typed { ch_type, .. } = child {
-                write_dynamic_type_entry(buf, ch_type, types_in_binary_format);
-            }
-        }
-    }
+            // Direct Native Dynamic always uses Variant BASIC mode.
+            buf.extend_from_slice(&0u64.to_le_bytes());
 
-    for child in &col.children {
-        if let DynamicChild::Typed { ch_type, values } = child {
-            write_state_prefix(buf, ch_type, values, options, types_in_binary_format)?;
+            for slot in &order {
+                if let Some(DynamicChild::Typed { ch_type, values }) =
+                    slot.map(|index| &col.children[index])
+                {
+                    write_state_prefix(buf, ch_type, values, options, types_in_binary_format)?;
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// The Dynamic wire representation selected for a column under `options`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DynamicWireShape {
+    V1V2,
+    Flattened,
+}
+
+fn dynamic_wire_shape(col: &DynamicColumn, options: &EncodeOptions) -> DynamicWireShape {
+    if col.shared_child_index().is_none() && options.flattened_dynamic {
+        DynamicWireShape::Flattened
+    } else {
+        DynamicWireShape::V1V2
+    }
+}
+
+/// The V1/V2 global wire order of a column's children: one slot per wire
+/// discriminator, holding `Some(memory index)` for a stored child and `None`
+/// for the implicit empty `SharedVariant` of a shared-less column.
+///
+/// The decoder rebuilds the global order by sorting the typed canonical names
+/// together with `"SharedVariant"`, so a shared-less column (whose FLATTENED
+/// table order is not necessarily sorted) must be permuted here. A column with
+/// a real shared child was validated to already be in this order, so its
+/// mapping comes out the identity.
+fn dynamic_wire_order(col: &DynamicColumn) -> Vec<Option<usize>> {
+    let mut order: Vec<(String, Option<usize>)> = col
+        .children
+        .iter()
+        .enumerate()
+        .map(|(index, child)| {
+            let name = match child {
+                DynamicChild::Typed { ch_type, .. } => ch_type.to_string(),
+                DynamicChild::Shared(_) => "SharedVariant".to_string(),
+            };
+            (name, Some(index))
+        })
+        .collect();
+    if col.shared_child_index().is_none() {
+        order.push(("SharedVariant".to_string(), None));
+    }
+    order.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    order.into_iter().map(|(_, slot)| slot).collect()
 }
 
 fn write_dynamic_type_entry(buf: &mut Vec<u8>, ch_type: &ChType, types_in_binary_format: bool) {
@@ -541,8 +613,11 @@ fn write_state_suffix(
         }
         ChType::Dynamic { .. } => {
             if let Column::Dynamic(col) = column {
-                for child in &col.children {
-                    if let DynamicChild::Typed { ch_type, values } = child {
+                // Same wire order as the prefix and body traversals.
+                for slot in dynamic_wire_order(col) {
+                    if let Some(DynamicChild::Typed { ch_type, values }) =
+                        slot.map(|index| &col.children[index])
+                    {
                         write_state_suffix(buf, ch_type, values)?;
                     }
                 }
@@ -573,6 +648,7 @@ fn encode_column_values(
     field: &Field,
     ch_type: &ChType,
     column: &Column,
+    options: &EncodeOptions,
 ) -> Result<(), EncodeError> {
     // A name-decoration alias (SimpleAggregateFunction, geo, Nested) encodes
     // exactly as the physical type it delegates to, the encode-side mirror of
@@ -580,7 +656,7 @@ fn encode_column_values(
     // so a geo/Nested alias that expands to an `Array` reaches the Array
     // fast-path.
     if let Some(under) = ch_type.physical_delegate() {
-        return encode_column_values(buf, field, &under, column);
+        return encode_column_values(buf, field, &under, column, options);
     }
     if let ChType::LowCardinality(inner) = ch_type {
         if let Column::Dictionary(c) = column {
@@ -600,25 +676,25 @@ fn encode_column_values(
     }
     if let ChType::Array(inner) = ch_type {
         if let Column::Array(c) = column {
-            return encode_array_data(buf, field, inner, c);
+            return encode_array_data(buf, field, inner, c, options);
         }
         return Err(column_error(field, ch_type));
     }
     if let ChType::Map(key, value) = ch_type {
         if let Column::Map(c) = column {
-            return encode_map_data(buf, field, ch_type, key, value, c);
+            return encode_map_data(buf, field, ch_type, key, value, c, options);
         }
         return Err(column_error(field, ch_type));
     }
     if let ChType::Variant(alternatives) = ch_type {
         if let Column::Variant(c) = column {
-            return encode_variant_data(buf, field, alternatives, c);
+            return encode_variant_data(buf, field, alternatives, c, options);
         }
         return Err(column_error(field, ch_type));
     }
     if let ChType::Dynamic { .. } = ch_type {
         if let Column::Dynamic(c) = column {
-            return encode_dynamic_data(buf, field, c);
+            return encode_dynamic_data(buf, field, c, options);
         }
         return Err(column_error(field, ch_type));
     }
@@ -637,7 +713,7 @@ fn encode_column_values(
     // body (element bodies still carry a placeholder value for null rows).
     if let ChType::Tuple(elements) = value_type {
         if let Column::Tuple(c) = column {
-            return encode_tuple_data(buf, field, elements, c);
+            return encode_tuple_data(buf, field, elements, c, options);
         }
         return Err(column_error(field, value_type));
     }
@@ -646,52 +722,82 @@ fn encode_column_values(
 
 /// Encode one Dynamic body after [`write_dynamic_state_prefix`] has emitted its
 /// block-local type table. V1/V2 writes one UInt8 discriminator per row, then
-/// dense child bodies in global order. FLATTENED writes its smallest fixed-width
-/// index run, then the dense typed bodies. The stored offsets are routing-only
-/// and validation has already proved they are occurrence ordinals, so encoding
-/// touches only `type_ids` once and performs one bulk write per child.
+/// dense child bodies in global order; a shared-less column's implicit
+/// `SharedVariant` slot maps through the same [`dynamic_wire_order`] the prefix
+/// used, and its zero-row dense body writes no bytes. FLATTENED (opt-in) writes
+/// its smallest fixed-width index run, then the dense typed bodies. The stored
+/// offsets are routing-only and validation has already proved they are
+/// occurrence ordinals, so encoding touches only `type_ids` once and performs
+/// one bulk write per child.
 fn encode_dynamic_data(
     buf: &mut Vec<u8>,
     field: &Field,
     col: &DynamicColumn,
+    options: &EncodeOptions,
 ) -> Result<(), EncodeError> {
-    if col.shared_child_index().is_some() {
-        buf.reserve(col.type_ids.len());
-        for &type_id in &col.type_ids {
-            if type_id == u32::MAX {
-                buf.push(u8::MAX);
-            } else {
-                let discriminator =
-                    u8::try_from(type_id).map_err(|_| column_error(field, &field.ch_type))?;
-                buf.push(discriminator);
+    match dynamic_wire_shape(col, options) {
+        DynamicWireShape::V1V2 => {
+            let order = dynamic_wire_order(col);
+            // Memory child index -> wire discriminator. The identity for a
+            // column with a real shared child (validated canonical order); a
+            // permutation over the implicit SharedVariant slot otherwise.
+            let mut discriminator_of = vec![u8::MAX; col.children.len()];
+            for (discriminator, slot) in order.iter().enumerate() {
+                if let Some(index) = slot {
+                    discriminator_of[*index] = u8::try_from(discriminator)
+                        .map_err(|_| column_error(field, &field.ch_type))?;
+                }
+            }
+            buf.reserve(col.type_ids.len());
+            for &type_id in &col.type_ids {
+                if type_id == u32::MAX {
+                    buf.push(u8::MAX);
+                } else {
+                    let discriminator = discriminator_of
+                        .get(type_id as usize)
+                        .copied()
+                        .ok_or_else(|| column_error(field, &field.ch_type))?;
+                    buf.push(discriminator);
+                }
+            }
+            for slot in &order {
+                match slot.map(|index| &col.children[index]) {
+                    Some(DynamicChild::Typed { ch_type, values }) => {
+                        encode_column_values(buf, field, ch_type, values, options)?;
+                    }
+                    Some(DynamicChild::Shared(values)) => encode_string_data(buf, values),
+                    // The implicit empty SharedVariant: a zero-row String body
+                    // writes no bytes, matching the decoder's zero-count read.
+                    None => {}
+                }
             }
         }
-    } else {
-        let null_index = col.children.len() as u64;
-        let width = dynamic_flat_index_width(col.children.len());
-        buf.reserve(col.type_ids.len().saturating_mul(width));
-        for &type_id in &col.type_ids {
-            let index = if type_id == u32::MAX {
-                null_index
-            } else {
-                u64::from(type_id)
-            };
-            match width {
-                1 => buf.push(index as u8),
-                2 => buf.extend_from_slice(&(index as u16).to_le_bytes()),
-                4 => buf.extend_from_slice(&(index as u32).to_le_bytes()),
-                8 => buf.extend_from_slice(&index.to_le_bytes()),
-                _ => unreachable!("Dynamic index width is selected from 1/2/4/8"),
+        DynamicWireShape::Flattened => {
+            let null_index = col.children.len() as u64;
+            let width = dynamic_flat_index_width(col.children.len());
+            buf.reserve(col.type_ids.len().saturating_mul(width));
+            for &type_id in &col.type_ids {
+                let index = if type_id == u32::MAX {
+                    null_index
+                } else {
+                    u64::from(type_id)
+                };
+                match width {
+                    1 => buf.push(index as u8),
+                    2 => buf.extend_from_slice(&(index as u16).to_le_bytes()),
+                    4 => buf.extend_from_slice(&(index as u32).to_le_bytes()),
+                    8 => buf.extend_from_slice(&index.to_le_bytes()),
+                    _ => unreachable!("Dynamic index width is selected from 1/2/4/8"),
+                }
             }
-        }
-    }
-
-    for child in &col.children {
-        match child {
-            DynamicChild::Typed { ch_type, values } => {
-                encode_column_values(buf, field, ch_type, values)?;
+            for child in &col.children {
+                match child {
+                    DynamicChild::Typed { ch_type, values } => {
+                        encode_column_values(buf, field, ch_type, values, options)?;
+                    }
+                    DynamicChild::Shared(values) => encode_string_data(buf, values),
+                }
             }
-            DynamicChild::Shared(values) => encode_string_data(buf, values),
         }
     }
     Ok(())
@@ -729,10 +835,11 @@ fn encode_variant_data(
     field: &Field,
     alternatives: &[ChType],
     col: &VariantColumn,
+    options: &EncodeOptions,
 ) -> Result<(), EncodeError> {
     buf.extend_from_slice(col.discriminators());
     for (alternative, child) in alternatives.iter().zip(&col.variants) {
-        encode_column_values(buf, field, alternative, child)?;
+        encode_column_values(buf, field, alternative, child, options)?;
     }
     Ok(())
 }
@@ -762,6 +869,7 @@ fn encode_map_data(
     key: &ChType,
     value: &ChType,
     col: &MapColumn,
+    options: &EncodeOptions,
 ) -> Result<(), EncodeError> {
     // `get(1..)` rather than `[1..]`: validation guarantees the leading 0
     // exists, but stay panic-free if a caller reaches this without validating.
@@ -770,8 +878,8 @@ fn encode_map_data(
     }
     match col.entries.as_ref() {
         Column::Tuple(entries) if entries.fields.len() == 2 => {
-            encode_column_values(buf, field, key, &entries.fields[0])?;
-            encode_column_values(buf, field, value, &entries.fields[1])
+            encode_column_values(buf, field, key, &entries.fields[0], options)?;
+            encode_column_values(buf, field, value, &entries.fields[1], options)
         }
         // Defensive: `validate_map` rejected any other entries shape before
         // the write phase.
@@ -802,13 +910,14 @@ fn encode_tuple_data(
     field: &Field,
     elements: &[(Option<String>, ChType)],
     col: &TupleColumn,
+    options: &EncodeOptions,
 ) -> Result<(), EncodeError> {
     if elements.is_empty() {
         buf.resize(buf.len() + col.len, b'0');
         return Ok(());
     }
     for ((_, element_type), element_col) in elements.iter().zip(&col.fields) {
-        encode_column_values(buf, field, element_type, element_col)?;
+        encode_column_values(buf, field, element_type, element_col, options)?;
     }
     Ok(())
 }
@@ -928,6 +1037,7 @@ fn encode_array_data(
     field: &Field,
     inner: &ChType,
     col: &ArrayColumn,
+    options: &EncodeOptions,
 ) -> Result<(), EncodeError> {
     // `get(1..)` rather than `[1..]`: validation guarantees the leading 0
     // exists, but stay panic-free if a caller reaches this without validating
@@ -935,7 +1045,7 @@ fn encode_array_data(
     if let Some(end_offsets) = col.offsets.get(1..) {
         encode_primitive!(buf, end_offsets, i64);
     }
-    encode_column_values(buf, field, inner, col.values.as_ref())
+    encode_column_values(buf, field, inner, col.values.as_ref(), options)
 }
 
 /// Encode a `Nullable(T)` null map: one byte per row, 0x00 = valid, 0x01 = NULL,

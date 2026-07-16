@@ -4,9 +4,9 @@
 
 use crate::batch::ColBatch;
 use crate::column::{
-    variant_layout_from_discriminators, AggregateStateColumn, ArrayColumn, Column, DecimalColumn,
+    variant_child_counts, AggregateStateColumn, ArrayColumn, Column, DecimalColumn,
     DictionaryColumn, DynamicChild, DynamicColumn, FixedBinaryColumn, MapColumn, TupleColumn,
-    Utf8Column, VariantColumn,
+    Utf8Column, VariantColumn, VariantLayout, ARROW_UNION_MAX_CHILDREN,
 };
 use crate::native::aggregate_function::{
     aggregate_state_codec, is_valid_aggregate_state, AggregateStateCodec,
@@ -19,13 +19,18 @@ use crate::native::type_parser::{
 };
 use crate::schema::{ChType, Field};
 
-use super::{column_error, is_encodable, EncodeError};
+use super::{column_error, is_encodable, EncodeError, EncodeOptions};
 
 /// Validate that `batch` can be encoded, without writing anything. Every rejection
 /// condition lives here, so a caller can validate a whole [`ChunkedBatch`] up front
 /// (see [`encode_chunked`]) and then write every block knowing none will fail
 /// partway and leave a partial stream.
-pub(super) fn validate_block(batch: &ColBatch) -> Result<(), EncodeError> {
+///
+/// `options` is consulted for the one options-dependent legality rule: a
+/// shared-less `Dynamic` column encodes as FLATTENED only when
+/// [`EncodeOptions::flattened_dynamic`] is set, and the V1/V2 fallback has
+/// count limits FLATTENED does not.
+pub(super) fn validate_block(batch: &ColBatch, options: &EncodeOptions) -> Result<(), EncodeError> {
     let num_cols = batch.schema.num_fields();
     if num_cols != batch.columns.len() {
         return Err(EncodeError::InconsistentBatch {
@@ -36,7 +41,7 @@ pub(super) fn validate_block(batch: &ColBatch) -> Result<(), EncodeError> {
         });
     }
     for (field, column) in batch.schema.fields.iter().zip(&batch.columns) {
-        validate_column(field, column, batch.num_rows)?;
+        validate_column(field, column, batch.num_rows, options, 0)?;
     }
     Ok(())
 }
@@ -47,7 +52,22 @@ pub(super) fn validate_block(batch: &ColBatch) -> Result<(), EncodeError> {
 /// infallible once validation passes. Runs at every row count, including zero: a
 /// not-yet-encodable type is rejected even in a zero-row block (see the note on
 /// [`encode_block`]).
-fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<(), EncodeError> {
+///
+/// `depth` is the cumulative nesting depth from the batch column root,
+/// incremented on every recursive descent. The `type_depth` cap below bounds
+/// one declared type, but a `DynamicColumn`'s children carry their own
+/// `ChType`s, so each Dynamic level restarts that per-type budget;
+/// [`validate_dynamic`] charges every level against this one cumulative budget
+/// so a pathologically nested Dynamic column errors instead of overflowing the
+/// stack (here and in the write phase, which recurses over the same tree only
+/// after validation passes).
+fn validate_column(
+    field: &Field,
+    column: &Column,
+    num_rows: usize,
+    options: &EncodeOptions,
+    depth: usize,
+) -> Result<(), EncodeError> {
     // Bound the declared type's nesting depth before anything walks it.
     // Encode input is caller-constructed and never passes through
     // `parse_ch_type`'s depth cap, and `column_variant_matches`, `is_encodable`,
@@ -232,27 +252,27 @@ fn validate_column(field: &Field, column: &Column, num_rows: usize) -> Result<()
     }
 
     if let (ChType::LowCardinality(inner), Column::Dictionary(c)) = (physical_type, column) {
-        validate_low_cardinality(field, inner, c, num_rows)?;
+        validate_low_cardinality(field, inner, c, num_rows, options, depth)?;
     }
 
     if let (ChType::Array(inner), Column::Array(c)) = (value_type, column) {
-        validate_array(field, inner, c, num_rows)?;
+        validate_array(field, inner, c, num_rows, options, depth)?;
     }
 
     if let (ChType::Tuple(elements), Column::Tuple(c)) = (value_type, column) {
-        validate_tuple(field, elements, c, num_rows)?;
+        validate_tuple(field, elements, c, num_rows, options, depth)?;
     }
 
     if let (ChType::Map(key, value), Column::Map(c)) = (value_type, column) {
-        validate_map(field, key, value, c, num_rows)?;
+        validate_map(field, key, value, c, num_rows, options, depth)?;
     }
 
     if let (ChType::Variant(alternatives), Column::Variant(c)) = (value_type, column) {
-        validate_variant(field, alternatives, c, num_rows)?;
+        validate_variant(field, alternatives, c, num_rows, options, depth)?;
     }
 
     if let (ChType::Dynamic { max_types }, Column::Dynamic(c)) = (value_type, column) {
-        validate_dynamic(field, *max_types, c, num_rows)?;
+        validate_dynamic(field, *max_types, c, num_rows, options, depth)?;
     }
 
     // A `Bool` column is unpacked from its packed bitmap positionally, so the
@@ -701,6 +721,8 @@ fn validate_low_cardinality(
     inner: &ChType,
     col: &DictionaryColumn,
     num_rows: usize,
+    options: &EncodeOptions,
+    depth: usize,
 ) -> Result<(), EncodeError> {
     // Resolve the inner through the shared helper (full SAF chain + optional
     // removeNullable Nullable + inner SAF chain), so the dictionary body and index
@@ -744,7 +766,13 @@ fn validate_low_cardinality(
         name: format!("{} dictionary", field.name),
         ch_type: dict_value_type.clone(),
     };
-    validate_column(&dict_field, col.values.as_ref(), num_keys)?;
+    validate_column(
+        &dict_field,
+        col.values.as_ref(),
+        num_keys,
+        options,
+        depth + 1,
+    )?;
 
     for (row, &idx) in col.indices.iter().enumerate() {
         if idx < 0 {
@@ -811,6 +839,8 @@ fn validate_array(
     inner: &ChType,
     col: &ArrayColumn,
     num_rows: usize,
+    options: &EncodeOptions,
+    depth: usize,
 ) -> Result<(), EncodeError> {
     // Arrow LargeList offset invariants (shape, leading 0, monotonic, final
     // offset == flattened element count). Equal adjacent offsets (empty rows)
@@ -833,7 +863,13 @@ fn validate_array(
         name: format!("{} element", field.name),
         ch_type: inner.clone(),
     };
-    validate_column(&element_field, col.values.as_ref(), element_rows)
+    validate_column(
+        &element_field,
+        col.values.as_ref(),
+        element_rows,
+        options,
+        depth + 1,
+    )
 }
 
 /// Validate a `Tuple(T1, ...)` column before any bytes are written.
@@ -862,6 +898,8 @@ fn validate_tuple(
     elements: &[(Option<String>, ChType)],
     col: &TupleColumn,
     num_rows: usize,
+    options: &EncodeOptions,
+    depth: usize,
 ) -> Result<(), EncodeError> {
     if elements.len() != col.fields.len() {
         return Err(EncodeError::InconsistentBatch {
@@ -881,7 +919,7 @@ fn validate_tuple(
             },
             ch_type: element_type.clone(),
         };
-        validate_column(&element_field, element_col, num_rows)?;
+        validate_column(&element_field, element_col, num_rows, options, depth + 1)?;
     }
     Ok(())
 }
@@ -906,6 +944,8 @@ fn validate_map(
     value: &ChType,
     col: &MapColumn,
     num_rows: usize,
+    options: &EncodeOptions,
+    depth: usize,
 ) -> Result<(), EncodeError> {
     let reject = |detail: String| Err(EncodeError::InconsistentBatch { detail });
 
@@ -957,12 +997,24 @@ fn validate_map(
         name: format!("{} key", field.name),
         ch_type: key.clone(),
     };
-    validate_column(&key_field, &entries.fields[0], entry_rows)?;
+    validate_column(
+        &key_field,
+        &entries.fields[0],
+        entry_rows,
+        options,
+        depth + 1,
+    )?;
     let value_field = Field {
         name: format!("{} value", field.name),
         ch_type: value.clone(),
     };
-    validate_column(&value_field, &entries.fields[1], entry_rows)
+    validate_column(
+        &value_field,
+        &entries.fields[1],
+        entry_rows,
+        options,
+        depth + 1,
+    )
 }
 
 /// Validate a Variant's discriminator run, Arrow Dense Union tree, and dense
@@ -971,19 +1023,23 @@ fn validate_map(
 /// `VariantColumn::discriminators` is the single source of routing truth: the
 /// exact Native wire run of one global UInt8 discriminator per logical row (255
 /// = NULL). `layout` is the deterministic Arrow view the decoder derives from
-/// it, so this recomputes that layout from the discriminators and requires the
-/// stored routing buffers to match it exactly. Because the layout is a pure
-/// function of the discriminators, that one comparison catches every drift the
-/// old per-row walk checked by hand: an out-of-range discriminator (rejected by
-/// the recompute itself), the wrong flat-vs-nested shape for the alternative
-/// count, non-canonical type ids, offsets that are not occurrence ordinals, and
-/// malformed groups. Client-side rejection stays deliberately stricter than the
-/// server, whose bulk deserialize path has no discriminator range check at all.
+/// it, so this walks the discriminators once with running per-child counters
+/// and requires every stored routing entry to equal the canonical derivation,
+/// without materializing a throwaway layout (the old recompute allocated ~5
+/// bytes per row per encoded column). The comparison covers everything the
+/// whole-layout equality did: an out-of-range discriminator (rejected by the
+/// shared [`variant_child_counts`], the same helper the streaming scan uses),
+/// the wrong flat-vs-nested shape for the alternative count, non-canonical
+/// type ids, offsets that are not occurrence ordinals, and malformed groups.
+/// Client-side rejection stays deliberately stricter than the server, whose
+/// bulk deserialize path has no discriminator range check at all.
 fn validate_variant(
     field: &Field,
     alternatives: &[ChType],
     col: &VariantColumn,
     num_rows: usize,
+    options: &EncodeOptions,
+    depth: usize,
 ) -> Result<(), EncodeError> {
     let reject = |detail: String| Err(EncodeError::InconsistentBatch { detail });
 
@@ -997,8 +1053,9 @@ fn validate_variant(
     }
 
     // The discriminator run carries one byte per logical row, so its length is
-    // the row count. Check it before recomputing so a short/long run is reported
-    // as a row-count mismatch rather than surfacing later as a layout mismatch.
+    // the row count. Check it before the layout walk so a short/long run is
+    // reported as a row-count mismatch rather than surfacing later as a layout
+    // mismatch.
     if col.discriminators().len() != num_rows {
         return reject(format!(
             "column {:?} declares {num_rows} Variant rows but carries {} discriminators",
@@ -1007,29 +1064,29 @@ fn validate_variant(
         ));
     }
 
-    // Recompute the canonical Arrow layout (and the per-alternative and NULL
-    // counts) from the discriminators. This rejects an out-of-range discriminator
-    // with the same error decode would, and hands back the counts the child
-    // columns must match.
-    let (layout, counts, null_count) =
-        variant_layout_from_discriminators(col.discriminators(), alternatives.len()).map_err(
-            |err| EncodeError::InconsistentBatch {
-                detail: format!(
-                    "column {:?} has invalid Variant discriminators: {err}",
-                    field.name
-                ),
-            },
-        )?;
-
-    // The stored routing buffers must be exactly the layout the discriminators
-    // imply. `VariantLayout` derives `PartialEq`, so this compares the flat/nested
-    // shape, every type id, every dense offset, and every group in one check.
-    if col.layout != layout {
+    // Every dense offset is an occurrence ordinal bounded by the row count, so
+    // the i32 routing entries only exist below i32::MAX rows (the same guard
+    // the decode-side layout builder applies).
+    if num_rows > i32::MAX as usize {
         return reject(format!(
-            "column {:?} Variant routing buffers do not match the canonical Arrow layout of its discriminators",
+            "column {:?} Variant row count {num_rows} exceeds Arrow Dense Union's i32 child-offset range",
             field.name
         ));
     }
+
+    // Count each alternative's rows through the helper shared with the
+    // streaming skip scan, so an out-of-range discriminator is rejected with
+    // the same error on both paths, and the counts the child columns must
+    // match come back without any per-row materialization.
+    let (counts, null_count) = variant_child_counts(col.discriminators(), alternatives.len())
+        .map_err(|err| EncodeError::InconsistentBatch {
+            detail: format!(
+                "column {:?} has invalid Variant discriminators: {err}",
+                field.name
+            ),
+        })?;
+
+    validate_variant_layout(field, alternatives.len(), col)?;
 
     if col.nulls.len != null_count || col.nulls.validity.is_some() {
         return reject(format!(
@@ -1057,7 +1114,144 @@ fn validate_variant(
             name: format!("{} alternative {alternative}", field.name),
             ch_type: ch_type.clone(),
         };
-        validate_column(&child_field, child, expected)?;
+        validate_column(&child_field, child, expected, options, depth + 1)?;
+    }
+    Ok(())
+}
+
+/// Require `col.layout` to be exactly the canonical Arrow routing the
+/// discriminators imply, comparing entry by entry against running counters
+/// instead of materializing a second layout.
+///
+/// The caller has already proved every discriminator in range and the row
+/// count within i32, so the counter arithmetic here cannot overflow and the
+/// per-row expectations are total.
+fn validate_variant_layout(
+    field: &Field,
+    num_variants: usize,
+    col: &VariantColumn,
+) -> Result<(), EncodeError> {
+    let reject = |detail: String| Err(EncodeError::InconsistentBatch { detail });
+    let mismatch = |row: usize| {
+        Err(EncodeError::InconsistentBatch {
+            detail: format!(
+                "column {:?} Variant routing buffers diverge from the canonical Arrow layout of its discriminators at row {row}",
+                field.name
+            ),
+        })
+    };
+    let discriminators = col.discriminators();
+    let num_rows = discriminators.len();
+    let mut child_rows = vec![0usize; num_variants];
+    let mut null_rows = 0usize;
+
+    match &col.layout {
+        VariantLayout::Flat { type_ids, offsets } => {
+            if num_variants >= ARROW_UNION_MAX_CHILDREN {
+                return reject(format!(
+                    "column {:?} Variant with {num_variants} alternatives must use the nested union layout, but carries a flat one",
+                    field.name
+                ));
+            }
+            if type_ids.len() != num_rows || offsets.len() != num_rows {
+                return reject(format!(
+                    "column {:?} Variant carries {} type ids and {} offsets for {num_rows} rows",
+                    field.name,
+                    type_ids.len(),
+                    offsets.len()
+                ));
+            }
+            for (row, &discriminator) in discriminators.iter().enumerate() {
+                let (expected_id, expected_offset) = if discriminator == u8::MAX {
+                    let offset = null_rows;
+                    null_rows += 1;
+                    (num_variants as i8, offset)
+                } else {
+                    let alternative = discriminator as usize;
+                    let offset = child_rows[alternative];
+                    child_rows[alternative] += 1;
+                    (discriminator as i8, offset)
+                };
+                if type_ids[row] != expected_id || offsets[row] != expected_offset as i32 {
+                    return mismatch(row);
+                }
+            }
+        }
+        VariantLayout::Nested {
+            type_ids,
+            offsets,
+            groups,
+        } => {
+            if num_variants < ARROW_UNION_MAX_CHILDREN {
+                return reject(format!(
+                    "column {:?} Variant with {num_variants} alternatives must use the flat union layout, but carries a nested one",
+                    field.name
+                ));
+            }
+            let num_groups = num_variants.div_ceil(ARROW_UNION_MAX_CHILDREN);
+            if groups.len() != num_groups {
+                return reject(format!(
+                    "column {:?} Variant carries {} union groups, expected {num_groups}",
+                    field.name,
+                    groups.len()
+                ));
+            }
+            for (group_index, group) in groups.iter().enumerate() {
+                if group.first_variant != group_index * ARROW_UNION_MAX_CHILDREN {
+                    return reject(format!(
+                        "column {:?} Variant union group {group_index} starts at alternative {}, expected {}",
+                        field.name,
+                        group.first_variant,
+                        group_index * ARROW_UNION_MAX_CHILDREN
+                    ));
+                }
+            }
+            if type_ids.len() != num_rows || offsets.len() != num_rows {
+                return reject(format!(
+                    "column {:?} Variant carries {} type ids and {} offsets for {num_rows} rows",
+                    field.name,
+                    type_ids.len(),
+                    offsets.len()
+                ));
+            }
+            let mut group_rows = vec![0usize; num_groups];
+            for (row, &discriminator) in discriminators.iter().enumerate() {
+                if discriminator == u8::MAX {
+                    if type_ids[row] != num_groups as i8 || offsets[row] != null_rows as i32 {
+                        return mismatch(row);
+                    }
+                    null_rows += 1;
+                    continue;
+                }
+                let alternative = discriminator as usize;
+                let group_index = alternative / ARROW_UNION_MAX_CHILDREN;
+                let local_id = alternative % ARROW_UNION_MAX_CHILDREN;
+                let group_row = group_rows[group_index];
+                let group = &groups[group_index];
+                if type_ids[row] != group_index as i8
+                    || offsets[row] != group_row as i32
+                    || group.type_ids.get(group_row) != Some(&(local_id as i8))
+                    || group.offsets.get(group_row) != Some(&(child_rows[alternative] as i32))
+                {
+                    return mismatch(row);
+                }
+                group_rows[group_index] += 1;
+                child_rows[alternative] += 1;
+            }
+            // Every group buffer must hold exactly the rows the discriminators
+            // routed to it; a longer buffer would smuggle unreferenced entries
+            // past the per-row comparison above.
+            for (group_index, (group, expected)) in groups.iter().zip(group_rows).enumerate() {
+                if group.type_ids.len() != expected || group.offsets.len() != expected {
+                    return reject(format!(
+                        "column {:?} Variant union group {group_index} carries {} type ids and {} offsets, expected {expected}",
+                        field.name,
+                        group.type_ids.len(),
+                        group.offsets.len()
+                    ));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1069,16 +1263,47 @@ fn validate_variant(
 /// order and the number of direct typed children must fit the declared
 /// `max_types`. A FLATTENED column has typed children only and preserves its
 /// transmitted order; it may exceed `max_types` because the server expands
-/// overflow values out of SharedVariant for this representation. Both shapes
-/// use occurrence-ordinal dense offsets, permitting the body writer to emit one
+/// overflow values out of SharedVariant for this representation. A shared-less
+/// column only encodes as FLATTENED when [`EncodeOptions::flattened_dynamic`]
+/// is set; otherwise it takes the V1/V2 fallback with an implicit empty
+/// SharedVariant, so the V1/V2 count limits apply to it too. Both shapes use
+/// occurrence-ordinal dense offsets, permitting the body writer to emit one
 /// routing run followed by one bulk body per child with no materialization.
 fn validate_dynamic(
     field: &Field,
     max_types: u8,
     col: &DynamicColumn,
     num_rows: usize,
+    options: &EncodeOptions,
+    depth: usize,
 ) -> Result<(), EncodeError> {
     let reject = |detail: String| Err(EncodeError::InconsistentBatch { detail });
+
+    // Charge the cumulative nesting budget before walking this level's
+    // children. The per-column `type_depth` cap bounds one declared type, but
+    // every Dynamic level carries fresh child `ChType`s that restart it, so an
+    // unbounded chain of nested DynamicColumns would otherwise overflow the
+    // stack here (and in the write phase, which recurses over the same tree).
+    if depth >= MAX_TYPE_DEPTH {
+        return reject(format!(
+            "column {:?} Dynamic nesting exceeds the maximum type depth {MAX_TYPE_DEPTH}",
+            field.name
+        ));
+    }
+    // Each child type is caller-constructed and about to be rendered
+    // (`to_string`) and semantically walked below, both of which recurse to
+    // its full depth, so bound it first with the same iterative walk
+    // `validate_column` applies to the declared type.
+    for child in &col.children {
+        if let DynamicChild::Typed { ch_type, .. } = child {
+            if type_depth(ch_type) > MAX_TYPE_DEPTH {
+                return reject(format!(
+                    "column {:?} Dynamic child type nesting exceeds the maximum depth of {MAX_TYPE_DEPTH} wrapper/container levels",
+                    field.name
+                ));
+            }
+        }
+    }
 
     if col.type_ids.len() != num_rows || col.offsets.len() != num_rows {
         return reject(format!(
@@ -1088,9 +1313,12 @@ fn validate_dynamic(
             col.offsets.len()
         ));
     }
-    if col.children.len() > u32::MAX as usize {
+    // `>=`, matching decode's `read_dynamic_state`: the u32 routing model
+    // reserves u32::MAX as the NULL sentinel, so u32::MAX children could not
+    // all be addressed.
+    if col.children.len() >= u32::MAX as usize {
         return reject(format!(
-            "column {:?} Dynamic has {} children, exceeding its u32 type-id buffer",
+            "column {:?} Dynamic has {} children, exceeding its u32 type-id routing model (u32::MAX is the NULL sentinel)",
             field.name,
             col.children.len()
         ));
@@ -1108,21 +1336,26 @@ fn validate_dynamic(
         ));
     }
     let direct_count = col.children.len() - shared_count;
-    if shared_count == 1 {
+    // The V1/V2 wire shape applies to a column with a real SharedVariant child
+    // and, when FLATTENED is not opted into, to a shared-less column too (its
+    // implicit empty SharedVariant still occupies a discriminator slot).
+    let v1_v2_wire = shared_count == 1 || !options.flattened_dynamic;
+    if v1_v2_wire {
         if direct_count > max_types as usize {
             return reject(format!(
                 "column {:?} Dynamic carries {direct_count} direct types, exceeding max_types={max_types}",
                 field.name
             ));
         }
-        if col.children.len() > u8::MAX as usize {
+        if direct_count + 1 > u8::MAX as usize {
             return reject(format!(
                 "column {:?} direct Dynamic carries {} children including SharedVariant, exceeding the UInt8 discriminator range",
                 field.name,
-                col.children.len()
+                direct_count + 1
             ));
         }
-
+    }
+    if shared_count == 1 {
         let mut previous: Option<String> = None;
         for child in &col.children {
             let name = match child {
@@ -1217,7 +1450,7 @@ fn validate_dynamic(
                     name: format!("{} Dynamic child {ch_type}", field.name),
                     ch_type: ch_type.clone(),
                 };
-                validate_column(&child_field, values, expected)?;
+                validate_column(&child_field, values, expected, options, depth + 1)?;
             }
             DynamicChild::Shared(values) => {
                 if values.validity.is_some() {

@@ -8,6 +8,7 @@
 
 use std::io;
 
+use crate::native::aggregate_function::aggregate_state_codec;
 use crate::native::protocol::MAX_TYPE_DEPTH;
 use crate::native::type_parser::{normalize_variant_alternatives, parse_ch_type};
 use crate::native::varint::{write_varint, ByteReader};
@@ -340,17 +341,27 @@ fn read_aggregate_function(
     depth: usize,
     complexity: &mut usize,
 ) -> Result<ChType, BinaryTypeError> {
+    // The version VarUInt selects the runtime state layout only (functions
+    // with `IAggregateFunction::getDefaultVersion` overrides, e.g. sumMap and
+    // groupBitmap at v26.3, emit 1, and combinators propagate the nested
+    // version); the descriptor's parameter/argument grammar is identical for
+    // every version. A function whose state this crate parses has a v0-layout
+    // codec registered in `aggregate_function.rs`, so a nonzero version there
+    // is unsupported rather than misframed. A function without a codec is not
+    // framed by this crate, so its version passes through unchecked and its
+    // support is decided downstream.
     let version = reader.read_varint()?;
-    if version != 0 {
-        return Err(BinaryTypeError::Unsupported(format!(
-            "AggregateFunction version {version}"
-        )));
-    }
     let (function, arguments) = read_aggregate_signature(reader, depth, complexity)?;
-    Ok(ChType::AggregateFunction {
+    let ch_type = ChType::AggregateFunction {
         function,
         arguments,
-    })
+    };
+    if version != 0 && aggregate_state_codec(&ch_type).is_some() {
+        return Err(BinaryTypeError::Unsupported(format!(
+            "{ch_type} with state version {version}"
+        )));
+    }
+    Ok(ch_type)
 }
 
 fn read_simple_aggregate_function(
@@ -794,6 +805,30 @@ mod tests {
                 arguments: vec![ChType::UInt64],
             }
         );
+
+        // A nonzero state version changes the runtime state layout. `sum` has
+        // a registered v0 state codec, so its versioned descriptor must be
+        // rejected instead of silently decoding v1 states with v0 framing.
+        let versioned = [0x25, 0x01, 0x03, b's', b'u', b'm', 0x00, 0x01, 0x04];
+        assert!(matches!(
+            read_binary_type(&mut ByteReader::new(&versioned)),
+            Err(BinaryTypeError::Unsupported(reason))
+                if reason.contains("sum") && reason.contains("version 1")
+        ));
+
+        // The version gate applies only to functions with a registered codec.
+        // `sumMap` (which emits version 1 at v26.3) passes the gate at any
+        // version; its classification stays the textual round-trip check's
+        // no-codec rejection, identical for version 0 and 1.
+        for version in [0x00, 0x01] {
+            let opaque = [
+                0x25, version, 0x06, b's', b'u', b'm', b'M', b'a', b'p', 0x00, 0x01, 0x04,
+            ];
+            assert!(matches!(
+                read_binary_type(&mut ByteReader::new(&opaque)),
+                Err(BinaryTypeError::Invalid(reason)) if reason.contains("sumMap")
+            ));
+        }
 
         let simple = [
             0x2e, 0x07, b'a', b'n', b'y', b'L', b'a', b's', b't', 0x00, 0x01, 0x15,

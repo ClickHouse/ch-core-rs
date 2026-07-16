@@ -238,6 +238,7 @@ fn encode_chunked_roundtrips_uuid_ip_blocks() {
             &batch,
             &EncodeOptions {
                 protocol_revision: revision,
+                ..EncodeOptions::default()
             },
         )
         .unwrap();

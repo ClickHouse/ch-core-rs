@@ -458,6 +458,326 @@ fn export_batch_rejects_dynamic_child_set_beyond_union_limit() {
 }
 
 #[test]
+fn stream_routes_null_dynamic_rows_across_chunks() {
+    // NULL rows (u32::MAX ids) spread over multiple chunks must remap to the
+    // trailing Null child of the result-wide union while their borrowed dense
+    // offsets keep the per-chunk null ordinals. Plan children sort by name:
+    // String = 0, UInt64 = 1, NULL = 2.
+    let first = dynamic_batch(
+        DynamicChild::Typed {
+            ch_type: ChType::String,
+            values: Column::Utf8(Utf8Column::new(vec![0, 6, 12], b"user_1user_2".to_vec())),
+        },
+        &[0, u32::MAX, 0, u32::MAX],
+    );
+    let second = dynamic_batch(
+        DynamicChild::Typed {
+            ch_type: ChType::UInt64,
+            values: Column::UInt64(PrimitiveColumn::new(vec![79])),
+        },
+        &[u32::MAX, 0, u32::MAX],
+    );
+    let schema = first.schema.clone();
+
+    unsafe {
+        let mut stream: ArrowArrayStream = std::mem::zeroed();
+        export_chunks_to_stream(schema, vec![first, second], &mut stream);
+
+        let mut first_array: ArrowArray = std::mem::zeroed();
+        assert_eq!((stream.get_next.unwrap())(&mut stream, &mut first_array), 0);
+        let dynamic = &**first_array.children.add(0);
+        assert_eq!(dynamic.n_children, 3);
+        let ids = *dynamic.buffers.add(0) as *const i8;
+        assert_eq!(std::slice::from_raw_parts(ids, 4), &[0, 2, 0, 2]);
+        let offsets = *dynamic.buffers.add(1) as *const i32;
+        assert_eq!(std::slice::from_raw_parts(offsets, 4), &[0, 0, 1, 1]);
+        let null_child = &**dynamic.children.add(2);
+        assert_eq!(null_child.length, 2);
+        assert_eq!(null_child.null_count, 2);
+
+        let mut second_array: ArrowArray = std::mem::zeroed();
+        assert_eq!(
+            (stream.get_next.unwrap())(&mut stream, &mut second_array),
+            0
+        );
+        let dynamic = &**second_array.children.add(0);
+        let ids = *dynamic.buffers.add(0) as *const i8;
+        assert_eq!(std::slice::from_raw_parts(ids, 3), &[2, 1, 2]);
+        let offsets = *dynamic.buffers.add(1) as *const i32;
+        assert_eq!(std::slice::from_raw_parts(offsets, 3), &[0, 0, 1]);
+        assert_eq!((**dynamic.children.add(0)).length, 0);
+        assert_eq!((**dynamic.children.add(1)).length, 1);
+        assert_eq!((**dynamic.children.add(2)).length, 2);
+
+        (second_array.release.unwrap())(&mut second_array);
+        (first_array.release.unwrap())(&mut first_array);
+        (stream.release.unwrap())(&mut stream);
+    }
+}
+
+#[test]
+fn stream_exports_empty_shared_variant_for_chunk_missing_it() {
+    // The plan unifies SharedVariant from the first chunk with String from
+    // both. The second chunk has no SharedVariant child, so its batch must
+    // export an empty Binary child in that slot and remap its lone local
+    // String child to the planned index. Name order: SharedVariant = 0,
+    // String = 1, NULL = 2.
+    let shared = Utf8Column::new(vec![0, 3], vec![0x15, 0x01, b'x']);
+    let first = Arc::new(ColBatch::new(
+        Schema::new(vec![Field {
+            name: "v".into(),
+            ch_type: ChType::Dynamic { max_types: 2 },
+        }]),
+        vec![Column::Dynamic(
+            DynamicColumn::try_new(
+                &[0, 1],
+                vec![
+                    DynamicChild::Shared(shared),
+                    DynamicChild::Typed {
+                        ch_type: ChType::String,
+                        values: Column::Utf8(Utf8Column::new(vec![0, 6], b"user_1".to_vec())),
+                    },
+                ],
+            )
+            .unwrap(),
+        )],
+        2,
+    ));
+    let second = dynamic_batch(
+        DynamicChild::Typed {
+            ch_type: ChType::String,
+            values: Column::Utf8(Utf8Column::new(vec![0, 6], b"user_2".to_vec())),
+        },
+        &[0],
+    );
+    let schema = first.schema.clone();
+
+    unsafe {
+        let mut stream: ArrowArrayStream = std::mem::zeroed();
+        export_chunks_to_stream(schema, vec![first, second], &mut stream);
+
+        let mut arrow_schema: ArrowSchema = std::mem::zeroed();
+        assert_eq!(
+            (stream.get_schema.unwrap())(&mut stream, &mut arrow_schema),
+            0
+        );
+        let dynamic_schema = &**arrow_schema.children.add(0);
+        assert_eq!(dynamic_schema.n_children, 3);
+        assert_eq!(
+            CStr::from_ptr((**dynamic_schema.children.add(0)).name)
+                .to_str()
+                .unwrap(),
+            "SharedVariant"
+        );
+        assert_eq!(
+            CStr::from_ptr((**dynamic_schema.children.add(1)).name)
+                .to_str()
+                .unwrap(),
+            "String"
+        );
+
+        let mut first_array: ArrowArray = std::mem::zeroed();
+        assert_eq!((stream.get_next.unwrap())(&mut stream, &mut first_array), 0);
+        let dynamic = &**first_array.children.add(0);
+        let ids = *dynamic.buffers.add(0) as *const i8;
+        assert_eq!(std::slice::from_raw_parts(ids, 2), &[0, 1]);
+        assert_eq!((**dynamic.children.add(0)).length, 1);
+        assert_eq!((**dynamic.children.add(1)).length, 1);
+
+        let mut second_array: ArrowArray = std::mem::zeroed();
+        assert_eq!(
+            (stream.get_next.unwrap())(&mut stream, &mut second_array),
+            0
+        );
+        let dynamic = &**second_array.children.add(0);
+        assert_eq!(dynamic.n_children, 3);
+        let ids = *dynamic.buffers.add(0) as *const i8;
+        assert_eq!(*ids, 1);
+        // The missing SharedVariant slot is a valid empty Binary array.
+        let empty_shared = &**dynamic.children.add(0);
+        assert_eq!(empty_shared.length, 0);
+        assert_eq!(empty_shared.n_buffers, 3);
+        assert_eq!((**dynamic.children.add(1)).length, 1);
+
+        (second_array.release.unwrap())(&mut second_array);
+        (first_array.release.unwrap())(&mut first_array);
+        (arrow_schema.release.unwrap())(&mut arrow_schema);
+        (stream.release.unwrap())(&mut stream);
+    }
+}
+
+/// A Dynamic column with two block-local children sharing one canonical name,
+/// constructible only through the public fields (`try_new` rejects it).
+fn duplicate_child_dynamic_batch() -> Arc<ColBatch> {
+    let column = DynamicColumn {
+        type_ids: vec![0, 1],
+        offsets: vec![0, 0],
+        children: vec![
+            DynamicChild::Typed {
+                ch_type: ChType::String,
+                values: Column::Utf8(Utf8Column::new(vec![0, 6], b"user_1".to_vec())),
+            },
+            DynamicChild::Typed {
+                ch_type: ChType::String,
+                values: Column::Utf8(Utf8Column::new(vec![0, 6], b"user_2".to_vec())),
+            },
+        ],
+        nulls: NothingColumn::new(0),
+    };
+    Arc::new(ColBatch::new(
+        Schema::new(vec![Field {
+            name: "v".into(),
+            ch_type: ChType::Dynamic { max_types: 2 },
+        }]),
+        vec![Column::Dynamic(column)],
+        2,
+    ))
+}
+
+#[test]
+fn stream_rejects_duplicate_dynamic_child_names() {
+    let batch = duplicate_child_dynamic_batch();
+    let schema = batch.schema.clone();
+
+    unsafe {
+        let mut stream: ArrowArrayStream = std::mem::zeroed();
+        export_chunks_to_stream(schema, vec![batch], &mut stream);
+
+        let mut arrow_schema: ArrowSchema = std::mem::zeroed();
+        assert_ne!(
+            (stream.get_schema.unwrap())(&mut stream, &mut arrow_schema),
+            0
+        );
+        assert!(arrow_schema.release.is_none());
+
+        let mut array: ArrowArray = std::mem::zeroed();
+        assert_ne!((stream.get_next.unwrap())(&mut stream, &mut array), 0);
+        assert!(array.release.is_none());
+
+        let msg = CStr::from_ptr((stream.get_last_error.unwrap())(&mut stream))
+            .to_str()
+            .unwrap();
+        assert!(msg.contains("String"), "unexpected message: {msg}");
+        assert!(msg.contains("unique"), "unexpected message: {msg}");
+
+        (stream.release.unwrap())(&mut stream);
+    }
+}
+
+#[test]
+fn export_batch_rejects_duplicate_dynamic_child_names() {
+    let batch = duplicate_child_dynamic_batch();
+    let expected = ExportError::DynamicDuplicateChild {
+        name: "String".to_string(),
+    };
+
+    unsafe {
+        let mut schema: ArrowSchema = std::mem::zeroed();
+        let mut array: ArrowArray = std::mem::zeroed();
+        assert_eq!(
+            export_batch(&batch, &mut schema, &mut array).unwrap_err(),
+            expected
+        );
+        assert!(schema.release.is_none());
+        assert!(array.release.is_none());
+
+        let mut schema_only: ArrowSchema = std::mem::zeroed();
+        assert_eq!(
+            export_batch_schema(&batch, &mut schema_only).unwrap_err(),
+            expected
+        );
+        assert!(schema_only.release.is_none());
+
+        let mut array_only: ArrowArray = std::mem::zeroed();
+        assert_eq!(
+            export_batch_array(&batch, &mut array_only).unwrap_err(),
+            expected
+        );
+        assert!(array_only.release.is_none());
+    }
+}
+
+// The standalone export clamps a block-local id that indexes no child (public
+// fields allow constructing one) to the NULL child instead of emitting a
+// wrapped union code or indexing out of bounds. Debug builds trip the
+// deliberate assert instead; release builds take the silent safe route.
+#[test]
+#[cfg_attr(debug_assertions, should_panic(expected = "indexes no child"))]
+fn export_batch_routes_out_of_range_dynamic_id_to_null() {
+    let column = DynamicColumn {
+        type_ids: vec![0, 5],
+        offsets: vec![0, 0],
+        children: vec![DynamicChild::Typed {
+            ch_type: ChType::String,
+            values: Column::Utf8(Utf8Column::new(vec![0, 6], b"user_1".to_vec())),
+        }],
+        nulls: NothingColumn::new(0),
+    };
+    let batch = Arc::new(ColBatch::new(
+        Schema::new(vec![Field {
+            name: "v".into(),
+            ch_type: ChType::Dynamic { max_types: 1 },
+        }]),
+        vec![Column::Dynamic(column)],
+        2,
+    ));
+
+    unsafe {
+        let mut schema: ArrowSchema = std::mem::zeroed();
+        let mut array: ArrowArray = std::mem::zeroed();
+        export_batch(&batch, &mut schema, &mut array).unwrap();
+        let dynamic = &**array.children.add(0);
+        let ids = *dynamic.buffers.add(0) as *const i8;
+        // Row 1's unroutable id 5 lands on the trailing NULL child (code 1).
+        assert_eq!(std::slice::from_raw_parts(ids, 2), &[0, 1]);
+        (array.release.unwrap())(&mut array);
+        (schema.release.unwrap())(&mut schema);
+    }
+}
+
+// Same clamp in the grouped (128+ children) branch, where an out-of-range id
+// previously indexed `group_counts` out of bounds and aborted the process.
+#[test]
+#[cfg_attr(debug_assertions, should_panic(expected = "indexes no child"))]
+fn export_batch_routes_out_of_range_dynamic_id_to_null_in_grouped_union() {
+    let children = (1..=128)
+        .map(|width| DynamicChild::Typed {
+            ch_type: ChType::FixedString(width),
+            values: Column::FixedBinary(FixedBinaryColumn::new(
+                if width == 1 { vec![0x13] } else { Vec::new() },
+                width,
+            )),
+        })
+        .collect();
+    let column = DynamicColumn {
+        type_ids: vec![0, 200],
+        offsets: vec![0, 0],
+        children,
+        nulls: NothingColumn::new(0),
+    };
+    let batch = Arc::new(ColBatch::new(
+        Schema::new(vec![Field {
+            name: "v".into(),
+            ch_type: ChType::Dynamic { max_types: 254 },
+        }]),
+        vec![Column::Dynamic(column)],
+        2,
+    ));
+
+    unsafe {
+        let mut schema: ArrowSchema = std::mem::zeroed();
+        let mut array: ArrowArray = std::mem::zeroed();
+        export_batch(&batch, &mut schema, &mut array).unwrap();
+        let outer = &**array.children.add(0);
+        let outer_ids = *outer.buffers.add(0) as *const i8;
+        // Row 1's unroutable id 200 lands on the outer NULL child (code 1).
+        assert_eq!(std::slice::from_raw_parts(outer_ids, 2), &[0, 1]);
+        (array.release.unwrap())(&mut array);
+        (schema.release.unwrap())(&mut schema);
+    }
+}
+
+#[test]
 fn stream_remaps_reversed_local_children_and_preserves_dense_offsets() {
     let make = |children, ids: &[u32]| {
         Arc::new(ColBatch::new(

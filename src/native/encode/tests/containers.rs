@@ -567,6 +567,7 @@ fn roundtrip_map_all_empty_lc_key() {
         &batch,
         &EncodeOptions {
             protocol_revision: 0,
+            ..EncodeOptions::default()
         },
     )
     .unwrap();
@@ -766,6 +767,7 @@ fn roundtrip_array_of_tuple_all_empty() {
         &batch,
         &EncodeOptions {
             protocol_revision: 0,
+            ..EncodeOptions::default()
         },
     )
     .unwrap();
@@ -817,6 +819,7 @@ fn encode_chunked_roundtrips_array_blocks() {
             &batch,
             &EncodeOptions {
                 protocol_revision: revision,
+                ..EncodeOptions::default()
             },
         )
         .unwrap();

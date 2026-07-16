@@ -20,6 +20,7 @@ pub use crate::native::protocol::{
 };
 use crate::native::protocol::{
     LC_HAS_ADDITIONAL_KEYS_BIT, LC_NEED_GLOBAL_DICTIONARY_BIT, LOW_CARDINALITY_KEY_VERSION,
+    MAX_TYPE_DEPTH,
 };
 use crate::native::type_binary::{read_binary_type, BinaryTypeError};
 use crate::native::type_parser::{
@@ -401,12 +402,25 @@ fn decode_bfloat16_data(reader: &mut ByteReader, num_rows: usize) -> io::Result<
 ///
 /// Returns the parsed key version for `LowCardinality` (so the decoder does not
 /// re-read it), `None` for every other type.
+///
+/// `depth` is the cumulative nesting depth from the column root, incremented on
+/// every structural descent. The parser bounds a single type string at
+/// [`MAX_TYPE_DEPTH`], but Dynamic's runtime type table is column DATA parsed
+/// fresh at each Dynamic level, so each level would restart that budget: a
+/// hostile stream nesting `Array(Dynamic)` tens of thousands of levels deep
+/// would otherwise overflow the stack here. Charging every level against one
+/// cumulative budget and checking it at the Dynamic arm turns that into an
+/// [`DecodeError::InvalidDynamic`]. This gate also bounds the body and suffix
+/// traversals ([`decode_values`], [`skip_values`], [`read_state_suffix`]): they
+/// recurse over exactly the prefix traversal's tree, consuming the
+/// `dynamic_states` this function retained, so no deeper state can exist.
 fn read_state_prefix(
     reader: &mut ByteReader,
     ch_type: &ChType,
     column: &str,
     options: &DecodeSettings,
     dynamic_states: &mut Vec<DynamicState>,
+    depth: usize,
 ) -> Result<Option<u64>, DecodeError> {
     // A name-decoration alias (SimpleAggregateFunction, geo, Nested) has the
     // exact state prefix of the type it delegates to, so expand and recurse. For
@@ -414,7 +428,7 @@ fn read_state_prefix(
     // 8-byte key version through the delegated Array(Tuple(...)) chain, hoisting
     // it to the very front of the whole column, before the offsets.
     if let Some(under) = ch_type.physical_delegate() {
-        return read_state_prefix(reader, &under, column, options, dynamic_states);
+        return read_state_prefix(reader, &under, column, options, dynamic_states, depth + 1);
     }
     match ch_type {
         ChType::LowCardinality(_) => {
@@ -432,7 +446,9 @@ fn read_state_prefix(
         // prefix (confirmed at v26.6.1.1193-stable). This is how a leaf
         // `LowCardinality`'s 8-byte key version is consumed here, at the front of
         // the whole Array column, before the offsets.
-        ChType::Array(inner) => read_state_prefix(reader, inner, column, options, dynamic_states),
+        ChType::Array(inner) => {
+            read_state_prefix(reader, inner, column, options, dynamic_states, depth + 1)
+        }
         // Tuple writes no prefix of its own; `SerializationTuple`'s
         // `deserializeBinaryBulkStatePrefix` loops over the elements in
         // declaration order and delegates to each (confirmed at
@@ -441,7 +457,14 @@ fn read_state_prefix(
         // and nothing for the Int32.
         ChType::Tuple(elements) => {
             for (_, element_type) in elements {
-                read_state_prefix(reader, element_type, column, options, dynamic_states)?;
+                read_state_prefix(
+                    reader,
+                    element_type,
+                    column,
+                    options,
+                    dynamic_states,
+                    depth + 1,
+                )?;
             }
             Ok(None)
         }
@@ -452,8 +475,8 @@ fn read_state_prefix(
         // Map(LowCardinality(String), Int32) has the LC 8-byte key version at
         // the very front of the whole column, before the offsets.
         ChType::Map(key, value) => {
-            read_state_prefix(reader, key, column, options, dynamic_states)?;
-            read_state_prefix(reader, value, column, options, dynamic_states)
+            read_state_prefix(reader, key, column, options, dynamic_states, depth + 1)?;
+            read_state_prefix(reader, value, column, options, dynamic_states, depth + 1)
         }
         // Direct FORMAT Native always uses BASIC Variant discriminators at the
         // pinned server tag. The prefix starts with one fixed-width LE UInt64
@@ -472,11 +495,28 @@ fn read_state_prefix(
                 });
             }
             for alternative in alternatives {
-                read_state_prefix(reader, alternative, column, options, dynamic_states)?;
+                read_state_prefix(
+                    reader,
+                    alternative,
+                    column,
+                    options,
+                    dynamic_states,
+                    depth + 1,
+                )?;
             }
             Ok(None)
         }
         ChType::Dynamic { max_types } => {
+            // Charge the cumulative budget HERE, before parsing this level's
+            // runtime type table: Dynamic is the only construct whose nested
+            // types arrive as data rather than through the depth-capped header
+            // parser, so it is the only place the per-type cap can be restarted.
+            if depth >= MAX_TYPE_DEPTH {
+                return Err(invalid_dynamic(
+                    column,
+                    format!("Dynamic nesting exceeds the maximum type depth {MAX_TYPE_DEPTH}"),
+                ));
+            }
             let state = read_dynamic_state(reader, *max_types, column, options)?;
             // Prefix and body traversals visit Dynamic nodes in the same
             // preorder. Recurse while `state` is still local, then insert this
@@ -486,7 +526,7 @@ fn read_state_prefix(
             let state_index = dynamic_states.len();
             for child in &state.children {
                 if let DynamicStateChild::Typed(ch_type) = child {
-                    read_state_prefix(reader, ch_type, column, options, dynamic_states)?;
+                    read_state_prefix(reader, ch_type, column, options, dynamic_states, depth + 1)?;
                 }
             }
             dynamic_states.insert(state_index, state);
@@ -500,7 +540,7 @@ fn read_state_prefix(
         // LowCardinality element), but recursing unconditionally keeps this
         // faithful to the server for any future nullable-wrappable container.
         ChType::Nullable(inner) => {
-            read_state_prefix(reader, inner, column, options, dynamic_states)
+            read_state_prefix(reader, inner, column, options, dynamic_states, depth + 1)
         }
         _ => Ok(None),
     }
@@ -947,7 +987,7 @@ fn decode_column(
     // element type's prefix (so a leaf LowCardinality key version is consumed
     // here, before the offsets).
     let mut dynamic_states = Vec::new();
-    read_state_prefix(reader, ch_type, column, options, &mut dynamic_states)?;
+    read_state_prefix(reader, ch_type, column, options, &mut dynamic_states, 0)?;
     let mut dynamic_index = 0usize;
     let decoded = decode_values(
         reader,
@@ -1183,13 +1223,19 @@ fn decode_dynamic(
             "row count exceeds Arrow Dense Union's i32 child-offset range",
         ));
     }
-    let mut type_ids = Vec::with_capacity(num_rows);
-    let mut offsets = Vec::with_capacity(num_rows);
     let mut counts = vec![0usize; num_children];
     let mut null_count = 0usize;
+    // Read-before-allocate (the `decode_primitive!` hardening): each arm reads
+    // its index run first, bounding it against the bytes present, and only then
+    // reserves the routing buffers, so a hostile row count cannot drive a giant
+    // allocation ahead of the truncation error.
+    let mut type_ids = Vec::new();
+    let mut offsets = Vec::new();
     match state.kind {
         DynamicWireKind::Variant => {
             let raw = reader.read_slice(num_rows)?;
+            type_ids.reserve_exact(num_rows);
+            offsets.reserve_exact(num_rows);
             for (row, &discriminator) in raw.iter().enumerate() {
                 if discriminator == u8::MAX {
                     type_ids.push(u32::MAX);
@@ -1214,6 +1260,11 @@ fn decode_dynamic(
             let values = num_children
                 .checked_add(1)
                 .ok_or_else(|| invalid_dynamic(column, "flattened child count overflows usize"))?;
+            // The server's getSmallestIndexesType picks width 4 for
+            // `values <= u32::MAX + 1`; the `<= u32::MAX` here diverges by one,
+            // but the divergence is unreachable: `read_dynamic_state` rejects a
+            // runtime type count >= u32::MAX first, so `values <= u32::MAX`
+            // always holds and the width-8 arm is dead.
             let width = if values <= u8::MAX as usize + 1 {
                 1
             } else if values <= u16::MAX as usize + 1 {
@@ -1230,6 +1281,8 @@ fn decode_dynamic(
                 ))
             })?;
             let raw = reader.read_slice(byte_len)?;
+            type_ids.reserve_exact(num_rows);
+            offsets.reserve_exact(num_rows);
             for (row, bytes) in raw.chunks_exact(width).enumerate() {
                 let index = match width {
                     1 => bytes[0] as u64,
@@ -2540,7 +2593,7 @@ fn skip_column_data(
     // bytes for every type except LowCardinality; Array, Tuple, and Nullable
     // recurse into their element/inner prefixes.
     let mut dynamic_states = Vec::new();
-    read_state_prefix(reader, ch_type, column, options, &mut dynamic_states)?;
+    read_state_prefix(reader, ch_type, column, options, &mut dynamic_states, 0)?;
     let mut dynamic_index = 0usize;
     skip_values(
         reader,
@@ -2730,6 +2783,9 @@ fn skip_dynamic_data(
             let values = num_children
                 .checked_add(1)
                 .ok_or_else(|| invalid_dynamic(column, "flattened child count overflows usize"))?;
+            // Same width selection as `decode_dynamic`: `<= u32::MAX` diverges
+            // by one from the server's `<= u32::MAX + 1`, unreachably, because
+            // `read_dynamic_state` rejects a type count >= u32::MAX first.
             let width = if values <= u8::MAX as usize + 1 {
                 1
             } else if values <= u16::MAX as usize + 1 {

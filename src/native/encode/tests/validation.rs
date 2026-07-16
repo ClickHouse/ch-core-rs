@@ -138,6 +138,7 @@ fn zero_row_block_roundtrips_schema() {
             &batch,
             &EncodeOptions {
                 protocol_revision: revision,
+                ..EncodeOptions::default()
             },
         )
         .unwrap();
@@ -203,6 +204,7 @@ fn rev_tcp_frames_block_info_and_marker() {
         &batch,
         &EncodeOptions {
             protocol_revision: DBMS_TCP_PROTOCOL_VERSION,
+            ..EncodeOptions::default()
         },
     )
     .unwrap();

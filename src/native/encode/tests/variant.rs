@@ -112,6 +112,71 @@ fn malformed_variant_routing_is_rejected_before_writing() {
 }
 
 #[test]
+fn malformed_nested_variant_group_routing_is_rejected() {
+    // >= 128 alternatives force the Nested layout; tamper with a group's dense
+    // routing and with a group's buffer length, each of which the incremental
+    // layout validation must catch before any bytes are written.
+    let mut names: Vec<String> = (1..=130).map(|w| format!("FixedString({w})")).collect();
+    names.sort();
+    let type_name = format!("Variant({})", names.join(", "));
+    let ch_type = parse_ch_type(&type_name).expect("canonical Variant header parses");
+    let ChType::Variant(alternatives) = &ch_type else {
+        unreachable!("parsed a Variant header");
+    };
+    let widths: Vec<usize> = alternatives
+        .iter()
+        .map(|a| match a {
+            ChType::FixedString(w) => *w,
+            other => panic!("expected FixedString alternative, got {other:?}"),
+        })
+        .collect();
+    let discriminators = [0u8, 129];
+    let children: Vec<Column> = widths
+        .iter()
+        .enumerate()
+        .map(|(alt, &width)| {
+            let count = discriminators
+                .iter()
+                .filter(|&&d| d as usize == alt)
+                .count();
+            Column::FixedBinary(FixedBinaryColumn::new(vec![0x13; width * count], width))
+        })
+        .collect();
+    let column = VariantColumn::try_new(&discriminators, children).unwrap();
+    let make_batch = |column: VariantColumn| {
+        ColBatch::new(
+            Schema::new(vec![Field {
+                name: "v".into(),
+                ch_type: ch_type.clone(),
+            }]),
+            vec![Column::Variant(column)],
+            discriminators.len(),
+        )
+    };
+
+    let mut bad_offset = column.clone();
+    let VariantLayout::Nested { groups, .. } = &mut bad_offset.layout else {
+        panic!("130 alternatives must use the nested union layout");
+    };
+    groups[1].offsets[0] = 5;
+    assert!(matches!(
+        encode_block(&make_batch(bad_offset), &EncodeOptions::default()),
+        Err(EncodeError::InconsistentBatch { .. })
+    ));
+
+    let mut oversized_group = column;
+    let VariantLayout::Nested { groups, .. } = &mut oversized_group.layout else {
+        panic!("130 alternatives must use the nested union layout");
+    };
+    groups[0].type_ids.push(0);
+    groups[0].offsets.push(1);
+    assert!(matches!(
+        encode_block(&make_batch(oversized_group), &EncodeOptions::default()),
+        Err(EncodeError::InconsistentBatch { .. })
+    ));
+}
+
+#[test]
 fn roundtrip_nested_variant_128_plus_alternatives() {
     // A Variant with >= 128 alternatives forces the two-level (Nested) Arrow
     // union layout. Use FixedString(1..=200) so canonicalization spreads the

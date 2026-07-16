@@ -269,13 +269,19 @@ fn assert_batches_eq(left: &ColBatch, right: &ColBatch) {
 /// Encode `batch` as one block at `revision`, decode it back, and assert the
 /// buffers survived unchanged.
 fn roundtrip(batch: &ColBatch, revision: u64) {
-    let bytes = encode_block(
+    roundtrip_opts(
         batch,
         &EncodeOptions {
             protocol_revision: revision,
+            ..EncodeOptions::default()
         },
-    )
-    .unwrap();
+    );
+}
+
+/// [`roundtrip`] with full encode options (e.g. the Dynamic FLATTENED opt-in).
+fn roundtrip_opts(batch: &ColBatch, options: &EncodeOptions) {
+    let revision = options.protocol_revision;
+    let bytes = encode_block(batch, options).unwrap();
     let decoded = decode_all_bytes(
         &bytes,
         &DecodeOptions {

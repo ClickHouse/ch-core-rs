@@ -2,3 +2,6 @@
 name = "ch-core-rs"
 version = "0.1.0"
 edition = "2021"
+# The ffi module's abort-on-unwind contract relies on extern "C" unwind abort
+# semantics guaranteed from Rust 1.81.
+rust-version = "1.81"

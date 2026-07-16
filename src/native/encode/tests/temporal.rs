@@ -155,6 +155,7 @@ fn encode_chunked_roundtrips_time_blocks() {
             &batch,
             &EncodeOptions {
                 protocol_revision: revision,
+                ..EncodeOptions::default()
             },
         )
         .unwrap();
