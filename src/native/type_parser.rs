@@ -6,7 +6,10 @@
 
 use crate::native::aggregate_function::aggregate_state_codec;
 use crate::native::protocol::MAX_TYPE_DEPTH;
-use crate::schema::{ChType, GeoKind, IntervalKind};
+use crate::schema::{
+    ChType, GeoKind, IntervalKind, JSON_DEFAULT_MAX_DYNAMIC_PATHS, JSON_DEFAULT_MAX_DYNAMIC_TYPES,
+    JSON_MAX_DYNAMIC_PATHS, JSON_MAX_DYNAMIC_TYPES, JSON_MAX_TYPED_PATHS,
+};
 
 // ---------------------------------------------------------------------------
 // Type name parsing
@@ -146,6 +149,30 @@ fn parse_ch_type_depth(type_name: &str, depth: usize) -> Option<ChType> {
             }
             let max_types = value.trim().parse::<u8>().ok()?;
             return (max_types <= 254).then_some(ChType::Dynamic { max_types });
+        }
+    }
+
+    // JSON / JSON(...). The new `DataTypeObject` (confirmed at
+    // v26.6.1.1193-stable, `registerDataTypeJSON` / `DataTypeObject::doGetName` /
+    // `ParserDataType` ObjectArgumentParser). The server registers it
+    // case-insensitively, but `NativeWriter` always emits the canonical `doGetName`
+    // spelling, so only the exact `JSON` word and `JSON(...)` prefix are parsed
+    // here. Legacy `Object('json')` is unregistered at this tag and is not parsed.
+    // Charges one depth level for the JSON node itself; typed-path types recurse
+    // at `depth + 1`, so the `MAX_TYPE_DEPTH` cap bounds a hostile nested-JSON
+    // header exactly like the container arms.
+    if type_name == "JSON" {
+        return Some(ChType::Json {
+            max_dynamic_paths: JSON_DEFAULT_MAX_DYNAMIC_PATHS,
+            max_dynamic_types: JSON_DEFAULT_MAX_DYNAMIC_TYPES,
+            typed_paths: Vec::new(),
+            skip_paths: Vec::new(),
+            skip_regexps: Vec::new(),
+        });
+    }
+    if let Some(inner) = type_name.strip_prefix("JSON(") {
+        if let Some(inner) = inner.strip_suffix(')') {
+            return parse_json_arguments(inner, depth);
         }
     }
 
@@ -578,6 +605,27 @@ pub(crate) fn unsupported_header_type_name(ch_type: &ChType) -> Option<String> {
                 arguments.iter().find_map(unsupported_header_type_name)
             }
         }
+        // A `JSON` header is unsupported if a parameter is past the server's
+        // construction limits, or if any typed-path type is unsupported. The
+        // dynamic paths and skip entries carry no nested types, and the sorted
+        // canonical form is enforced separately by the encode round-trip check.
+        ChType::Json {
+            max_dynamic_paths,
+            max_dynamic_types,
+            typed_paths,
+            ..
+        } => {
+            if *max_dynamic_paths > JSON_MAX_DYNAMIC_PATHS
+                || *max_dynamic_types > JSON_MAX_DYNAMIC_TYPES
+                || typed_paths.len() > JSON_MAX_TYPED_PATHS
+            {
+                Some(ch_type.to_string())
+            } else {
+                typed_paths
+                    .iter()
+                    .find_map(|(_, ty)| unsupported_header_type_name(ty))
+            }
+        }
         _ => None,
     }
 }
@@ -699,6 +747,153 @@ fn parse_nested_elements(inner: &str, depth: usize) -> Option<Vec<(String, ChTyp
         fields.push((name, ch_type));
     }
     Some(fields)
+}
+
+/// Parse the argument list of a `JSON(...)` type string into a
+/// [`ChType::Json`], canonicalizing to the server's `doGetName` order.
+///
+/// The list is split on top-level commas ([`split_top_level_commas`], which
+/// already protects parenthesized type arguments, single-quoted `SKIP REGEXP`
+/// literals, and backtick-quoted paths), and each part is classified in this
+/// order: the named parameters `max_dynamic_types=M` / `max_dynamic_paths=N`
+/// (both distinguished by the literal `=`, so a typed path merely named
+/// `max_dynamic_types` still parses as a path), then `SKIP REGEXP '<regex>'`
+/// (checked before the bare `SKIP` since it shares the prefix), then `SKIP
+/// <path>`, then a typed path `<path> <TypeName>`. Duplicate parameters, a typed
+/// path that repeats a name, or any value past the server's construction limits
+/// (`max_dynamic_paths` <= 10000, `max_dynamic_types` <= 254, typed paths <=
+/// 1000) return `None` (-> `UnsupportedType`). Typed paths, skip paths, and skip
+/// regexps are sorted so the parsed type is already canonical and round-trips
+/// through `Display`.
+fn parse_json_arguments(inner: &str, depth: usize) -> Option<ChType> {
+    let mut max_dynamic_paths = JSON_DEFAULT_MAX_DYNAMIC_PATHS;
+    let mut max_dynamic_types = JSON_DEFAULT_MAX_DYNAMIC_TYPES;
+    let mut seen_max_paths = false;
+    let mut seen_max_types = false;
+    let mut typed_paths: Vec<(String, ChType)> = Vec::new();
+    let mut skip_paths: Vec<String> = Vec::new();
+    let mut skip_regexps: Vec<String> = Vec::new();
+
+    let trimmed = inner.trim_matches(' ');
+    // `JSON()` is not a spelling the server emits (it drops the parens when
+    // every parameter is default), but accept an empty list as the default JSON
+    // rather than rejecting a harmless header.
+    if !trimmed.is_empty() {
+        for part in split_top_level_commas(trimmed)? {
+            let part = part.trim_matches(' ');
+            if let Some(value) = part.strip_prefix("max_dynamic_types=") {
+                if seen_max_types {
+                    return None;
+                }
+                seen_max_types = true;
+                max_dynamic_types = value.trim().parse::<u8>().ok()?;
+                if max_dynamic_types > JSON_MAX_DYNAMIC_TYPES {
+                    return None;
+                }
+            } else if let Some(value) = part.strip_prefix("max_dynamic_paths=") {
+                if seen_max_paths {
+                    return None;
+                }
+                seen_max_paths = true;
+                max_dynamic_paths = value.trim().parse::<u32>().ok()?;
+                if max_dynamic_paths > JSON_MAX_DYNAMIC_PATHS {
+                    return None;
+                }
+            } else if let Some(regex) = part.strip_prefix("SKIP REGEXP ") {
+                skip_regexps.push(parse_single_quoted_literal(regex.trim_matches(' '))?);
+            } else if let Some(path) = part.strip_prefix("SKIP ") {
+                skip_paths.push(parse_json_path_token(path.trim_matches(' '))?);
+            } else {
+                typed_paths.push(parse_json_typed_path(part, depth)?);
+            }
+        }
+    }
+
+    if typed_paths.len() > JSON_MAX_TYPED_PATHS {
+        return None;
+    }
+    // Canonicalize: sort by path and reject a repeated typed-path name.
+    typed_paths.sort_by(|left, right| left.0.cmp(&right.0));
+    if typed_paths.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return None;
+    }
+    skip_paths.sort();
+    skip_paths.dedup();
+    skip_regexps.sort();
+    skip_regexps.dedup();
+
+    Some(ChType::Json {
+        max_dynamic_paths,
+        max_dynamic_types,
+        typed_paths,
+        skip_paths,
+        skip_regexps,
+    })
+}
+
+/// Parse one `JSON` typed path `<path> <TypeName>` into a `(path, type)` pair.
+///
+/// The path is either a whole-path backtick-quoted string (any bytes, via
+/// [`parse_back_quoted_name`]) or a bare token running to the first space (which
+/// permits a dotted path like `a.b.c` that is not a valid single identifier).
+/// The remainder after the path is the element type, parsed at `depth + 1`.
+fn parse_json_typed_path(part: &str, depth: usize) -> Option<(String, ChType)> {
+    let bytes = part.as_bytes();
+    if bytes.first() == Some(&b'`') {
+        let mut pos = 1usize;
+        let name = parse_back_quoted_name(bytes, &mut pos)?;
+        let rest = part.get(pos..)?.trim_matches(' ');
+        if rest.is_empty() {
+            return None;
+        }
+        let ch_type = parse_ch_type_depth(rest, depth + 1)?;
+        Some((name, ch_type))
+    } else {
+        let (path, rest) = part.split_once(' ')?;
+        let rest = rest.trim_matches(' ');
+        if path.is_empty() || rest.is_empty() {
+            return None;
+        }
+        let ch_type = parse_ch_type_depth(rest, depth + 1)?;
+        Some((path.to_string(), ch_type))
+    }
+}
+
+/// Parse a bare or backtick-quoted `JSON` path token that carries no trailing
+/// type (a `SKIP <path>` entry). A bare token may be a dotted path but must not
+/// contain a space; a backtick-quoted token must be the whole remainder.
+fn parse_json_path_token(token: &str) -> Option<String> {
+    let bytes = token.as_bytes();
+    if bytes.first() == Some(&b'`') {
+        let mut pos = 1usize;
+        let name = parse_back_quoted_name(bytes, &mut pos)?;
+        token
+            .get(pos..)?
+            .trim_matches(' ')
+            .is_empty()
+            .then_some(name)
+    } else if token.is_empty() || token.contains(' ') {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
+/// Parse a single-quoted string literal (a `SKIP REGEXP '<regex>'` value),
+/// applying the server's `writeQuotedString` unescape set via
+/// [`parse_enum_name`]. The closing quote must be the end of the token.
+fn parse_single_quoted_literal(token: &str) -> Option<String> {
+    let bytes = token.as_bytes();
+    if bytes.first() != Some(&b'\'') {
+        return None;
+    }
+    let mut pos = 1usize;
+    let value = parse_enum_name(bytes, &mut pos)?;
+    token
+        .get(pos..)?
+        .trim_matches(' ')
+        .is_empty()
+        .then_some(value)
 }
 
 /// Whether `func` is a valid `SimpleAggregateFunction` function-name spelling:

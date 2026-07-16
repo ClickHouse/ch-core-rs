@@ -1,7 +1,27 @@
 use ch_core_rs::batch::ChunkedBatch;
-use ch_core_rs::column::{Column, DynamicChild, FixedBinaryColumn, Utf8Column};
+use ch_core_rs::column::{
+    Column, DynamicChild, FixedBinaryColumn, JsonBody, JsonColumn, StructuredJson, Utf8Column,
+};
 use ch_core_rs::native::decode::{decode_all_bytes, DecodeOptions, DBMS_TCP_PROTOCOL_VERSION};
-use ch_core_rs::schema::{ChType, GeoKind, IntervalKind};
+use ch_core_rs::schema::{
+    ChType, GeoKind, IntervalKind, JSON_DEFAULT_MAX_DYNAMIC_PATHS, JSON_DEFAULT_MAX_DYNAMIC_TYPES,
+};
+
+/// Build the expected `ChType::Json` for a fixture column. `max_dynamic_types`
+/// and the SKIP lists default to the server's canonical empty values; only the
+/// two parameters the fixtures actually vary are taken as arguments.
+fn json_type(max_dynamic_paths: u32, typed_paths: Vec<(&str, ChType)>) -> ChType {
+    ChType::Json {
+        max_dynamic_paths,
+        max_dynamic_types: JSON_DEFAULT_MAX_DYNAMIC_TYPES,
+        typed_paths: typed_paths
+            .into_iter()
+            .map(|(p, t)| (p.to_string(), t))
+            .collect(),
+        skip_paths: Vec::new(),
+        skip_regexps: Vec::new(),
+    }
+}
 
 /// Declare one `#[test]` per committed Native fixture. Each generated test
 /// decodes the fixture bytes through the public API and runs its asserter, so
@@ -44,6 +64,135 @@ fixture_tests! {
         protocol_revision: 0,
         assert: assert_multi_block,
     },
+    json_string_rev0: {
+        file: "json_string_rev0.native",
+        protocol_revision: 0,
+        assert: assert_json_string,
+    },
+    json_flattened_rev0: {
+        file: "json_flattened_rev0.native",
+        protocol_revision: 0,
+        assert: assert_json_flattened,
+    },
+}
+
+/// `output_format_native_write_json_as_string=1` (STRING mode): the JSON column
+/// serializes as one re-serialized document string per row (structure word 1),
+/// so it decodes to a `JsonBody::Text` and the declared typed paths never appear
+/// on the wire. The re-serialization always materializes the typed path `a.b`
+/// (as 0 when the object omitted it), matching the server's canonical output.
+fn assert_json_string(batch: &ChunkedBatch) {
+    assert_eq!(batch.num_chunks(), 1);
+    assert_eq!(batch.num_rows(), 4);
+    assert_schema(
+        batch,
+        &[Expected::Exact(
+            "j",
+            json_type(1, vec![("a.b", ChType::Int64)]),
+        )],
+    );
+    let json = as_json(batch.chunks[0].column(0));
+    assert_eq!(json.len(), 4);
+    match &json.body {
+        JsonBody::Text(values) => {
+            assert_eq!(values.value(0), br#"{"a":{"b":13},"x":"user_1"}"#);
+            assert_eq!(values.value(1), br#"{"a":{"b":79},"y":7}"#);
+            assert_eq!(values.value(2), br#"{"a":{"b":0},"x":"user_2","z":[1,2]}"#);
+            assert_eq!(values.value(3), br#"{"a":{"b":0}}"#);
+        }
+        JsonBody::Structured(_) => panic!("STRING mode must decode to a Text body"),
+    }
+}
+
+/// `output_format_native_use_flattened_dynamic_and_json_serialization=1`
+/// (FLATTENED mode, structure word 3): the typed path stays typed, but the
+/// dynamic and shared-data paths are written as the union of shared-less
+/// per-path Dynamics, with NO shared-data stream. So `y` and `z`, which spill to
+/// shared data under V1/V2, appear here as flattened dynamic paths instead.
+fn assert_json_flattened(batch: &ChunkedBatch) {
+    assert_eq!(batch.num_chunks(), 1);
+    assert_eq!(batch.num_rows(), 4);
+    assert_schema(
+        batch,
+        &[Expected::Exact(
+            "j",
+            json_type(1, vec![("a.b", ChType::Int64)]),
+        )],
+    );
+    let s = structured_json(batch.chunks[0].column(0));
+    assert_eq!(s.len, 4);
+
+    // Typed path survives as a plain Int64 child.
+    assert_eq!(s.typed.len(), 1);
+    assert_eq!(s.typed[0].0, "a.b");
+    match &s.typed[0].1 {
+        Column::Int64(c) => assert_eq!(c.values, vec![13, 79, 0, 0]),
+        other => panic!("expected Int64 typed path, got {other:?}"),
+    }
+
+    // The dynamic + shared paths flatten into three shared-less Dynamics, sorted.
+    assert_eq!(
+        s.dynamic
+            .iter()
+            .map(|(p, _)| p.as_str())
+            .collect::<Vec<_>>(),
+        vec!["x", "y", "z"]
+    );
+
+    // x: String, present on rows 0 and 2.
+    let x = &s.dynamic[0].1;
+    assert_eq!(x.type_ids, vec![0, u32::MAX, 0, u32::MAX]);
+    assert_flattened_string_child(x, &[b"user_1", b"user_2"]);
+
+    // y: Int64 7, present on row 1 only.
+    let y = &s.dynamic[1].1;
+    assert_eq!(y.type_ids, vec![u32::MAX, 0, u32::MAX, u32::MAX]);
+    match &y.children[0] {
+        DynamicChild::Typed { ch_type, values } => {
+            assert_eq!(ch_type, &ChType::Int64);
+            match values {
+                Column::Int64(c) => assert_eq!(c.values, vec![7]),
+                other => panic!("expected Int64 path y values, got {other:?}"),
+            }
+        }
+        other => panic!("expected typed Int64 child for flattened path y, got {other:?}"),
+    }
+
+    // z: Array(Nullable(Int64)) [1, 2], present on row 2 only.
+    let z = &s.dynamic[2].1;
+    assert_eq!(z.type_ids, vec![u32::MAX, u32::MAX, 0, u32::MAX]);
+    match &z.children[0] {
+        DynamicChild::Typed { ch_type, values } => {
+            assert_eq!(
+                ch_type,
+                &ChType::Array(Box::new(ChType::Nullable(Box::new(ChType::Int64))))
+            );
+            let arr = as_array(values);
+            assert_eq!(arr.offsets, vec![0, 2]);
+            match arr.values.as_ref() {
+                Column::Int64(c) => assert_eq!(c.values, vec![1, 2]),
+                other => panic!("expected Int64 array leaf, got {other:?}"),
+            }
+        }
+        other => panic!("expected typed Array child for flattened path z, got {other:?}"),
+    }
+
+    // FLATTENED carries no shared-data stream.
+    assert_eq!(s.shared_offsets, vec![0, 0, 0, 0, 0]);
+    assert!(s.shared_paths.is_empty());
+    assert!(s.shared_values.is_empty());
+}
+
+/// A flattened (shared-less) dynamic path whose sole child is a String, present
+/// on the rows routed to child 0.
+fn assert_flattened_string_child(dynamic: &ch_core_rs::column::DynamicColumn, expected: &[&[u8]]) {
+    match &dynamic.children[0] {
+        DynamicChild::Typed { ch_type, values } => {
+            assert_eq!(ch_type, &ChType::String);
+            assert_utf8_values(values, expected);
+        }
+        other => panic!("expected a typed String flattened child, got {other:?}"),
+    }
 }
 
 /// Expected schema entry. Most columns pin an exact `ChType`. The `dt_utc`
@@ -522,6 +671,15 @@ fn assert_all_types(batch: &ChunkedBatch) {
                 ChType::Variant(vec![ChType::String, ChType::UInt64]),
             ),
             Expected::Exact("dynamic", ChType::Dynamic { max_types: 1 }),
+            // JSON (DataTypeObject). The type string is revision-independent, so
+            // both all_types fixtures pin the same ChType. `a.b` renders
+            // backtick-quoted (dotted path) but parses to the bare path "a.b".
+            Expected::Exact("j_typed", json_type(1, vec![("a.b", ChType::Int64)])),
+            Expected::Exact("j_bare", json_type(JSON_DEFAULT_MAX_DYNAMIC_PATHS, vec![])),
+            Expected::Exact(
+                "j_null",
+                ChType::Nullable(Box::new(json_type(JSON_DEFAULT_MAX_DYNAMIC_PATHS, vec![]))),
+            ),
         ],
     );
 
@@ -1759,6 +1917,140 @@ fn assert_all_types(batch: &ChunkedBatch) {
         }
         other => panic!("expected Dynamic, got {other:?}"),
     }
+
+    // JSON(max_dynamic_paths=1, `a.b` Int64) (col 106): the typed path `a.b` is a
+    // plain Int64 child (default 0 where the object omits it). The single dynamic
+    // path `x` is a block-local Dynamic; its children sort SharedVariant (0)
+    // before String (1), and rows 1 and 3 carry the path's intrinsic NULL. Every
+    // later distinct path spills to shared data: `y` (Int64 7) on row 1 and `z`
+    // (Array(Nullable(Int64)) [1, 2]) on row 2, each an opaque binary descriptor +
+    // serializeBinary payload pinned exactly.
+    let j_typed = structured_json(block.column(106));
+    assert_eq!(j_typed.len, 4);
+    assert_eq!(j_typed.typed.len(), 1);
+    assert_eq!(j_typed.typed[0].0, "a.b");
+    match &j_typed.typed[0].1 {
+        Column::Int64(c) => assert_eq!(c.values, vec![13, 79, 0, 0]),
+        other => panic!("expected Int64 typed path, got {other:?}"),
+    }
+    assert_eq!(j_typed.dynamic.len(), 1);
+    assert_eq!(j_typed.dynamic[0].0, "x");
+    let x = &j_typed.dynamic[0].1;
+    assert_eq!(x.type_ids, vec![1, u32::MAX, 1, u32::MAX]);
+    assert_eq!(x.offsets, vec![0, 0, 1, 1]);
+    assert_eq!(x.null_count(), 2);
+    match (&x.children[0], &x.children[1]) {
+        (DynamicChild::Shared(shared), DynamicChild::Typed { ch_type, values }) => {
+            assert!(
+                shared.is_empty(),
+                "path x routes nothing to its own shared child"
+            );
+            assert_eq!(ch_type, &ChType::String);
+            assert_utf8_values(values, &[b"user_1", b"user_2"]);
+        }
+        other => panic!("expected (Shared, String) children for path x, got {other:?}"),
+    }
+    // Shared-data overflow: `y` on row 1, `z` on row 2.
+    assert_eq!(j_typed.shared_offsets, vec![0, 0, 1, 2, 2]);
+    assert_utf8_column(&j_typed.shared_paths, &[b"y", b"z"]);
+    let mut y_blob = vec![0x0a]; // Int64 binary type tag
+    y_blob.extend_from_slice(&7i64.to_le_bytes());
+    // Array(Nullable(Int64)) descriptor, then size 2 and two non-null i64 values.
+    let mut z_blob = vec![0x1e, 0x23, 0x0a, 0x02];
+    z_blob.push(0x00);
+    z_blob.extend_from_slice(&1i64.to_le_bytes());
+    z_blob.push(0x00);
+    z_blob.extend_from_slice(&2i64.to_le_bytes());
+    assert_eq!(j_typed.shared_values.value(0), y_blob.as_slice());
+    assert_eq!(j_typed.shared_values.value(1), z_blob.as_slice());
+
+    // Bare JSON (col 107): two dynamic paths, no shared spill, and an empty-object
+    // row (row 2). `p` is a String path (SharedVariant sorts to child 0), `q` an
+    // Int64 path (Int64 sorts to child 0). Paths decode sorted by name.
+    let j_bare = structured_json(block.column(107));
+    assert_eq!(j_bare.len, 4);
+    assert!(j_bare.typed.is_empty());
+    assert_eq!(j_bare.shared_offsets, vec![0, 0, 0, 0, 0]);
+    assert!(j_bare.shared_paths.is_empty());
+    assert_eq!(
+        j_bare
+            .dynamic
+            .iter()
+            .map(|(p, _)| p.as_str())
+            .collect::<Vec<_>>(),
+        vec!["p", "q"]
+    );
+    let p = &j_bare.dynamic[0].1;
+    assert_eq!(p.type_ids, vec![1, 1, u32::MAX, u32::MAX]);
+    match (&p.children[0], &p.children[1]) {
+        (DynamicChild::Shared(_), DynamicChild::Typed { ch_type, values }) => {
+            assert_eq!(ch_type, &ChType::String);
+            assert_utf8_values(values, &[b"user_1", b"user_2"]);
+        }
+        other => panic!("expected (Shared, String) children for path p, got {other:?}"),
+    }
+    let q = &j_bare.dynamic[1].1;
+    assert_eq!(q.type_ids, vec![0, u32::MAX, u32::MAX, 0]);
+    match (&q.children[0], &q.children[1]) {
+        (DynamicChild::Typed { ch_type, values }, DynamicChild::Shared(_)) => {
+            assert_eq!(ch_type, &ChType::Int64);
+            match values {
+                Column::Int64(c) => assert_eq!(c.values, vec![13, 79]),
+                other => panic!("expected Int64 path q values, got {other:?}"),
+            }
+        }
+        other => panic!("expected (Int64, Shared) children for path q, got {other:?}"),
+    }
+
+    // Nullable(JSON) (col 108): the top-level null map marks rows 1 and 3 null; the
+    // body still carries the single Int64 dynamic path `m` for the valid rows.
+    let j_null = as_json(block.column(108));
+    assert_eq!(j_null.len(), 4);
+    assert_eq!(j_null.null_count(), 2);
+    let validity = j_null
+        .validity
+        .as_ref()
+        .expect("Nullable(JSON) keeps validity");
+    assert!(validity.is_valid(0));
+    assert!(!validity.is_valid(1));
+    assert!(validity.is_valid(2));
+    assert!(!validity.is_valid(3));
+    let j_null = structured(j_null);
+    assert_eq!(j_null.dynamic.len(), 1);
+    assert_eq!(j_null.dynamic[0].0, "m");
+    let m = &j_null.dynamic[0].1;
+    assert_eq!(m.type_ids, vec![0, u32::MAX, 0, u32::MAX]);
+    match &m.children[0] {
+        DynamicChild::Typed { ch_type, values } => {
+            assert_eq!(ch_type, &ChType::Int64);
+            match values {
+                Column::Int64(c) => assert_eq!(c.values, vec![13, 79]),
+                other => panic!("expected Int64 path m values, got {other:?}"),
+            }
+        }
+        other => panic!("expected typed Int64 first child for path m, got {other:?}"),
+    }
+}
+
+/// Borrow a decoded `JsonColumn`, panicking with a useful message otherwise.
+fn as_json(column: &Column) -> &JsonColumn {
+    match column {
+        Column::Json(j) => j,
+        other => panic!("expected JSON column, got {other:?}"),
+    }
+}
+
+/// Borrow the `StructuredJson` body of a decoded `JsonColumn`.
+fn structured(column: &JsonColumn) -> &StructuredJson {
+    match &column.body {
+        JsonBody::Structured(structured) => structured.as_ref(),
+        JsonBody::Text(_) => panic!("expected a structured JSON body, got a Text body"),
+    }
+}
+
+/// Borrow the `StructuredJson` body directly from a `Column`.
+fn structured_json(column: &Column) -> &StructuredJson {
+    structured(as_json(column))
 }
 
 fn assert_bfloat16_bits(column: &Column, expected: &[u16]) {

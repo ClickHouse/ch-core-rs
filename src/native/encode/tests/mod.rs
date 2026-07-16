@@ -1,7 +1,7 @@
 use super::*;
 use crate::bitmap::Bitmap;
 use crate::column::{
-    AggregateStateColumn, DecimalColumn, DictionaryColumn, DynamicChild, NothingColumn,
+    AggregateStateColumn, DecimalColumn, DictionaryColumn, DynamicChild, JsonBody, NothingColumn,
     PrimitiveColumn,
 };
 use crate::native::decode::{decode_all_bytes, DecodeOptions, DBMS_TCP_PROTOCOL_VERSION};
@@ -17,6 +17,7 @@ mod containers;
 mod decimal;
 mod dynamic;
 mod interval;
+mod json;
 mod low_cardinality;
 mod nothing;
 mod nullable;
@@ -225,6 +226,58 @@ fn assert_columns_eq(left: &Column, right: &Column, label: &str) {
                 }
             }
         }
+        (Column::Json(x), Column::Json(y)) => match (&x.body, &y.body) {
+            (JsonBody::Structured(a), JsonBody::Structured(b)) => {
+                assert_eq!(a.len, b.len, "{label} JSON len differs");
+                assert_eq!(
+                    a.typed.len(),
+                    b.typed.len(),
+                    "{label} JSON typed path count differs"
+                );
+                for ((ap, ac), (bp, bc)) in a.typed.iter().zip(&b.typed) {
+                    assert_eq!(ap, bp, "{label} JSON typed path name differs");
+                    assert_columns_eq(ac, bc, &format!("{label} JSON path {ap}"));
+                }
+                assert_eq!(
+                    a.dynamic.len(),
+                    b.dynamic.len(),
+                    "{label} JSON dynamic path count differs"
+                );
+                for ((ap, ac), (bp, bc)) in a.dynamic.iter().zip(&b.dynamic) {
+                    assert_eq!(ap, bp, "{label} JSON dynamic path name differs");
+                    assert_columns_eq(
+                        &Column::Dynamic(ac.clone()),
+                        &Column::Dynamic(bc.clone()),
+                        &format!("{label} JSON dynamic path {ap}"),
+                    );
+                }
+                assert_eq!(
+                    a.shared_offsets, b.shared_offsets,
+                    "{label} JSON shared offsets differ"
+                );
+                assert_eq!(
+                    a.shared_paths.offsets, b.shared_paths.offsets,
+                    "{label} JSON shared path offsets differ"
+                );
+                assert_eq!(
+                    a.shared_paths.data, b.shared_paths.data,
+                    "{label} JSON shared path data differ"
+                );
+                assert_eq!(
+                    a.shared_values.offsets, b.shared_values.offsets,
+                    "{label} JSON shared value offsets differ"
+                );
+                assert_eq!(
+                    a.shared_values.data, b.shared_values.data,
+                    "{label} JSON shared value data differ"
+                );
+            }
+            (JsonBody::Text(a), JsonBody::Text(b)) => {
+                assert_eq!(a.offsets, b.offsets, "{label} JSON text offsets differ");
+                assert_eq!(a.data, b.data, "{label} JSON text data differ");
+            }
+            _ => panic!("{label} JSON body kind differs"),
+        },
         (other_a, other_b) => panic!("{label}: unexpected {other_a:?} vs {other_b:?}"),
     }
 

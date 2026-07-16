@@ -47,16 +47,21 @@ point-in-time snapshot for the next agent, not a changelog. Keep it short. Alway
 include a "Recommended next" with a one-line reason, so the next agent has a
 default; the user may override it.
 
-- **Last updated:** 2026-07-15. `Dynamic` is complete at decode/encode parity
-  against `v26.6.1.1193-stable`. The core accepts direct V1/V2 and FLATTENED
-  word 3 Native layouts, retains SharedVariant cells as opaque binary
-  descriptor+payload values, rejects malformed structure/mode/routing, and
-  supports textual or binary-encoded type headers through explicit APIs.
-  Arrow export uses typed Dense Union children plus Binary SharedVariant;
-  Arrow C Stream pre-scans supplied chunks and fixes one recursive result-wide
-  schema while remapping only union routing when block-local child sets differ.
-  Unit, zero-row, nested, multi-block, encode round-trip, Arrow, captured
-  real-server fixture, and live INSERT round-trip coverage are present. Two project
+- **Last updated:** 2026-07-16. `JSON` (`DataTypeObject`) is complete at
+  decode/encode parity against `v26.6.1.1193-stable`. The core reads its LE u64
+  structure word (V1=0 with the legacy count slot, STRING=1, V2=2, opt-in
+  FLATTENED=3; V3 word 4 rejected), decodes typed paths, one block-local
+  `Dynamic` per dynamic/flattened path, and the V1/V2 shared-data
+  `Array(Tuple(String, String))` overflow (opaque descriptor+payload blobs kept
+  unmaterialized), enforcing the V1/V2 `max_dynamic_paths` bound while accepting
+  the confirmed-unbounded FLATTENED count. `Nullable(JSON)` is legal,
+  `LowCardinality(JSON)` illegal, and JSON composes in every container and as its
+  own typed path. Arrow export is a struct of typed paths plus result-wide
+  dynamic-path Dense Unions plus a `_shared_data` LargeList of
+  `{paths utf8, values binary}`, or a plain utf8 column for a STRING body; binary
+  type descriptor tag 0x30. Unit, all_types fixture columns
+  (`j_typed`/`j_bare`/`j_null`), the STRING and FLATTENED auxiliary fixtures, and
+  live INSERT + binary-type-header round-trips are all green. Two project
   decisions still govern sequencing. First, further
   `AggregateFunction(...)` work is paused. The format has no generic state
   framing, so completing the long tail requires a separately confirmed boundary
@@ -87,31 +92,35 @@ default; the user may override it.
   not as an open-ended completeness exercise.
 - **Scope:** frame compression and its unwired files also remain untouched and
   out of scope. Completeness still means uncompressed HTTP `FORMAT Native`.
-- **Dynamic checkpoint:** V1 is selected below protocol revision 54473 and
-  carries a legacy ignored count; V2 removes it. Both carry direct type names,
-  BASIC Variant mode 0, a UInt8 discriminator run, dense typed children, and
-  implicit SharedVariant. FLATTENED word 3 carries its type table, the smallest
-  fixed-width indexes with index K as NULL, and sparse typed bodies. V3 word 4
-  and direct COMPACT mode are rejected because NativeWriter never emits them.
-- **Recommended next:** `JSON`. Dynamic supplies the runtime type-table,
-  SharedVariant, binary descriptor, and result-wide Arrow planning machinery
-  JSON needs, so JSON is now the highest-value remaining common type.
-- **After that:** `Geometry` (mostly free now that Variant and the
-  geo aliases are done), with
-  `QBit(T, N)` last or on demand. QBit is small and isolated but niche, so it
-  buys little for real-workload POC testing compared to the
-  Variant/Dynamic/JSON family. Before opening the POC to outside users, also
-  resolve sparse column serialization (see "Wire / protocol features"): it is
-  default-on server-side since 23.7 and reaches any client that negotiates
-  `client_protocol_version >= 54454`, and the decoder currently rejects its
-  marker.
-- **Key references:** the Dynamic wire, buffer, Arrow, encode, binary type, and
+- **JSON checkpoint:** V1 is selected below protocol revision 54473 (with the
+  legacy ignored count) and V2 at/above it; STRING word 1 is one document string
+  per row; FLATTENED word 3 is opt-in via `EncodeOptions.flattened_dynamic` and
+  only when the column carries no shared pairs (word 3 is unknown to pre-25.6
+  servers). Shared values stay opaque binary descriptor+payload blobs. The
+  type-aware per-column row-count guard exempts JSON, so a pathless FLATTENED
+  block that writes zero body bytes per row still decodes. The V1/V2 direct path
+  count is capped at `max_dynamic_paths`; the FLATTENED count is confirmed
+  unbounded and protected by read-before-allocate instead.
+- **Recommended next:** `Geometry`. It is just `Variant(Point, LineString,
+  MultiLineString, Polygon, MultiPolygon, Ring)` (alias `GEOMETRY`), and both
+  prerequisites (Variant and the geo aliases) are already done, so it is the
+  cheapest remaining common type.
+- **After that:** `QBit(T, N)` last or on demand. It is small and isolated but
+  niche, and its `SerializationQBit` wire layout still needs a
+  `clickhouse-server-reader` read before implementing. Before opening the binding
+  POC to outside workloads, also resolve sparse column serialization (see "Wire /
+  protocol features"): it is default-on server-side since 23.7 and reaches any
+  client that negotiates `client_protocol_version >= 54454`, and the decoder
+  currently rejects its marker.
+- **Key references:** the JSON wire, buffer, Arrow, encode, binary-type, and
   version contract is in `CODEC_CONTRACT.md`; its implementation is in
   `src/column.rs`, `src/native/{type_binary,type_parser,decode,encode}`, and
-  `src/ffi/mod.rs`. The aggregate
-  checkpoint and paused boundary are recorded in the Tier 3 item below. The
-  deferred sink assessment is in "Streaming encode and the encode-push overlap"
-  below. The docs-sourced sparse wire notes are in "Wire / protocol features".
+  `src/ffi/mod.rs`, with coverage in `tests/integration.rs`,
+  `tests/live_insert.rs`, and the JSON `decode`/`encode`/`ffi` test modules. The
+  aggregate checkpoint and paused boundary are recorded in the Tier 3 item below.
+  The deferred sink assessment is in "Streaming encode and the encode-push
+  overlap" below. The docs-sourced sparse wire notes are in "Wire / protocol
+  features".
 
 ---
 
@@ -638,12 +647,32 @@ where the across-release churn lives.
       schemas, malformed-input rejection, synthetic tests, and real-server
       fixtures at `v26.6.1.1193-stable`. V3 word 4 is intentionally rejected
       because direct NativeWriter does not emit it.
-- [ ] `JSON` (new object type) - dynamic subcolumns, carries its own structure
-      header; highest effort. Confirmed registered (case-insensitive) and GA at
-      v26.6.1.1193-stable. The legacy `Object('json')` spelling is **not registered
-      at this pin** (only the obsolete `allow_experimental_object_type` setting
-      remains as a vestige), so there is nothing to decode against here; do not
-      implement it.
+- [x] `JSON` (new object type) - complete at decode/encode parity at
+      v26.6.1.1193-stable. Carries its own LE u64 structure word: V1 (0, with the
+      legacy ignored count slot), STRING (1, one document string per row), V2 (2),
+      and opt-in FLATTENED (3); V3 word 4 is rejected because direct NativeWriter
+      never emits it. A structured body decodes into typed paths (sorted), one
+      block-local `Dynamic` per dynamic/flattened path, and the shared-data
+      `Array(Tuple(String, String))` overflow (V1/V2 only) whose values are opaque
+      binary descriptor+payload blobs kept unmaterialized. The V1/V2 direct path
+      count is bounded by `max_dynamic_paths`, while the FLATTENED count is
+      confirmed UNBOUNDED (`unflattenAndInsertPaths`, `SerializationObjectHelpers`),
+      so a pathless FLATTENED block with zero body bytes per row still decodes
+      under the type-aware row-count guard. `Nullable(JSON)` is legal (top-level
+      null map), `LowCardinality(JSON)` illegal, and JSON composes in
+      Array/Tuple/Map/Variant/Dynamic and as its own typed path (nested), bounded
+      by `MAX_TYPE_DEPTH`. Arrow export is a struct of the typed paths, the
+      result-wide dynamic-path Dense Unions, and a `_shared_data` LargeList of
+      `{paths utf8, values binary}`, with a Text body exporting as utf8; binary
+      type descriptor tag 0x30. Legacy `Object('json')` is not registered at the
+      pin and is intentionally not implemented. Unit (plain, Nullable, zero-row,
+      multi-block, encode round-trip, Arrow), the `j_typed`/`j_bare`/`j_null`
+      all_types fixture columns, the STRING and FLATTENED single-column auxiliary
+      fixtures, and the live JSON INSERT and binary-type-header round-trips are all
+      present and green. Introduction: production ready in 25.3; the STRING setting
+      `output_format_native_write_json_as_string` shipped in 24.10 and the
+      FLATTENED setting `output_format_native_use_flattened_dynamic_and_json_serialization`
+      in 25.6 (per `SettingsChangesHistory.cpp`).
 - [ ] `Geometry` - `Variant(Point, LineString, MultiLineString, Polygon,
       MultiPolygon, Ring)`, alias `GEOMETRY`. Depends on `Variant` plus the geo
       aliases. Confirmed registered and GA at v26.6.1.1193-stable.

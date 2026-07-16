@@ -6,8 +6,8 @@ use crate::bitmap::Bitmap;
 use crate::column::{
     variant_child_counts, variant_layout_from_discriminators, AggregateStateColumn, ArrayColumn,
     BoolColumn, Column, DecimalColumn, DictionaryColumn, DynamicChild, DynamicColumn,
-    FixedBinaryColumn, MapColumn, NothingColumn, PrimitiveColumn, TupleColumn, Utf8Column,
-    VariantColumn,
+    FixedBinaryColumn, JsonColumn, MapColumn, NothingColumn, PrimitiveColumn, StructuredJson,
+    TupleColumn, Utf8Column, VariantColumn,
 };
 use crate::native::aggregate_function::{
     decode_aggregate_states, decode_state_codec, scan_aggregate_states,
@@ -92,6 +92,12 @@ pub enum DecodeError {
         column: String,
         reason: String,
     },
+    /// A JSON column carried an invalid structure version, dynamic-path list,
+    /// path count, or shared-data layout.
+    InvalidJson {
+        column: String,
+        reason: String,
+    },
 }
 
 impl From<io::Error> for DecodeError {
@@ -142,6 +148,9 @@ impl std::fmt::Display for DecodeError {
             }
             DecodeError::InvalidDynamic { column, reason } => {
                 write!(f, "Invalid Dynamic layout for column '{column}': {reason}")
+            }
+            DecodeError::InvalidJson { column, reason } => {
+                write!(f, "Invalid JSON layout for column '{column}': {reason}")
             }
         }
     }
@@ -206,6 +215,42 @@ enum DynamicWireKind {
 struct DynamicState {
     kind: DynamicWireKind,
     children: Vec<DynamicStateChild>,
+}
+
+/// The wire shape a JSON column's structure prefix selected for this block
+/// (`SerializationObject::SerializationVersion`, confirmed at
+/// v26.6.1.1193-stable). `Structured` covers both V1 (word 0) and V2 (word 2),
+/// which differ only in V1's ignored legacy count slot and carry a shared-data
+/// stream. `Flattened` (word 3) carries no shared-data stream. `Text` (STRING,
+/// word 1) re-serializes each document to one string per row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonWireKind {
+    Structured,
+    Flattened,
+    Text,
+}
+
+/// Per-block JSON structure state read in the prefix and consumed in the body.
+///
+/// `dynamic_paths` are the block-local runtime path names (sorted, strictly
+/// increasing), each of which has its own full `SerializationDynamic` state that
+/// lives as a separate [`StatePrefix::Dynamic`] in the shared state vector, in
+/// the same sorted order. `Text` blocks carry no dynamic paths.
+#[derive(Debug, Clone)]
+struct JsonState {
+    kind: JsonWireKind,
+    dynamic_paths: Vec<String>,
+}
+
+/// One entry in the per-column preorder state vector shared by the prefix, body,
+/// suffix, and skip traversals. `Dynamic` and `Json` are the only self-describing
+/// types whose per-block structure must be read once in the prefix and reused in
+/// the body, so both push a state here; the body walks the same tree in the same
+/// preorder and pops them in order.
+#[derive(Debug, Clone)]
+enum StatePrefix {
+    Dynamic(DynamicState),
+    Json(JsonState),
 }
 
 // ---------------------------------------------------------------------------
@@ -413,13 +458,13 @@ fn decode_bfloat16_data(reader: &mut ByteReader, num_rows: usize) -> io::Result<
 /// [`DecodeError::InvalidDynamic`]. This gate also bounds the body and suffix
 /// traversals ([`decode_values`], [`skip_values`], [`read_state_suffix`]): they
 /// recurse over exactly the prefix traversal's tree, consuming the
-/// `dynamic_states` this function retained, so no deeper state can exist.
+/// `states` this function retained, so no deeper state can exist.
 fn read_state_prefix(
     reader: &mut ByteReader,
     ch_type: &ChType,
     column: &str,
     options: &DecodeSettings,
-    dynamic_states: &mut Vec<DynamicState>,
+    states: &mut Vec<StatePrefix>,
     depth: usize,
 ) -> Result<Option<u64>, DecodeError> {
     // A name-decoration alias (SimpleAggregateFunction, geo, Nested) has the
@@ -428,7 +473,7 @@ fn read_state_prefix(
     // 8-byte key version through the delegated Array(Tuple(...)) chain, hoisting
     // it to the very front of the whole column, before the offsets.
     if let Some(under) = ch_type.physical_delegate() {
-        return read_state_prefix(reader, &under, column, options, dynamic_states, depth + 1);
+        return read_state_prefix(reader, &under, column, options, states, depth + 1);
     }
     match ch_type {
         ChType::LowCardinality(_) => {
@@ -447,7 +492,7 @@ fn read_state_prefix(
         // `LowCardinality`'s 8-byte key version is consumed here, at the front of
         // the whole Array column, before the offsets.
         ChType::Array(inner) => {
-            read_state_prefix(reader, inner, column, options, dynamic_states, depth + 1)
+            read_state_prefix(reader, inner, column, options, states, depth + 1)
         }
         // Tuple writes no prefix of its own; `SerializationTuple`'s
         // `deserializeBinaryBulkStatePrefix` loops over the elements in
@@ -457,14 +502,7 @@ fn read_state_prefix(
         // and nothing for the Int32.
         ChType::Tuple(elements) => {
             for (_, element_type) in elements {
-                read_state_prefix(
-                    reader,
-                    element_type,
-                    column,
-                    options,
-                    dynamic_states,
-                    depth + 1,
-                )?;
+                read_state_prefix(reader, element_type, column, options, states, depth + 1)?;
             }
             Ok(None)
         }
@@ -475,8 +513,8 @@ fn read_state_prefix(
         // Map(LowCardinality(String), Int32) has the LC 8-byte key version at
         // the very front of the whole column, before the offsets.
         ChType::Map(key, value) => {
-            read_state_prefix(reader, key, column, options, dynamic_states, depth + 1)?;
-            read_state_prefix(reader, value, column, options, dynamic_states, depth + 1)
+            read_state_prefix(reader, key, column, options, states, depth + 1)?;
+            read_state_prefix(reader, value, column, options, states, depth + 1)
         }
         // Direct FORMAT Native always uses BASIC Variant discriminators at the
         // pinned server tag. The prefix starts with one fixed-width LE UInt64
@@ -495,41 +533,21 @@ fn read_state_prefix(
                 });
             }
             for alternative in alternatives {
-                read_state_prefix(
-                    reader,
-                    alternative,
-                    column,
-                    options,
-                    dynamic_states,
-                    depth + 1,
-                )?;
+                read_state_prefix(reader, alternative, column, options, states, depth + 1)?;
             }
             Ok(None)
         }
         ChType::Dynamic { max_types } => {
-            // Charge the cumulative budget HERE, before parsing this level's
-            // runtime type table: Dynamic is the only construct whose nested
-            // types arrive as data rather than through the depth-capped header
-            // parser, so it is the only place the per-type cap can be restarted.
-            if depth >= MAX_TYPE_DEPTH {
-                return Err(invalid_dynamic(
-                    column,
-                    format!("Dynamic nesting exceeds the maximum type depth {MAX_TYPE_DEPTH}"),
-                ));
-            }
-            let state = read_dynamic_state(reader, *max_types, column, options)?;
-            // Prefix and body traversals visit Dynamic nodes in the same
-            // preorder. Recurse while `state` is still local, then insert this
-            // parent ahead of the nested states. This avoids cloning the type
-            // table and its ChType trees just to satisfy Vec's mutable-borrow
-            // rules; the bounded insertion moves only small state records.
-            let state_index = dynamic_states.len();
-            for child in &state.children {
-                if let DynamicStateChild::Typed(ch_type) = child {
-                    read_state_prefix(reader, ch_type, column, options, dynamic_states, depth + 1)?;
-                }
-            }
-            dynamic_states.insert(state_index, state);
+            read_dynamic_state_prefix(reader, *max_types, column, options, states, depth)?;
+            Ok(None)
+        }
+        // JSON's structure prefix mirrors Dynamic's: it is charged the cumulative
+        // depth budget (its dynamic paths arrive as data, restarting the
+        // per-type cap), its state is read once here and reused in the body, and
+        // its JsonState is inserted ahead of the states its typed-path and
+        // dynamic-path prefixes append, so the preorder walk stays aligned.
+        ChType::Json { .. } => {
+            read_json_state_prefix(reader, ch_type, column, options, states, depth)?;
             Ok(None)
         }
         // Nullable writes no prefix of its own either;
@@ -540,7 +558,7 @@ fn read_state_prefix(
         // LowCardinality element), but recursing unconditionally keeps this
         // faithful to the server for any future nullable-wrappable container.
         ChType::Nullable(inner) => {
-            read_state_prefix(reader, inner, column, options, dynamic_states, depth + 1)
+            read_state_prefix(reader, inner, column, options, states, depth + 1)
         }
         _ => Ok(None),
     }
@@ -556,37 +574,68 @@ fn read_state_suffix(
     reader: &mut ByteReader,
     ch_type: &ChType,
     column: &str,
-    dynamic_states: &[DynamicState],
-    dynamic_index: &mut usize,
+    states: &[StatePrefix],
+    state_cursor: &mut usize,
 ) -> Result<(), DecodeError> {
     if let Some(under) = ch_type.physical_delegate() {
-        return read_state_suffix(reader, &under, column, dynamic_states, dynamic_index);
+        return read_state_suffix(reader, &under, column, states, state_cursor);
     }
     match ch_type {
         ChType::Array(inner) | ChType::Nullable(inner) => {
-            read_state_suffix(reader, inner, column, dynamic_states, dynamic_index)
+            read_state_suffix(reader, inner, column, states, state_cursor)
         }
         ChType::Tuple(elements) => {
             for (_, element_type) in elements {
-                read_state_suffix(reader, element_type, column, dynamic_states, dynamic_index)?;
+                read_state_suffix(reader, element_type, column, states, state_cursor)?;
             }
             Ok(())
         }
         ChType::Map(key, value) => {
-            read_state_suffix(reader, key, column, dynamic_states, dynamic_index)?;
-            read_state_suffix(reader, value, column, dynamic_states, dynamic_index)
+            read_state_suffix(reader, key, column, states, state_cursor)?;
+            read_state_suffix(reader, value, column, states, state_cursor)
         }
         ChType::Variant(alternatives) => {
             for alternative in alternatives {
-                read_state_suffix(reader, alternative, column, dynamic_states, dynamic_index)?;
+                read_state_suffix(reader, alternative, column, states, state_cursor)?;
             }
             Ok(())
         }
         ChType::Dynamic { .. } => {
-            let state = next_dynamic_state(dynamic_states, dynamic_index, column)?;
+            let state = next_dynamic_state(states, state_cursor, column)?;
             for child in &state.children {
                 if let DynamicStateChild::Typed(ch_type) = child {
-                    read_state_suffix(reader, ch_type, column, dynamic_states, dynamic_index)?;
+                    read_state_suffix(reader, ch_type, column, states, state_cursor)?;
+                }
+            }
+            Ok(())
+        }
+        // JSON owns no suffix bytes, but its typed-path and dynamic-path children
+        // must still be walked in the same preorder as the prefix and body so the
+        // state cursor stays aligned (all suffixes are no-ops today).
+        ChType::Json { typed_paths, .. } => {
+            let (kind, num_dynamic) = match next_state(states, state_cursor, column)? {
+                StatePrefix::Json(state) => (state.kind, state.dynamic_paths.len()),
+                StatePrefix::Dynamic(_) => {
+                    return Err(invalid_json(
+                        column,
+                        "expected a JSON structure state during the suffix traversal",
+                    ))
+                }
+            };
+            if kind == JsonWireKind::Text {
+                return Ok(());
+            }
+            for (_, element_type) in typed_paths {
+                read_state_suffix(reader, element_type, column, states, state_cursor)?;
+            }
+            // Each dynamic path is a full Dynamic; walk its typed children, one
+            // per path in the same sorted order the prefix appended them.
+            for _ in 0..num_dynamic {
+                let state = next_dynamic_state(states, state_cursor, column)?;
+                for child in &state.children {
+                    if let DynamicStateChild::Typed(ch_type) = child {
+                        read_state_suffix(reader, ch_type, column, states, state_cursor)?;
+                    }
                 }
             }
             Ok(())
@@ -725,23 +774,228 @@ fn read_dynamic_type_entry(
     })
 }
 
-fn next_dynamic_state<'a>(
-    dynamic_states: &'a [DynamicState],
-    dynamic_index: &mut usize,
+/// Pop the next preorder state, advancing the shared cursor. The prefix
+/// traversal retained one entry per self-describing node (`Dynamic` or `JSON`)
+/// in the exact order the body, suffix, and skip traversals revisit them.
+fn next_state<'a>(
+    states: &'a [StatePrefix],
+    state_cursor: &mut usize,
     column: &str,
-) -> Result<&'a DynamicState, DecodeError> {
-    let state = dynamic_states.get(*dynamic_index).ok_or_else(|| {
+) -> Result<&'a StatePrefix, DecodeError> {
+    let state = states.get(*state_cursor).ok_or_else(|| {
         invalid_dynamic(
             column,
-            "internal Dynamic prefix traversal did not retain a body state",
+            "internal prefix traversal did not retain a body state",
         )
     })?;
-    *dynamic_index += 1;
+    *state_cursor += 1;
     Ok(state)
+}
+
+/// Pop the next preorder state, requiring it to be a Dynamic structure state.
+fn next_dynamic_state<'a>(
+    states: &'a [StatePrefix],
+    state_cursor: &mut usize,
+    column: &str,
+) -> Result<&'a DynamicState, DecodeError> {
+    match next_state(states, state_cursor, column)? {
+        StatePrefix::Dynamic(state) => Ok(state),
+        StatePrefix::Json(_) => Err(invalid_dynamic(
+            column,
+            "expected a Dynamic structure state but found a JSON one",
+        )),
+    }
+}
+
+/// Read one Dynamic column's structure prefix, recurse into its runtime typed
+/// children's prefixes, and insert its state ahead of them in the preorder
+/// state vector (the shared insertion trick that keeps the prefix and body
+/// traversals aligned without cloning the runtime type table).
+fn read_dynamic_state_prefix(
+    reader: &mut ByteReader,
+    max_types: u8,
+    column: &str,
+    options: &DecodeSettings,
+    states: &mut Vec<StatePrefix>,
+    depth: usize,
+) -> Result<(), DecodeError> {
+    // Charge the cumulative budget HERE, before parsing this level's runtime
+    // type table: Dynamic is one of the two constructs (with JSON) whose nested
+    // types arrive as data rather than through the depth-capped header parser,
+    // so it is where the per-type cap can be restarted.
+    if depth >= MAX_TYPE_DEPTH {
+        return Err(invalid_dynamic(
+            column,
+            format!("Dynamic nesting exceeds the maximum type depth {MAX_TYPE_DEPTH}"),
+        ));
+    }
+    let state = read_dynamic_state(reader, max_types, column, options)?;
+    // Recurse while `state` is still local, then insert this parent ahead of the
+    // nested states. This avoids cloning the type table and its ChType trees just
+    // to satisfy Vec's mutable-borrow rules; the bounded insertion moves only
+    // small state records.
+    let state_index = states.len();
+    for child in &state.children {
+        if let DynamicStateChild::Typed(ch_type) = child {
+            read_state_prefix(reader, ch_type, column, options, states, depth + 1)?;
+        }
+    }
+    states.insert(state_index, StatePrefix::Dynamic(state));
+    Ok(())
+}
+
+/// Read one JSON column's structure prefix. Mirrors
+/// [`read_dynamic_state_prefix`]: the JSON structure word, dynamic-path list,
+/// typed-path prefixes, and per-dynamic-path full Dynamic prefixes are read, and
+/// the JsonState is inserted ahead of the states its children appended so the
+/// preorder walk stays aligned.
+///
+/// Wire layout (`SerializationObject::serializeBinaryBulkStatePrefix` /
+/// `deserializeObjectStructureStatePrefix`, confirmed at v26.6.1.1193-stable):
+/// an LE u64 structure version word (V1=0, STRING=1, V2=2, FLATTENED=3, V3=4);
+/// V3 is MergeTree-only and never emitted by `NativeWriter`, so it is rejected
+/// like the Dynamic V3 precedent. STRING carries nothing else in the prefix. V1
+/// carries a VarUInt legacy count (the dynamic-path count, ignored on read,
+/// confirmed) then the VarUInt dynamic-path count and the sorted path strings;
+/// V2 and FLATTENED carry the count and paths without the legacy slot. Then, for
+/// every non-STRING form, the typed-path nested prefixes in sorted path order,
+/// then one full `SerializationDynamic` state prefix per dynamic path in sorted
+/// order (each a `Dynamic` at `max_dynamic_types`). The shared-data child
+/// (`Array(Tuple(String, String))`, V1/V2 only) contributes no prefix bytes.
+fn read_json_state_prefix(
+    reader: &mut ByteReader,
+    ch_type: &ChType,
+    column: &str,
+    options: &DecodeSettings,
+    states: &mut Vec<StatePrefix>,
+    depth: usize,
+) -> Result<(), DecodeError> {
+    if depth >= MAX_TYPE_DEPTH {
+        return Err(invalid_json(
+            column,
+            format!("JSON nesting exceeds the maximum type depth {MAX_TYPE_DEPTH}"),
+        ));
+    }
+    let ChType::Json {
+        max_dynamic_paths,
+        max_dynamic_types,
+        typed_paths,
+        ..
+    } = ch_type
+    else {
+        return Err(invalid_json(column, "not a JSON type"));
+    };
+
+    let version = reader.read_u64_le()?;
+    let kind = match version {
+        0 => JsonWireKind::Structured, // V1
+        1 => JsonWireKind::Text,       // STRING
+        2 => JsonWireKind::Structured, // V2
+        3 => JsonWireKind::Flattened,
+        4 => {
+            return Err(invalid_json(
+                column,
+                "structure word 4 (V3) is not emitted by NativeWriter",
+            ))
+        }
+        other => {
+            return Err(invalid_json(
+                column,
+                format!("unknown JSON structure word {other}"),
+            ))
+        }
+    };
+
+    let mut dynamic_paths: Vec<String> = Vec::new();
+    if kind != JsonWireKind::Text {
+        if version == 0 {
+            // V1's leading VarUInt is a legacy back-compat slot whose value is the
+            // dynamic-path count; the reader consumes it and ignores it
+            // (confirmed at v26.6.1.1193-stable), matching the Dynamic V1
+            // precedent.
+            reader.read_varint()?;
+        }
+        let count = varint_usize(reader.read_varint()?, "JSON dynamic path count")?;
+        // The path-count bound is V1/V2 only. In those forms the writer routes
+        // any path past `max_dynamic_paths` into shared data, so the direct list
+        // can never exceed it, and a larger count is malformed. FLATTENED is
+        // different: `flattenPaths` writes the union of the dynamic paths AND
+        // every distinct shared-data path (sorted), and the server's FLATTENED
+        // reader (`SerializationObject::deserializeObjectStructureStatePrefix` ->
+        // `unflattenAndInsertPaths` in `SerializationObjectHelpers.cpp`, confirmed
+        // at v26.6.1.1193-stable) enforces NO bound on that count at all: it
+        // greedily assigns the first sorted paths that fit `max_dynamic_paths`
+        // and spills the rest back into shared data. So the FLATTENED count
+        // legitimately and routinely exceeds `max_dynamic_paths`; capping it here
+        // would reject valid data. It is protected purely by the read-before-
+        // allocate discipline below (a hostile count fails on the truncated path
+        // reads), the same as any other untrusted count.
+        if kind == JsonWireKind::Structured && count > *max_dynamic_paths as usize {
+            return Err(invalid_json(
+                column,
+                format!("dynamic path count {count} exceeds max_dynamic_paths={max_dynamic_paths}"),
+            ));
+        }
+        // Every path is at least its one-byte varint length prefix, so bound the
+        // reservation at the bytes present (the read-before-allocate discipline).
+        dynamic_paths.reserve(reader.capacity_for(count, 1));
+        for _ in 0..count {
+            let path = reader.read_varint_string()?;
+            // The server always writes the dynamic paths sorted and unique;
+            // reject anything else as malformed rather than silently accept a
+            // duplicate or out-of-order path.
+            if let Some(last) = dynamic_paths.last() {
+                if path.as_str() <= last.as_str() {
+                    return Err(invalid_json(
+                        column,
+                        "dynamic paths are not strictly increasing (sorted, unique)",
+                    ));
+                }
+            }
+            dynamic_paths.push(path);
+        }
+    }
+
+    let state_index = states.len();
+    if kind != JsonWireKind::Text {
+        // Typed-path prefixes, in the ChType's sorted path order.
+        for (_, element_type) in typed_paths {
+            read_state_prefix(reader, element_type, column, options, states, depth + 1)?;
+        }
+        // Per dynamic path: a full SerializationDynamic prefix, in sorted order.
+        for _ in 0..dynamic_paths.len() {
+            read_dynamic_state_prefix(
+                reader,
+                *max_dynamic_types,
+                column,
+                options,
+                states,
+                depth + 1,
+            )?;
+        }
+        // Shared data (V1/V2 only) is an Array(Tuple(String, String)) whose
+        // default serialization contributes no prefix bytes, so there is nothing
+        // to read here.
+    }
+    states.insert(
+        state_index,
+        StatePrefix::Json(JsonState {
+            kind,
+            dynamic_paths,
+        }),
+    );
+    Ok(())
 }
 
 fn invalid_dynamic(column: &str, reason: impl Into<String>) -> DecodeError {
     DecodeError::InvalidDynamic {
+        column: column.to_string(),
+        reason: reason.into(),
+    }
+}
+
+fn invalid_json(column: &str, reason: impl Into<String>) -> DecodeError {
+    DecodeError::InvalidJson {
         column: column.to_string(),
         reason: reason.into(),
     }
@@ -986,25 +1240,25 @@ fn decode_column(
     // LowCardinality, which reads its key version here; Array recurses into its
     // element type's prefix (so a leaf LowCardinality key version is consumed
     // here, before the offsets).
-    let mut dynamic_states = Vec::new();
-    read_state_prefix(reader, ch_type, column, options, &mut dynamic_states, 0)?;
-    let mut dynamic_index = 0usize;
+    let mut states = Vec::new();
+    read_state_prefix(reader, ch_type, column, options, &mut states, 0)?;
+    let mut state_cursor = 0usize;
     let decoded = decode_values(
         reader,
         ch_type,
         num_rows,
         column,
-        &dynamic_states,
-        &mut dynamic_index,
+        &states,
+        &mut state_cursor,
     )?;
-    if dynamic_index != dynamic_states.len() {
+    if state_cursor != states.len() {
         return Err(invalid_dynamic(
             column,
-            "body traversal did not consume every Dynamic prefix state",
+            "body traversal did not consume every prefix state",
         ));
     }
     let mut suffix_index = 0usize;
-    read_state_suffix(reader, ch_type, column, &dynamic_states, &mut suffix_index)?;
+    read_state_suffix(reader, ch_type, column, &states, &mut suffix_index)?;
     Ok(decoded)
 }
 
@@ -1020,8 +1274,8 @@ fn decode_values(
     ch_type: &ChType,
     num_rows: usize,
     column: &str,
-    dynamic_states: &[DynamicState],
-    dynamic_index: &mut usize,
+    states: &[StatePrefix],
+    state_cursor: &mut usize,
 ) -> Result<Column, DecodeError> {
     // A name-decoration alias (SimpleAggregateFunction, geo, Nested) decodes
     // exactly as the physical type it delegates to, producing the underlying
@@ -1030,14 +1284,7 @@ fn decode_values(
     // Array fast-path, and a SimpleAggregateFunction over any inner delegates to
     // that inner.
     if let Some(under) = ch_type.physical_delegate() {
-        return decode_values(
-            reader,
-            &under,
-            num_rows,
-            column,
-            dynamic_states,
-            dynamic_index,
-        );
+        return decode_values(reader, &under, num_rows, column, states, state_cursor);
     }
     // LowCardinality carries its own dictionary, indexes, and (for a Nullable
     // inner type) null handling, so it is decoded as a unit rather than going
@@ -1063,14 +1310,7 @@ fn decode_values(
     // element type's prefix was already consumed by the caller's
     // `read_state_prefix`.
     if let ChType::Array(inner) = ch_type {
-        return decode_array(
-            reader,
-            inner,
-            num_rows,
-            column,
-            dynamic_states,
-            dynamic_index,
-        );
+        return decode_array(reader, inner, num_rows, column, states, state_cursor);
     }
 
     // Map is the Array(Tuple(keys, values)) wire layout decoded as a unit; like
@@ -1078,41 +1318,19 @@ fn decode_values(
     // Nullable unwrap. The key/value prefixes were consumed by the caller's
     // `read_state_prefix`.
     if let ChType::Map(key, value) = ch_type {
-        return decode_map(
-            reader,
-            key,
-            value,
-            num_rows,
-            column,
-            dynamic_states,
-            dynamic_index,
-        );
+        return decode_map(reader, key, value, num_rows, column, states, state_cursor);
     }
 
     // Variant is one discriminator byte per row followed by dense alternative
     // bodies. It has intrinsic NULL semantics and cannot be wrapped in Nullable,
     // so dispatch it before the ordinary Nullable unwrap.
     if let ChType::Variant(alternatives) = ch_type {
-        return decode_variant(
-            reader,
-            alternatives,
-            num_rows,
-            column,
-            dynamic_states,
-            dynamic_index,
-        );
+        return decode_variant(reader, alternatives, num_rows, column, states, state_cursor);
     }
 
     if matches!(ch_type, ChType::Dynamic { .. }) {
-        let state = next_dynamic_state(dynamic_states, dynamic_index, column)?;
-        return decode_dynamic(
-            reader,
-            state,
-            num_rows,
-            column,
-            dynamic_states,
-            dynamic_index,
-        );
+        let state = next_dynamic_state(states, state_cursor, column)?;
+        return decode_dynamic(reader, state, num_rows, column, states, state_cursor);
     }
 
     let (nullable, inner) = match ch_type {
@@ -1144,8 +1362,24 @@ fn decode_values(
             num_rows,
             column,
             validity,
-            dynamic_states,
-            dynamic_index,
+            states,
+            state_cursor,
+        );
+    }
+
+    // JSON is a container decoded as a unit, dispatched after the Nullable
+    // unwrap because `Nullable(JSON)` is legal (`DataTypeObject::canBeInsideNullable`
+    // is true): the per-row null map precedes the full JSON body, the ordinary
+    // Nullable framing, so `validity` is threaded into the body builder.
+    if let ChType::Json { .. } = inner {
+        return decode_json(
+            reader,
+            inner,
+            num_rows,
+            column,
+            validity,
+            states,
+            state_cursor,
         );
     }
 
@@ -1167,8 +1401,8 @@ fn decode_variant(
     alternatives: &[ChType],
     num_rows: usize,
     column: &str,
-    dynamic_states: &[DynamicState],
-    dynamic_index: &mut usize,
+    states: &[StatePrefix],
+    state_cursor: &mut usize,
 ) -> Result<Column, DecodeError> {
     let discriminators = reader.read_slice(num_rows)?;
     let (layout, counts, null_count) =
@@ -1186,8 +1420,8 @@ fn decode_variant(
             alternative,
             count,
             column,
-            dynamic_states,
-            dynamic_index,
+            states,
+            state_cursor,
         )?);
     }
 
@@ -1213,8 +1447,8 @@ fn decode_dynamic(
     state: &DynamicState,
     num_rows: usize,
     column: &str,
-    dynamic_states: &[DynamicState],
-    dynamic_index: &mut usize,
+    states: &[StatePrefix],
+    state_cursor: &mut usize,
 ) -> Result<Column, DecodeError> {
     let num_children = state.children.len();
     if num_rows > i32::MAX as usize {
@@ -1318,14 +1552,7 @@ fn decode_dynamic(
     for (state_child, count) in state.children.iter().zip(counts) {
         match state_child {
             DynamicStateChild::Typed(ch_type) => {
-                let values = decode_values(
-                    reader,
-                    ch_type,
-                    count,
-                    column,
-                    dynamic_states,
-                    dynamic_index,
-                )?;
+                let values = decode_values(reader, ch_type, count, column, states, state_cursor)?;
                 children.push(DynamicChild::Typed {
                     ch_type: ch_type.clone(),
                     values,
@@ -1341,6 +1568,141 @@ fn decode_dynamic(
     Ok(Column::Dynamic(DynamicColumn::from_parts(
         type_ids, offsets, children, null_count,
     )))
+}
+
+/// Decode one `JSON` column body after its structure state prefix was retained
+/// by [`read_json_state_prefix`].
+///
+/// Wire layout (`SerializationObject::serializeBinaryBulkWithMultipleStreams`,
+/// confirmed at v26.6.1.1193-stable). STRING (word 1): one varint-length string
+/// per row, the re-serialized JSON document, and nothing else. V1/V2
+/// (`Structured`): the typed-path columns in sorted path order (each the path
+/// type's normal bulk body), then one complete Dynamic column body per dynamic
+/// path in sorted order (consuming the per-path DynamicState read in the
+/// prefix), then the shared data last as a plain `Array(Tuple(String, String))`:
+/// num_rows cumulative LE UInt64 end-offsets, then the flattened `paths` String
+/// column, then the flattened `values` String column (whose cells are opaque
+/// binary descriptor + `serializeBinary` payloads, kept as raw bytes and never
+/// materialized, exactly like a `SharedVariant` cell). FLATTENED (word 3): the
+/// typed-path columns then one full Dynamic column per flattened path, with NO
+/// shared-data stream. `validity` is the `Nullable(JSON)` null map already
+/// decoded by the caller.
+fn decode_json(
+    reader: &mut ByteReader,
+    ch_type: &ChType,
+    num_rows: usize,
+    column: &str,
+    validity: Option<Bitmap>,
+    states: &[StatePrefix],
+    state_cursor: &mut usize,
+) -> Result<Column, DecodeError> {
+    let ChType::Json { typed_paths, .. } = ch_type else {
+        return Err(invalid_json(column, "not a JSON type"));
+    };
+
+    // Pop this node's structure state; clone the small path list so the borrow
+    // of `states` ends before the child decodes below take it again.
+    let (kind, dynamic_paths) = match next_state(states, state_cursor, column)? {
+        StatePrefix::Json(state) => (state.kind, state.dynamic_paths.clone()),
+        StatePrefix::Dynamic(_) => {
+            return Err(invalid_json(column, "expected a JSON structure state"))
+        }
+    };
+
+    if kind == JsonWireKind::Text {
+        // STRING mode carries only one document string per row; the declared
+        // typed paths are not present on the wire in this mode.
+        let (offsets, data) = decode_string_data(reader, num_rows)?;
+        return Ok(Column::Json(
+            JsonColumn::text(Utf8Column::new(offsets, data)).with_validity(validity),
+        ));
+    }
+
+    // Typed-path columns, in the ChType's sorted path order.
+    let mut typed = Vec::with_capacity(typed_paths.len());
+    for (path, element_type) in typed_paths {
+        let values = decode_values(reader, element_type, num_rows, column, states, state_cursor)?;
+        typed.push((path.clone(), values));
+    }
+
+    // Dynamic-path columns, in sorted path order, each a full Dynamic body.
+    let mut dynamic = Vec::with_capacity(dynamic_paths.len());
+    for path in &dynamic_paths {
+        let state = match next_state(states, state_cursor, column)? {
+            StatePrefix::Dynamic(state) => state,
+            StatePrefix::Json(_) => {
+                return Err(invalid_json(
+                    column,
+                    "expected a Dynamic state for a JSON dynamic path",
+                ))
+            }
+        };
+        match decode_dynamic(reader, state, num_rows, column, states, state_cursor)? {
+            Column::Dynamic(dynamic_col) => dynamic.push((path.clone(), dynamic_col)),
+            _ => {
+                return Err(invalid_json(
+                    column,
+                    "JSON dynamic path did not decode to a Dynamic column",
+                ))
+            }
+        }
+    }
+
+    // Shared data (V1/V2 only): the plain Array(Tuple(String, String)) layout.
+    // FLATTENED carries no shared-data stream, so it decodes to empty shared
+    // columns.
+    let (shared_offsets, shared_paths, shared_values) = if kind == JsonWireKind::Structured {
+        let mut offsets = Vec::new();
+        let total_pairs = read_array_offsets(reader, num_rows, column, Some(&mut offsets))?;
+        let (path_offsets, path_data) = decode_string_data(reader, total_pairs)?;
+        let (value_offsets, value_data) = decode_string_data(reader, total_pairs)?;
+        (
+            offsets,
+            Utf8Column::new(path_offsets, path_data),
+            Utf8Column::new(value_offsets, value_data),
+        )
+    } else {
+        // FLATTENED carries no shared-data stream, so the shared columns are
+        // empty. The offsets still carry the Arrow leading 0 plus one entry per
+        // row (all zero, no pairs), so the column is a valid empty-shared
+        // structured column that re-encodes as either FLATTENED or V1/V2.
+        //
+        // This synthetic fill is a DELIBERATE, contained deviation from the
+        // read-before-allocate `capacity_for` discipline: FLATTENED writes no
+        // per-row body bytes, so `num_rows` is not bounded by the bytes present
+        // (unlike every other run, which reads its payload first). A pathless
+        // FLATTENED block can therefore drive an `n`-entry allocation from a tiny
+        // buffer. We accept it because `vec![0i64; n]` lowers to `alloc_zeroed`,
+        // whose pages stay untouched (lazily zero-mapped) until a consumer reads
+        // them, 8 bytes per row is exactly what any consumer of an `n`-row column
+        // allocates anyway, and the server itself materializes this shared-data
+        // offsets column for the same input (bounding it with its memory tracker,
+        // not an input-size ratio). The `+ 1` is checked so a `num_rows` of
+        // `usize::MAX` returns a clean error instead of overflowing.
+        let offsets_len = num_rows.checked_add(1).ok_or_else(|| {
+            invalid_json(
+                column,
+                "row count overflows usize for the shared-data offsets",
+            )
+        })?;
+        (
+            vec![0i64; offsets_len],
+            Utf8Column::new(vec![0], Vec::new()),
+            Utf8Column::new(vec![0], Vec::new()),
+        )
+    };
+
+    Ok(Column::Json(
+        JsonColumn::structured(StructuredJson::from_parts(
+            typed,
+            dynamic,
+            shared_offsets,
+            shared_paths,
+            shared_values,
+            num_rows,
+        ))
+        .with_validity(validity),
+    ))
 }
 
 /// Decode one `Tuple(T1, ...)` column body into an Arrow struct `Column`.
@@ -1380,8 +1742,8 @@ fn decode_tuple(
     num_rows: usize,
     column: &str,
     validity: Option<Bitmap>,
-    dynamic_states: &[DynamicState],
-    dynamic_index: &mut usize,
+    states: &[StatePrefix],
+    state_cursor: &mut usize,
 ) -> Result<Column, DecodeError> {
     if elements.is_empty() {
         // Tuple(): one placeholder byte per row, values not validated (the
@@ -1393,14 +1755,7 @@ fn decode_tuple(
 
     let mut fields = Vec::with_capacity(elements.len());
     for (_, element_type) in elements {
-        let element = decode_values(
-            reader,
-            element_type,
-            num_rows,
-            column,
-            dynamic_states,
-            dynamic_index,
-        )?;
+        let element = decode_values(reader, element_type, num_rows, column, states, state_cursor)?;
         // Mirror the server's equal-sizes assert. Unreachable in practice:
         // every element decode above is driven by the same num_rows.
         if element.len() != num_rows {
@@ -1454,8 +1809,8 @@ fn decode_array(
     inner: &ChType,
     num_rows: usize,
     column: &str,
-    dynamic_states: &[DynamicState],
-    dynamic_index: &mut usize,
+    states: &[StatePrefix],
+    state_cursor: &mut usize,
 ) -> Result<Column, DecodeError> {
     // Offsets: the shared walk reads and validates the run and builds the
     // Arrow-shaped offsets (leading 0, each wire offset widened to i64),
@@ -1466,14 +1821,7 @@ fn decode_array(
 
     // Element body: the flattened element column. The state prefix was consumed
     // by the caller's `read_state_prefix`, so decode the values only.
-    let values = decode_values(
-        reader,
-        inner,
-        total_elements,
-        column,
-        dynamic_states,
-        dynamic_index,
-    )?;
+    let values = decode_values(reader, inner, total_elements, column, states, state_cursor)?;
     Ok(Column::Array(ArrayColumn::new(offsets, values)))
 }
 
@@ -1505,8 +1853,8 @@ fn decode_map(
     value: &ChType,
     num_rows: usize,
     column: &str,
-    dynamic_states: &[DynamicState],
-    dynamic_index: &mut usize,
+    states: &[StatePrefix],
+    state_cursor: &mut usize,
 ) -> Result<Column, DecodeError> {
     // Offsets: the shared Array walk (a Map's offsets are byte-identical to an
     // Array's), building the Arrow-shaped run with the leading 0 and bounding
@@ -1517,22 +1865,8 @@ fn decode_map(
     // Flattened entries: the keys' full run then the values' full run, the
     // Tuple(K, V) body with prefixes already consumed. Both decodes are driven
     // by the same total, so the two fields cannot come out ragged.
-    let keys = decode_values(
-        reader,
-        key,
-        total_entries,
-        column,
-        dynamic_states,
-        dynamic_index,
-    )?;
-    let values = decode_values(
-        reader,
-        value,
-        total_entries,
-        column,
-        dynamic_states,
-        dynamic_index,
-    )?;
+    let keys = decode_values(reader, key, total_entries, column, states, state_cursor)?;
+    let values = decode_values(reader, value, total_entries, column, states, state_cursor)?;
     // The entries tuple never carries validity: the wire has no null map here
     // (a map is never nullable at the entries level), so it goes through the
     // shared constructor with `None`.
@@ -1951,6 +2285,7 @@ fn decode_column_body(
         | ChType::Map(..)
         | ChType::Variant(_)
         | ChType::Dynamic { .. }
+        | ChType::Json { .. }
         | ChType::SimpleAggregateFunction { .. }
         | ChType::Geo(_)
         | ChType::Nested(_) => {
@@ -2220,6 +2555,29 @@ fn empty_column(ch_type: &ChType) -> Column {
         ChType::Dynamic { .. } => {
             Column::Dynamic(DynamicColumn::from_parts(vec![], vec![], vec![], 0))
         }
+        // NativeWriter gates the entire JSON data step on rows > 0 too, so a
+        // zero-row block carries no structure word or path list. Build the
+        // canonical empty structured column: the declared typed paths present
+        // with their own empty columns, no dynamic paths, and empty shared data.
+        // A `Nullable(JSON)` zero-row column carries the empty top-level validity
+        // bitmap like the other nullable empties.
+        ChType::Json { typed_paths, .. } => {
+            let typed = typed_paths
+                .iter()
+                .map(|(path, ty)| (path.clone(), empty_column(ty)))
+                .collect();
+            Column::Json(
+                JsonColumn::structured(StructuredJson::from_parts(
+                    typed,
+                    Vec::new(),
+                    vec![0i64],
+                    Utf8Column::new(vec![0], Vec::new()),
+                    Utf8Column::new(vec![0], Vec::new()),
+                    0,
+                ))
+                .with_validity(empty_validity),
+            )
+        }
         // The outer `Nullable` was unwrapped above, `parse_ch_type` never
         // produces a `Nullable` directly inside a `Nullable`, and any
         // name-decoration alias was expanded to its physical delegate above, so
@@ -2479,7 +2837,6 @@ fn decode_block_body(
     num_rows: usize,
 ) -> Result<ColBatch, DecodeError> {
     check_header_count(num_cols, "column count", reader)?;
-    check_header_count(num_rows, "row count", reader)?;
 
     // `check_header_count` bounds `num_cols` at one byte per column, but each
     // column also stores a `Field` and a `Column` several dozen bytes wide, so a
@@ -2499,6 +2856,22 @@ fn decode_block_body(
         if num_rows == 0 {
             columns.push(empty_column(&ch_type));
         } else {
+            // Type-aware row-count guard, applied per column now that the type is
+            // known (the header is read here, so a single pre-loop guard could
+            // not see it). Every pre-JSON type writes at least one byte per row
+            // (a fixed/variable primitive, a null map, Array/Map offsets, a
+            // LowCardinality index, a Variant/Dynamic discriminator, or the
+            // Nothing/`Tuple()` placeholder byte), so a claimed row count above
+            // the bytes remaining is impossible and rejected early, exactly as
+            // the old global guard did. A `JSON` column, or a container that
+            // bottoms out in one, can legitimately write ZERO bytes per row (a
+            // pathless FLATTENED object under the flattened JSON serialization),
+            // so it is bounded by its own read-before-allocate decode instead
+            // (`decode_json`), keeping decode symmetric with the allocation-free
+            // scan, which never applied a row-count guard.
+            if has_min_one_byte_per_row(&ch_type) {
+                check_header_count(num_rows, "row count", reader)?;
+            }
             columns.push(decode_column(
                 reader, &ch_type, num_rows, &col_name, options,
             )?);
@@ -2512,6 +2885,31 @@ fn decode_block_body(
 
     let schema = Schema::new(fields);
     Ok(ColBatch::new(schema, columns, num_rows))
+}
+
+/// Whether every non-empty block of `ch_type` writes at least one byte per row,
+/// which lets [`decode_block_body`] reject an impossible row count early.
+///
+/// True for every type except one that can bottom out in a `JSON` body with no
+/// paths: a pathless FLATTENED `JSON` column writes zero bytes per row (no typed
+/// paths, no dynamic paths, and FLATTENED carries no shared-data stream), and a
+/// non-empty `Tuple` all of whose elements are such columns inherits that. A
+/// `Nullable` wrapper (null map), `Array`/`Map` (offsets), `LowCardinality`
+/// (index word plus per-row indexes), `Variant`/`Dynamic` (discriminators), and
+/// the empty `Tuple()` (one placeholder byte) all still guarantee >= 1 byte per
+/// row, so only a JSON leaf or a Tuple entirely of them returns false. Name
+/// decorations resolve through [`ChType::physical_delegate`].
+fn has_min_one_byte_per_row(ch_type: &ChType) -> bool {
+    if let Some(under) = ch_type.physical_delegate() {
+        return has_min_one_byte_per_row(&under);
+    }
+    match ch_type {
+        ChType::Json { .. } => false,
+        ChType::Tuple(elements) => {
+            elements.is_empty() || elements.iter().any(|(_, t)| has_min_one_byte_per_row(t))
+        }
+        _ => true,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2592,19 +2990,19 @@ fn skip_column_data(
     // Per-column bulk-state prefix, the same step `decode_column` runs. Zero
     // bytes for every type except LowCardinality; Array, Tuple, and Nullable
     // recurse into their element/inner prefixes.
-    let mut dynamic_states = Vec::new();
-    read_state_prefix(reader, ch_type, column, options, &mut dynamic_states, 0)?;
-    let mut dynamic_index = 0usize;
+    let mut states = Vec::new();
+    read_state_prefix(reader, ch_type, column, options, &mut states, 0)?;
+    let mut state_cursor = 0usize;
     skip_values(
         reader,
         ch_type,
         num_rows,
         column,
-        &dynamic_states,
-        &mut dynamic_index,
+        &states,
+        &mut state_cursor,
     )?;
     let mut suffix_index = 0usize;
-    read_state_suffix(reader, ch_type, column, &dynamic_states, &mut suffix_index)
+    read_state_suffix(reader, ch_type, column, &states, &mut suffix_index)
 }
 
 /// Advance `reader` past one column's value payload once its per-column state
@@ -2616,21 +3014,14 @@ fn skip_values(
     ch_type: &ChType,
     num_rows: usize,
     column: &str,
-    dynamic_states: &[DynamicState],
-    dynamic_index: &mut usize,
+    states: &[StatePrefix],
+    state_cursor: &mut usize,
 ) -> Result<(), DecodeError> {
     // Expand a name-decoration alias to its physical delegate, the scan-side
     // mirror of `decode_values`, so a geo/Nested alias reaches the Array
     // fast-path and a SimpleAggregateFunction walks its inner.
     if let Some(under) = ch_type.physical_delegate() {
-        return skip_values(
-            reader,
-            &under,
-            num_rows,
-            column,
-            dynamic_states,
-            dynamic_index,
-        );
+        return skip_values(reader, &under, num_rows, column, states, state_cursor);
     }
     if let ChType::LowCardinality(inner) = ch_type {
         // A zero-length run has no LowCardinality body bytes at all (see the
@@ -2642,51 +3033,22 @@ fn skip_values(
     }
 
     if let ChType::Array(inner) = ch_type {
-        return skip_array_data(
-            reader,
-            inner,
-            num_rows,
-            column,
-            dynamic_states,
-            dynamic_index,
-        );
+        return skip_array_data(reader, inner, num_rows, column, states, state_cursor);
     }
 
     // Map before the Nullable unwrap, mirroring `decode_values`: a map is
     // never nullable at this level.
     if let ChType::Map(key, value) = ch_type {
-        return skip_map_data(
-            reader,
-            key,
-            value,
-            num_rows,
-            column,
-            dynamic_states,
-            dynamic_index,
-        );
+        return skip_map_data(reader, key, value, num_rows, column, states, state_cursor);
     }
 
     if let ChType::Variant(alternatives) = ch_type {
-        return skip_variant_data(
-            reader,
-            alternatives,
-            num_rows,
-            column,
-            dynamic_states,
-            dynamic_index,
-        );
+        return skip_variant_data(reader, alternatives, num_rows, column, states, state_cursor);
     }
 
     if matches!(ch_type, ChType::Dynamic { .. }) {
-        let state = next_dynamic_state(dynamic_states, dynamic_index, column)?;
-        return skip_dynamic_data(
-            reader,
-            state,
-            num_rows,
-            column,
-            dynamic_states,
-            dynamic_index,
-        );
+        let state = next_dynamic_state(states, state_cursor, column)?;
+        return skip_dynamic_data(reader, state, num_rows, column, states, state_cursor);
     }
 
     let inner = match ch_type {
@@ -2706,14 +3068,13 @@ fn skip_values(
     // `Nullable(Tuple(...))` walks its per-row null map above, then the tuple
     // body.
     if let ChType::Tuple(elements) = inner {
-        return skip_tuple_data(
-            reader,
-            elements,
-            num_rows,
-            column,
-            dynamic_states,
-            dynamic_index,
-        );
+        return skip_tuple_data(reader, elements, num_rows, column, states, state_cursor);
+    }
+
+    // JSON after the Nullable unwrap, mirroring `decode_values`: a
+    // `Nullable(JSON)` walks its per-row null map above, then the JSON body.
+    if let ChType::Json { .. } = inner {
+        return skip_json_data(reader, inner, num_rows, column, states, state_cursor);
     }
 
     skip_column_body(reader, inner, num_rows)
@@ -2725,8 +3086,8 @@ fn skip_variant_data(
     alternatives: &[ChType],
     num_rows: usize,
     column: &str,
-    dynamic_states: &[DynamicState],
-    dynamic_index: &mut usize,
+    states: &[StatePrefix],
+    state_cursor: &mut usize,
 ) -> Result<(), DecodeError> {
     let discriminators = reader.read_slice(num_rows)?;
     let (counts, _null_count) =
@@ -2737,14 +3098,7 @@ fn skip_variant_data(
             }
         })?;
     for (alternative, count) in alternatives.iter().zip(counts) {
-        skip_values(
-            reader,
-            alternative,
-            count,
-            column,
-            dynamic_states,
-            dynamic_index,
-        )?;
+        skip_values(reader, alternative, count, column, states, state_cursor)?;
     }
     Ok(())
 }
@@ -2756,8 +3110,8 @@ fn skip_dynamic_data(
     state: &DynamicState,
     num_rows: usize,
     column: &str,
-    dynamic_states: &[DynamicState],
-    dynamic_index: &mut usize,
+    states: &[StatePrefix],
+    state_cursor: &mut usize,
 ) -> Result<(), DecodeError> {
     let num_children = state.children.len();
     let mut counts = vec![0usize; num_children];
@@ -2833,14 +3187,9 @@ fn skip_dynamic_data(
 
     for (child, count) in state.children.iter().zip(counts) {
         match child {
-            DynamicStateChild::Typed(ch_type) => skip_values(
-                reader,
-                ch_type,
-                count,
-                column,
-                dynamic_states,
-                dynamic_index,
-            )?,
+            DynamicStateChild::Typed(ch_type) => {
+                skip_values(reader, ch_type, count, column, states, state_cursor)?
+            }
             DynamicStateChild::Shared => {
                 for _ in 0..count {
                     let len = varint_usize(reader.read_varint()?, "Dynamic shared value length")?;
@@ -2848,6 +3197,58 @@ fn skip_dynamic_data(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Walk one `JSON` column body without materializing it, the scan-side mirror of
+/// [`decode_json`]. Consumes exactly what the decode reads: the STRING form's
+/// per-row varint strings, or the structured/flattened form's typed-path bodies,
+/// per-dynamic-path Dynamic bodies, and (V1/V2 only) the shared-data offsets plus
+/// its two flattened String columns.
+fn skip_json_data(
+    reader: &mut ByteReader,
+    ch_type: &ChType,
+    num_rows: usize,
+    column: &str,
+    states: &[StatePrefix],
+    state_cursor: &mut usize,
+) -> Result<(), DecodeError> {
+    let ChType::Json { typed_paths, .. } = ch_type else {
+        return Err(invalid_json(column, "not a JSON type"));
+    };
+    let (kind, num_dynamic) = match next_state(states, state_cursor, column)? {
+        StatePrefix::Json(state) => (state.kind, state.dynamic_paths.len()),
+        StatePrefix::Dynamic(_) => {
+            return Err(invalid_json(column, "expected a JSON structure state"))
+        }
+    };
+
+    if kind == JsonWireKind::Text {
+        return skip_column_body(reader, &ChType::String, num_rows);
+    }
+
+    for (_, element_type) in typed_paths {
+        skip_values(reader, element_type, num_rows, column, states, state_cursor)?;
+    }
+    for _ in 0..num_dynamic {
+        let state = match next_state(states, state_cursor, column)? {
+            StatePrefix::Dynamic(state) => state,
+            StatePrefix::Json(_) => {
+                return Err(invalid_json(
+                    column,
+                    "expected a Dynamic state for a JSON dynamic path",
+                ))
+            }
+        };
+        skip_dynamic_data(reader, state, num_rows, column, states, state_cursor)?;
+    }
+    if kind == JsonWireKind::Structured {
+        // Shared data: the Array(Tuple(String, String)) offsets, then the two
+        // flattened String columns, walked exactly as `decode_json` reads them.
+        let total_pairs = read_array_offsets(reader, num_rows, column, None)?;
+        skip_column_body(reader, &ChType::String, total_pairs)?;
+        skip_column_body(reader, &ChType::String, total_pairs)?;
     }
     Ok(())
 }
@@ -2862,22 +3263,15 @@ fn skip_tuple_data(
     elements: &[(Option<String>, ChType)],
     num_rows: usize,
     column: &str,
-    dynamic_states: &[DynamicState],
-    dynamic_index: &mut usize,
+    states: &[StatePrefix],
+    state_cursor: &mut usize,
 ) -> Result<(), DecodeError> {
     if elements.is_empty() {
         reader.skip(num_rows)?;
         return Ok(());
     }
     for (_, element_type) in elements {
-        skip_values(
-            reader,
-            element_type,
-            num_rows,
-            column,
-            dynamic_states,
-            dynamic_index,
-        )?;
+        skip_values(reader, element_type, num_rows, column, states, state_cursor)?;
     }
     Ok(())
 }
@@ -2893,26 +3287,12 @@ fn skip_map_data(
     value: &ChType,
     num_rows: usize,
     column: &str,
-    dynamic_states: &[DynamicState],
-    dynamic_index: &mut usize,
+    states: &[StatePrefix],
+    state_cursor: &mut usize,
 ) -> Result<(), DecodeError> {
     let total_entries = read_array_offsets(reader, num_rows, column, None)?;
-    skip_values(
-        reader,
-        key,
-        total_entries,
-        column,
-        dynamic_states,
-        dynamic_index,
-    )?;
-    skip_values(
-        reader,
-        value,
-        total_entries,
-        column,
-        dynamic_states,
-        dynamic_index,
-    )
+    skip_values(reader, key, total_entries, column, states, state_cursor)?;
+    skip_values(reader, value, total_entries, column, states, state_cursor)
 }
 
 /// Walk one `Array(T)` column block (after its element state prefix) in the
@@ -2931,18 +3311,11 @@ fn skip_array_data(
     inner: &ChType,
     num_rows: usize,
     column: &str,
-    dynamic_states: &[DynamicState],
-    dynamic_index: &mut usize,
+    states: &[StatePrefix],
+    state_cursor: &mut usize,
 ) -> Result<(), DecodeError> {
     let total_elements = read_array_offsets(reader, num_rows, column, None)?;
-    skip_values(
-        reader,
-        inner,
-        total_elements,
-        column,
-        dynamic_states,
-        dynamic_index,
-    )
+    skip_values(reader, inner, total_elements, column, states, state_cursor)
 }
 
 /// Advance `reader` past one column's value payload for a concrete inner type,
@@ -3026,6 +3399,7 @@ fn skip_column_body(
         | ChType::Map(..)
         | ChType::Variant(_)
         | ChType::Dynamic { .. }
+        | ChType::Json { .. }
         | ChType::SimpleAggregateFunction { .. }
         | ChType::Geo(_)
         | ChType::Nested(_) => {

@@ -12,7 +12,9 @@ use crate::native::aggregate_function::aggregate_state_codec;
 use crate::native::protocol::MAX_TYPE_DEPTH;
 use crate::native::type_parser::{normalize_variant_alternatives, parse_ch_type};
 use crate::native::varint::{write_varint, ByteReader};
-use crate::schema::{ChType, IntervalKind};
+use crate::schema::{
+    ChType, IntervalKind, JSON_MAX_DYNAMIC_PATHS, JSON_MAX_DYNAMIC_TYPES, JSON_MAX_TYPED_PATHS,
+};
 
 const MAX_BINARY_TYPE_COMPLEXITY: usize = 1_000;
 const MAX_BINARY_TYPE_LIST: usize = 1_000_000;
@@ -185,7 +187,7 @@ fn read_binary_type_inner(
             0x2d => ChType::Bool,
             0x2e => read_simple_aggregate_function(reader, depth, complexity)?,
             0x2f => ChType::Nested(read_nested(reader, depth, complexity)?),
-            0x30 => return Err(BinaryTypeError::Unsupported("JSON".into())),
+            0x30 => read_json(reader, depth, complexity)?,
             0x31 => ChType::BFloat16,
             0x32 => ChType::Time,
             0x33 | 0x35 => {
@@ -315,6 +317,78 @@ fn read_nested(
         fields.push((name, ch_type));
     }
     Ok(fields)
+}
+
+/// Read a `JSON` binary type descriptor (tag 0x30, `DataTypesBinaryEncoding`,
+/// confirmed at v26.6.1.1193-stable): a `TYPE_JSON_SERIALIZATION_VERSION` byte
+/// (currently 0; a nonzero value throws `INCORRECT_DATA` server-side, rejected
+/// here), a VarUInt `max_dynamic_paths` (<= 10000), a raw u8 `max_dynamic_types`
+/// (NOT a varint; <= 254), then a VarUInt-counted list of typed paths (each a
+/// varint string plus a recursive type descriptor, <= 1000), a VarUInt-counted
+/// list of skip paths, and a VarUInt-counted list of skip regexps.
+///
+/// The server iterates an `unordered_map`/`set` here, so paths arrive in
+/// arbitrary order. This canonicalizes into the sorted [`ChType::Json`] form
+/// (duplicate typed paths collapse, last wins; duplicate skip entries collapse)
+/// so the outer round-trip through `parse_ch_type` accepts it, matching how the
+/// server accepts any order on its own read side.
+fn read_json(
+    reader: &mut ByteReader,
+    depth: usize,
+    complexity: &mut usize,
+) -> Result<ChType, BinaryTypeError> {
+    let version = reader.read_u8()?;
+    if version != 0 {
+        return Err(BinaryTypeError::Invalid(format!(
+            "JSON serialization version {version} exceeds 0"
+        )));
+    }
+    let max_dynamic_paths = usize_from_varint(reader.read_varint()?, "JSON max_dynamic_paths")?;
+    if max_dynamic_paths > JSON_MAX_DYNAMIC_PATHS as usize {
+        return Err(BinaryTypeError::Invalid(format!(
+            "JSON max_dynamic_paths {max_dynamic_paths} exceeds {JSON_MAX_DYNAMIC_PATHS}"
+        )));
+    }
+    let max_dynamic_types = reader.read_u8()?;
+    if max_dynamic_types > JSON_MAX_DYNAMIC_TYPES {
+        return Err(BinaryTypeError::Invalid(format!(
+            "JSON max_dynamic_types {max_dynamic_types} exceeds {JSON_MAX_DYNAMIC_TYPES}"
+        )));
+    }
+
+    let typed_count = usize_from_varint(reader.read_varint()?, "JSON typed path count")?;
+    if typed_count > JSON_MAX_TYPED_PATHS {
+        return Err(BinaryTypeError::Invalid(format!(
+            "JSON typed path count {typed_count} exceeds {JSON_MAX_TYPED_PATHS}"
+        )));
+    }
+    ensure_type_budget(typed_count, *complexity, "JSON typed paths")?;
+    let mut typed = std::collections::BTreeMap::<String, ChType>::new();
+    for _ in 0..typed_count {
+        let path = reader.read_varint_string()?;
+        let ch_type = read_binary_type_inner(reader, depth + 1, complexity)?;
+        typed.insert(path, ch_type);
+    }
+
+    let skip_count = read_count(reader, "JSON skip paths")?;
+    let mut skip_paths = std::collections::BTreeSet::<String>::new();
+    for _ in 0..skip_count {
+        skip_paths.insert(reader.read_varint_string()?);
+    }
+
+    let regexp_count = read_count(reader, "JSON skip regexps")?;
+    let mut skip_regexps = std::collections::BTreeSet::<String>::new();
+    for _ in 0..regexp_count {
+        skip_regexps.insert(reader.read_varint_string()?);
+    }
+
+    Ok(ChType::Json {
+        max_dynamic_paths: max_dynamic_paths as u32,
+        max_dynamic_types,
+        typed_paths: typed.into_iter().collect(),
+        skip_paths: skip_paths.into_iter().collect(),
+        skip_regexps: skip_regexps.into_iter().collect(),
+    })
 }
 
 fn read_interval(kind: u8) -> Result<IntervalKind, BinaryTypeError> {
@@ -625,6 +699,36 @@ pub(crate) fn write_binary_type(buf: &mut Vec<u8>, ch_type: &ChType) {
                 write_binary_type(buf, field);
             }
         }
+        // JSON (tag 0x30): the serialization-version byte (0), then
+        // max_dynamic_paths (VarUInt), max_dynamic_types (raw u8), and the sorted
+        // typed-path / skip-path / skip-regexp lists. The ChType keeps these
+        // sorted, so the descriptor is emitted deterministically; the server
+        // accepts any order on read since it rebuilds maps.
+        ChType::Json {
+            max_dynamic_paths,
+            max_dynamic_types,
+            typed_paths,
+            skip_paths,
+            skip_regexps,
+        } => {
+            buf.push(0x30);
+            buf.push(0);
+            write_varint(buf, *max_dynamic_paths as u64);
+            buf.push(*max_dynamic_types);
+            write_varint(buf, typed_paths.len() as u64);
+            for (path, ch_type) in typed_paths {
+                write_string(buf, path.as_bytes());
+                write_binary_type(buf, ch_type);
+            }
+            write_varint(buf, skip_paths.len() as u64);
+            for path in skip_paths {
+                write_string(buf, path.as_bytes());
+            }
+            write_varint(buf, skip_regexps.len() as u64);
+            for regex in skip_regexps {
+                write_string(buf, regex.as_bytes());
+            }
+        }
         ChType::SimpleAggregateFunction { .. }
         | ChType::AggregateFunction { .. }
         | ChType::Geo(_) => {
@@ -840,5 +944,65 @@ mod tests {
                 inner: Box::new(ChType::String),
             }
         );
+    }
+
+    #[test]
+    fn json_binary_descriptor_roundtrips_and_canonicalizes() {
+        // A JSON type with non-default parameters, typed paths, skip paths, and
+        // skip regexps round-trips through the structural tag 0x30.
+        let json = parse_ch_type(
+            "JSON(max_dynamic_types=8, max_dynamic_paths=64, a Int64, b String, SKIP secret, SKIP REGEXP '^tmp')",
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        write_binary_type(&mut bytes, &json);
+        let mut reader = ByteReader::new(&bytes);
+        assert_eq!(read_binary_type(&mut reader).unwrap(), json);
+        assert_eq!(reader.remaining(), 0);
+
+        // The server iterates unordered maps/sets, so a descriptor may present
+        // typed paths out of order. Hand-build one with `b` before `a` and
+        // confirm it canonicalizes into the sorted ChType. Descriptor layout:
+        // tag, version 0, max_dynamic_paths (VarUInt), max_dynamic_types (u8),
+        // typed count + entries, skip count, skip-regexp count.
+        let mut unsorted = vec![0x30, 0x00];
+        write_varint(&mut unsorted, 1024); // max_dynamic_paths (default)
+        unsorted.push(32); // max_dynamic_types (default)
+        write_varint(&mut unsorted, 2); // typed path count
+        write_string(&mut unsorted, b"b");
+        write_binary_type(&mut unsorted, &ChType::String);
+        write_string(&mut unsorted, b"a");
+        write_binary_type(&mut unsorted, &ChType::Int64);
+        write_varint(&mut unsorted, 0); // skip paths
+        write_varint(&mut unsorted, 0); // skip regexps
+        assert_eq!(
+            read_binary_type(&mut ByteReader::new(&unsorted)).unwrap(),
+            parse_ch_type("JSON(a Int64, b String)").unwrap()
+        );
+
+        // A nonzero TYPE_JSON_SERIALIZATION_VERSION byte is rejected (the server
+        // throws INCORRECT_DATA on > 0).
+        let mut nonzero_version = vec![0x30, 0x01];
+        write_varint(&mut nonzero_version, 1024);
+        nonzero_version.push(32);
+        write_varint(&mut nonzero_version, 0);
+        write_varint(&mut nonzero_version, 0);
+        write_varint(&mut nonzero_version, 0);
+        assert!(matches!(
+            read_binary_type(&mut ByteReader::new(&nonzero_version)),
+            Err(BinaryTypeError::Invalid(_))
+        ));
+
+        // A parameter past the construction limits is rejected.
+        let mut over_paths = vec![0x30, 0x00];
+        write_varint(&mut over_paths, 10001); // max_dynamic_paths > 10000
+        over_paths.push(32);
+        write_varint(&mut over_paths, 0);
+        write_varint(&mut over_paths, 0);
+        write_varint(&mut over_paths, 0);
+        assert!(matches!(
+            read_binary_type(&mut ByteReader::new(&over_paths)),
+            Err(BinaryTypeError::Invalid(_))
+        ));
     }
 }

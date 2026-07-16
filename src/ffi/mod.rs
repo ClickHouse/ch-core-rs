@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use crate::batch::ColBatch;
 use crate::column::{
-    Column, DynamicChild, DynamicColumn, Utf8Column, VariantColumn, VariantGroup, VariantLayout,
-    ARROW_UNION_MAX_CHILDREN,
+    Column, DynamicChild, DynamicColumn, JsonBody, JsonColumn, NothingColumn, StructuredJson,
+    Utf8Column, VariantColumn, VariantGroup, VariantLayout, ARROW_UNION_MAX_CHILDREN,
 };
 use crate::native::decode::low_cardinality_dict_value_type;
 use crate::schema::{ChType, IntervalKind, Schema};
@@ -135,6 +135,27 @@ enum FieldExportPlan {
     },
     Variant(Vec<FieldExportPlan>),
     Dynamic(DynamicExportPlan),
+    Json(JsonExportPlan),
+}
+
+/// Result-wide export plan for one `JSON` field. The body kind (structured vs
+/// text) is fixed for a whole query result by a server setting, so the stream
+/// planner resolves it once here; a chunk that disagreed is rejected before the
+/// first batch (see [`ExportError::JsonBodyKindMismatch`]).
+enum JsonExportPlan {
+    /// `STRING`-mode blocks: every row is one re-serialized JSON document
+    /// string, exported exactly like a plain `String` column.
+    Text,
+    /// Structured blocks export as an Arrow struct. `typed` holds one plan per
+    /// declared typed path, aligned with the field's `ChType::Json` typed-path
+    /// order. `dynamic` holds one result-wide `DynamicExportPlan` per dynamic
+    /// path name discovered across all chunks, in BTreeMap name order, so the
+    /// per-block dynamic path sets unify into one fixed child list. The trailing
+    /// `_shared_data` child is plain utf8/binary and needs no plan.
+    Structured {
+        typed: Vec<FieldExportPlan>,
+        dynamic: Vec<(String, DynamicExportPlan)>,
+    },
 }
 
 struct DynamicExportPlan {
@@ -186,6 +207,13 @@ pub enum ExportError {
     /// enforce uniqueness; this is reachable only through the public
     /// `DynamicColumn` fields.
     DynamicDuplicateChild { name: String },
+    /// A `JSON` field's chunks disagree on body kind: some are structured
+    /// (typed paths, dynamic paths, shared data) and some are `STRING`-mode
+    /// text. The Arrow field format is fixed for a whole stream (`+s` struct vs
+    /// `u` utf8), so a mix cannot be exported as one field. The body kind is a
+    /// server-result-wide setting, so this only arises from chunks assembled
+    /// from different results or hand-built columns.
+    JsonBodyKindMismatch,
 }
 
 impl std::fmt::Display for ExportError {
@@ -200,6 +228,11 @@ impl std::fmt::Display for ExportError {
                 f,
                 "Dynamic column has more than one child named {name}; \
                  child type names must be unique"
+            ),
+            ExportError::JsonBodyKindMismatch => write!(
+                f,
+                "JSON column mixes structured and text bodies across chunks; a \
+                 JSON field must be all structured or all text in one result"
             ),
         }
     }
@@ -221,16 +254,34 @@ fn dynamic_plan_over_limit(plan: &FieldExportPlan) -> Option<usize> {
         FieldExportPlan::Map { key, value } => {
             dynamic_plan_over_limit(key).or_else(|| dynamic_plan_over_limit(value))
         }
-        FieldExportPlan::Dynamic(dynamic) => {
-            if dynamic.children.len() > DYNAMIC_MAX_EXPORT_CHILDREN {
-                return Some(dynamic.children.len());
-            }
-            dynamic.children.iter().find_map(|child| match child {
-                DynamicPlanChild::Typed { plan, .. } => dynamic_plan_over_limit(plan),
-                DynamicPlanChild::Shared => None,
+        FieldExportPlan::Dynamic(dynamic) => dynamic_export_plan_over_limit(dynamic),
+        // A JSON field's typed-path plans recurse like any other field, and each
+        // dynamic-path plan carries its own Dynamic union whose per-child budget
+        // must fit the signed Int8 code space, exactly as a standalone Dynamic
+        // does (the limit is per union node, not summed across paths). Text
+        // streams have no Dynamic nodes.
+        FieldExportPlan::Json(JsonExportPlan::Text) => None,
+        FieldExportPlan::Json(JsonExportPlan::Structured { typed, dynamic }) => {
+            typed.iter().find_map(dynamic_plan_over_limit).or_else(|| {
+                dynamic
+                    .iter()
+                    .find_map(|(_, plan)| dynamic_export_plan_over_limit(plan))
             })
         }
     }
+}
+
+/// The distinct child count of one Dynamic export plan (or a nested Dynamic
+/// below its typed children) that exceeds [`DYNAMIC_MAX_EXPORT_CHILDREN`], or
+/// `None` when every node fits Arrow's signed Int8 dense-union code space.
+fn dynamic_export_plan_over_limit(dynamic: &DynamicExportPlan) -> Option<usize> {
+    if dynamic.children.len() > DYNAMIC_MAX_EXPORT_CHILDREN {
+        return Some(dynamic.children.len());
+    }
+    dynamic.children.iter().find_map(|child| match child {
+        DynamicPlanChild::Typed { plan, .. } => dynamic_plan_over_limit(plan),
+        DynamicPlanChild::Shared => None,
+    })
 }
 
 /// Canonical exported child name of one block-local Dynamic child, the same
@@ -251,32 +302,50 @@ fn dynamic_child_name(child: &DynamicChild) -> String {
 /// ([`DYNAMIC_MAX_EXPORT_CHILDREN`]) and child type names must be unique.
 fn check_column_dynamic_export(col: &Column) -> Result<(), ExportError> {
     match col {
-        Column::Dynamic(c) => {
-            if c.children.len() > DYNAMIC_MAX_EXPORT_CHILDREN {
-                return Err(ExportError::DynamicUnionTooWide {
-                    children: c.children.len(),
-                    limit: DYNAMIC_MAX_EXPORT_CHILDREN,
-                });
-            }
-            let mut names = std::collections::HashSet::with_capacity(c.children.len());
-            for child in &c.children {
-                let name = dynamic_child_name(child);
-                if !names.insert(name.clone()) {
-                    return Err(ExportError::DynamicDuplicateChild { name });
-                }
-            }
-            c.children.iter().try_for_each(|child| match child {
-                DynamicChild::Typed { values, .. } => check_column_dynamic_export(values),
-                DynamicChild::Shared(_) => Ok(()),
-            })
-        }
+        Column::Dynamic(c) => check_dynamic_column_export(c),
         Column::Array(c) => check_column_dynamic_export(&c.values),
         Column::Tuple(c) => c.fields.iter().try_for_each(check_column_dynamic_export),
         Column::Map(c) => check_column_dynamic_export(&c.entries),
         Column::Variant(c) => c.variants.iter().try_for_each(check_column_dynamic_export),
         Column::Dictionary(c) => check_column_dynamic_export(&c.values),
+        // A structured JSON column descends exactly where its Arrow export does:
+        // each typed-path child column (which can itself be JSON or Dynamic) and
+        // each block-local dynamic-path Dynamic column. Shared data is opaque
+        // binary and carries no Dynamic. Text JSON has neither.
+        Column::Json(c) => {
+            c.typed_paths()
+                .iter()
+                .try_for_each(|(_, values)| check_column_dynamic_export(values))?;
+            c.dynamic_paths()
+                .iter()
+                .try_for_each(|(_, dynamic)| check_dynamic_column_export(dynamic))
+        }
         _ => Ok(()),
     }
+}
+
+/// Validate one `Dynamic` column for export: the child set must fit Arrow's
+/// signed Int8 dense-union code space ([`DYNAMIC_MAX_EXPORT_CHILDREN`]), child
+/// type names must be unique, and each typed child recurses. Shared by the
+/// `Column::Dynamic` and `Column::Json` (dynamic-path) arms above.
+fn check_dynamic_column_export(c: &DynamicColumn) -> Result<(), ExportError> {
+    if c.children.len() > DYNAMIC_MAX_EXPORT_CHILDREN {
+        return Err(ExportError::DynamicUnionTooWide {
+            children: c.children.len(),
+            limit: DYNAMIC_MAX_EXPORT_CHILDREN,
+        });
+    }
+    let mut names = std::collections::HashSet::with_capacity(c.children.len());
+    for child in &c.children {
+        let name = dynamic_child_name(child);
+        if !names.insert(name.clone()) {
+            return Err(ExportError::DynamicDuplicateChild { name });
+        }
+    }
+    c.children.iter().try_for_each(|child| match child {
+        DynamicChild::Typed { values, .. } => check_column_dynamic_export(values),
+        DynamicChild::Shared(_) => Ok(()),
+    })
 }
 
 /// Reject a batch whose Arrow export would emit a malformed Dynamic union: a
@@ -378,90 +447,185 @@ fn build_export_plan(
             Ok(FieldExportPlan::Variant(plans))
         }
         ChType::Dynamic { .. } => {
-            // Discover the result-wide child set in one pass, mapping each
-            // canonical child name to its concrete `ChType` (absent for
-            // SharedVariant) and the block-local value columns that feed it.
-            // Collecting the value columns here rather than re-scanning per
-            // discovered name keeps this linear in the number of children; a
-            // result-wide Dynamic can reach tens of thousands of distinct types.
-            let mut discovered =
-                std::collections::BTreeMap::<String, (Option<ChType>, Vec<(usize, &Column)>)>::new(
-                );
-            for &(chunk, column) in columns {
-                if let Column::Dynamic(column) = column {
-                    let mut names = std::collections::HashSet::with_capacity(column.children.len());
-                    for child in &column.children {
-                        let name = dynamic_child_name(child);
-                        if !names.insert(name.clone()) {
-                            return Err(ExportError::DynamicDuplicateChild { name });
-                        }
-                        match child {
-                            DynamicChild::Typed { ch_type, values } => {
-                                discovered
-                                    .entry(name)
-                                    .or_insert_with(|| (Some(ch_type.clone()), Vec::new()))
-                                    .1
-                                    .push((chunk, values));
-                            }
-                            DynamicChild::Shared(_) => {
-                                discovered.entry(name).or_insert((None, Vec::new()));
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Result-wide ids follow the BTreeMap's name order. Precompute each
-            // chunk's block-local -> result-wide table now so `get_next` never
-            // recomputes child names or a name-keyed map per batch.
-            let global_by_name: std::collections::HashMap<&str, u32> = discovered
-                .keys()
-                .enumerate()
-                .map(|(global, name)| (name.as_str(), global as u32))
-                .collect();
-            let mut chunk_remaps: Vec<Option<Vec<u32>>> = vec![None; num_chunks];
-            for &(chunk, column) in columns {
-                if let Column::Dynamic(column) = column {
-                    let local_to_global = column
-                        .children
-                        .iter()
-                        .map(|child| {
-                            // Every child was discovered above; `u32::MAX` is
-                            // unreachable and would only route rows to NULL.
-                            global_by_name
-                                .get(dynamic_child_name(child).as_str())
-                                .copied()
-                                .unwrap_or(u32::MAX)
-                        })
-                        .collect();
-                    if let Some(slot) = chunk_remaps.get_mut(chunk) {
-                        *slot = Some(local_to_global);
-                    }
-                }
-            }
-
-            let children = discovered
-                .into_values()
-                .map(|(ch_type, values)| {
-                    Ok(match ch_type {
-                        Some(ch_type) => {
-                            let plan = build_export_plan(&ch_type, &values, num_chunks)?;
-                            DynamicPlanChild::Typed {
-                                ch_type,
-                                plan: Box::new(plan),
-                            }
-                        }
-                        None => DynamicPlanChild::Shared,
-                    })
+            let dynamics = columns
+                .iter()
+                .filter_map(|&(chunk, column)| match column {
+                    Column::Dynamic(column) => Some((chunk, column)),
+                    _ => None,
                 })
-                .collect::<Result<Vec<_>, ExportError>>()?;
-            Ok(FieldExportPlan::Dynamic(DynamicExportPlan {
-                children,
-                chunk_remaps,
-            }))
+                .collect::<Vec<_>>();
+            Ok(FieldExportPlan::Dynamic(build_dynamic_plan(
+                &dynamics, num_chunks,
+            )?))
+        }
+        ChType::Json { typed_paths, .. } => {
+            build_json_plan(typed_paths, columns, num_chunks).map(FieldExportPlan::Json)
         }
         _ => Ok(FieldExportPlan::Plain),
     }
+}
+
+/// Build one result-wide [`DynamicExportPlan`] from the per-chunk `Dynamic`
+/// columns feeding one field position (a top-level Dynamic field or one JSON
+/// dynamic path). `columns` already pairs each present column with its chunk
+/// index; a chunk absent from the slice contributes an all-`None` remap so its
+/// batch routes every row to the NULL child. Shared by the `ChType::Dynamic`
+/// arm and JSON dynamic-path planning so the union unification logic lives in
+/// one place.
+fn build_dynamic_plan(
+    columns: &[(usize, &DynamicColumn)],
+    num_chunks: usize,
+) -> Result<DynamicExportPlan, ExportError> {
+    // Discover the result-wide child set in one pass, mapping each canonical
+    // child name to its concrete `ChType` (absent for SharedVariant) and the
+    // block-local value columns that feed it. Collecting the value columns here
+    // rather than re-scanning per discovered name keeps this linear in the
+    // number of children; a result-wide Dynamic can reach tens of thousands of
+    // distinct types.
+    let mut discovered =
+        std::collections::BTreeMap::<String, (Option<ChType>, Vec<(usize, &Column)>)>::new();
+    for &(chunk, column) in columns {
+        let mut names = std::collections::HashSet::with_capacity(column.children.len());
+        for child in &column.children {
+            let name = dynamic_child_name(child);
+            if !names.insert(name.clone()) {
+                return Err(ExportError::DynamicDuplicateChild { name });
+            }
+            match child {
+                DynamicChild::Typed { ch_type, values } => {
+                    discovered
+                        .entry(name)
+                        .or_insert_with(|| (Some(ch_type.clone()), Vec::new()))
+                        .1
+                        .push((chunk, values));
+                }
+                DynamicChild::Shared(_) => {
+                    discovered.entry(name).or_insert((None, Vec::new()));
+                }
+            }
+        }
+    }
+
+    // Result-wide ids follow the BTreeMap's name order. Precompute each chunk's
+    // block-local -> result-wide table now so `get_next` never recomputes child
+    // names or a name-keyed map per batch.
+    let global_by_name: std::collections::HashMap<&str, u32> = discovered
+        .keys()
+        .enumerate()
+        .map(|(global, name)| (name.as_str(), global as u32))
+        .collect();
+    let mut chunk_remaps: Vec<Option<Vec<u32>>> = vec![None; num_chunks];
+    for &(chunk, column) in columns {
+        let local_to_global = column
+            .children
+            .iter()
+            .map(|child| {
+                // Every child was discovered above; `u32::MAX` is unreachable
+                // and would only route rows to NULL.
+                global_by_name
+                    .get(dynamic_child_name(child).as_str())
+                    .copied()
+                    .unwrap_or(u32::MAX)
+            })
+            .collect();
+        if let Some(slot) = chunk_remaps.get_mut(chunk) {
+            *slot = Some(local_to_global);
+        }
+    }
+
+    let children = discovered
+        .into_values()
+        .map(|(ch_type, values)| {
+            Ok(match ch_type {
+                Some(ch_type) => {
+                    let plan = build_export_plan(&ch_type, &values, num_chunks)?;
+                    DynamicPlanChild::Typed {
+                        ch_type,
+                        plan: Box::new(plan),
+                    }
+                }
+                None => DynamicPlanChild::Shared,
+            })
+        })
+        .collect::<Result<Vec<_>, ExportError>>()?;
+    Ok(DynamicExportPlan {
+        children,
+        chunk_remaps,
+    })
+}
+
+/// Build one result-wide [`JsonExportPlan`] from the per-chunk `JSON` columns
+/// feeding one field position. The body kind must agree across chunks (see
+/// [`ExportError::JsonBodyKindMismatch`]); a text result needs no further
+/// planning. A structured result recurses `build_export_plan` per typed path
+/// and unifies the block-local dynamic path sets by name (BTreeMap order),
+/// building one Dynamic plan per result-wide path from the chunks that carry
+/// it. A result with no matching columns at all (a zero-chunk stream) plans as
+/// an empty structured body: only the declared typed paths and shared data.
+fn build_json_plan(
+    typed_paths: &[(String, ChType)],
+    columns: &[(usize, &Column)],
+    num_chunks: usize,
+) -> Result<JsonExportPlan, ExportError> {
+    let mut saw_structured = false;
+    let mut saw_text = false;
+    for &(_, column) in columns {
+        if let Column::Json(column) = column {
+            match column.body() {
+                JsonBody::Structured(_) => saw_structured = true,
+                JsonBody::Text(_) => saw_text = true,
+            }
+        }
+    }
+    if saw_structured && saw_text {
+        return Err(ExportError::JsonBodyKindMismatch);
+    }
+    if saw_text {
+        return Ok(JsonExportPlan::Text);
+    }
+
+    // Structured (also the zero-chunk / all-absent default). Typed-path children
+    // stay in the declared ChType order; each recurses through build_export_plan
+    // so a typed path that is itself JSON or Dynamic is planned result-wide too.
+    let typed = typed_paths
+        .iter()
+        .enumerate()
+        .map(|(index, (_, path_type))| {
+            let children = columns
+                .iter()
+                .filter_map(|&(chunk, column)| match column {
+                    Column::Json(column) => column
+                        .typed_paths()
+                        .get(index)
+                        .map(|(_, values)| (chunk, values)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            build_export_plan(path_type, &children, num_chunks)
+        })
+        .collect::<Result<Vec<_>, ExportError>>()?;
+
+    // Union the block-local dynamic path names across chunks; the BTreeMap key
+    // order fixes the exported child order. Each path's Dynamic plan is built
+    // from only the chunks that carry it, so a chunk missing the path leaves an
+    // all-`None` remap and exports an all-NULL union for it.
+    let mut discovered = std::collections::BTreeMap::<String, Vec<(usize, &DynamicColumn)>>::new();
+    for &(chunk, column) in columns {
+        if let Column::Json(column) = column {
+            for (path, dynamic) in column.dynamic_paths() {
+                discovered
+                    .entry(path.clone())
+                    .or_default()
+                    .push((chunk, dynamic));
+            }
+        }
+    }
+    let dynamic = discovered
+        .into_iter()
+        .map(|(name, dynamics)| Ok((name, build_dynamic_plan(&dynamics, num_chunks)?)))
+        .collect::<Result<Vec<_>, ExportError>>()?;
+
+    Ok(JsonExportPlan::Structured { typed, dynamic })
 }
 
 // ---------------------------------------------------------------------------
@@ -742,6 +906,12 @@ fn arrow_format(ch_type: &ChType) -> String {
         // LargeList `+L` regardless of the field types (which appear in the
         // `item` struct child), matching the `Array`/`Map` arms above.
         ChType::Nested(_) => "+L".into(),
+        // JSON never reaches this generic arm: the schema paths intercept it (as
+        // they do Variant and Dynamic) because its shape is column-driven, a
+        // structured `+s` struct or a `STRING`-mode `u` utf8 chosen per body.
+        // The structured struct is the honest logical default, so return it for
+        // any hypothetical direct caller rather than a misleading `n`.
+        ChType::Json { .. } => "+s".into(),
     }
 }
 
@@ -783,6 +953,11 @@ fn field_is_nullable(ch_type: &ChType) -> bool {
         // have no top-level validity bitmap, but the field can still be nullable.
         ChType::Variant(_) => true,
         ChType::Dynamic { .. } => true,
+        // JSON is nullable-flagged like Variant/Dynamic. A structured body's
+        // struct validity carries a real `Nullable(JSON)` null map; a bare JSON
+        // leaves a null validity buffer with null_count 0, which the C Data spec
+        // permits for a nullable field.
+        ChType::Json { .. } => true,
         _ => false,
     }
 }
@@ -875,6 +1050,20 @@ unsafe fn write_field_schema_for_column(
             _ => None,
         };
         write_dynamic_schema(out, name, dynamic);
+        return;
+    }
+    // JSON's shape is column-driven like Variant/Dynamic: a structured body is
+    // an Arrow struct whose children are the declared typed paths, the
+    // block-local dynamic paths, and the shared-data LargeList, while a
+    // STRING-mode body is a plain utf8 column. Both wrappers (`JSON`,
+    // `Nullable(JSON)`) reach this via `inner()`; the array path dispatches on
+    // `Column::Json` and stays in agreement.
+    if let ChType::Json { typed_paths, .. } = ch_type.inner() {
+        let json = match column {
+            Some(Column::Json(col)) => Some(col),
+            _ => None,
+        };
+        write_json_schema(out, name, typed_paths, json);
         return;
     }
 
@@ -1193,6 +1382,12 @@ unsafe fn write_field_schema_with_plan(
         write_dynamic_schema_with_plan(out, name, dynamic);
         return;
     }
+    if let (ChType::Json { typed_paths, .. }, FieldExportPlan::Json(json_plan)) =
+        (ch_type.inner(), plan)
+    {
+        write_json_schema_with_plan(out, name, typed_paths, json_plan);
+        return;
+    }
 
     let dictionary = if is_dictionary(ch_type) {
         let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
@@ -1305,6 +1500,100 @@ unsafe fn write_dynamic_schema_with_plan(
     write_dynamic_schema_tree(out, name, dynamic.children.len(), &mut write_leaf);
 }
 
+/// Write one block-local / standalone `JSON` field schema. A structured body is
+/// an Arrow struct (`+s`) with children in the fixed order: one per declared
+/// typed path, then one per block-local dynamic path (each a Dynamic union),
+/// then the `_shared_data` LargeList. A text body is a plain utf8 (`u`) column.
+/// The field is nullable-flagged either way (see [`field_is_nullable`]). With no
+/// column (the logical [`export_schema`] path) only the declared typed paths and
+/// shared data are known, exactly as Dynamic exposes only its NULL child.
+unsafe fn write_json_schema(
+    out: *mut ArrowSchema,
+    name: &str,
+    typed_paths: &[(String, ChType)],
+    column: Option<&JsonColumn>,
+) {
+    let structured = match column {
+        // Text body: same Arrow shape as a plain String column.
+        Some(column) => match column.body() {
+            JsonBody::Text(_) => {
+                write_schema_node(out, name, "u", true, Vec::new(), ptr::null_mut());
+                return;
+            }
+            JsonBody::Structured(structured) => Some(structured.as_ref()),
+        },
+        None => None,
+    };
+
+    let mut children = Vec::new();
+    for (index, (path, path_type)) in typed_paths.iter().enumerate() {
+        let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+        let values =
+            structured.and_then(|structured| structured.typed.get(index).map(|(_, values)| values));
+        write_field_schema_for_column(child, path, path_type, values);
+        children.push(child);
+    }
+    if let Some(structured) = structured {
+        for (path, dynamic) in &structured.dynamic {
+            let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+            write_dynamic_schema(child, path, Some(dynamic));
+            children.push(child);
+        }
+    }
+    let shared = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+    write_json_shared_schema(shared, "_shared_data");
+    children.push(shared);
+    write_struct_schema_node(out, name, children, true);
+}
+
+/// Write one result-wide `JSON` field schema from its stream plan. Same fixed
+/// child order as [`write_json_schema`], but the dynamic-path children are the
+/// unified result-wide set (BTreeMap name order) rather than one block's set.
+unsafe fn write_json_schema_with_plan(
+    out: *mut ArrowSchema,
+    name: &str,
+    typed_paths: &[(String, ChType)],
+    plan: &JsonExportPlan,
+) {
+    let (typed, dynamic) = match plan {
+        JsonExportPlan::Text => {
+            write_schema_node(out, name, "u", true, Vec::new(), ptr::null_mut());
+            return;
+        }
+        JsonExportPlan::Structured { typed, dynamic } => (typed, dynamic),
+    };
+    let mut children = Vec::new();
+    for ((path, path_type), path_plan) in typed_paths.iter().zip(typed) {
+        let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+        write_field_schema_with_plan(child, path, path_type, path_plan);
+        children.push(child);
+    }
+    for (path, path_plan) in dynamic {
+        let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+        write_dynamic_schema_with_plan(child, path, path_plan);
+        children.push(child);
+    }
+    let shared = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+    write_json_shared_schema(shared, "_shared_data");
+    children.push(shared);
+    write_struct_schema_node(out, name, children, true);
+}
+
+/// Write the `_shared_data` child schema: an Arrow LargeList (`+L`) of a
+/// non-nullable struct (`+s`) pairing `paths` (utf8 `u`, like a String column)
+/// with `values` (binary `z`, like a SharedVariant cell; the values are opaque
+/// descriptor+payload bytes, never utf8). The list is non-nullable, matching
+/// how Array export never sets list-level validity.
+unsafe fn write_json_shared_schema(out: *mut ArrowSchema, name: &str) {
+    let paths = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+    write_schema_node(paths, "paths", "u", false, Vec::new(), ptr::null_mut());
+    let values = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+    write_binary_schema(values, "values");
+    let item = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+    write_struct_schema_node(item, "item", vec![paths, values], false);
+    write_schema_node(out, name, "+L", false, vec![item], ptr::null_mut());
+}
+
 unsafe fn write_struct_schema_node(
     out: *mut ArrowSchema,
     name: &str,
@@ -1384,11 +1673,24 @@ unsafe fn write_union_schema_node(
 /// zeroed struct. On return `out` owns its data and must be freed through its
 /// `release` callback per the Arrow C Data Interface.
 ///
-/// This logical-schema-only API cannot discover `Dynamic`'s block-local child
-/// set. A schema containing Dynamic therefore exposes only its intrinsic Null
-/// child here and must not be paired with [`export_batch_array`]. Use
-/// [`export_batch`] or [`export_batch_schema`] for a concrete batch, or the
-/// Arrow C Stream API for multiple chunks.
+/// This logical-schema-only API cannot discover the block-local, column-driven
+/// shapes of `Dynamic` and `JSON`, so a schema containing either is incomplete
+/// here and MUST NOT be paired with [`export_batch_array`]: the resulting
+/// schema/array pair would disagree. Use [`export_batch`] or
+/// [`export_batch_schema`] for a concrete batch, or the Arrow C Stream API for
+/// multiple chunks.
+///
+/// - `Dynamic` exposes only its intrinsic Null child (no discovered typed
+///   children), because the concrete child set lives on the column, not the
+///   `ChType`.
+/// - `JSON` exposes the structured struct with ONLY the declared typed-path
+///   children plus the `_shared_data` child. It cannot show a block's
+///   block-local dynamic-path children (which come from the column), and it
+///   cannot represent a `STRING`-mode text body (which exports as a `u` utf8
+///   array, not a struct), because the body kind is a per-column choice. A
+///   concrete JSON array from [`export_batch_array`] may therefore carry extra
+///   dynamic-path children or be a utf8 array, either of which mismatches this
+///   struct schema.
 pub unsafe fn export_schema(schema_in: &Schema, out: *mut ArrowSchema) {
     let n_children = schema_in.num_fields() as i64;
 
@@ -1786,6 +2088,13 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
         }
         Column::Dynamic(c) => {
             export_dynamic_array(batch, c, out);
+            return;
+        }
+        // JSON is column-driven and writes its whole node here, exactly like
+        // Dynamic above: a structured body becomes an Arrow struct, a text body
+        // a plain utf8 column.
+        Column::Json(c) => {
+            export_json_array(batch, c, out);
             return;
         }
     }
@@ -2241,6 +2550,9 @@ unsafe fn export_empty_column_with_plan(
         (ChType::Dynamic { .. }, FieldExportPlan::Dynamic(dynamic)) => {
             export_empty_dynamic_with_plan(batch, dynamic, chunk, out);
         }
+        (ChType::Json { typed_paths, .. }, FieldExportPlan::Json(json_plan)) => {
+            export_empty_json_with_plan(batch, typed_paths, json_plan, chunk, out);
+        }
         (ChType::LowCardinality(inner), _) => {
             let dictionary = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
             export_empty_column_with_plan(
@@ -2385,6 +2697,73 @@ unsafe fn export_empty_dynamic_with_plan(
     );
 }
 
+/// Export a zero-length `JSON` node matching its result-wide plan, used when a
+/// JSON column is a Dynamic typed child absent from one chunk. Structured emits
+/// the empty struct (empty typed children, empty dynamic unions, empty
+/// `_shared_data`); text emits an empty utf8 column.
+unsafe fn export_empty_json_with_plan(
+    batch: &Arc<ColBatch>,
+    typed_paths: &[(String, ChType)],
+    plan: &JsonExportPlan,
+    chunk: usize,
+    out: *mut ArrowArray,
+) {
+    let (typed, dynamic) = match plan {
+        JsonExportPlan::Text => {
+            export_empty_binary_array(batch, out);
+            return;
+        }
+        JsonExportPlan::Structured { typed, dynamic } => (typed, dynamic),
+    };
+    let mut children = Vec::new();
+    for ((_, path_type), path_plan) in typed_paths.iter().zip(typed) {
+        let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+        export_empty_column_with_plan(batch, path_type, path_plan, chunk, child);
+        children.push(child);
+    }
+    for (_, path_plan) in dynamic {
+        let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+        export_empty_dynamic_with_plan(batch, path_plan, chunk, child);
+        children.push(child);
+    }
+    // Empty _shared_data: a zero-row LargeList over an empty (paths, values)
+    // struct, matching the shared schema shape with no borrowed data.
+    let paths = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+    export_empty_binary_array(batch, paths);
+    let values = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+    export_empty_binary_array(batch, values);
+    let item = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+    write_array_node(
+        batch,
+        item,
+        0,
+        0,
+        vec![ptr::null()],
+        vec![paths, values],
+        ptr::null_mut(),
+    );
+    let shared = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+    write_array_node(
+        batch,
+        shared,
+        0,
+        0,
+        vec![ptr::null(), EMPTY_OFFSETS_I64.as_ptr() as *const c_void],
+        vec![item],
+        ptr::null_mut(),
+    );
+    children.push(shared);
+    write_array_node(
+        batch,
+        out,
+        0,
+        0,
+        vec![ptr::null()],
+        children,
+        ptr::null_mut(),
+    );
+}
+
 unsafe fn export_dynamic_child_array(
     batch: &Arc<ColBatch>,
     child: &DynamicChild,
@@ -2409,6 +2788,196 @@ unsafe fn export_binary_array(batch: &Arc<ColBatch>, values: &Utf8Column, out: *
         buffers,
         Vec::new(),
         ptr::null_mut(),
+    );
+}
+
+/// The struct/utf8 validity buffer for one `JSON` column: the `Nullable(JSON)`
+/// null map when present, else a null pointer (all valid). A bare JSON leaves
+/// this null with null_count 0.
+fn json_validity_buffer(column: &JsonColumn) -> *const c_void {
+    column.validity.as_ref().map_or(ptr::null(), |bitmap| {
+        bitmap.as_bytes().as_ptr() as *const c_void
+    })
+}
+
+/// Export one standalone / block-local `JSON` column. A structured body becomes
+/// an Arrow struct whose children are the typed paths, the block-local dynamic
+/// paths (each a Dynamic union), then `_shared_data`; a text body becomes a
+/// plain utf8 column. Every buffer is borrowed from the batch-owned column and
+/// kept alive by the `Arc<ColBatch>` in each node's private data.
+unsafe fn export_json_array(batch: &Arc<ColBatch>, column: &JsonColumn, out: *mut ArrowArray) {
+    let length = column.len() as i64;
+    let null_count = column.null_count() as i64;
+    let validity = json_validity_buffer(column);
+    match column.body() {
+        JsonBody::Text(text) => {
+            let mut buffers = vec![validity];
+            push_offsets(&mut buffers, &text.offsets, EMPTY_OFFSETS_I32.as_ptr());
+            buffers.push(text.data.as_ptr() as *const c_void);
+            write_array_node(
+                batch,
+                out,
+                length,
+                null_count,
+                buffers,
+                Vec::new(),
+                ptr::null_mut(),
+            );
+        }
+        JsonBody::Structured(structured) => {
+            let mut children = Vec::new();
+            for (_, values) in &structured.typed {
+                let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+                export_one_column(batch, values, child);
+                children.push(child);
+            }
+            for (_, dynamic) in &structured.dynamic {
+                let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+                export_dynamic_array(batch, dynamic, child);
+                children.push(child);
+            }
+            let shared = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+            export_json_shared_array(batch, structured, shared);
+            children.push(shared);
+            write_array_node(
+                batch,
+                out,
+                length,
+                null_count,
+                vec![validity],
+                children,
+                ptr::null_mut(),
+            );
+        }
+    }
+}
+
+/// Export a structured JSON body's `_shared_data` as an Arrow LargeList of a
+/// (`paths`, `values`) struct. `shared_offsets` is already the i64 list-offset
+/// run and both string columns are borrowed zero-copy; `paths` is utf8 and
+/// `values` is opaque binary, but they share one physical layout (validity,
+/// i32 offsets, data) so `export_binary_array` builds both. The list length is
+/// the JSON row count; the inner struct length is the flattened pair count.
+unsafe fn export_json_shared_array(
+    batch: &Arc<ColBatch>,
+    structured: &StructuredJson,
+    out: *mut ArrowArray,
+) {
+    let paths = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+    export_binary_array(batch, &structured.shared_paths, paths);
+    let values = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+    export_binary_array(batch, &structured.shared_values, values);
+    let item = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+    write_array_node(
+        batch,
+        item,
+        structured.shared_paths.len() as i64,
+        0,
+        vec![ptr::null()],
+        vec![paths, values],
+        ptr::null_mut(),
+    );
+    let mut buffers = vec![ptr::null()];
+    push_offsets(
+        &mut buffers,
+        &structured.shared_offsets,
+        EMPTY_OFFSETS_I64.as_ptr(),
+    );
+    write_array_node(
+        batch,
+        out,
+        structured.len as i64,
+        0,
+        buffers,
+        vec![item],
+        ptr::null_mut(),
+    );
+}
+
+/// Export an all-NULL Dynamic union of `len` rows against a result-wide plan.
+/// Used when a JSON dynamic path is absent from one chunk: every row routes to
+/// the union's trailing NULL child and the non-null children are empty.
+///
+/// Unlike [`export_dynamic_array_with_plan`], every buffer is OWNED by the
+/// exported node (the type ids and the dense-union offsets both move into the
+/// node's [`ArrayPrivateData`]), so nothing borrows from a caller-local column.
+/// A synthetic `DynamicColumn` routed through the borrowing fast path would hand
+/// out a dangling offsets pointer, because only the `Arc<ColBatch>` is kept
+/// alive in private data, not the synthetic column. The output is byte-identical
+/// to what the borrowing path would produce for an all-NULL block, just backed
+/// by owned storage. Real (batch-owned) columns keep the zero-copy borrow.
+unsafe fn export_null_dynamic_with_plan(
+    batch: &Arc<ColBatch>,
+    plan: &DynamicExportPlan,
+    len: usize,
+    chunk: usize,
+    out: *mut ArrowArray,
+) {
+    // The NULL child is a Nothing column of `len` rows; each row's dense-union
+    // offset is its occurrence index there, i.e. the 0..len run.
+    let null_offsets: Vec<i32> = (0..len).map(|row| row as i32).collect();
+    let null_child = |batch: &Arc<ColBatch>| {
+        let out = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+        export_one_column(batch, &Column::Nothing(NothingColumn::new(len)), out);
+        out
+    };
+
+    if plan.children.len() < ARROW_UNION_MAX_CHILDREN {
+        let null_id = plan.children.len() as i8;
+        let type_ids = vec![null_id; len];
+        let mut children = (0..plan.children.len())
+            .map(|global| {
+                export_dynamic_plan_child_array(batch, &plan.children[global], None, chunk)
+            })
+            .collect::<Vec<_>>();
+        children.push(null_child(batch));
+        write_owned_union_array_node(
+            batch,
+            out,
+            len,
+            type_ids,
+            ptr::null(),
+            null_offsets,
+            children,
+        );
+        return;
+    }
+
+    // 128+ planned children: every row routes to the trailing null group, so
+    // each non-null group node is empty and the outer node's owned ids all name
+    // the null group.
+    let num_groups = plan.children.len().div_ceil(ARROW_UNION_MAX_CHILDREN);
+    let outer_ids = vec![num_groups as i8; len];
+    let mut children = Vec::with_capacity(num_groups + 1);
+    for group in 0..num_groups {
+        let first = group * ARROW_UNION_MAX_CHILDREN;
+        let end = (first + ARROW_UNION_MAX_CHILDREN).min(plan.children.len());
+        let group_children = (first..end)
+            .map(|global| {
+                export_dynamic_plan_child_array(batch, &plan.children[global], None, chunk)
+            })
+            .collect::<Vec<_>>();
+        let group_array = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+        write_owned_union_array_node(
+            batch,
+            group_array,
+            0,
+            Vec::new(),
+            ptr::null(),
+            Vec::new(),
+            group_children,
+        );
+        children.push(group_array);
+    }
+    children.push(null_child(batch));
+    write_owned_union_array_node(
+        batch,
+        out,
+        len,
+        outer_ids,
+        ptr::null(),
+        null_offsets,
+        children,
     );
 }
 
@@ -2621,9 +3190,11 @@ fn push_offsets<T>(buffers: &mut Vec<*const c_void>, offsets: &[T], empty: *cons
 /// `out` must be a valid, writable pointer to an `ArrowArray`, normally a
 /// zeroed struct. The exported array borrows the batch buffers and keeps the
 /// `Arc<ColBatch>` alive until `out` is freed through its `release` callback.
-/// If the batch schema contains Dynamic, pair this only with
+/// If the batch schema contains Dynamic or JSON, pair this only with
 /// [`export_batch_schema`], preferably through [`export_batch`]; the logical
-/// [`export_schema`] API cannot describe Dynamic's block-local children.
+/// [`export_schema`] API cannot describe Dynamic's block-local children or
+/// JSON's block-local dynamic paths and body-kind choice, so pairing this array
+/// with an [`export_schema`] schema yields a mismatched schema/array pair.
 ///
 /// Every Dynamic column's routing buffers (`type_ids` indexing `children`,
 /// `u32::MAX` for NULL) must be internally consistent, as the decoder and
@@ -2773,7 +3344,103 @@ unsafe fn export_one_column_with_plan(
         (FieldExportPlan::Dynamic(dynamic_plan), Column::Dynamic(column)) => {
             export_dynamic_array_with_plan(batch, column, dynamic_plan, chunk, out);
         }
+        (FieldExportPlan::Json(json_plan), Column::Json(column)) => {
+            export_json_array_with_plan(batch, column, json_plan, chunk, out);
+        }
         _ => export_one_column(batch, column, out),
+    }
+}
+
+/// Export one `JSON` column against its result-wide stream plan. Typed paths
+/// recurse per plan; dynamic paths are the unified result-wide set, each routed
+/// to this chunk's matching Dynamic column or, when the chunk lacks the path, to
+/// a synthetic all-NULL union of the block's row count; `_shared_data` is plain
+/// utf8/binary and reuses the standalone writer.
+unsafe fn export_json_array_with_plan(
+    batch: &Arc<ColBatch>,
+    column: &JsonColumn,
+    plan: &JsonExportPlan,
+    chunk: usize,
+    out: *mut ArrowArray,
+) {
+    let length = column.len() as i64;
+    let null_count = column.null_count() as i64;
+    let validity = json_validity_buffer(column);
+    match (plan, column.body()) {
+        (JsonExportPlan::Text, JsonBody::Text(text)) => {
+            let mut buffers = vec![validity];
+            push_offsets(&mut buffers, &text.offsets, EMPTY_OFFSETS_I32.as_ptr());
+            buffers.push(text.data.as_ptr() as *const c_void);
+            write_array_node(
+                batch,
+                out,
+                length,
+                null_count,
+                buffers,
+                Vec::new(),
+                ptr::null_mut(),
+            );
+        }
+        (JsonExportPlan::Structured { typed, dynamic }, JsonBody::Structured(structured)) => {
+            let mut children = Vec::new();
+            for (path_plan, (_, values)) in typed.iter().zip(&structured.typed) {
+                let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+                export_one_column_with_plan(batch, values, path_plan, chunk, child);
+                children.push(child);
+            }
+            // Map this chunk's block-local dynamic paths by name so a result-wide
+            // path present here reuses its column and an absent one exports an
+            // all-NULL union of the block's length.
+            let mut present: std::collections::HashMap<&str, &DynamicColumn> =
+                std::collections::HashMap::with_capacity(structured.dynamic.len());
+            for (path, dynamic) in &structured.dynamic {
+                present.insert(path.as_str(), dynamic);
+            }
+            for (path, path_plan) in dynamic {
+                let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+                match present.get(path.as_str()) {
+                    Some(dynamic) => {
+                        export_dynamic_array_with_plan(batch, dynamic, path_plan, chunk, child)
+                    }
+                    // Absent path: export an all-NULL union of the block's row
+                    // count with OWNED buffers, so no offsets pointer dangles
+                    // into a caller-local column.
+                    None => export_null_dynamic_with_plan(
+                        batch,
+                        path_plan,
+                        structured.len,
+                        chunk,
+                        child,
+                    ),
+                }
+                children.push(child);
+            }
+            let shared = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+            export_json_shared_array(batch, structured, shared);
+            children.push(shared);
+            write_array_node(
+                batch,
+                out,
+                length,
+                null_count,
+                vec![validity],
+                children,
+                ptr::null_mut(),
+            );
+        }
+        // Unreachable for a well-formed stream: the plan body kind is derived
+        // from these same chunks, so a Structured plan pairs only with
+        // Structured bodies and a Text plan only with Text (a mix is rejected as
+        // JsonBodyKindMismatch before the first batch). A body mutated after the
+        // plan was fixed lands here; fall back to the memory-safe block-local
+        // shape even though it may disagree with the fixed stream schema.
+        _ => {
+            debug_assert!(
+                false,
+                "JSON body kind disagrees with its stream export plan"
+            );
+            export_json_array(batch, column, out);
+        }
     }
 }
 

@@ -13,21 +13,50 @@ cross-checked against the matching `.server-ref` tag `v26.6.1.1193-stable`.
 
 | File | Capture path | `protocol_revision` | First bytes |
 |------|--------------|---------------------|-------------|
-| `all_types_rev0.native` | HTTP `FORMAT Native` | `0` | `6a 04 02 69 38 04 49 6e 74 38 80 ff 00 7f 03 69` |
-| `all_types_rev54485.native` | HTTP `FORMAT Native` with `client_protocol_version=54485` | `54485` | `01 00 02 ff ff ff ff 03 00 00 6a 04 02 69 38 04` |
+| `all_types_rev0.native` | HTTP `FORMAT Native` | `0` | `6d 04 02 69 38 04 49 6e 74 38 80 ff 00 7f 03 69` |
+| `all_types_rev54485.native` | HTTP `FORMAT Native` with `client_protocol_version=54485` | `54485` | `01 00 02 ff ff ff ff 03 00 00 6d 04 02 69 38 04` |
 | `multi_block_rev0.native` | HTTP `FORMAT Native`, `max_block_size=2` | `0` | `01 02 01 6e 05 49 6e 74 33 32 0d 00 00 00 0e 00` |
+| `json_string_rev0.native` | HTTP `FORMAT Native`, `output_format_native_write_json_as_string=1` | `0` | `01 04 01 6a 26 4a 53 4f 4e 28 6d 61 78 5f 64 79` |
+| `json_flattened_rev0.native` | HTTP `FORMAT Native`, `output_format_native_use_flattened_dynamic_and_json_serialization=1` | `0` | `01 04 01 6a 26 4a 53 4f 4e 28 6d 61 78 5f 64 79` |
 
 The framed fixture starts with the standard 10-byte `BlockInfo` preamble:
 `01 00 02 ff ff ff ff 03 00 00`.
 
-Both `all_types` fixtures now carry 106 columns, so the leading column-count
-varint is `0x6a` (106): at the very start of `all_types_rev0.native`, and
+Both `all_types` fixtures now carry 109 columns, so the leading column-count
+varint is `0x6d` (109): at the very start of `all_types_rev0.native`, and
 immediately after the 10-byte `BlockInfo` preamble in
 `all_types_rev54485.native`. Next is the `0x04` row-count varint (4 rows), then
 the first column: name length `0x02`, name `i8` (`69 38`), type length `0x04`,
 type `Int8` (`49 6e 74 38`). At revision 54485 a per-column
 custom-serialization marker byte follows each type string; at revision 0 it does
 not.
+
+The final three `all_types` columns are `JSON` values (`DataTypeObject`, GA at
+this server version): `j_typed` is
+`JSON(max_dynamic_paths=1, `a.b` Int64)` exercising a typed path, exactly one
+direct dynamic path, and shared-data spill (paths `y` and `z` overflow into the
+shared stream as opaque binary descriptor + payload blobs); `j_bare` is a bare
+`JSON` with two dynamic paths and an empty-object row; and `j_null` is a
+`Nullable(JSON)` with NULL rows. The JSON body bytes are the same at both
+protocol revisions, so both `all_types` fixtures assert the same decoded values.
+
+## Setting-gated JSON wire shapes
+
+`json_string_rev0.native` and `json_flattened_rev0.native` capture the SAME
+single `JSON(max_dynamic_paths=1, `a.b` Int64)` column and data as `all_types`'
+`j_typed`, but under one extra output-format setting each, so the two
+setting-gated Native serializations are covered against the real server:
+
+- `json_string_rev0.native` uses `output_format_native_write_json_as_string=1`
+  (STRING mode, structure word 1): one re-serialized JSON document string per
+  row. The typed path is materialized in the text (as `0` where omitted); the
+  declared typed/dynamic split does not appear on the wire.
+- `json_flattened_rev0.native` uses
+  `output_format_native_use_flattened_dynamic_and_json_serialization=1`
+  (FLATTENED mode, structure word 3): the typed path stays typed, the dynamic
+  and shared-data paths are written as the union of shared-less per-path
+  Dynamics (so `y` and `z` become flattened dynamic paths), and there is NO
+  shared-data stream.
 
 The final nine columns are exact base `AggregateFunction(sum, T)` states for
 UInt8, BFloat16, Decimal32, UInt256, Nullable(UInt8), and Enum8, followed by

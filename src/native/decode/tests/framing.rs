@@ -54,8 +54,8 @@ fn test_block_end_rejects_unsupported_type() {
     // An unsupported type inside an otherwise-complete block must surface as
     // a DecodeError from the scan, not be silently skipped or reported as
     // incomplete. Cover both a bare unknown name and an unknown parameterized
-    // header; neither `JSON` nor `QBit` is decoded.
-    for type_name in ["JSON", "QBit(Float32, 16)"] {
+    // header; neither `Geometry` nor `QBit` is decoded.
+    for type_name in ["Geometry", "QBit(Float32, 16)"] {
         let data = BlockBuilder::new()
             .header(1, 1)
             .column_header("id", type_name)
@@ -76,8 +76,8 @@ fn test_block_end_no_block_at_clean_boundary() {
 #[test]
 fn test_unsupported_type() {
     // Cover both a bare unknown name and an unknown parameterized header;
-    // neither `JSON` nor `QBit` is decoded.
-    for type_name in ["JSON", "QBit(Float32, 16)"] {
+    // neither `Geometry` nor `QBit` is decoded.
+    for type_name in ["Geometry", "QBit(Float32, 16)"] {
         let data = BlockBuilder::new()
             .header(1, 1)
             .column_header("id", type_name)

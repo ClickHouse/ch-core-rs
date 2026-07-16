@@ -5,8 +5,8 @@
 use crate::batch::ColBatch;
 use crate::column::{
     variant_child_counts, AggregateStateColumn, ArrayColumn, Column, DecimalColumn,
-    DictionaryColumn, DynamicChild, DynamicColumn, FixedBinaryColumn, MapColumn, TupleColumn,
-    Utf8Column, VariantColumn, VariantLayout, ARROW_UNION_MAX_CHILDREN,
+    DictionaryColumn, DynamicChild, DynamicColumn, FixedBinaryColumn, JsonBody, JsonColumn,
+    MapColumn, TupleColumn, Utf8Column, VariantColumn, VariantLayout, ARROW_UNION_MAX_CHILDREN,
 };
 use crate::native::aggregate_function::{
     aggregate_state_codec, is_valid_aggregate_state, AggregateStateCodec,
@@ -19,7 +19,7 @@ use crate::native::type_parser::{
 };
 use crate::schema::{ChType, Field};
 
-use super::{column_error, is_encodable, EncodeError, EncodeOptions};
+use super::{column_error, is_encodable, json_uses_flattened, EncodeError, EncodeOptions};
 
 /// Validate that `batch` can be encoded, without writing anything. Every rejection
 /// condition lives here, so a caller can validate a whole [`ChunkedBatch`] up front
@@ -275,6 +275,28 @@ fn validate_column(
         validate_dynamic(field, *max_types, c, num_rows, options, depth)?;
     }
 
+    if let (
+        ChType::Json {
+            max_dynamic_paths,
+            max_dynamic_types,
+            typed_paths,
+            ..
+        },
+        Column::Json(c),
+    ) = (value_type, column)
+    {
+        validate_json(
+            field,
+            *max_dynamic_paths,
+            *max_dynamic_types,
+            typed_paths,
+            c,
+            num_rows,
+            options,
+            depth,
+        )?;
+    }
+
     // A `Bool` column is unpacked from its packed bitmap positionally, so the
     // bitmap must hold at least `len.div_ceil(8)` bytes. `BoolColumn`'s fields are
     // public and `ColBatch::new` only debug-asserts, so a release-mode caller could
@@ -424,6 +446,12 @@ fn validate_saf_func_spellings(field: &Field, ch_type: &ChType) -> Result<(), En
             }
             Ok(())
         }
+        ChType::Json { typed_paths, .. } => {
+            for (_, ty) in typed_paths {
+                validate_saf_func_spellings(field, ty)?;
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -486,6 +514,14 @@ pub(super) fn type_depth(ch_type: &ChType) -> usize {
             }
             ChType::Geo(kind) => {
                 max_depth = max_depth.max(depth + kind.expansion_depth());
+            }
+            // JSON charges one level for the JSON node itself; each typed-path
+            // type is one level deeper, matching the decode parser's `depth + 1`
+            // recursion, so a nested-JSON type near the cap is not under-counted.
+            ChType::Json { typed_paths, .. } => {
+                for (_, ty) in typed_paths {
+                    work.push((ty, depth + 1));
+                }
             }
             _ => {}
         }
@@ -1466,6 +1502,142 @@ fn validate_dynamic(
     Ok(())
 }
 
+/// Validate a `JSON` column's typed paths, block-local dynamic paths, and
+/// shared-data layout before any bytes are written, mirroring the rigor of
+/// [`validate_dynamic`].
+///
+/// A `Text`-body column just validates its one-string-per-row `Utf8Column`.
+/// A structured body must carry exactly the declared typed paths (names and
+/// order), each a valid child column of `num_rows`; strictly sorted, unique
+/// dynamic path names within `max_dynamic_paths`, each a valid `Dynamic` column
+/// at `max_dynamic_types`; and a shared-data offset run that is a well-formed
+/// Arrow list over the matching flattened `paths`/`values` string columns.
+///
+/// `depth` is charged before recursing, so a pathologically nested JSON (its
+/// typed-path or dynamic-path children carry fresh types that restart the
+/// per-type cap) errors rather than overflowing the stack.
+#[allow(clippy::too_many_arguments)]
+fn validate_json(
+    field: &Field,
+    max_dynamic_paths: u32,
+    max_dynamic_types: u8,
+    typed_paths: &[(String, ChType)],
+    col: &JsonColumn,
+    num_rows: usize,
+    options: &EncodeOptions,
+    depth: usize,
+) -> Result<(), EncodeError> {
+    let reject = |detail: String| Err(EncodeError::InconsistentBatch { detail });
+
+    if depth >= MAX_TYPE_DEPTH {
+        return reject(format!(
+            "column {:?} JSON nesting exceeds the maximum type depth {MAX_TYPE_DEPTH}",
+            field.name
+        ));
+    }
+
+    let structured = match &col.body {
+        JsonBody::Text(values) => {
+            return validate_utf8_column(field, values, num_rows);
+        }
+        JsonBody::Structured(structured) => structured,
+    };
+
+    // Typed paths must be exactly the declared paths, in the same sorted order.
+    if structured.typed.len() != typed_paths.len() {
+        return reject(format!(
+            "column {:?} JSON declares {} typed paths but the buffer carries {}",
+            field.name,
+            typed_paths.len(),
+            structured.typed.len()
+        ));
+    }
+    for ((declared_path, declared_type), (buffer_path, buffer_column)) in
+        typed_paths.iter().zip(&structured.typed)
+    {
+        if declared_path != buffer_path {
+            return reject(format!(
+                "column {:?} JSON typed path {buffer_path:?} does not match the declared path {declared_path:?}",
+                field.name
+            ));
+        }
+        let typed_field = Field {
+            name: format!("{} JSON path {declared_path}", field.name),
+            ch_type: declared_type.clone(),
+        };
+        validate_column(&typed_field, buffer_column, num_rows, options, depth + 1)?;
+    }
+
+    // Dynamic paths: strictly sorted and unique, each a valid Dynamic column at
+    // max_dynamic_types. The `max_dynamic_paths` bound applies only to the V1/V2
+    // wire shape: there the writer routes any overflow path into shared data, so
+    // the direct list cannot exceed the bound. A column that encodes FLATTENED
+    // (empty shared data + the opt-in) carries the union of dynamic and
+    // shared-data paths and legitimately exceeds it, matching the server's
+    // unbounded FLATTENED reader (`unflattenAndInsertPaths`,
+    // `SerializationObjectHelpers.cpp`, v26.6.1.1193-stable). Gating on the same
+    // shape decision the writer makes keeps a FLATTENED-decoded column with more
+    // paths than `max_dynamic_paths` re-encodable while still rejecting a V1/V2
+    // column the server could not have produced.
+    if !json_uses_flattened(structured, options)
+        && structured.dynamic.len() > max_dynamic_paths as usize
+    {
+        return reject(format!(
+            "column {:?} JSON carries {} dynamic paths, exceeding max_dynamic_paths={max_dynamic_paths} for the V1/V2 wire shape",
+            field.name,
+            structured.dynamic.len()
+        ));
+    }
+    let mut previous: Option<&str> = None;
+    for (path, dynamic_col) in &structured.dynamic {
+        if previous.is_some_and(|prior| prior >= path.as_str()) {
+            return reject(format!(
+                "column {:?} JSON dynamic paths are not strictly sorted and unique at {path:?}",
+                field.name
+            ));
+        }
+        previous = Some(path);
+        let dynamic_field = Field {
+            name: format!("{} JSON dynamic path {path}", field.name),
+            ch_type: ChType::Dynamic {
+                max_types: max_dynamic_types,
+            },
+        };
+        validate_dynamic(
+            &dynamic_field,
+            max_dynamic_types,
+            dynamic_col,
+            num_rows,
+            options,
+            depth + 1,
+        )?;
+    }
+
+    // Shared data: the paths/values pair counts must agree, the offset run must
+    // be a well-formed Arrow list over that pair count, and each string column's
+    // own offsets must be valid.
+    if structured.shared_paths.len() != structured.shared_values.len() {
+        return reject(format!(
+            "column {:?} JSON shared data has {} paths but {} values",
+            field.name,
+            structured.shared_paths.len(),
+            structured.shared_values.len()
+        ));
+    }
+    validate_offsets(
+        field,
+        "JSON shared",
+        "flattened shared pairs",
+        &structured.shared_offsets,
+        structured.shared_paths.len(),
+        num_rows,
+    )?;
+    let shared_pairs = structured.shared_paths.len();
+    validate_utf8_column(field, &structured.shared_paths, shared_pairs)?;
+    validate_utf8_column(field, &structured.shared_values, shared_pairs)?;
+    Ok(())
+}
+
 /// Whether `value_type` (the unwrapped inner value type) and `column` form a
 /// supported, matching pair this encoder can write.
 ///
@@ -1532,6 +1704,12 @@ fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
                 .all(|(t, child)| column_variant_matches(t.inner(), child));
     }
     if let (ChType::Dynamic { .. }, Column::Dynamic(_)) = (value_type, column) {
+        return true;
+    }
+    // JSON's typed-path, dynamic-path, and shared-data children are validated
+    // against the concrete JsonColumn in `validate_json`, so only the buffer
+    // variant is matched here, like Dynamic.
+    if let (ChType::Json { .. }, Column::Json(_)) = (value_type, column) {
         return true;
     }
     matches!(

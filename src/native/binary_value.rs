@@ -312,7 +312,13 @@ impl ValueBuilder {
                     .collect::<Result<_, _>>()?,
                 rows: 0,
             },
-            ChType::Variant(_) | ChType::Dynamic { .. } | ChType::AggregateFunction { .. } => {
+            // JSON values are not materialized here: shared-data and
+            // SharedVariant cells stay opaque, so a JSON-typed binary value is
+            // reported unsupported rather than partially decoded.
+            ChType::Variant(_)
+            | ChType::Dynamic { .. }
+            | ChType::Json { .. }
+            | ChType::AggregateFunction { .. } => {
                 return Err(BinaryValueError::Unsupported(ch_type.to_string()))
             }
             // physical_delegate expanded these above.
@@ -1016,9 +1022,17 @@ mod tests {
             assert_eq!(parsed, ch_type);
             assert_eq!(consumed, bytes.len() - 4);
         }
-        // JSON is an unsupported descriptor, not an error class of its own.
+        // A JSON descriptor now parses (type_binary supports tag 0x30), so the
+        // prefix reader accepts it, but a JSON value is never materialized as a
+        // shared cell: decode_binary_value stays Unsupported rather than panicking.
+        let json_type = parse("JSON");
+        let mut json_bytes = Vec::new();
+        write_binary_type(&mut json_bytes, &json_type);
+        let (parsed, consumed) = read_binary_type_prefix(&json_bytes).unwrap();
+        assert_eq!(parsed, json_type);
+        assert_eq!(consumed, json_bytes.len());
         assert!(matches!(
-            read_binary_type_prefix(&[0x30]),
+            decode_binary_value(&json_type, &[]),
             Err(BinaryValueError::Unsupported(_))
         ));
         // A truncated descriptor is invalid.

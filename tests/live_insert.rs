@@ -30,10 +30,12 @@ use ch_core_rs::batch::ColBatch;
 use ch_core_rs::bitmap::Bitmap;
 use ch_core_rs::column::{
     AggregateStateColumn, ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn,
-    DynamicChild, DynamicColumn, FixedBinaryColumn, MapColumn, NothingColumn, PrimitiveColumn,
-    TupleColumn, Utf8Column, VariantColumn,
+    DynamicChild, DynamicColumn, FixedBinaryColumn, JsonBody, JsonColumn, MapColumn, NothingColumn,
+    PrimitiveColumn, StructuredJson, TupleColumn, Utf8Column, VariantColumn,
 };
-use ch_core_rs::native::decode::{decode_all_bytes, decode_all_bytes_binary_types, DecodeOptions};
+use ch_core_rs::native::decode::{
+    decode_all_bytes, decode_all_bytes_binary_types, parse_ch_type, DecodeOptions,
+};
 use ch_core_rs::native::encode::{encode_block, encode_block_binary_types, EncodeOptions};
 use ch_core_rs::schema::{ChType, Field, GeoKind, IntervalKind, Schema};
 
@@ -45,6 +47,13 @@ const AGG_NOTHING_TABLE: &str = "ch_core_rs_encode_agg_nothing_test";
 const AGG_SUM_TABLE: &str = "ch_core_rs_encode_agg_sum_test";
 const DYNAMIC_TABLE: &str = "ch_core_rs_encode_dynamic_test";
 const DYNAMIC_BINARY_TABLE: &str = "ch_core_rs_encode_dynamic_binary_test";
+const JSON_TABLE: &str = "ch_core_rs_encode_json_test";
+const JSON_BINARY_TABLE: &str = "ch_core_rs_encode_json_binary_test";
+
+/// The canonical `JSON` type declaration reused by the JSON round-trip tests.
+/// `max_dynamic_paths=1` forces overflow to shared data; the typed path never
+/// counts against that limit.
+const JSON_TYPE: &str = "JSON(max_dynamic_paths=1, `a.b` Int64)";
 
 /// Build a `Utf8Column` from raw byte values, computing Arrow offsets the same
 /// way the decoder does.
@@ -90,6 +99,68 @@ fn dynamic_batch() -> ColBatch {
         vec![
             Column::UInt8(PrimitiveColumn::new(vec![0, 1, 2, 3])),
             Column::Dynamic(dynamic),
+        ],
+        4,
+    )
+}
+
+/// Build the JSON round-trip batch: `id UInt8` plus a
+/// `JSON(max_dynamic_paths=1, `a.b` Int64)` column shaped exactly as the decoder
+/// produces it for the `all_types`/`j_typed` data. It has a typed path (`a.b`),
+/// exactly one direct dynamic path (`x`), and shared-data spill (`y`, `z`). The
+/// server reproduces this same typed/dynamic/shared partition on an
+/// INSERT/SELECT round-trip (verified live), so `column_repr` compares physically.
+fn json_batch() -> ColBatch {
+    // `y` overflowed to shared data as an Int64 7: [0x0a] tag + i64 7.
+    let mut y_blob = vec![0x0a];
+    y_blob.extend_from_slice(&7i64.to_le_bytes());
+    // `z` overflowed as Array(Nullable(Int64)) [1, 2]: [0x1e 0x23 0x0a] descriptor,
+    // varint size 2, then two (not-null flag, i64) elements.
+    let mut z_blob = vec![0x1e, 0x23, 0x0a, 0x02];
+    z_blob.push(0x00);
+    z_blob.extend_from_slice(&1i64.to_le_bytes());
+    z_blob.push(0x00);
+    z_blob.extend_from_slice(&2i64.to_le_bytes());
+
+    // Path `x`: String runtime type, with the leading SharedVariant child (child 0)
+    // in canonical global-discriminator order. Rows 1 and 3 are the path's NULL.
+    let x = DynamicColumn::try_new(
+        &[1, u32::MAX, 1, u32::MAX],
+        vec![
+            DynamicChild::Shared(utf8_column(&[])),
+            DynamicChild::Typed {
+                ch_type: ChType::String,
+                values: Column::Utf8(utf8_column(&[b"user_1", b"user_2"])),
+            },
+        ],
+    )
+    .unwrap();
+    let structured = StructuredJson::try_new(
+        vec![(
+            "a.b".into(),
+            Column::Int64(PrimitiveColumn::new(vec![13, 79, 0, 0])),
+        )],
+        vec![("x".into(), x)],
+        vec![0, 0, 1, 2, 2],
+        utf8_column(&[b"y", b"z"]),
+        utf8_column(&[&y_blob, &z_blob]),
+        4,
+    )
+    .unwrap();
+    ColBatch::new(
+        Schema::new(vec![
+            Field {
+                name: "id".into(),
+                ch_type: ChType::UInt8,
+            },
+            Field {
+                name: "j".into(),
+                ch_type: parse_ch_type(JSON_TYPE).unwrap(),
+            },
+        ]),
+        vec![
+            Column::UInt8(PrimitiveColumn::new(vec![0, 1, 2, 3])),
+            Column::Json(JsonColumn::structured(structured)),
         ],
         4,
     )
@@ -1277,29 +1348,84 @@ fn raw_column_repr(column: &Column) -> Vec<String> {
                 })
                 .collect()
         }
-        Column::Dynamic(c) => {
-            let children = c
-                .children
-                .iter()
-                .map(|child| match child {
-                    DynamicChild::Typed { values, .. } => raw_column_repr(values),
-                    DynamicChild::Shared(values) => (0..values.len())
-                        .map(|row| format!("{:?}", values.value(row)))
-                        .collect(),
-                })
-                .collect::<Vec<Vec<String>>>();
-            (0..c.len())
-                .map(|row| match c.value_position(row) {
-                    Some((u32::MAX, _)) => "NULL".to_string(),
-                    Some((child, offset)) => format!(
-                        "Dynamic({child}, {})",
-                        children[child as usize][offset as usize]
-                    ),
-                    None => "INVALID".to_string(),
-                })
-                .collect()
-        }
+        Column::Dynamic(c) => dynamic_repr(c),
+        // JSON renders one canonical per-row string covering every physical
+        // stream: the typed paths, the block-local dynamic paths (each resolved
+        // through `dynamic_repr`, so a value that stays typed and one that spills
+        // render distinctly), and the shared-data overflow pairs (path + raw
+        // opaque blob) for that row. Parts are emitted in the column's stored
+        // order (typed as declared, dynamic sorted by path, shared in wire order),
+        // which the server reproduces verbatim on an INSERT/SELECT round-trip, so
+        // the sent and decoded sides render identically. A `Text`-body column
+        // renders its document string per row.
+        Column::Json(c) => match c.body() {
+            JsonBody::Text(values) => (0..values.len())
+                .map(|row| format!("{:?}", values.value(row)))
+                .collect(),
+            JsonBody::Structured(s) => {
+                let typed: Vec<(&str, Vec<String>)> = s
+                    .typed
+                    .iter()
+                    .map(|(path, col)| (path.as_str(), raw_column_repr(col)))
+                    .collect();
+                let dynamic: Vec<(&str, Vec<String>)> = s
+                    .dynamic
+                    .iter()
+                    .map(|(path, col)| (path.as_str(), dynamic_repr(col)))
+                    .collect();
+                (0..s.len)
+                    .map(|row| {
+                        let mut parts = Vec::new();
+                        for (path, vals) in &typed {
+                            parts.push(format!("{path}={}", vals[row]));
+                        }
+                        for (path, vals) in &dynamic {
+                            parts.push(format!("{path}={}", vals[row]));
+                        }
+                        let start = s.shared_offsets[row] as usize;
+                        let end = s.shared_offsets[row + 1] as usize;
+                        for i in start..end {
+                            parts.push(format!(
+                                "{}#{:?}",
+                                String::from_utf8_lossy(s.shared_paths.value(i)),
+                                s.shared_values.value(i)
+                            ));
+                        }
+                        format!("{{{}}}", parts.join(", "))
+                    })
+                    .collect()
+            }
+        },
     }
+}
+
+/// Render each row of a block-local `Dynamic` column: the selected child's value
+/// tagged with its local child index, or `NULL`. Shared children render their
+/// raw opaque blob bytes. Shared by the `Column::Dynamic` arm and JSON's dynamic
+/// paths so both resolve identically.
+fn dynamic_repr(c: &DynamicColumn) -> Vec<String> {
+    let children = c
+        .children
+        .iter()
+        .map(|child| match child {
+            DynamicChild::Typed { values, .. } => raw_column_repr(values),
+            DynamicChild::Shared(values) => (0..values.len())
+                .map(|row| format!("{:?}", values.value(row)))
+                .collect(),
+        })
+        .collect::<Vec<Vec<String>>>();
+    (0..c.len())
+        .map(|row| match c.value_position(row) {
+            Some((u32::MAX, _)) => "NULL".to_string(),
+            Some((child, offset)) => {
+                format!(
+                    "Dynamic({child}, {})",
+                    children[child as usize][offset as usize]
+                )
+            }
+            None => "INVALID".to_string(),
+        })
+        .collect()
 }
 
 /// Gather every value of column `col` across all chunks, in chunk order, as a
@@ -1834,6 +1960,58 @@ fn dynamic_binary_type_headers_roundtrip_through_server() {
     let decoded = decode_all_bytes_binary_types(&native, &DecodeOptions::default())
         .expect("decode server Dynamic binary-type response");
     server.ddl(&format!("DROP TABLE IF EXISTS {DYNAMIC_BINARY_TABLE}"));
+
+    let sent = single_block(&batch);
+    assert_eq!(column_repr(&decoded, 0), column_repr(&sent, 0));
+    assert_eq!(column_repr(&decoded, 1), column_repr(&sent, 1));
+}
+
+#[test]
+#[ignore = "requires a live ClickHouse server matching .server-ref; run with --ignored"]
+fn json_roundtrips_through_server() {
+    let server = Server::from_env();
+    let batch = json_batch();
+
+    server.ddl(&format!("DROP TABLE IF EXISTS {JSON_TABLE}"));
+    server.ddl(&format!(
+        "CREATE TABLE {JSON_TABLE} (id UInt8, j {JSON_TYPE}) ENGINE = Memory"
+    ));
+    let bytes = encode_block(&batch, &EncodeOptions::default()).expect("encode JSON batch");
+    server.insert_native_into(JSON_TABLE, &bytes);
+
+    let native = server.select(&format!(
+        "SELECT id, j FROM {JSON_TABLE} ORDER BY id FORMAT Native"
+    ));
+    let decoded =
+        decode_all_bytes(&native, &DecodeOptions::default()).expect("decode server JSON response");
+    server.ddl(&format!("DROP TABLE IF EXISTS {JSON_TABLE}"));
+
+    let sent = single_block(&batch);
+    assert_eq!(column_repr(&decoded, 0), column_repr(&sent, 0));
+    assert_eq!(column_repr(&decoded, 1), column_repr(&sent, 1));
+}
+
+#[test]
+#[ignore = "requires a live ClickHouse server matching .server-ref; run with --ignored"]
+fn json_binary_type_headers_roundtrip_through_server() {
+    let server = Server::from_env();
+    let batch = json_batch();
+
+    server.ddl(&format!("DROP TABLE IF EXISTS {JSON_BINARY_TABLE}"));
+    server.ddl(&format!(
+        "CREATE TABLE {JSON_BINARY_TABLE} (id UInt8, j {JSON_TYPE}) ENGINE = Memory"
+    ));
+    let bytes = encode_block_binary_types(&batch, &EncodeOptions::default())
+        .expect("encode JSON batch with binary type headers");
+    server.insert_native_binary_types_into(JSON_BINARY_TABLE, &bytes);
+
+    let native = server.select_with_params(
+        &format!("SELECT id, j FROM {JSON_BINARY_TABLE} ORDER BY id FORMAT Native"),
+        "?output_format_native_encode_types_in_binary_format=1",
+    );
+    let decoded = decode_all_bytes_binary_types(&native, &DecodeOptions::default())
+        .expect("decode server JSON binary-type response");
+    server.ddl(&format!("DROP TABLE IF EXISTS {JSON_BINARY_TABLE}"));
 
     let sent = single_block(&batch);
     assert_eq!(column_repr(&decoded, 0), column_repr(&sent, 0));

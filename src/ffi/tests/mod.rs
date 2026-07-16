@@ -11,6 +11,7 @@ use std::ffi::CStr;
 mod aggregate_function;
 mod containers;
 mod dynamic;
+mod json;
 mod low_cardinality;
 mod nothing;
 mod saf_geo_nested;

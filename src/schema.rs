@@ -213,7 +213,48 @@ pub enum ChType {
     // `checkTupleNames` rules as a named `Tuple`. `Nullable(Nested)` and
     // `LowCardinality(Nested)` are both illegal (it is an Array).
     Nested(Vec<(String, ChType)>),
+
+    // `JSON` (the new `DataTypeObject`, confirmed at v26.6.1.1193-stable in
+    // `src/DataTypes/DataTypeObject.{h,cpp}` and `registerDataTypeJSON`). Legacy
+    // `Object('json')` is fully unregistered at this tag and is NOT parsed. The
+    // canonical `doGetName` form is the bare word `JSON` with parenthesized
+    // parameters omitted entirely when empty, otherwise `JSON(...)` joining, in
+    // order: `max_dynamic_types=M` (only if != 32), `max_dynamic_paths=N` (only
+    // if != 1024), the typed paths sorted lexicographically (each `<path>
+    // <TypeName>`), the `SKIP <path>` entries sorted, then the `SKIP REGEXP
+    // '<regex>'` entries. Each path is rendered through `backQuoteIfNeed` on the
+    // whole path (a dotted path always quotes, and a path literally named `SKIP`
+    // case-insensitively always quotes).
+    //
+    // This is a physical type (`physical_delegate` returns `None`); the runtime
+    // typed-path columns, block-local dynamic paths, and shared-data overflow all
+    // live on [`crate::column::JsonColumn`], not here. `max_dynamic_paths` default
+    // 1024 (legal max 10000), `max_dynamic_types` default 32 (legal max 254),
+    // typed paths max 1000. A typed path type may itself be `JSON` (nested).
+    Json {
+        max_dynamic_paths: u32,
+        max_dynamic_types: u8,
+        /// Declared typed paths, kept sorted lexicographically by path string.
+        typed_paths: Vec<(String, ChType)>,
+        /// `SKIP <path>` entries, kept sorted lexicographically.
+        skip_paths: Vec<String>,
+        /// `SKIP REGEXP '<regex>'` entries, kept sorted.
+        skip_regexps: Vec<String>,
+    },
 }
+
+/// Default `max_dynamic_paths` for `JSON` (`DEFAULT_MAX_DYNAMIC_PATHS`, confirmed
+/// at v26.6.1.1193-stable). Omitted from the canonical name at this value.
+pub const JSON_DEFAULT_MAX_DYNAMIC_PATHS: u32 = 1024;
+/// Largest legal `max_dynamic_paths` for `JSON` (`MAX_DYNAMIC_PATHS_LIMIT`).
+pub const JSON_MAX_DYNAMIC_PATHS: u32 = 10000;
+/// Default `max_dynamic_types` for `JSON` (`DataTypeDynamic::DEFAULT_MAX_DYNAMIC_TYPES`).
+/// Omitted from the canonical name at this value.
+pub const JSON_DEFAULT_MAX_DYNAMIC_TYPES: u8 = 32;
+/// Largest legal `max_dynamic_types` for `JSON`.
+pub const JSON_MAX_DYNAMIC_TYPES: u8 = 254;
+/// Largest number of typed paths a `JSON` type may declare (`MAX_TYPED_PATHS`).
+pub const JSON_MAX_TYPED_PATHS: usize = 1000;
 
 /// The six ClickHouse geo alias kinds. Each renders its bare alias name and
 /// expands to a fixed `Tuple`/`Array`-of-`Float64` nesting via
@@ -446,7 +487,92 @@ impl std::fmt::Display for ChType {
             // The bare alias spelling, never the expanded form.
             ChType::Geo(kind) => write!(f, "{}", kind.name()),
             ChType::Nested(fields) => write_nested(f, fields),
+            ChType::Json {
+                max_dynamic_paths,
+                max_dynamic_types,
+                typed_paths,
+                skip_paths,
+                skip_regexps,
+            } => write_json(
+                f,
+                *max_dynamic_paths,
+                *max_dynamic_types,
+                typed_paths,
+                skip_paths,
+                skip_regexps,
+            ),
         }
+    }
+}
+
+/// Render the canonical `JSON` type string (`DataTypeObject::doGetName`,
+/// confirmed at v26.6.1.1193-stable). The bare word `JSON` when no parameter is
+/// non-default and no paths are declared, otherwise `JSON(...)` joining these in
+/// order: `max_dynamic_types=M` (only if != 32), `max_dynamic_paths=N` (only if
+/// != 1024), typed paths sorted (`<path> <TypeName>`), `SKIP <path>` entries
+/// sorted, then `SKIP REGEXP '<regex>'` entries. Each path is quoted through
+/// [`write_json_path`], the regex through [`escape_enum_name`] (the server's
+/// single-quoted string escaping).
+fn write_json(
+    f: &mut std::fmt::Formatter<'_>,
+    max_dynamic_paths: u32,
+    max_dynamic_types: u8,
+    typed_paths: &[(String, ChType)],
+    skip_paths: &[String],
+    skip_regexps: &[String],
+) -> std::fmt::Result {
+    let has_params = max_dynamic_types != JSON_DEFAULT_MAX_DYNAMIC_TYPES
+        || max_dynamic_paths != JSON_DEFAULT_MAX_DYNAMIC_PATHS
+        || !typed_paths.is_empty()
+        || !skip_paths.is_empty()
+        || !skip_regexps.is_empty();
+    if !has_params {
+        return write!(f, "JSON");
+    }
+    write!(f, "JSON(")?;
+    let mut first = true;
+    let mut sep = |f: &mut std::fmt::Formatter<'_>| -> std::fmt::Result {
+        if first {
+            first = false;
+            Ok(())
+        } else {
+            write!(f, ", ")
+        }
+    };
+    if max_dynamic_types != JSON_DEFAULT_MAX_DYNAMIC_TYPES {
+        sep(f)?;
+        write!(f, "max_dynamic_types={max_dynamic_types}")?;
+    }
+    if max_dynamic_paths != JSON_DEFAULT_MAX_DYNAMIC_PATHS {
+        sep(f)?;
+        write!(f, "max_dynamic_paths={max_dynamic_paths}")?;
+    }
+    for (path, ch_type) in typed_paths {
+        sep(f)?;
+        write_json_path(f, path)?;
+        write!(f, " {ch_type}")?;
+    }
+    for path in skip_paths {
+        sep(f)?;
+        write!(f, "SKIP ")?;
+        write_json_path(f, path)?;
+    }
+    for regex in skip_regexps {
+        sep(f)?;
+        write!(f, "SKIP REGEXP '{}'", escape_enum_name(regex))?;
+    }
+    write!(f, ")")
+}
+
+/// Write one `JSON` path, backtick-quoting it when the server's `backQuoteIfNeed`
+/// would (see [`is_bare_identifier`]) or when the whole path is the JSON keyword
+/// `SKIP` (case-insensitive), which the server always quotes as a typed/skip path
+/// name (confirmed at v26.6.1.1193-stable).
+fn write_json_path(f: &mut std::fmt::Formatter<'_>, path: &str) -> std::fmt::Result {
+    if is_bare_identifier(path) && !path.eq_ignore_ascii_case("skip") {
+        write!(f, "{path}")
+    } else {
+        write!(f, "`{}`", escape_back_quoted(path))
     }
 }
 

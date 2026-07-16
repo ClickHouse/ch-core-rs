@@ -430,7 +430,33 @@ SELECT
         n < 2, CAST(concat('user_', toString(n + 1)), 'Dynamic(max_types=1)'),
         n = 2, CAST(toUInt64(13), 'Dynamic(max_types=1)'),
         CAST([toInt32(79), toInt32(-13)], 'Dynamic(max_types=1)')
-    ) AS dynamic
+    ) AS dynamic,
+    -- JSON (DataTypeObject, GA at this server version; needs no special setting).
+    -- Three shapes exercise the whole structured wire form. This first one has a
+    -- typed path, exactly ONE dynamic path, and shared-data spill.
+    -- JSON(max_dynamic_paths=1, `a.b` Int64): the typed path `a.b` never counts
+    -- against max_dynamic_paths, so it is always a typed child (rows 13, 79, 0, 0;
+    -- absent objects read back as the type default 0). The first distinct
+    -- non-typed path encountered, `x`, becomes THE one direct dynamic path (rows 0
+    -- and 2 -> "user_1"/"user_2", rows 1 and 3 -> the path's intrinsic NULL). Every
+    -- later distinct path overflows into shared data: `y` on row 1 and `z` on row
+    -- 2. Shared values are opaque binary blobs (a binary type descriptor then one
+    -- serializeBinary payload): `y` is [0x0a] (Int64 tag) + the i64 7, and `z` is
+    -- [0x1e 0x23 0x0a] (Array(Nullable(Int64))) + the array [1, 2]. Confirmed live
+    -- against v26.6.1.1193-stable via JSONDynamicPaths / JSONSharedDataPaths.
+    CAST(multiIf(n = 0, '{"a":{"b":13}, "x":"user_1"}', n = 1, '{"a":{"b":79}, "y":7}', n = 2, '{"x":"user_2", "z":[1,2]}', '{}'), 'JSON(max_dynamic_paths=1, `a.b` Int64)') AS j_typed,
+    -- Bare JSON (default max_dynamic_paths=1024): two dynamic paths and NO shared
+    -- spill. `p` is a String path (rows 0, 1) and `q` an Int64 path (rows 0, 3);
+    -- row 2 is an empty object, so every path reads NULL there. The two dynamic
+    -- paths decode sorted by name, each a block-local Dynamic whose child order is
+    -- the canonical global-discriminator (sorted type-name) order, so `p`'s
+    -- SharedVariant child sorts before String and `q`'s Int64 child sorts before
+    -- SharedVariant.
+    CAST(multiIf(n = 0, '{"p":"user_1", "q":13}', n = 1, '{"p":"user_2"}', n = 2, '{}', '{"q":79}'), 'JSON') AS j_bare,
+    -- Nullable(JSON): the top-level null map precedes the full JSON body. Rows 1
+    -- and 3 are NULL; rows 0 and 2 are `{"m": 13}` / `{"m": 79}` with the single
+    -- Int64 dynamic path `m`.
+    CAST(multiIf(n = 1, NULL, n = 3, NULL, n = 0, '{"m":13}', '{"m":79}'), 'Nullable(JSON)') AS j_null
 FROM numbers(4)
 SETTINGS allow_suspicious_low_cardinality_types = 1, enable_nullable_tuple_type = 1, enable_time_time64_type = 1, flatten_nested = 0
 FORMAT Native
@@ -442,6 +468,21 @@ multi_block_query=$(
 SELECT CAST(number + 13, 'Int32') AS n
 FROM numbers(5)
 SETTINGS max_block_size = 2
+FORMAT Native
+SQL
+)
+
+# A single JSON column reused for the two setting-gated wire shapes below. It is
+# the same typed-path + dynamic + shared-spill data as `all_types`' j_typed, so
+# the STRING and FLATTENED captures show how one identical column serializes
+# under each setting. NativeWriter emits the structured V1/V2 form by default;
+# these two settings switch it to the STRING and FLATTENED forms instead.
+json_aux_query=$(
+  cat <<'SQL'
+WITH number AS n
+SELECT CAST(multiIf(n = 0, '{"a":{"b":13}, "x":"user_1"}', n = 1, '{"a":{"b":79}, "y":7}', n = 2, '{"x":"user_2", "z":[1,2]}', '{}'), 'JSON(max_dynamic_paths=1, `a.b` Int64)') AS j
+FROM numbers(4)
+SETTINGS flatten_nested = 0
 FORMAT Native
 SQL
 )
@@ -463,5 +504,16 @@ capture "all_types_rev0.native" "${all_types_query}"
 capture "all_types_rev54485.native" "${all_types_query}" \
   --data-urlencode "client_protocol_version=54485"
 capture "multi_block_rev0.native" "${multi_block_query}"
+
+# Setting-gated JSON wire shapes, captured at the default (rev 0) HTTP protocol
+# like `all_types_rev0.native`. Only the extra output-format setting differs.
+# STRING mode re-serializes one JSON document string per row (a Text body).
+capture "json_string_rev0.native" "${json_aux_query}" \
+  --data-urlencode "output_format_native_write_json_as_string=1"
+# FLATTENED mode writes structure word 3: typed paths, then one shared-less
+# Dynamic per flattened path (the union of the dynamic and shared-data paths),
+# and NO shared-data stream.
+capture "json_flattened_rev0.native" "${json_aux_query}" \
+  --data-urlencode "output_format_native_use_flattened_dynamic_and_json_serialization=1"
 
 echo "Wrote fixtures to ${fixture_dir}"

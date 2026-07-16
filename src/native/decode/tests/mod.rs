@@ -11,6 +11,7 @@ mod decimal;
 mod dynamic;
 mod framing;
 mod interval;
+mod json;
 mod low_cardinality;
 mod nothing;
 mod numeric;

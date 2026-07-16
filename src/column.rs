@@ -1208,6 +1208,288 @@ pub(crate) fn variant_layout_from_discriminators(
     ))
 }
 
+/// Invalid input to [`StructuredJson::try_new`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonColumnError {
+    /// A typed-path child column does not carry `len` rows.
+    TypedPathLength {
+        path: String,
+        expected: usize,
+        actual: usize,
+    },
+    /// A dynamic-path child column does not carry `len` rows.
+    DynamicPathLength {
+        path: String,
+        expected: usize,
+        actual: usize,
+    },
+    /// Dynamic path names are not strictly increasing (sorted and unique).
+    UnsortedDynamicPath { path: String },
+    /// The shared `paths` and `values` string columns disagree on pair count.
+    SharedPairMismatch { paths: usize, values: usize },
+    /// The shared-data offsets are not a valid Arrow list-offset run.
+    SharedOffsets { reason: &'static str },
+}
+
+impl std::fmt::Display for JsonColumnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JsonColumnError::TypedPathLength {
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "JSON typed path {path} has {actual} rows, expected {expected}"
+            ),
+            JsonColumnError::DynamicPathLength {
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "JSON dynamic path {path} has {actual} rows, expected {expected}"
+            ),
+            JsonColumnError::UnsortedDynamicPath { path } => write!(
+                f,
+                "JSON dynamic paths are not strictly sorted and unique at {path}"
+            ),
+            JsonColumnError::SharedPairMismatch { paths, values } => {
+                write!(f, "JSON shared data has {paths} paths but {values} values")
+            }
+            JsonColumnError::SharedOffsets { reason } => {
+                write!(f, "JSON shared data offsets are invalid: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for JsonColumnError {}
+
+/// The structured (non-text) body of a `JSON` column: the declared typed paths,
+/// the block-local discovered dynamic paths, and the shared-data overflow.
+///
+/// `typed` holds one child column per declared typed path, in the same sorted
+/// order as [`crate::schema::ChType::Json`]'s `typed_paths`, each of length
+/// `len`. `dynamic` holds one [`DynamicColumn`] per block-local dynamic path,
+/// sorted by path, each of length `len`; the set is column data (like a
+/// `Dynamic`'s children), not part of the logical schema.
+///
+/// Shared data is the server's `SharedData` overflow, physically an
+/// `Array(Tuple(String, String))`: `shared_offsets` is the Arrow list-offset run
+/// (leading `0`, length `len + 1`) over the flattened `(path, value)` pairs, and
+/// `shared_paths`/`shared_values` are the two flattened string columns. The
+/// `values` strings are opaque binary-encoded values (a binary type descriptor
+/// plus a `serializeBinary` payload, the same shape as a `SharedVariant` cell),
+/// kept as raw bytes and never materialized. A `FLATTENED`-wire block carries no
+/// shared data, so it decodes with empty shared columns (`shared_offsets` is
+/// `[0]`).
+#[derive(Debug, Clone)]
+pub struct StructuredJson {
+    pub typed: Vec<(String, Column)>,
+    pub dynamic: Vec<(String, DynamicColumn)>,
+    pub shared_offsets: Vec<i64>,
+    pub shared_paths: Utf8Column,
+    pub shared_values: Utf8Column,
+    pub len: usize,
+}
+
+impl StructuredJson {
+    /// Build a structured JSON body from already-validated parts (the decode
+    /// path, which validated the wire framing as it read). Does not re-check the
+    /// invariants; use [`StructuredJson::try_new`] for untrusted parts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        typed: Vec<(String, Column)>,
+        dynamic: Vec<(String, DynamicColumn)>,
+        shared_offsets: Vec<i64>,
+        shared_paths: Utf8Column,
+        shared_values: Utf8Column,
+        len: usize,
+    ) -> Self {
+        Self {
+            typed,
+            dynamic,
+            shared_offsets,
+            shared_paths,
+            shared_values,
+            len,
+        }
+    }
+
+    /// Build a structured JSON body, validating the child lengths, the strictly
+    /// sorted dynamic path names, and the shared-data offset run.
+    pub fn try_new(
+        typed: Vec<(String, Column)>,
+        dynamic: Vec<(String, DynamicColumn)>,
+        shared_offsets: Vec<i64>,
+        shared_paths: Utf8Column,
+        shared_values: Utf8Column,
+        len: usize,
+    ) -> Result<Self, JsonColumnError> {
+        for (path, column) in &typed {
+            if column.len() != len {
+                return Err(JsonColumnError::TypedPathLength {
+                    path: path.clone(),
+                    expected: len,
+                    actual: column.len(),
+                });
+            }
+        }
+        let mut previous: Option<&str> = None;
+        for (path, column) in &dynamic {
+            if previous.is_some_and(|prior| prior >= path.as_str()) {
+                return Err(JsonColumnError::UnsortedDynamicPath { path: path.clone() });
+            }
+            previous = Some(path);
+            if column.len() != len {
+                return Err(JsonColumnError::DynamicPathLength {
+                    path: path.clone(),
+                    expected: len,
+                    actual: column.len(),
+                });
+            }
+        }
+        if shared_paths.len() != shared_values.len() {
+            return Err(JsonColumnError::SharedPairMismatch {
+                paths: shared_paths.len(),
+                values: shared_values.len(),
+            });
+        }
+        if shared_offsets.first() != Some(&0) {
+            return Err(JsonColumnError::SharedOffsets {
+                reason: "offsets do not start at 0",
+            });
+        }
+        // `len` comes from an untrusted-parts caller, so `len + 1` is checked: a
+        // `len` of `usize::MAX` cannot have a matching `len + 1`-entry offset
+        // vector, so it is rejected here rather than panicking in debug or
+        // wrapping in release.
+        let expected_offsets_len = len.checked_add(1).ok_or(JsonColumnError::SharedOffsets {
+            reason: "row count overflows usize",
+        })?;
+        if shared_offsets.len() != expected_offsets_len {
+            return Err(JsonColumnError::SharedOffsets {
+                reason: "offsets length is not len + 1",
+            });
+        }
+        for pair in shared_offsets.windows(2) {
+            if pair[1] < pair[0] {
+                return Err(JsonColumnError::SharedOffsets {
+                    reason: "offsets are not monotonically non-decreasing",
+                });
+            }
+        }
+        // `len < shared_offsets.len()` (the length check above passed), so this
+        // index is in bounds.
+        if shared_offsets[len] != shared_paths.len() as i64 {
+            return Err(JsonColumnError::SharedOffsets {
+                reason: "final offset does not equal the shared pair count",
+            });
+        }
+        Ok(Self::from_parts(
+            typed,
+            dynamic,
+            shared_offsets,
+            shared_paths,
+            shared_values,
+            len,
+        ))
+    }
+}
+
+/// The two physical shapes a decoded `JSON` column can take.
+///
+/// `Structured` is the V1/V2/FLATTENED wire form (typed paths, dynamic paths,
+/// and shared-data overflow). `Text` is the `STRING`-mode form: one re-serialized
+/// JSON document string per row, from the
+/// `output_format_native_write_json_as_string` setting.
+///
+/// [`StructuredJson`] is boxed because it is several times larger than a
+/// `Utf8Column`; keeping it behind a pointer stops the size of the whole
+/// [`Column`] enum (and every enum that embeds a `Column`) from ballooning.
+#[derive(Debug, Clone)]
+pub enum JsonBody {
+    Structured(Box<StructuredJson>),
+    Text(Utf8Column),
+}
+
+/// A ClickHouse `JSON` column (`DataTypeObject`, confirmed at
+/// v26.6.1.1193-stable).
+///
+/// `validity` is the top-level null map, populated ONLY under a `Nullable(JSON)`
+/// wrapper (the server serializes the null map first, then the full JSON body);
+/// a bare `JSON` column always leaves it `None`. This mirrors how
+/// [`TupleColumn`] carries `Nullable(Tuple(...))` validity independent of its
+/// children.
+#[derive(Debug, Clone)]
+pub struct JsonColumn {
+    pub body: JsonBody,
+    pub validity: Option<Bitmap>,
+}
+
+impl JsonColumn {
+    /// A structured JSON column with no top-level null map.
+    pub fn structured(body: StructuredJson) -> Self {
+        Self {
+            body: JsonBody::Structured(Box::new(body)),
+            validity: None,
+        }
+    }
+
+    /// A `STRING`-mode JSON column (one document string per row).
+    pub fn text(values: Utf8Column) -> Self {
+        Self {
+            body: JsonBody::Text(values),
+            validity: None,
+        }
+    }
+
+    /// Attach a top-level `Nullable(JSON)` validity bitmap.
+    pub fn with_validity(mut self, validity: Option<Bitmap>) -> Self {
+        self.validity = validity;
+        self
+    }
+
+    pub fn body(&self) -> &JsonBody {
+        &self.body
+    }
+
+    /// The declared typed paths and their child columns, or an empty slice for a
+    /// `Text`-mode column.
+    pub fn typed_paths(&self) -> &[(String, Column)] {
+        match &self.body {
+            JsonBody::Structured(structured) => &structured.typed,
+            JsonBody::Text(_) => &[],
+        }
+    }
+
+    /// The block-local dynamic paths and their `Dynamic` columns, or an empty
+    /// slice for a `Text`-mode column.
+    pub fn dynamic_paths(&self) -> &[(String, DynamicColumn)] {
+        match &self.body {
+            JsonBody::Structured(structured) => &structured.dynamic,
+            JsonBody::Text(_) => &[],
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match &self.body {
+            JsonBody::Structured(structured) => structured.len,
+            JsonBody::Text(values) => values.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Top-level nulls, present only under a `Nullable(JSON)` wrapper.
+    pub fn null_count(&self) -> usize {
+        self.validity.as_ref().map_or(0, |b| b.null_count())
+    }
+}
+
 /// Enum over all supported column types.
 #[derive(Debug, Clone)]
 pub enum Column {
@@ -1291,6 +1573,11 @@ pub enum Column {
     // Dynamic: block-local self-describing typed children, optional raw binary
     // SharedVariant overflow child, and dense routing buffers.
     Dynamic(DynamicColumn),
+    // JSON: declared typed-path child columns, block-local dynamic-path Dynamic
+    // columns, and the shared-data string overflow (or a single re-serialized
+    // document string per row in STRING mode). Top-level nulls only under a
+    // Nullable(JSON) wrapper.
+    Json(JsonColumn),
 }
 
 impl Column {
@@ -1334,6 +1621,7 @@ impl Column {
             Column::Map(c) => c.len(),
             Column::Variant(c) => c.len(),
             Column::Dynamic(c) => c.len(),
+            Column::Json(c) => c.len(),
         }
     }
 
@@ -1381,6 +1669,7 @@ impl Column {
             Column::Map(c) => c.null_count(),
             Column::Variant(c) => c.null_count(),
             Column::Dynamic(c) => c.null_count(),
+            Column::Json(c) => c.null_count(),
         }
     }
 
@@ -1432,6 +1721,9 @@ impl Column {
             Column::Variant(_) => None,
             // Dynamic has the same intrinsic-NULL union semantics as Variant.
             Column::Dynamic(_) => None,
+            // JSON carries a top-level validity bitmap only under a
+            // Nullable(JSON) wrapper, like Tuple; a bare JSON column has None.
+            Column::Json(c) => c.validity.as_ref(),
         }
     }
 }
@@ -1494,6 +1786,22 @@ mod tests {
         let col = Column::Int32(PrimitiveColumn::new(vec![10, 20]));
         assert_eq!(col.len(), 2);
         assert_eq!(col.null_count(), 0);
+    }
+
+    #[test]
+    fn test_structured_json_try_new_len_overflow_is_error_not_panic() {
+        // An untrusted-parts caller could pass `len == usize::MAX`; the `len + 1`
+        // offset-length check must return an error, not panic in debug or wrap in
+        // release.
+        let result = StructuredJson::try_new(
+            Vec::new(),
+            Vec::new(),
+            vec![0i64],
+            Utf8Column::new(vec![0], Vec::new()),
+            Utf8Column::new(vec![0], Vec::new()),
+            usize::MAX,
+        );
+        assert!(matches!(result, Err(JsonColumnError::SharedOffsets { .. })));
     }
 
     #[test]

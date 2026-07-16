@@ -290,6 +290,7 @@ than an error.
 | `Nested(name1 T1, ...)` for supported field types                                      | `Nested(Vec<(String, ChType)>)`        | `Array`           | `+L` (LargeList of a `+s` struct with the field names)             | validity, i64 offsets (+ item struct child) | no (it is an `Array`)                                    |
 | `Variant(T1, ...)` for 1 through 255 legal alternatives                               | `Variant(Vec<ChType>)`                 | `Variant`         | `+ud:...` Dense Union, nested for 128+ alternatives                | i8 type ids, i32 offsets (+ dense children) | intrinsic NULL child; no top-level validity              |
 | `Dynamic`, `Dynamic(max_types=N)`                                                     | `Dynamic { max_types }`                | `Dynamic`         | `+ud:...` result-wide Dense Union; SharedVariant child is `z`      | remapped i8 type ids, i32 offsets (+ dense children) | intrinsic NULL child; no top-level validity              |
+| `JSON`, `JSON(...)` (typed paths, `max_dynamic_paths`/`max_dynamic_types`, `SKIP`)     | `Json { max_dynamic_paths, max_dynamic_types, typed_paths, skip_paths, skip_regexps }` | `Json` | `+s` (struct of typed paths, dynamic-path Dense Unions, and a `_shared_data` LargeList); `u` for a STRING-mode body | validity (one child per typed path, per dynamic path, plus `_shared_data`) | yes (`Nullable(JSON)` is legal) |
 
 Any type not in this matrix is rejected. See "Unsupported types" below.
 
@@ -2202,6 +2203,173 @@ V1/V2 table, and retaining SharedVariant blobs without parsing their trailing
 payload are deliberate core policies, not claims about additional server
 validation.
 
+### JSON
+
+**Type string(s):** `JSON` is the canonical spelling when every parameter is
+default and no paths are declared. Otherwise the server emits `JSON(...)` joining
+these in order: `max_dynamic_types=M` (only when != 32), `max_dynamic_paths=N`
+(only when != 1024), the typed paths sorted lexicographically (each
+`<path> <TypeName>`), the `SKIP <path>` entries sorted, then the
+`SKIP REGEXP '<regex>'` entries. Each path renders through the server's
+`backQuoteIfNeed` on the WHOLE path, so a dotted path such as `a.b` always
+backtick-quotes to `` `a.b` `` and a path literally named `SKIP`
+(case-insensitive) always quotes; the parser strips the quoting back to the bare
+path string. `parse_ch_type` canonicalizes an unsorted or out-of-order header
+into this form, so `parse(display(t)) == t`. Parameter bounds are
+`max_dynamic_paths` <= 10000, `max_dynamic_types` <= 254, and typed paths <=
+1000; a header past any bound, a duplicate parameter, or the legacy
+`Object('json')` spelling (unregistered at this tag) is `UnsupportedType`. A
+typed-path type may itself be `JSON` (nested), bounded by `MAX_TYPE_DEPTH`.
+
+**Logical type:** `ChType::Json { max_dynamic_paths: u32, max_dynamic_types: u8,
+typed_paths: Vec<(String, ChType)>, skip_paths: Vec<String>, skip_regexps:
+Vec<String> }`. Typed paths are stored sorted by path. The runtime dynamic paths
+and shared-data overflow are NOT in the logical type: like Dynamic they are
+discovered per Native block and can differ across chunks of one result.
+
+**Wire payload:** a block with rows starts with one little-endian UInt64
+structure version word. Direct NativeWriter selects V1/V2 from the negotiated
+revision; its opt-in flattened setting selects word 3:
+
+```text
+one LE u64 structure word:
+  0 = V1, 1 = STRING, 2 = V2, 3 = FLATTENED (4 = V3 is MergeTree-only, rejected)
+
+prefix by form:
+  V1 (word 0):     VarUInt M legacy ignored slot (equals the path count),
+                   VarUInt M dynamic-path count, M sorted path strings
+  STRING (word 1): nothing else in the prefix
+  V2 (word 2):     VarUInt M dynamic-path count, M sorted path strings
+  FLATTENED (3):   VarUInt K flattened-path count (UNBOUNDED), K sorted paths
+
+  then, for every non-STRING form:
+    typed-path state prefixes, in sorted path order
+    one full SerializationDynamic prefix per dynamic/flattened path, sorted
+    (shared data contributes no prefix bytes)
+
+body with rows:
+  STRING:  one VarUInt-length-prefixed document string per row
+  others:  typed-path bodies, in sorted path order
+           one full Dynamic body per dynamic/flattened path, sorted
+           V1/V2 only: shared-data Array(Tuple(String, String)) body:
+             num_rows LE u64 end-offsets, then the flattened path strings,
+             then the flattened value strings
+
+suffix: zero bytes (JSON owns no suffix; children walked for cursor alignment)
+```
+
+V1 and V2 differ only in V1's ignored legacy VarUInt slot; both carry the
+shared-data stream. The dynamic-path count is strictly bounded by
+`max_dynamic_paths` on V1/V2, where the writer routes any path past the limit
+into shared data so a larger direct count is malformed
+(`DecodeError::InvalidJson`). The FLATTENED count is UNBOUNDED and routinely
+exceeds `max_dynamic_paths`: `unflattenAndInsertPaths`
+(`SerializationObjectHelpers.cpp`) writes the union of the dynamic paths and
+every distinct shared-data path, greedily assigns the first sorted paths that
+fit `max_dynamic_paths`, and spills the rest back to shared data, so it is
+protected by the read-before-allocate discipline rather than a count cap.
+Dynamic paths must be strictly increasing (sorted, unique); anything else is
+`InvalidJson`.
+
+FLATTENED carries no shared-data stream (each path is a shared-less Dynamic) and
+decodes to a structured column with empty shared columns (`shared_offsets` all
+zero, one per row plus the Arrow leading 0). A PATHLESS FLATTENED column writes
+ZERO body bytes per row, so a block can legitimately claim more rows than it has
+bytes; the type-aware per-column row-count guard excludes JSON (and any container
+that bottoms out in it) and bounds it by its own read-before-allocate decode.
+SharedVariant and shared-data values are opaque binary blobs, one binary
+data-type descriptor followed by one `serializeBinary` payload, the same shape as
+a Dynamic SharedVariant cell, kept opaque and never materialized. A zero-row
+Native block writes only the column header (no structure word, path list, or
+bodies); `empty_column` builds the declared typed paths with empty children and
+empty shared data.
+
+**Arrow export:** a structured body exports as an Arrow struct (`+s`) whose
+children are, in fixed order: one child per declared typed path (each the path
+type's own schema and buffers), one Dense Union child per dynamic path (the same
+result-wide Dynamic export as a standalone `Dynamic` column, SharedVariant child
+`z`, final Null child), and a `_shared_data` child. `_shared_data` is a
+non-nullable Arrow LargeList (`+L`) of a non-nullable struct (`+s`) pairing
+`paths` (utf8 `u`, like a String column) with `values` (binary `z`, the opaque
+descriptor+payload bytes, never utf8). A STRING-mode (`Text`) body exports as a
+plain utf8 column (`u`), the same shape as `String`. `Nullable(JSON)` fills the
+struct or utf8 validity from the top-level null map.
+
+Because the dynamic-path child set is block-local column data,
+`export_chunks_to_stream` pre-scans the chunks once and fixes one result-wide
+dynamic-path set (BTreeMap name order) before exposing the stream schema, exactly
+like Dynamic; each record batch supplies zero-length arrays for paths absent from
+that block. The `DynamicUnionTooWide` cap applies per dynamic-path union. A pure
+logical `export_schema` (no sample column) cannot invent block-local dynamic
+paths, so it describes only the declared typed paths plus `_shared_data`; pair
+`export_batch_schema`/`export_batch_array` (or `export_batch`) for the full child
+set. All chunks of one JSON field must agree on body kind (all structured or all
+Text); a mismatch returns `ExportError::JsonBodyKindMismatch`.
+
+**Rust buffer:** `Column::Json(JsonColumn { body, validity })`. `body` is
+`JsonBody::Structured(Box<StructuredJson>)` or `JsonBody::Text(Utf8Column)`;
+`StructuredJson` is boxed because it is much larger than a `Utf8Column`.
+`StructuredJson` is `{ typed: Vec<(String, Column)>, dynamic: Vec<(String,
+DynamicColumn)>, shared_offsets: Vec<i64>, shared_paths: Utf8Column,
+shared_values: Utf8Column, len: usize }`: typed paths in the declared sorted
+order, dynamic paths sorted by name (each a block-local `DynamicColumn`), and the
+shared-data overflow as an Arrow list-offset run (leading 0, length `len + 1`)
+over the two flattened string columns. `shared_values` are opaque blobs, never
+materialized. `validity` is populated only under a `Nullable(JSON)` wrapper (the
+top-level null map), independent of the children, exactly as `TupleColumn`
+carries `Nullable(Tuple(...))` validity. `StructuredJson::try_new` validates
+child lengths, strictly sorted dynamic paths, and the shared-offset run.
+
+**Wrappers, containers, and keys:** `Nullable(JSON)` is legal; the null map
+precedes the full JSON body. `LowCardinality(JSON)` is illegal. JSON composes
+inside `Array`, `Tuple`, and `Map` (as key or value), as a `Variant`
+alternative, as a `Dynamic` runtime type, and as its own typed-path type (nested
+JSON), all bounded by `MAX_TYPE_DEPTH`.
+
+**Encode:** see the "Encoding" section. In brief: a `Text` body writes STRING
+(word 1); a structured body writes FLATTENED (word 3) only via
+`EncodeOptions.flattened_dynamic` when the column carries no shared pairs (pre
+25.6 servers reject word 3), otherwise the revision-selected V1 (< 54473) or V2
+(>= 54473). Validation proves the typed-path set and lengths match the declared
+type, the dynamic paths are strictly sorted and within `max_dynamic_paths` on
+V1/V2, and the shared-offset run is well formed.
+
+**Binary type descriptor:** JSON's `DataTypesBinaryEncoding` tag is `0x30`: a
+`TYPE_JSON_SERIALIZATION_VERSION` byte (must be 0), a VarUInt `max_dynamic_paths`,
+a RAW u8 `max_dynamic_types`, then the typed-path list (VarUInt count, each a
+StringBinary path then a nested descriptor), the `SKIP`-path list, and the
+`SKIP REGEXP` list. The lists may arrive in arbitrary order and are canonicalized
+on read (sorted typed paths, sorted skip sets), so the reconstructed
+`ChType::Json` matches the textual-header form. The bounds above and a nonzero
+version byte are rejected before any payload decode. The
+`decode_*_binary_types` / `encode_*_binary_types` APIs select this out-of-band
+form.
+
+**Introduction version:** the JSON data type is marked production ready in
+ClickHouse 25.3 per the `registerDataTypeJSON` documentation string
+(`DataTypeObject.cpp`), and is GA/stable at `v26.6.1.1193-stable`. The default
+Native serialization at the pin is the structured V1/V2 form; both output
+settings default off. Per `SettingsChangesHistory.cpp` the two settings were
+introduced in DIFFERENT releases: `output_format_native_write_json_as_string` in
+24.10 and `output_format_native_use_flattened_dynamic_and_json_serialization` in
+25.6.
+
+**Server reference:** `SerializationObject` (structure state prefix, body, and
+suffix; `deserializeObjectStructureStatePrefix`), `SerializationObjectSharedData`,
+and `SerializationObjectHelpers` (`unflattenAndInsertPaths`, the unbounded
+FLATTENED count) in `src/DataTypes/Serializations/`; `DataTypeObject`,
+`registerDataTypeJSON`, and `DataTypeObject::doGetName` in
+`src/DataTypes/DataTypeObject.{h,cpp}`; the `0x30` descriptor in
+`DataTypesBinaryEncoding` (`src/DataTypes/`); and `NativeWriter`/`NativeReader`
+(`src/Formats/`) for the zero-row gate and revision selection. The structure
+words, V1 legacy slot, the V1/V2 path-count bound versus the confirmed unbounded
+FLATTENED count, the body order, STRING and FLATTENED shapes, opaque shared
+blobs, and the version history above are CONFIRMED at `v26.6.1.1193-stable`.
+Stricter Rust rejection of a V3/unknown structure word and of a V1/V2 direct
+count above `max_dynamic_paths`, and retaining shared blobs without parsing their
+trailing payload, are deliberate core policies, not claims about additional
+server validation.
+
 ---
 
 ## Encoding
@@ -2274,9 +2442,11 @@ inner types decode accepts, `Array(T)` over any encodable element type
 zero-element `Tuple()` included, composing inside `Array` and inside
 `Nullable`), and `Map(K, V)` for a legal key type over encodable key/value
 types (composing inside `Array` and `Tuple`), `Variant(T1, ...)` when every
-alternative is encodable, and `Dynamic` with recursively encodable typed
-children plus an optional opaque SharedVariant child, the non-wrapper types and
-`Tuple` each optionally wrapped in `Nullable`. The name-decoration aliases
+alternative is encodable, `Dynamic` with recursively encodable typed
+children plus an optional opaque SharedVariant child, and `JSON` (structured
+bodies with recursively encodable typed paths, block-local dynamic paths, and
+opaque shared-data blobs, or a STRING-mode `Text` body), the non-wrapper types,
+`Tuple`, and `JSON` each optionally wrapped in `Nullable`. The name-decoration aliases
 `SimpleAggregateFunction(func, T)` (encodable when its inner `T` is, at any
 nesting position), the six geo types (`Point`, `Ring`, `LineString`,
 `MultiLineString`, `Polygon`, `MultiPolygon`, always encodable since they
@@ -2510,6 +2680,20 @@ one valid wire form, and encode commits to these:
   the smallest fixed-width index run, then dense bodies. Validation checks the
   table/order/max-types and every routing/child invariant before either form is
   emitted. A zero-row block writes no Dynamic structure or child prefix.
+- **JSON.** A `Text` body writes STRING (structure word 1) then one
+  length-prefixed document per row. A structured body writes FLATTENED (word 3)
+  ONLY when `EncodeOptions.flattened_dynamic` is set AND the column carries no
+  shared pairs (word 3 is unknown to pre-25.6 servers, so it stays opt-in);
+  otherwise it writes the revision-selected V1 (< 54473, with the legacy count
+  slot) or V2 (>= 54473), including the shared-data `Array(Tuple(String,
+  String))` stream. Either structured form writes the sorted dynamic-path list,
+  the typed-path bodies in sorted order, then one full Dynamic body per path.
+  Validation proves the typed-path set and lengths match the declared type, the
+  dynamic paths are strictly sorted and (on V1/V2) within `max_dynamic_paths`,
+  and the shared-offset run is well formed, before any bytes are written; a
+  shared-bearing column with `flattened_dynamic` set still writes V1/V2 because
+  FLATTENED cannot represent shared data. A zero-row block writes no JSON
+  structure word or child prefix.
 
 ### Round-trip guarantees
 

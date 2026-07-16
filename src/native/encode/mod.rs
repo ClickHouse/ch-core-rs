@@ -32,7 +32,8 @@
 use crate::batch::{ChunkedBatch, ColBatch};
 use crate::column::{
     ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn, DynamicChild, DynamicColumn,
-    FixedBinaryColumn, MapColumn, TupleColumn, Utf8Column, VariantColumn,
+    FixedBinaryColumn, JsonBody, JsonColumn, MapColumn, StructuredJson, TupleColumn, Utf8Column,
+    VariantColumn,
 };
 use crate::native::aggregate_function::aggregate_state_codec;
 use crate::schema::{ChType, Field};
@@ -424,6 +425,14 @@ fn write_state_prefix(
                 write_dynamic_state_prefix(buf, col, options, types_in_binary_format)?;
             }
         }
+        // JSON writes its structure word, dynamic-path list, typed-path prefixes,
+        // and per-dynamic-path Dynamic prefixes here. For a `Nullable(JSON)` the
+        // Nullable arm below recurses into this arm with the same Column::Json.
+        ChType::Json { typed_paths, .. } => {
+            if let Column::Json(col) = column {
+                write_json_state_prefix(buf, typed_paths, col, options, types_in_binary_format)?;
+            }
+        }
         // `SerializationNullable::serializeBinaryBulkStatePrefix` delegates to
         // the nested type (confirmed at v26.6.1.1193-stable); only a
         // `Nullable(Tuple(...))` can nest a prefix-bearing type today.
@@ -510,6 +519,89 @@ fn write_dynamic_state_prefix(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Whether a structured JSON column encodes as FLATTENED (word 3) rather than
+/// V1/V2. FLATTENED omits the shared-data stream, so it is only chosen when the
+/// column carries no shared pairs AND [`EncodeOptions::flattened_dynamic`] is set
+/// (structure word 3 is unknown to pre-25.6 servers). Shared by the prefix and
+/// body writers so they agree on the wire shape.
+fn json_uses_flattened(structured: &StructuredJson, options: &EncodeOptions) -> bool {
+    options.flattened_dynamic
+        && structured.shared_paths.is_empty()
+        && structured.shared_values.is_empty()
+}
+
+/// Write a JSON column's structure prefix and every child's prefix, the inverse
+/// of [`super::decode::read_json_state_prefix`].
+///
+/// STRING mode (a `Text` body) writes structure word 1 and nothing else. A
+/// structured body writes FLATTENED word 3 (when [`json_uses_flattened`]) or the
+/// protocol-revision-selected V1/V2 structure word (0 before
+/// [`DBMS_MIN_REVISION_WITH_V2_DYNAMIC_AND_JSON_SERIALIZATION`], else 2), then the
+/// dynamic-path count and sorted names, the typed-path prefixes in sorted order,
+/// and one full Dynamic prefix per dynamic path. V1 also repeats the dynamic-path
+/// count in the leading legacy slot. The shared-data child contributes no prefix
+/// bytes.
+fn write_json_state_prefix(
+    buf: &mut Vec<u8>,
+    typed_paths: &[(String, ChType)],
+    col: &JsonColumn,
+    options: &EncodeOptions,
+    types_in_binary_format: bool,
+) -> Result<(), EncodeError> {
+    let structured = match &col.body {
+        JsonBody::Text(_) => {
+            // STRING: structure word 1, nothing else in the prefix.
+            buf.extend_from_slice(&1u64.to_le_bytes());
+            return Ok(());
+        }
+        JsonBody::Structured(structured) => structured,
+    };
+
+    if json_uses_flattened(structured, options) {
+        buf.extend_from_slice(&3u64.to_le_bytes());
+        write_varint(buf, structured.dynamic.len() as u64);
+        for (path, _) in &structured.dynamic {
+            write_string(buf, path.as_bytes());
+        }
+    } else {
+        let version = if options.protocol_revision
+            < DBMS_MIN_REVISION_WITH_V2_DYNAMIC_AND_JSON_SERIALIZATION
+        {
+            0u64
+        } else {
+            2u64
+        };
+        buf.extend_from_slice(&version.to_le_bytes());
+        let dynamic_count = structured.dynamic.len() as u64;
+        if version == 0 {
+            // V1's leading VarUInt is a legacy slot the reader ignores; the
+            // server writes the dynamic-path count into it.
+            write_varint(buf, dynamic_count);
+        }
+        write_varint(buf, dynamic_count);
+        for (path, _) in &structured.dynamic {
+            write_string(buf, path.as_bytes());
+        }
+    }
+
+    // Typed-path prefixes in sorted path order (typed_paths and the column's
+    // typed children share that order, validated before the write phase).
+    for ((_, element_type), (_, element_col)) in typed_paths.iter().zip(&structured.typed) {
+        write_state_prefix(
+            buf,
+            element_type,
+            element_col,
+            options,
+            types_in_binary_format,
+        )?;
+    }
+    // Per dynamic path, a full Dynamic prefix in sorted order.
+    for (_, dynamic_col) in &structured.dynamic {
+        write_dynamic_state_prefix(buf, dynamic_col, options, types_in_binary_format)?;
     }
     Ok(())
 }
@@ -623,11 +715,42 @@ fn write_state_suffix(
                 }
             }
         }
+        // JSON owns no suffix bytes, but walk its typed-path and dynamic-path
+        // children in the same order as prefix/body to stay symmetric with the
+        // server (all no-ops today). Skipped entirely for a Text-mode column.
+        ChType::Json { typed_paths, .. } => {
+            if let Column::Json(col) = column {
+                if let JsonBody::Structured(structured) = &col.body {
+                    for ((_, element_type), (_, element_col)) in
+                        typed_paths.iter().zip(&structured.typed)
+                    {
+                        write_state_suffix(buf, element_type, element_col)?;
+                    }
+                    for (_, dynamic_col) in &structured.dynamic {
+                        write_dynamic_state_suffix(buf, dynamic_col)?;
+                    }
+                }
+            }
+        }
         _ => {
             // Intentionally a no-op: no type this crate currently supports writes
             // suffix bytes. The arm exists only to keep this traversal symmetric
             // with the server's prefix/body/suffix serialization contract.
             let _ = buf;
+        }
+    }
+    Ok(())
+}
+
+/// Write one Dynamic column's bulk-state suffix (a no-op today), walking its
+/// typed children in the wire order the prefix and body use. Shared with the
+/// JSON suffix traversal, whose dynamic paths are each a full Dynamic.
+fn write_dynamic_state_suffix(buf: &mut Vec<u8>, col: &DynamicColumn) -> Result<(), EncodeError> {
+    for slot in dynamic_wire_order(col) {
+        if let Some(DynamicChild::Typed { ch_type, values }) =
+            slot.map(|index| &col.children[index])
+        {
+            write_state_suffix(buf, ch_type, values)?;
         }
     }
     Ok(())
@@ -717,6 +840,14 @@ fn encode_column_values(
         }
         return Err(column_error(field, value_type));
     }
+    // JSON after the Nullable unwrap, mirroring the decode side: a
+    // `Nullable(JSON)` writes its per-row null map above, then the JSON body.
+    if let ChType::Json { typed_paths, .. } = value_type {
+        if let Column::Json(c) = column {
+            return encode_json_data(buf, field, typed_paths, c, options);
+        }
+        return Err(column_error(field, value_type));
+    }
     encode_column_body(buf, field, value_type, column)
 }
 
@@ -799,6 +930,51 @@ fn encode_dynamic_data(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Encode one JSON column body after [`write_json_state_prefix`] emitted its
+/// structure word and path list, the inverse of [`super::decode::decode_json`].
+///
+/// A `Text` body writes one varint-length document string per row (STRING mode)
+/// and nothing else. A structured body writes the typed-path columns in sorted
+/// order, then one full Dynamic body per dynamic path, then (V1/V2 only, i.e.
+/// not [`json_uses_flattened`]) the shared-data stream: the `Array` end-offsets
+/// (`shared_offsets[1..]` as raw LE i64, validated non-negative) then the two
+/// flattened String columns. The child bodies go through the shared
+/// [`encode_column_values`]/[`encode_dynamic_data`] paths with no prefix
+/// re-emission, so nested prefixes are hoisted to the front of the column.
+fn encode_json_data(
+    buf: &mut Vec<u8>,
+    field: &Field,
+    typed_paths: &[(String, ChType)],
+    col: &JsonColumn,
+    options: &EncodeOptions,
+) -> Result<(), EncodeError> {
+    let structured = match &col.body {
+        JsonBody::Text(values) => {
+            encode_string_data(buf, values);
+            return Ok(());
+        }
+        JsonBody::Structured(structured) => structured,
+    };
+
+    for ((_, element_type), (_, element_col)) in typed_paths.iter().zip(&structured.typed) {
+        encode_column_values(buf, field, element_type, element_col, options)?;
+    }
+    for (_, dynamic_col) in &structured.dynamic {
+        encode_dynamic_data(buf, field, dynamic_col, options)?;
+    }
+    if !json_uses_flattened(structured, options) {
+        // Shared data: the Array end-offsets then the two flattened String
+        // columns. `get(1..)` stays panic-free if a caller reaches here without
+        // validating (validation guarantees the leading 0).
+        if let Some(end_offsets) = structured.shared_offsets.get(1..) {
+            encode_primitive!(buf, end_offsets, i64);
+        }
+        encode_string_data(buf, &structured.shared_paths);
+        encode_string_data(buf, &structured.shared_values);
     }
     Ok(())
 }
@@ -1401,6 +1577,13 @@ fn is_encodable(ch_type: &ChType) -> bool {
         // the logical schema. Their recursive encodability is checked against
         // the concrete DynamicColumn during validation.
         ChType::Dynamic { .. } => true,
+        // JSON is encodable when every declared typed-path type is encodable; a
+        // Nullable typed path unwraps like the Tuple/Array arms. The block-local
+        // dynamic paths and shared data carry runtime types checked against the
+        // concrete JsonColumn during validation, like Dynamic.
+        ChType::Json { typed_paths, .. } => {
+            typed_paths.iter().all(|(_, t)| is_encodable(t.inner()))
+        }
         ChType::AggregateFunction { .. } => aggregate_state_codec(ch_type).is_some(),
         // Name-decoration aliases are encodable exactly when their physical
         // delegate is: `SimpleAggregateFunction` over its inner, a geo alias over
