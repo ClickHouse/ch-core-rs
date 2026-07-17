@@ -756,8 +756,9 @@ fn parse_nested_elements(inner: &str, depth: usize) -> Option<Vec<(String, ChTyp
 /// already protects parenthesized type arguments, single-quoted `SKIP REGEXP`
 /// literals, and backtick-quoted paths), and each part is classified in this
 /// order: the named parameters `max_dynamic_types=M` / `max_dynamic_paths=N`
-/// (both distinguished by the literal `=`, so a typed path merely named
-/// `max_dynamic_types` still parses as a path), then `SKIP REGEXP '<regex>'`
+/// (both distinguished by the literal `=`, with optional spaces around it, so a
+/// typed path merely named `max_dynamic_types` still parses as a path), then
+/// `SKIP REGEXP '<regex>'`
 /// (checked before the bare `SKIP` since it shares the prefix), then `SKIP
 /// <path>`, then a typed path `<path> <TypeName>`. Duplicate parameters, a typed
 /// path that repeats a name, or any value past the server's construction limits
@@ -781,21 +782,21 @@ fn parse_json_arguments(inner: &str, depth: usize) -> Option<ChType> {
     if !trimmed.is_empty() {
         for part in split_top_level_commas(trimmed)? {
             let part = part.trim_matches(' ');
-            if let Some(value) = part.strip_prefix("max_dynamic_types=") {
+            if let Some(value) = json_named_argument(part, "max_dynamic_types") {
                 if seen_max_types {
                     return None;
                 }
                 seen_max_types = true;
-                max_dynamic_types = value.trim().parse::<u8>().ok()?;
+                max_dynamic_types = value.parse::<u8>().ok()?;
                 if max_dynamic_types > JSON_MAX_DYNAMIC_TYPES {
                     return None;
                 }
-            } else if let Some(value) = part.strip_prefix("max_dynamic_paths=") {
+            } else if let Some(value) = json_named_argument(part, "max_dynamic_paths") {
                 if seen_max_paths {
                     return None;
                 }
                 seen_max_paths = true;
-                max_dynamic_paths = value.trim().parse::<u32>().ok()?;
+                max_dynamic_paths = value.parse::<u32>().ok()?;
                 if max_dynamic_paths > JSON_MAX_DYNAMIC_PATHS {
                     return None;
                 }
@@ -829,6 +830,17 @@ fn parse_json_arguments(inner: &str, depth: usize) -> Option<ChType> {
         skip_paths,
         skip_regexps,
     })
+}
+
+/// Match one `JSON` named parameter `name=value`, with optional spaces around
+/// the `=`, returning the trimmed value. `None` when `part` does not start with
+/// `name` followed by `=` (so a typed path merely named `name` falls through to
+/// the path parser).
+fn json_named_argument<'a>(part: &'a str, name: &str) -> Option<&'a str> {
+    part.strip_prefix(name)?
+        .trim_start_matches(' ')
+        .strip_prefix('=')
+        .map(|value| value.trim_matches(' '))
 }
 
 /// Parse one `JSON` typed path `<path> <TypeName>` into a `(path, type)` pair.

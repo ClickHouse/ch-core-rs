@@ -594,6 +594,158 @@ fn stream_unifies_differing_dynamic_path_sets() {
     }
 }
 
+#[test]
+fn absent_paths_share_null_union_buffers_within_a_chunk() {
+    // Chunk A carries only p1; chunk B carries p2 and p3. Exporting A leaves p2
+    // and p3 absent, and both all-NULL unions must share one offsets buffer and
+    // one type-ids buffer (each path plan has one child, so both NULL ids are 1).
+    let chunk_a = structured_json_batch(
+        vec![(
+            "p1".to_string(),
+            single_child_dynamic(
+                ChType::Int64,
+                Column::Int64(PrimitiveColumn::new(vec![13, 79, 101])),
+                &[0, 0, 0],
+            ),
+        )],
+        3,
+    );
+    let chunk_b = structured_json_batch(
+        vec![
+            (
+                "p2".to_string(),
+                single_child_dynamic(
+                    ChType::Int64,
+                    Column::Int64(PrimitiveColumn::new(vec![1, 2, 3])),
+                    &[0, 0, 0],
+                ),
+            ),
+            (
+                "p3".to_string(),
+                single_child_dynamic(
+                    ChType::String,
+                    Column::Utf8(Utf8Column::new(vec![0, 2, 4, 6], b"hihuho".to_vec())),
+                    &[0, 0, 0],
+                ),
+            ),
+        ],
+        3,
+    );
+    let schema = chunk_a.schema.clone();
+
+    unsafe {
+        let mut stream: ArrowArrayStream = std::mem::zeroed();
+        export_chunks_to_stream(schema, vec![chunk_a, chunk_b], &mut stream);
+
+        // Chunk A: p2 and p3 are the synthetic all-NULL unions.
+        let mut first: ArrowArray = std::mem::zeroed();
+        assert_eq!((stream.get_next.unwrap())(&mut stream, &mut first), 0);
+        let json_a = &**first.children.add(0);
+        assert_eq!(json_a.n_children, 4, "p1, p2, p3, _shared_data");
+        let p2 = &**json_a.children.add(1);
+        let p3 = &**json_a.children.add(2);
+        let (p2_ids, p2_offsets) = union_ids_and_offsets(p2, 3);
+        let (p3_ids, p3_offsets) = union_ids_and_offsets(p3, 3);
+        assert_eq!(p2_ids, [1, 1, 1], "p2 missing -> every row NULL");
+        assert_eq!(p3_ids, [1, 1, 1], "p3 missing -> every row NULL");
+        assert_eq!(p2_offsets, [0, 1, 2]);
+        assert_eq!(p3_offsets, [0, 1, 2]);
+        assert_eq!((**p2.children.add(1)).length, 3, "three NULL rows");
+        assert_eq!((**p3.children.add(1)).length, 3, "three NULL rows");
+        // Pointer identity pins the per-chunk sharing.
+        assert_eq!(
+            *p2.buffers.add(0),
+            *p3.buffers.add(0),
+            "absent paths share one type-ids buffer"
+        );
+        assert_eq!(
+            *p2.buffers.add(1),
+            *p3.buffers.add(1),
+            "absent paths share one offsets buffer"
+        );
+
+        // Chunk B: p1 is absent, p2/p3 carry their real rows. Read the shared
+        // buffers of both chunks' nodes to prove they stay valid independently.
+        let mut second: ArrowArray = std::mem::zeroed();
+        assert_eq!((stream.get_next.unwrap())(&mut stream, &mut second), 0);
+        let json_b = &**second.children.add(0);
+        let p1_b = &**json_b.children.add(0);
+        let (p1_b_ids, p1_b_offsets) = union_ids_and_offsets(p1_b, 3);
+        assert_eq!(p1_b_ids, [1, 1, 1], "p1 missing in B -> every row NULL");
+        assert_eq!(p1_b_offsets, [0, 1, 2]);
+        let p2_b = &**json_b.children.add(1);
+        assert_eq!((**p2_b.children.add(0)).length, 3, "real Int64 rows in B");
+
+        // Release the first chunk, then re-read the second chunk's buffers: the
+        // Arcs are per chunk, so dropping A must not invalidate B.
+        (first.release.unwrap())(&mut first);
+        let (p1_b_ids, _) = union_ids_and_offsets(p1_b, 3);
+        assert_eq!(p1_b_ids, [1, 1, 1]);
+
+        (second.release.unwrap())(&mut second);
+        (stream.release.unwrap())(&mut stream);
+    }
+}
+
+#[test]
+fn zero_row_chunk_does_not_pin_json_body_kind() {
+    // A zero-row block carries no JSON state prefix, so its structured empty
+    // body must not veto a text stream: the plan resolves from the nonempty
+    // chunk and the zero-row chunk exports an empty utf8 array.
+    let zero = structured_json_batch(Vec::new(), 0);
+    let text_chunk = Arc::new(ColBatch::new(
+        Schema::new(vec![Field {
+            name: "j".into(),
+            ch_type: json_type(Vec::new()),
+        }]),
+        vec![Column::Json(JsonColumn::text(Utf8Column::new(
+            vec![0, 7],
+            b"{\"k\":1}".to_vec(),
+        )))],
+        1,
+    ));
+    let schema = zero.schema.clone();
+
+    unsafe {
+        let mut stream: ArrowArrayStream = std::mem::zeroed();
+        export_chunks_to_stream(schema, vec![zero, text_chunk], &mut stream);
+
+        let mut out_schema: ArrowSchema = std::mem::zeroed();
+        assert_eq!(
+            (stream.get_schema.unwrap())(&mut stream, &mut out_schema),
+            0,
+            "zero-row structured chunk must not fail a text stream"
+        );
+        let field = &**out_schema.children.add(0);
+        assert_eq!(cstr(field.format), "u", "stream resolves to text");
+
+        // Zero-row chunk exports as an empty utf8 node matching the schema.
+        let mut first: ArrowArray = std::mem::zeroed();
+        assert_eq!((stream.get_next.unwrap())(&mut stream, &mut first), 0);
+        let json_a = &**first.children.add(0);
+        assert_eq!(json_a.length, 0);
+        assert_eq!(json_a.n_buffers, 3, "validity, offsets, data");
+        assert_eq!(json_a.n_children, 0);
+        let offsets = std::slice::from_raw_parts(*json_a.buffers.add(1) as *const i32, 1);
+        assert_eq!(offsets, &[0]);
+
+        // The text chunk exports its document unchanged.
+        let mut second: ArrowArray = std::mem::zeroed();
+        assert_eq!((stream.get_next.unwrap())(&mut stream, &mut second), 0);
+        let json_b = &**second.children.add(0);
+        assert_eq!(json_b.length, 1);
+        let b_offsets = std::slice::from_raw_parts(*json_b.buffers.add(1) as *const i32, 2);
+        assert_eq!(b_offsets, &[0, 7]);
+        let data = std::slice::from_raw_parts(*json_b.buffers.add(2) as *const u8, 7);
+        assert_eq!(data, b"{\"k\":1}");
+
+        (second.release.unwrap())(&mut second);
+        (first.release.unwrap())(&mut first);
+        (out_schema.release.unwrap())(&mut out_schema);
+        (stream.release.unwrap())(&mut stream);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Stream: Dynamic union remap inside a shared JSON dynamic path
 // ---------------------------------------------------------------------------

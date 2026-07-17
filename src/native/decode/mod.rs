@@ -613,15 +613,8 @@ fn read_state_suffix(
         // must still be walked in the same preorder as the prefix and body so the
         // state cursor stays aligned (all suffixes are no-ops today).
         ChType::Json { typed_paths, .. } => {
-            let (kind, num_dynamic) = match next_state(states, state_cursor, column)? {
-                StatePrefix::Json(state) => (state.kind, state.dynamic_paths.len()),
-                StatePrefix::Dynamic(_) => {
-                    return Err(invalid_json(
-                        column,
-                        "expected a JSON structure state during the suffix traversal",
-                    ))
-                }
-            };
+            let state = next_json_state(states, state_cursor, column)?;
+            let (kind, num_dynamic) = (state.kind, state.dynamic_paths.len());
             if kind == JsonWireKind::Text {
                 return Ok(());
             }
@@ -774,22 +767,18 @@ fn read_dynamic_type_entry(
     })
 }
 
+/// Shared reason for a traversal that ran past the retained preorder states.
+const MISSING_BODY_STATE: &str = "internal prefix traversal did not retain a body state";
+
 /// Pop the next preorder state, advancing the shared cursor. The prefix
 /// traversal retained one entry per self-describing node (`Dynamic` or `JSON`)
 /// in the exact order the body, suffix, and skip traversals revisit them.
-fn next_state<'a>(
-    states: &'a [StatePrefix],
-    state_cursor: &mut usize,
-    column: &str,
-) -> Result<&'a StatePrefix, DecodeError> {
-    let state = states.get(*state_cursor).ok_or_else(|| {
-        invalid_dynamic(
-            column,
-            "internal prefix traversal did not retain a body state",
-        )
-    })?;
+/// `None` means the traversal ran past the retained states; the caller reports
+/// it under its own node kind (Dynamic or JSON).
+fn next_state<'a>(states: &'a [StatePrefix], state_cursor: &mut usize) -> Option<&'a StatePrefix> {
+    let state = states.get(*state_cursor)?;
     *state_cursor += 1;
-    Ok(state)
+    Some(state)
 }
 
 /// Pop the next preorder state, requiring it to be a Dynamic structure state.
@@ -798,12 +787,28 @@ fn next_dynamic_state<'a>(
     state_cursor: &mut usize,
     column: &str,
 ) -> Result<&'a DynamicState, DecodeError> {
-    match next_state(states, state_cursor, column)? {
+    match next_state(states, state_cursor)
+        .ok_or_else(|| invalid_dynamic(column, MISSING_BODY_STATE))?
+    {
         StatePrefix::Dynamic(state) => Ok(state),
         StatePrefix::Json(_) => Err(invalid_dynamic(
             column,
             "expected a Dynamic structure state but found a JSON one",
         )),
+    }
+}
+
+/// Pop the next preorder state, requiring it to be a JSON structure state.
+fn next_json_state<'a>(
+    states: &'a [StatePrefix],
+    state_cursor: &mut usize,
+    column: &str,
+) -> Result<&'a JsonState, DecodeError> {
+    match next_state(states, state_cursor)
+        .ok_or_else(|| invalid_json(column, MISSING_BODY_STATE))?
+    {
+        StatePrefix::Json(state) => Ok(state),
+        StatePrefix::Dynamic(_) => Err(invalid_json(column, "expected a JSON structure state")),
     }
 }
 
@@ -1252,10 +1257,12 @@ fn decode_column(
         &mut state_cursor,
     )?;
     if state_cursor != states.len() {
-        return Err(invalid_dynamic(
-            column,
-            "body traversal did not consume every prefix state",
-        ));
+        // Report under the kind of the first unconsumed state.
+        let reason = "body traversal did not consume every prefix state";
+        return Err(match states.get(state_cursor) {
+            Some(StatePrefix::Json(_)) => invalid_json(column, reason),
+            _ => invalid_dynamic(column, reason),
+        });
     }
     let mut suffix_index = 0usize;
     read_state_suffix(reader, ch_type, column, &states, &mut suffix_index)?;
@@ -1570,6 +1577,13 @@ fn decode_dynamic(
     )))
 }
 
+/// Upper bound on the row count of a pathless FLATTENED `JSON` block, which
+/// writes zero body bytes per row and so is not bounded by the input size the
+/// way every other run is. Generous against real server blocks (default
+/// `max_block_size` is 65409); a larger count in a complete block is malformed
+/// input.
+const MAX_PATHLESS_JSON_ROWS: usize = 1 << 24;
+
 /// Decode one `JSON` column body after its structure state prefix was retained
 /// by [`read_json_state_prefix`].
 ///
@@ -1600,14 +1614,17 @@ fn decode_json(
         return Err(invalid_json(column, "not a JSON type"));
     };
 
+    if num_rows > i32::MAX as usize {
+        return Err(invalid_json(
+            column,
+            "row count exceeds Arrow's i32 offset range",
+        ));
+    }
+
     // Pop this node's structure state; clone the small path list so the borrow
     // of `states` ends before the child decodes below take it again.
-    let (kind, dynamic_paths) = match next_state(states, state_cursor, column)? {
-        StatePrefix::Json(state) => (state.kind, state.dynamic_paths.clone()),
-        StatePrefix::Dynamic(_) => {
-            return Err(invalid_json(column, "expected a JSON structure state"))
-        }
-    };
+    let state = next_json_state(states, state_cursor, column)?;
+    let (kind, dynamic_paths) = (state.kind, state.dynamic_paths.clone());
 
     if kind == JsonWireKind::Text {
         // STRING mode carries only one document string per row; the declared
@@ -1628,7 +1645,9 @@ fn decode_json(
     // Dynamic-path columns, in sorted path order, each a full Dynamic body.
     let mut dynamic = Vec::with_capacity(dynamic_paths.len());
     for path in &dynamic_paths {
-        let state = match next_state(states, state_cursor, column)? {
+        let state = match next_state(states, state_cursor)
+            .ok_or_else(|| invalid_json(column, MISSING_BODY_STATE))?
+        {
             StatePrefix::Dynamic(state) => state,
             StatePrefix::Json(_) => {
                 return Err(invalid_json(
@@ -1667,26 +1686,26 @@ fn decode_json(
         // row (all zero, no pairs), so the column is a valid empty-shared
         // structured column that re-encodes as either FLATTENED or V1/V2.
         //
-        // This synthetic fill is a DELIBERATE, contained deviation from the
-        // read-before-allocate `capacity_for` discipline: FLATTENED writes no
-        // per-row body bytes, so `num_rows` is not bounded by the bytes present
-        // (unlike every other run, which reads its payload first). A pathless
-        // FLATTENED block can therefore drive an `n`-entry allocation from a tiny
-        // buffer. We accept it because `vec![0i64; n]` lowers to `alloc_zeroed`,
-        // whose pages stay untouched (lazily zero-mapped) until a consumer reads
-        // them, 8 bytes per row is exactly what any consumer of an `n`-row column
-        // allocates anyway, and the server itself materializes this shared-data
-        // offsets column for the same input (bounding it with its memory tracker,
-        // not an input-size ratio). The `+ 1` is checked so a `num_rows` of
-        // `usize::MAX` returns a clean error instead of overflowing.
-        let offsets_len = num_rows.checked_add(1).ok_or_else(|| {
-            invalid_json(
+        // A pathless FLATTENED body writes ZERO bytes per row, so nothing on
+        // the wire bounds `num_rows` before this synthetic fill. The
+        // non-pathless case is bounded at the input size before reaching here:
+        // every path column reads at least one byte per row (`Nothing` skips
+        // its one placeholder byte, `Tuple()` likewise, `FixedString(0)` is
+        // parser-rejected), except a typed path that is itself a pathless
+        // FLATTENED JSON, which rejects the same row count through this guard
+        // recursively. Cap the pathless row count so a tiny buffer cannot
+        // drive an enormous allocation.
+        if typed_paths.is_empty() && dynamic_paths.is_empty() && num_rows > MAX_PATHLESS_JSON_ROWS {
+            return Err(invalid_json(
                 column,
-                "row count overflows usize for the shared-data offsets",
-            )
-        })?;
+                format!(
+                    "row count {num_rows} exceeds the pathless FLATTENED block limit {MAX_PATHLESS_JSON_ROWS}"
+                ),
+            ));
+        }
+        // num_rows <= i32::MAX (checked above), so `+ 1` cannot overflow.
         (
-            vec![0i64; offsets_len],
+            vec![0i64; num_rows + 1],
             Utf8Column::new(vec![0], Vec::new()),
             Utf8Column::new(vec![0], Vec::new()),
         )
@@ -3217,12 +3236,8 @@ fn skip_json_data(
     let ChType::Json { typed_paths, .. } = ch_type else {
         return Err(invalid_json(column, "not a JSON type"));
     };
-    let (kind, num_dynamic) = match next_state(states, state_cursor, column)? {
-        StatePrefix::Json(state) => (state.kind, state.dynamic_paths.len()),
-        StatePrefix::Dynamic(_) => {
-            return Err(invalid_json(column, "expected a JSON structure state"))
-        }
-    };
+    let state = next_json_state(states, state_cursor, column)?;
+    let (kind, num_dynamic) = (state.kind, state.dynamic_paths.len());
 
     if kind == JsonWireKind::Text {
         return skip_column_body(reader, &ChType::String, num_rows);
@@ -3232,7 +3247,9 @@ fn skip_json_data(
         skip_values(reader, element_type, num_rows, column, states, state_cursor)?;
     }
     for _ in 0..num_dynamic {
-        let state = match next_state(states, state_cursor, column)? {
+        let state = match next_state(states, state_cursor)
+            .ok_or_else(|| invalid_json(column, MISSING_BODY_STATE))?
+        {
             StatePrefix::Dynamic(state) => state,
             StatePrefix::Json(_) => {
                 return Err(invalid_json(

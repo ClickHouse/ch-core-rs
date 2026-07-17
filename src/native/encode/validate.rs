@@ -1538,6 +1538,12 @@ fn validate_json(
 
     let structured = match &col.body {
         JsonBody::Text(values) => {
+            if values.null_count() > 0 {
+                return reject(format!(
+                    "column {:?} JSON text body carries nulls; the STRING wire form has no null map (use Nullable(JSON))",
+                    field.name
+                ));
+            }
             return validate_utf8_column(field, values, num_rows);
         }
         JsonBody::Structured(structured) => structured,
@@ -1632,6 +1638,18 @@ fn validate_json(
         structured.shared_paths.len(),
         num_rows,
     )?;
+    if structured.shared_paths.null_count() > 0 {
+        return reject(format!(
+            "column {:?} JSON shared paths carry nulls; shared data has no wire null map",
+            field.name
+        ));
+    }
+    if structured.shared_values.null_count() > 0 {
+        return reject(format!(
+            "column {:?} JSON shared values carry nulls; shared data has no wire null map",
+            field.name
+        ));
+    }
     let shared_pairs = structured.shared_paths.len();
     validate_utf8_column(field, &structured.shared_paths, shared_pairs)?;
     validate_utf8_column(field, &structured.shared_values, shared_pairs)?;

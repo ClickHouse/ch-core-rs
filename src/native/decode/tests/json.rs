@@ -320,6 +320,188 @@ fn decode_pathless_flattened_with_fewer_bytes_than_rows() {
 }
 
 #[test]
+fn reject_unbounded_pathless_flattened_row_counts() {
+    // A pathless FLATTENED body writes zero bytes per row, so only decode_json's
+    // own guards bound the header row count: the i32::MAX cap and the pathless
+    // block-row ceiling. Each hostile count must return a clean error instead of
+    // allocating num_rows + 1 offsets.
+    let mut prefix = 3u64.to_le_bytes().to_vec(); // FLATTENED
+    write_varint(&mut prefix, 0); // zero flattened paths
+    for num_rows in [MAX_PATHLESS_JSON_ROWS + 1, 1usize << 45, 1usize << 61] {
+        let data = BlockBuilder::new()
+            .header(1, num_rows)
+            .column_header("j", "JSON")
+            .raw_bytes(&prefix)
+            .build();
+        // The allocation-free scan reads no per-row bytes, so it accepts the
+        // block; the StreamDecoder then hands it to decode, which must reject.
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len()),
+            "scan accepts the block at {num_rows} rows"
+        );
+        assert!(
+            matches!(
+                decode_all_bytes(&data, &DecodeOptions::default()),
+                Err(DecodeError::InvalidJson { .. })
+            ),
+            "decode must reject {num_rows} rows"
+        );
+    }
+
+    // The same body reached through a Tuple element (Tuple(JSON) also has no
+    // one-byte-per-row guarantee, so no header guard applies).
+    let data = BlockBuilder::new()
+        .header(1, 1usize << 45)
+        .column_header("t", "Tuple(JSON)")
+        .raw_bytes(&prefix)
+        .build();
+    assert_eq!(
+        block_end(&data, &DecodeOptions::default()).unwrap(),
+        Some(data.len())
+    );
+    assert!(matches!(
+        decode_all_bytes(&data, &DecodeOptions::default()),
+        Err(DecodeError::InvalidJson { .. })
+    ));
+}
+
+#[test]
+fn zero_width_looking_typed_paths_still_bound_the_row_count() {
+    // `Nothing`'s BULK body is one placeholder byte per row (unlike its
+    // zero-byte row-binary form), so a FLATTENED `JSON(a Nothing)` block with a
+    // huge row count and a tiny buffer fails the bounds-checked typed-path skip
+    // before the synthetic shared-offsets allocation is reached.
+    let mut prefix = 3u64.to_le_bytes().to_vec(); // FLATTENED
+    write_varint(&mut prefix, 0); // zero flattened paths
+    let huge = BlockBuilder::new()
+        .header(1, (i32::MAX - 1) as usize)
+        .column_header("j", "JSON(a Nothing)")
+        .raw_bytes(&prefix)
+        .build();
+    assert!(matches!(
+        decode_all_bytes(&huge, &DecodeOptions::default()),
+        Err(DecodeError::Io(_))
+    ));
+    assert!(matches!(
+        block_end(&huge, &DecodeOptions::default()),
+        Err(DecodeError::Io(_))
+    ));
+
+    // The same-count body with its placeholder bytes present decodes: the
+    // typed path really does consume one byte per row.
+    let mut body = prefix.clone();
+    body.extend_from_slice(&[0x30; 3]); // Nothing placeholder bytes, 3 rows
+    let valid = BlockBuilder::new()
+        .header(1, 3)
+        .column_header("j", "JSON(a Nothing)")
+        .raw_bytes(&body)
+        .build();
+    let decoded = decode_all_bytes(&valid, &DecodeOptions::default()).unwrap();
+    let s = structured(as_json(decoded.chunks[0].column(0)));
+    assert_eq!(s.typed.len(), 1);
+    assert_eq!(s.typed[0].1.len(), 3);
+    assert_eq!(s.shared_offsets, vec![0i64; 4]);
+
+    // A typed path that is itself a pathless FLATTENED JSON re-enters
+    // decode_json, so the pathless ceiling fires recursively.
+    let mut nested_prefix = 3u64.to_le_bytes().to_vec(); // outer FLATTENED
+    write_varint(&mut nested_prefix, 0);
+    nested_prefix.extend_from_slice(&3u64.to_le_bytes()); // inner FLATTENED
+    write_varint(&mut nested_prefix, 0);
+    let nested = BlockBuilder::new()
+        .header(1, 1usize << 30)
+        .column_header("j", "JSON(a JSON)")
+        .raw_bytes(&nested_prefix)
+        .build();
+    assert!(matches!(
+        decode_all_bytes(&nested, &DecodeOptions::default()),
+        Err(DecodeError::InvalidJson { .. })
+    ));
+}
+
+#[test]
+fn json_state_exhaustion_is_a_json_error() {
+    // A JSON body traversal that runs past the retained prefix states reports
+    // an InvalidJson error, not an InvalidDynamic one.
+    let mut cursor = 0usize;
+    let err = decode_json(
+        &mut ByteReader::new(&[]),
+        &parse_ch_type("JSON").unwrap(),
+        1,
+        "j",
+        None,
+        &[],
+        &mut cursor,
+    )
+    .unwrap_err();
+    assert!(matches!(err, DecodeError::InvalidJson { .. }), "{err}");
+}
+
+#[test]
+fn json_named_arguments_accept_spaces_around_equals() {
+    // Spaces around '=' parse and canonicalize to the compact form.
+    let spaced = parse_ch_type("JSON(max_dynamic_paths = 8)").unwrap();
+    assert_eq!(spaced.to_string(), "JSON(max_dynamic_paths=8)");
+    let both = parse_ch_type("JSON(max_dynamic_paths=8, max_dynamic_types = 4)").unwrap();
+    assert_eq!(
+        both.to_string(),
+        "JSON(max_dynamic_types=4, max_dynamic_paths=8)"
+    );
+    assert_eq!(
+        parse_ch_type("JSON(max_dynamic_paths =8, max_dynamic_types= 4)"),
+        Some(both)
+    );
+
+    // A backticked path whose NAME contains " = " stays a typed path.
+    let tricky = parse_ch_type("JSON(`max_dynamic_paths = x` Int8)").unwrap();
+    match &tricky {
+        ChType::Json {
+            typed_paths,
+            max_dynamic_paths,
+            ..
+        } => {
+            assert_eq!(
+                typed_paths[0],
+                ("max_dynamic_paths = x".to_string(), ChType::Int8)
+            );
+            assert_eq!(
+                *max_dynamic_paths,
+                crate::schema::JSON_DEFAULT_MAX_DYNAMIC_PATHS
+            );
+        }
+        other => panic!("expected JSON, got {other:?}"),
+    }
+    assert_eq!(tricky.to_string(), "JSON(`max_dynamic_paths = x` Int8)");
+
+    // A quoted literal elsewhere keeps its '=' untouched.
+    let regexp = parse_ch_type("JSON(max_dynamic_paths = 8, SKIP REGEXP 'a = b')").unwrap();
+    match &regexp {
+        ChType::Json {
+            skip_regexps,
+            max_dynamic_paths,
+            ..
+        } => {
+            assert_eq!(skip_regexps, &["a = b".to_string()]);
+            assert_eq!(*max_dynamic_paths, 8);
+        }
+        other => panic!("expected JSON, got {other:?}"),
+    }
+
+    // A bare path merely named like a parameter still parses as a path.
+    let path = parse_ch_type("JSON(max_dynamic_paths Int64)").unwrap();
+    match &path {
+        ChType::Json { typed_paths, .. } => {
+            assert_eq!(
+                typed_paths[0],
+                ("max_dynamic_paths".to_string(), ChType::Int64)
+            );
+        }
+        other => panic!("expected JSON, got {other:?}"),
+    }
+}
+
+#[test]
 fn reject_truncated_string_body() {
     // STRING mode still self-bounds: a block claiming 100 rows but carrying a
     // few document bytes fails on the per-row varint reads (UnexpectedEof), on

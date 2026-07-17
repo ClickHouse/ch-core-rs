@@ -1227,6 +1227,9 @@ pub enum JsonColumnError {
     UnsortedDynamicPath { path: String },
     /// The shared `paths` and `values` string columns disagree on pair count.
     SharedPairMismatch { paths: usize, values: usize },
+    /// The shared `paths` or `values` string column carries nulls; shared data
+    /// has no wire null map.
+    SharedNulls { which: &'static str },
     /// The shared-data offsets are not a valid Arrow list-offset run.
     SharedOffsets { reason: &'static str },
 }
@@ -1256,6 +1259,9 @@ impl std::fmt::Display for JsonColumnError {
             ),
             JsonColumnError::SharedPairMismatch { paths, values } => {
                 write!(f, "JSON shared data has {paths} paths but {values} values")
+            }
+            JsonColumnError::SharedNulls { which } => {
+                write!(f, "JSON shared {which} column carries nulls")
             }
             JsonColumnError::SharedOffsets { reason } => {
                 write!(f, "JSON shared data offsets are invalid: {reason}")
@@ -1318,7 +1324,8 @@ impl StructuredJson {
     }
 
     /// Build a structured JSON body, validating the child lengths, the strictly
-    /// sorted dynamic path names, and the shared-data offset run.
+    /// sorted dynamic path names, the null-free shared string columns, and the
+    /// shared-data offset run.
     pub fn try_new(
         typed: Vec<(String, Column)>,
         dynamic: Vec<(String, DynamicColumn)>,
@@ -1355,6 +1362,12 @@ impl StructuredJson {
                 paths: shared_paths.len(),
                 values: shared_values.len(),
             });
+        }
+        if shared_paths.null_count() > 0 {
+            return Err(JsonColumnError::SharedNulls { which: "paths" });
+        }
+        if shared_values.null_count() > 0 {
+            return Err(JsonColumnError::SharedNulls { which: "values" });
         }
         if shared_offsets.first() != Some(&0) {
             return Err(JsonColumnError::SharedOffsets {

@@ -395,6 +395,87 @@ fn exact_bytes_pin_small_v2_column() {
 }
 
 #[test]
+fn encode_rejects_nullable_text_body() {
+    // The STRING wire form has no null map, so a text body with nulls would
+    // silently encode null rows as valid strings.
+    let text = Utf8Column::new_nullable(
+        vec![0, 1, 2],
+        b"xy".to_vec(),
+        Bitmap::from_ch_null_map(&[0x00, 0x01]),
+    );
+    let batch = ColBatch::new(
+        Schema::new(vec![Field {
+            name: "j".into(),
+            ch_type: parse_ch_type("JSON").unwrap(),
+        }]),
+        vec![Column::Json(JsonColumn::text(text))],
+        2,
+    );
+    assert!(matches!(
+        encode_block(&batch, &EncodeOptions::default()),
+        Err(EncodeError::InconsistentBatch { .. })
+    ));
+}
+
+#[test]
+fn encode_rejects_nullable_shared_columns() {
+    // Shared data has no wire null map either; a nullable paths or values
+    // column is rejected. Built via from_parts since try_new also rejects it.
+    let nullable =
+        || Utf8Column::new_nullable(vec![0, 1], b"p".to_vec(), Bitmap::from_ch_null_map(&[0x01]));
+    for shared_paths_nullable in [true, false] {
+        let (paths, values) = if shared_paths_nullable {
+            (nullable(), utf8_column(&[b"v"]))
+        } else {
+            (utf8_column(&[b"p"]), nullable())
+        };
+        let structured =
+            StructuredJson::from_parts(Vec::new(), Vec::new(), vec![0, 1], paths, values, 1);
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "j".into(),
+                ch_type: parse_ch_type("JSON").unwrap(),
+            }]),
+            vec![Column::Json(JsonColumn::structured(structured))],
+            1,
+        );
+        assert!(matches!(
+            encode_block(&batch, &EncodeOptions::default()),
+            Err(EncodeError::InconsistentBatch { .. })
+        ));
+    }
+}
+
+#[test]
+fn try_new_rejects_nullable_shared_columns() {
+    use crate::column::JsonColumnError;
+    let nullable =
+        || Utf8Column::new_nullable(vec![0, 1], b"p".to_vec(), Bitmap::from_ch_null_map(&[0x01]));
+    assert!(matches!(
+        StructuredJson::try_new(
+            Vec::new(),
+            Vec::new(),
+            vec![0, 1],
+            nullable(),
+            utf8_column(&[b"v"]),
+            1
+        ),
+        Err(JsonColumnError::SharedNulls { which: "paths" })
+    ));
+    assert!(matches!(
+        StructuredJson::try_new(
+            Vec::new(),
+            Vec::new(),
+            vec![0, 1],
+            utf8_column(&[b"p"]),
+            nullable(),
+            1
+        ),
+        Err(JsonColumnError::SharedNulls { which: "values" })
+    ));
+}
+
+#[test]
 fn encode_rejects_unsorted_dynamic_paths() {
     // Build past `try_new` (which would reject) via `from_parts` so encode's
     // own validation is what rejects the unsorted dynamic path list.
