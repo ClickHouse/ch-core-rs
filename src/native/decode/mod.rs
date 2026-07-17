@@ -12,6 +12,7 @@ use crate::column::{
 use crate::native::aggregate_function::{
     decode_aggregate_states, decode_state_codec, scan_aggregate_states,
 };
+use crate::native::qbit::{transpose8, QBitWord};
 use crate::native::varint::ByteReader;
 use crate::schema::{ChType, Field, QBitElementType, Schema};
 
@@ -478,37 +479,45 @@ fn qbit_layout(
 /// `SerializationQBit::deserializeBinaryBulkWithMultipleStreams` delegates to a
 /// Tuple of one `FixedString(ceil(N / 8))` column per scalar bit. Tuple order is
 /// most-significant bit first. Within one plane row, logical element `i` is bit
-/// `i % 8` of byte `K - 1 - i / 8`. This reads each plane byte once per eight
-/// output values and writes the final child buffer in one allocation. Server
-/// readers ignore unused padding bits in the first plane byte, so this decoder
-/// does too and truncates each final group to the declared dimension.
-fn decode_qbit_words<T, F>(
+/// `i % 8` of byte `K - 1 - i / 8`. Each eight-element group is one 8-lane x
+/// bit-width bit matrix, rebuilt one byte position at a time with the 8x8 SWAR
+/// transpose, reading each plane byte once per eight output values and writing
+/// the final child buffer in one allocation. Server readers ignore unused
+/// padding bits in the first plane byte, so this decoder does too and truncates
+/// each final group to the declared dimension.
+fn decode_qbit_words<T, W, F>(
     wire: &[u8],
     num_rows: usize,
     dimension: usize,
-    bit_width: usize,
     bytes_per_plane_row: usize,
     value_count: usize,
     from_word: F,
 ) -> Vec<T>
 where
-    F: Fn(u64) -> T,
+    W: QBitWord,
+    F: Fn(W) -> T,
 {
+    let bit_width = W::BYTES * 8;
     let plane_stride = num_rows * bytes_per_plane_row;
     let mut values = Vec::with_capacity(value_count);
-    let mut words = [0u64; 8];
 
     for row in 0..num_rows {
         let row_base = row * bytes_per_plane_row;
         for group in 0..bytes_per_plane_row {
-            words.fill(0);
             let first_element = group * 8;
             let lanes = (dimension - first_element).min(8);
             let wire_byte = bytes_per_plane_row - 1 - group;
-            for plane in 0..bit_width {
-                let byte = wire[plane * plane_stride + row_base + wire_byte];
-                for (lane, word) in words[..lanes].iter_mut().enumerate() {
-                    *word = (*word << 1) | u64::from((byte >> lane) & 1);
+            let mut words = [W::default(); 8];
+            for j in 0..W::BYTES {
+                let mut x = 0u64;
+                // Element bit `8j + b` lives in plane `bit_width - 1 - (8j + b)`.
+                for b in 0..8 {
+                    let plane = bit_width - 1 - (8 * j + b);
+                    x |= u64::from(wire[plane * plane_stride + row_base + wire_byte]) << (8 * b);
+                }
+                let t = transpose8(x);
+                for (lane, word) in words.iter_mut().enumerate() {
+                    word.set_byte(j, (t >> (8 * lane)) as u8);
                 }
             }
             values.extend(words[..lanes].iter().copied().map(&from_word));
@@ -533,25 +542,22 @@ fn decode_qbit_data(
             wire,
             num_rows,
             dimension,
-            bit_width,
             bytes_per_plane_row,
             value_count,
-            |word| (word as u16).to_le_bytes(),
+            u16::to_le_bytes,
         ))),
         QBitElementType::Float32 => Column::Float32(PrimitiveColumn::new(decode_qbit_words(
             wire,
             num_rows,
             dimension,
-            bit_width,
             bytes_per_plane_row,
             value_count,
-            |word| f32::from_bits(word as u32),
+            f32::from_bits,
         ))),
         QBitElementType::Float64 => Column::Float64(PrimitiveColumn::new(decode_qbit_words(
             wire,
             num_rows,
             dimension,
-            bit_width,
             bytes_per_plane_row,
             value_count,
             f64::from_bits,

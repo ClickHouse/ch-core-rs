@@ -37,6 +37,7 @@ use crate::column::{
     Utf8Column, VariantColumn,
 };
 use crate::native::aggregate_function::aggregate_state_codec;
+use crate::native::qbit::{transpose8, QBitWord};
 use crate::schema::{geometry_underlying_type, ChType, Field, QBitElementType};
 
 use super::protocol::{
@@ -1461,25 +1462,28 @@ fn encode_bfloat16_data(buf: &mut Vec<u8>, col: &crate::column::PrimitiveColumn<
 /// At v26.6.1.1193-stable,
 /// `SerializationQBit::serializeBinaryBulkWithMultipleStreams` writes one
 /// `FixedString(ceil(N / 8))` run per scalar bit, most-significant plane first.
-/// Within each plane, element `i` is bit `i % 8` of byte `K - 1 - i / 8`. The
-/// destination is resized once and filled directly, with no per-row allocation
-/// or staging buffer. Unused padding bits remain zero, matching the server's
-/// canonical transposition.
-fn encode_qbit_words<T, F>(
+/// Within each plane, element `i` is bit `i % 8` of byte `K - 1 - i / 8`. Each
+/// eight-element group is one 8-lane x bit-width bit matrix, transposed one
+/// byte position at a time with the 8x8 SWAR transpose. The destination is
+/// resized once and filled directly, with no per-row allocation or staging
+/// buffer. Unused padding bits remain zero, matching the server's canonical
+/// transposition.
+fn encode_qbit_words<T, W, F>(
     buf: &mut Vec<u8>,
     values: &[T],
     num_rows: usize,
     dimension: usize,
-    bit_width: usize,
     to_word: F,
 ) where
-    F: Fn(&T) -> u64,
+    W: QBitWord,
+    F: Fn(&T) -> W,
 {
+    let bit_width = W::BYTES * 8;
     let bytes_per_plane_row = dimension / 8 + usize::from(dimension % 8 != 0);
     let plane_stride = num_rows * bytes_per_plane_row;
     let start = buf.len();
     buf.resize(start + plane_stride * bit_width, 0);
-    let mut words = [0u64; 8];
+    let out = &mut buf[start..];
 
     for row in 0..num_rows {
         let values_row = row * dimension;
@@ -1487,17 +1491,23 @@ fn encode_qbit_words<T, F>(
         for group in 0..bytes_per_plane_row {
             let first_element = group * 8;
             let lanes = (dimension - first_element).min(8);
+            let mut words = [W::default(); 8];
             for (lane, word) in words[..lanes].iter_mut().enumerate() {
                 *word = to_word(&values[values_row + first_element + lane]);
             }
             let wire_byte = bytes_per_plane_row - 1 - group;
-            for plane in 0..bit_width {
-                let shift = bit_width - 1 - plane;
-                let mut byte = 0u8;
-                for (lane, word) in words[..lanes].iter().enumerate() {
-                    byte |= (((word >> shift) & 1) as u8) << lane;
+            for j in 0..W::BYTES {
+                let mut x = 0u64;
+                for (lane, word) in words.iter().enumerate() {
+                    x |= u64::from(word.byte(j)) << (8 * lane);
                 }
-                buf[start + plane * plane_stride + wire_row + wire_byte] = byte;
+                let t = transpose8(x);
+                // Transposed byte `b` holds one bit per lane for element bit
+                // `8j + b`, which lands in plane `bit_width - 1 - (8j + b)`.
+                for b in 0..8 {
+                    let plane = bit_width - 1 - (8 * j + b);
+                    out[plane * plane_stride + wire_row + wire_byte] = (t >> (8 * b)) as u8;
+                }
             }
         }
     }
@@ -1506,30 +1516,21 @@ fn encode_qbit_words<T, F>(
 fn encode_qbit_data(buf: &mut Vec<u8>, col: &QBitColumn, element_type: QBitElementType) {
     let num_rows = col.len();
     match (element_type, col.values.as_ref()) {
-        (QBitElementType::BFloat16, Column::BFloat16(values)) => encode_qbit_words(
-            buf,
-            &values.values,
-            num_rows,
-            col.dimension,
-            element_type.bit_width(),
-            |word| u64::from(u16::from_le_bytes(*word)),
-        ),
-        (QBitElementType::Float32, Column::Float32(values)) => encode_qbit_words(
-            buf,
-            &values.values,
-            num_rows,
-            col.dimension,
-            element_type.bit_width(),
-            |value| u64::from(value.to_bits()),
-        ),
-        (QBitElementType::Float64, Column::Float64(values)) => encode_qbit_words(
-            buf,
-            &values.values,
-            num_rows,
-            col.dimension,
-            element_type.bit_width(),
-            |value| value.to_bits(),
-        ),
+        (QBitElementType::BFloat16, Column::BFloat16(values)) => {
+            encode_qbit_words(buf, &values.values, num_rows, col.dimension, |word| {
+                u16::from_le_bytes(*word)
+            })
+        }
+        (QBitElementType::Float32, Column::Float32(values)) => {
+            encode_qbit_words(buf, &values.values, num_rows, col.dimension, |value| {
+                value.to_bits()
+            })
+        }
+        (QBitElementType::Float64, Column::Float64(values)) => {
+            encode_qbit_words(buf, &values.values, num_rows, col.dimension, |value| {
+                value.to_bits()
+            })
+        }
         _ => unreachable!("QBit child type was validated before encoding"),
     }
 }
