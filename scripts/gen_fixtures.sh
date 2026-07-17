@@ -456,7 +456,29 @@ SELECT
     -- Nullable(JSON): the top-level null map precedes the full JSON body. Rows 1
     -- and 3 are NULL; rows 0 and 2 are `{"m": 13}` / `{"m": 79}` with the single
     -- Int64 dynamic path `m`.
-    CAST(multiIf(n = 1, NULL, n = 3, NULL, n = 0, '{"m":13}', '{"m":79}'), 'Nullable(JSON)') AS j_null
+    CAST(multiIf(n = 1, NULL, n = 3, NULL, n = 0, '{"m":13}', '{"m":79}'), 'Nullable(JSON)') AS j_null,
+    -- Geometry is a custom fixed name over the canonical Variant alternatives
+    -- LineString(0), MultiLineString(1), MultiPolygon(2), Point(3), Polygon(4),
+    -- Ring(5), with 255 for intrinsic NULL. The plain column covers three
+    -- different shapes plus NULL without changing this fixture's four-row size.
+    multiIf(
+        n = 0, [(13., 79.)]::LineString::Geometry,
+        n = 1, [[[(21., 31.)]]]::MultiPolygon::Geometry,
+        n = 2, (51., 61.)::Point::Geometry,
+        CAST(NULL, 'Geometry')
+    ) AS geometry,
+    -- One Array(Geometry) per row covers every Geometry alternative and NULL
+    -- against real server bytes while keeping the all_types query row-aligned.
+    -- Each row's flattened discriminator sequence is 0,1,2,3,4,5,255.
+    [
+        [(1., 2.)]::LineString::Geometry,
+        [[(3., 4.)]]::MultiLineString::Geometry,
+        [[[(5., 6.)]]]::MultiPolygon::Geometry,
+        (7., 8.)::Point::Geometry,
+        [[(9., 10.)]]::Polygon::Geometry,
+        [(11., 12.)]::Ring::Geometry,
+        CAST(NULL, 'Geometry')
+    ] AS geometry_all
 FROM numbers(4)
 SETTINGS allow_suspicious_low_cardinality_types = 1, enable_nullable_tuple_type = 1, enable_time_time64_type = 1, flatten_nested = 0
 FORMAT Native

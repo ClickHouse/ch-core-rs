@@ -680,6 +680,8 @@ fn assert_all_types(batch: &ChunkedBatch) {
                 "j_null",
                 ChType::Nullable(Box::new(json_type(JSON_DEFAULT_MAX_DYNAMIC_PATHS, vec![]))),
             ),
+            Expected::Exact("geometry", ChType::Geometry),
+            Expected::Exact("geometry_all", ChType::Array(Box::new(ChType::Geometry))),
         ],
     );
 
@@ -2030,6 +2032,51 @@ fn assert_all_types(batch: &ChunkedBatch) {
         }
         other => panic!("expected typed Int64 first child for path m, got {other:?}"),
     }
+
+    // Geometry (col 109): the real server emits the underlying BASIC Variant
+    // with canonical discriminators LineString=0, MultiPolygon=2, Point=3, and
+    // intrinsic NULL=255 for these four rows.
+    let geometry = as_variant(block.column(109));
+    assert_eq!(geometry.len(), 4);
+    assert_eq!(geometry.null_count(), 1);
+    assert_eq!(geometry.value_position(0), Some((0, 0)));
+    assert_eq!(geometry.value_position(1), Some((2, 0)));
+    assert_eq!(geometry.value_position(2), Some((3, 0)));
+    assert_eq!(geometry.value_position(3), Some((u8::MAX, 0)));
+    assert_eq!(geometry.variants.len(), 6);
+    assert_eq!(geometry_first_x(&geometry.variants[0], 1), 13.0);
+    assert!(geometry.variants[1].is_empty());
+    assert_eq!(geometry_first_x(&geometry.variants[2], 3), 21.0);
+    assert_eq!(geometry_first_x(&geometry.variants[3], 0), 51.0);
+    assert!(geometry.variants[4].is_empty());
+    assert!(geometry.variants[5].is_empty());
+
+    // Array(Geometry) (col 110): every one of the four rows carries all six
+    // alternatives followed by NULL, grounding all child layouts against one
+    // real Native fixture without changing the all_types row count.
+    let geometry_all = as_array(block.column(110));
+    assert_eq!(geometry_all.offsets, vec![0, 7, 14, 21, 28]);
+    let geometry_all = as_variant(geometry_all.values.as_ref());
+    assert_eq!(geometry_all.len(), 28);
+    assert_eq!(geometry_all.null_count(), 4);
+    for row in 0..4 {
+        for discriminator in 0..6u8 {
+            assert_eq!(
+                geometry_all.value_position(row * 7 + discriminator as usize),
+                Some((discriminator, row as i32))
+            );
+        }
+        assert_eq!(
+            geometry_all.value_position(row * 7 + 6),
+            Some((u8::MAX, row as i32))
+        );
+    }
+    assert_eq!(geometry_first_x(&geometry_all.variants[0], 1), 1.0);
+    assert_eq!(geometry_first_x(&geometry_all.variants[1], 2), 3.0);
+    assert_eq!(geometry_first_x(&geometry_all.variants[2], 3), 5.0);
+    assert_eq!(geometry_first_x(&geometry_all.variants[3], 0), 7.0);
+    assert_eq!(geometry_first_x(&geometry_all.variants[4], 2), 9.0);
+    assert_eq!(geometry_first_x(&geometry_all.variants[5], 1), 11.0);
 }
 
 /// Borrow a decoded `JsonColumn`, panicking with a useful message otherwise.
@@ -2095,6 +2142,26 @@ fn as_array(column: &Column) -> &ch_core_rs::column::ArrayColumn {
     match column {
         Column::Array(a) => a,
         other => panic!("expected Array, got {other:?}"),
+    }
+}
+
+/// Borrow the physical Variant backing a Geometry column.
+fn as_variant(column: &Column) -> &ch_core_rs::column::VariantColumn {
+    match column {
+        Column::Variant(variant) => variant,
+        other => panic!("expected Variant, got {other:?}"),
+    }
+}
+
+/// Read the first Point X coordinate below a fixed number of geo Array levels.
+fn geometry_first_x(mut column: &Column, array_depth: usize) -> f64 {
+    for _ in 0..array_depth {
+        column = as_array(column).values.as_ref();
+    }
+    let point = as_tuple(column);
+    match &point.fields[0] {
+        Column::Float64(x) => x.values[0],
+        other => panic!("expected Point X Float64 child, got {other:?}"),
     }
 }
 

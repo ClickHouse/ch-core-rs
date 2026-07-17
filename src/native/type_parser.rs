@@ -7,8 +7,9 @@
 use crate::native::aggregate_function::aggregate_state_codec;
 use crate::native::protocol::MAX_TYPE_DEPTH;
 use crate::schema::{
-    ChType, GeoKind, IntervalKind, JSON_DEFAULT_MAX_DYNAMIC_PATHS, JSON_DEFAULT_MAX_DYNAMIC_TYPES,
-    JSON_MAX_DYNAMIC_PATHS, JSON_MAX_DYNAMIC_TYPES, JSON_MAX_TYPED_PATHS,
+    ChType, GeoKind, IntervalKind, GEOMETRY_EXPANSION_DEPTH, JSON_DEFAULT_MAX_DYNAMIC_PATHS,
+    JSON_DEFAULT_MAX_DYNAMIC_TYPES, JSON_MAX_DYNAMIC_PATHS, JSON_MAX_DYNAMIC_TYPES,
+    JSON_MAX_TYPED_PATHS,
 };
 
 // ---------------------------------------------------------------------------
@@ -477,6 +478,13 @@ fn parse_ch_type_depth(type_name: &str, depth: usize) -> Option<ChType> {
         "UUID" => Some(ChType::Uuid),
         "IPv4" => Some(ChType::Ipv4),
         "IPv6" => Some(ChType::Ipv6),
+        // Geometry is a custom fixed name over a six-alternative Variant. The
+        // exact uppercase `GEOMETRY` spelling is a case-sensitive MySQL input
+        // alias registered by the server; both normalize to the canonical
+        // `Geometry` header. Lowercase `geometry` remains unsupported. Charge
+        // the complete Variant + MultiPolygon depth even though the token is a
+        // leaf in this parser.
+        "Geometry" | "GEOMETRY" => geometry_within_depth(depth),
         // Geo aliases. The server registers these case-sensitive with no
         // aliases and emits the bare spelling in the header (never the expanded
         // `Array(Tuple(...))` form); a wrong-case `point` is not a geo type and
@@ -512,6 +520,15 @@ fn geo_within_depth(kind: GeoKind, depth: usize) -> Option<ChType> {
     Some(ChType::Geo(kind))
 }
 
+/// Accept `Geometry` only when its physical Variant and deepest geo child stay
+/// within [`MAX_TYPE_DEPTH`].
+fn geometry_within_depth(depth: usize) -> Option<ChType> {
+    if depth + GEOMETRY_EXPANSION_DEPTH > MAX_TYPE_DEPTH {
+        return None;
+    }
+    Some(ChType::Geometry)
+}
+
 /// Whether `inner` may sit directly inside `Nullable`, the server's
 /// `IDataType::canBeInsideNullable()` (confirmed at v26.6.1.1193-stable): a
 /// `Nullable`, `LowCardinality`, `Array`, or `Map` cannot, while a `Tuple` and
@@ -524,8 +541,8 @@ fn geo_within_depth(kind: GeoKind, depth: usize) -> Option<ChType> {
 /// Array). The recursion is bounded by the parsed type depth, so it cannot run
 /// away on untrusted input.
 fn can_be_inside_nullable(inner: &ChType) -> bool {
-    if let Some(under) = inner.physical_delegate() {
-        return can_be_inside_nullable(&under);
+    if let Some(under) = inner.physical_delegate_ref() {
+        return can_be_inside_nullable(under.as_ref());
     }
     !matches!(
         inner,
@@ -558,8 +575,15 @@ fn can_be_inside_nullable(inner: &ChType) -> bool {
 /// `null`, or duplicate names, so such a header is unsupported wherever it
 /// appears. Unnamed tuples remain valid.
 pub(crate) fn unsupported_header_type_name(ch_type: &ChType) -> Option<String> {
-    if let Some(under) = ch_type.physical_delegate() {
-        return unsupported_header_type_name(&under);
+    // Geometry is one fixed, server-defined Variant with no user-supplied
+    // alternatives. Its parser and depth gate already establish the complete
+    // shape, so avoid normalizing six known-canonical alternatives into a
+    // temporary BTreeMap on every small-block scan and decode validation.
+    if matches!(ch_type, ChType::Geometry) {
+        return None;
+    }
+    if let Some(under) = ch_type.physical_delegate_ref() {
+        return unsupported_header_type_name(under.as_ref());
     }
 
     match ch_type {
@@ -679,16 +703,16 @@ pub(crate) fn normalize_variant_alternatives(
 /// recursion is bounded by the parsed type depth, so it cannot run away on
 /// untrusted input.
 pub(crate) fn resolves_to_nothing(alternative: &ChType) -> bool {
-    match alternative.physical_delegate() {
-        Some(under) => resolves_to_nothing(&under),
+    match alternative.physical_delegate_ref() {
+        Some(under) => resolves_to_nothing(under.as_ref()),
         None => matches!(alternative, ChType::Nothing),
     }
 }
 
 /// Whether one immediate Variant alternative satisfies the server constructor.
 pub(crate) fn is_valid_variant_alternative(alternative: &ChType) -> bool {
-    if let Some(under) = alternative.physical_delegate() {
-        return is_valid_variant_alternative(&under);
+    if let Some(under) = alternative.physical_delegate_ref() {
+        return is_valid_variant_alternative(under.as_ref());
     }
     match alternative {
         ChType::Nullable(_) | ChType::Variant(_) | ChType::Dynamic { .. } => false,
@@ -1353,8 +1377,8 @@ pub(crate) fn is_low_cardinality_inner(dict_value_type: &ChType) -> bool {
     // `LowCardinality(SimpleAggregateFunction(anyLast, String))` is a legal
     // header. A geo/`Nested` alias resolves to a `Tuple`/`Array`, which is not in
     // the allowlist, so those stay rejected.
-    if let Some(under) = dict_value_type.physical_delegate() {
-        return is_low_cardinality_inner(&under);
+    if let Some(under) = dict_value_type.physical_delegate_ref() {
+        return is_low_cardinality_inner(under.as_ref());
     }
     matches!(
         dict_value_type,
@@ -1448,8 +1472,8 @@ pub fn low_cardinality_dict_value_type(inner: &ChType) -> (bool, &ChType) {
 /// plain `UInt64`) while a `SimpleAggregateFunction(anyLast, Nullable(String))`
 /// key is not (it delegates to `Nullable(String)`).
 pub(crate) fn is_valid_map_key_type(key: &ChType) -> bool {
-    if let Some(under) = key.physical_delegate() {
-        return is_valid_map_key_type(&under);
+    if let Some(under) = key.physical_delegate_ref() {
+        return is_valid_map_key_type(under.as_ref());
     }
     match key {
         ChType::Nullable(_) => false,

@@ -47,34 +47,22 @@ point-in-time snapshot for the next agent, not a changelog. Keep it short. Alway
 include a "Recommended next" with a one-line reason, so the next agent has a
 default; the user may override it.
 
-- **Last updated:** 2026-07-16. `JSON` (`DataTypeObject`) is complete at
-  decode/encode parity against `v26.6.1.1193-stable`. The core reads its LE u64
-  structure word (V1=0 with the legacy count slot, STRING=1, V2=2, opt-in
-  FLATTENED=3; V3 word 4 rejected), decodes typed paths, one block-local
-  `Dynamic` per dynamic/flattened path, and the V1/V2 shared-data
-  `Array(Tuple(String, String))` overflow (opaque descriptor+payload blobs kept
-  unmaterialized), enforcing the V1/V2 `max_dynamic_paths` bound while accepting
-  the confirmed-unbounded FLATTENED count. `Nullable(JSON)` is legal,
-  `LowCardinality(JSON)` illegal, and JSON composes in every container and as its
-  own typed path. Arrow export is a struct of typed paths plus result-wide
-  dynamic-path Dense Unions plus a `_shared_data` LargeList of
-  `{paths utf8, values binary}`, or a plain utf8 column for a STRING body; binary
-  type descriptor tag 0x30. Unit, all_types fixture columns
-  (`j_typed`/`j_bare`/`j_null`), the STRING and FLATTENED auxiliary fixtures, and
-  live INSERT + binary-type-header round-trips are all green. Two project
-  decisions still govern sequencing. First, further
-  `AggregateFunction(...)` work is paused. The format has no generic state
-  framing, so completing the long tail requires a separately confirmed boundary
-  codec, fixtures, and tests for each function signature. That cost is not
-  justified right now. `SimpleAggregateFunction(func, T)` is complete and is
-  not part of this pause. Second, the path forward is type completeness, not
-  encode-API polish: the goal is to cover every major type so the Python
-  binding POC for clickhouse-connect can be opened to real workloads, where a
-  single unsupported column fails the whole query. The previously recommended
-  sink-based encode API is deferred as polish: `encode_block`'s owned `Vec`
-  already supports the encode/push overlap, the private `encode_block_into`
-  exists whenever a binding measures the extra allocation as mattering, and
-  the POC's pitch is decode-side anyway. Do not pick it up next.
+- **Last updated:** 2026-07-17. `Geometry` is complete at decode/encode parity
+  against `v26.6.1.1193-stable`. `ChType::Geometry` preserves the custom name
+  and delegates physically to the canonical
+  `Variant(LineString, MultiLineString, MultiPolygon, Point, Polygon, Ring)`
+  with discriminators 0 through 5 and 255 for NULL. Decode, streaming scan,
+  encode validation/writing, zero-row construction, and Arrow export all reuse
+  the existing Variant path. There is no Geometry-specific per-row work, copy,
+  remap, or Column variant. Binary type headers use Custom tag 0x2c plus
+  `Geometry`. The generic Custom name is reparsed at fresh text depth, matching
+  the server, then complete-type validation and encode both charge Geometry's
+  five physical levels under the crate's aggregate depth cap.
+  Unit coverage includes every alternative, NULL, zero rows, multi-block,
+  rev0/rev54485 encode round-trips, exact header bytes, and Arrow Dense Union
+  schema/buffers. The recaptured all_types fixtures add plain `Geometry` plus
+  `Array(Geometry)` with all six alternatives and NULL, and live Native INSERT
+  round-trips through the pinned server.
 - **AggregateFunction checkpoint:** decode, encode, streaming, Arrow LargeBinary
   export, real-server fixtures, and live INSERT coverage are complete for exact
   base `count` with zero or one argument, canonical
@@ -92,35 +80,22 @@ default; the user may override it.
   not as an open-ended completeness exercise.
 - **Scope:** frame compression and its unwired files also remain untouched and
   out of scope. Completeness still means uncompressed HTTP `FORMAT Native`.
-- **JSON checkpoint:** V1 is selected below protocol revision 54473 (with the
-  legacy ignored count) and V2 at/above it; STRING word 1 is one document string
-  per row; FLATTENED word 3 is opt-in via `EncodeOptions.flattened_dynamic` and
-  only when the column carries no shared pairs (word 3 is unknown to pre-25.6
-  servers). Shared values stay opaque binary descriptor+payload blobs. The
-  type-aware per-column row-count guard exempts JSON, so a pathless FLATTENED
-  block that writes zero body bytes per row still decodes. The V1/V2 direct path
-  count is capped at `max_dynamic_paths`; the FLATTENED count is confirmed
-  unbounded and protected by read-before-allocate instead.
-- **Recommended next:** `Geometry`. It is just `Variant(Point, LineString,
-  MultiLineString, Polygon, MultiPolygon, Ring)` (alias `GEOMETRY`), and both
-  prerequisites (Variant and the geo aliases) are already done, so it is the
-  cheapest remaining common type.
-- **After that:** `QBit(T, N)` last or on demand. It is small and isolated but
-  niche, and its `SerializationQBit` wire layout still needs a
-  `clickhouse-server-reader` read before implementing. Before opening the binding
-  POC to outside workloads, also resolve sparse column serialization (see "Wire /
-  protocol features"): it is default-on server-side since 23.7 and reaches any
-  client that negotiates `client_protocol_version >= 54454`, and the decoder
-  currently rejects its marker.
-- **Key references:** the JSON wire, buffer, Arrow, encode, binary-type, and
-  version contract is in `CODEC_CONTRACT.md`; its implementation is in
-  `src/column.rs`, `src/native/{type_binary,type_parser,decode,encode}`, and
-  `src/ffi/mod.rs`, with coverage in `tests/integration.rs`,
-  `tests/live_insert.rs`, and the JSON `decode`/`encode`/`ffi` test modules. The
-  aggregate checkpoint and paused boundary are recorded in the Tier 3 item below.
-  The deferred sink assessment is in "Streaming encode and the encode-push
-  overlap" below. The docs-sourced sparse wire notes are in "Wire / protocol
-  features".
+- **Sequencing:** type completeness remains ahead of encode-API polish. The
+  sink-based encode API stays deferred until a binding measures the owned
+  `encode_block` allocation as material. Further open-ended
+  `AggregateFunction` work also remains paused because each signature needs a
+  separately confirmed unframed state-boundary codec.
+- **Recommended next:** `QBit(T, N)`. It is the only unchecked registered type
+  at the pinned tag; confirm `SerializationQBit` through the server-reader before
+  implementing its isolated bit-transposed layout.
+- **After that:** resolve sparse column serialization before opening the binding
+  POC to outside workloads. Its marker can reach ordinary queries at negotiated
+  revisions >= 54454 and the decoder currently rejects it.
+- **Key references:** Geometry's wire, Arrow, binary-header, and encode contract
+  is in `CODEC_CONTRACT.md`. The logical delegate is in `src/schema.rs`; parser,
+  binary descriptor, decode/scan, and encode paths are under `src/native/`; Arrow
+  export is in `src/ffi/`; real-server coverage is in `scripts/gen_fixtures.sh`,
+  `tests/integration.rs`, and `tests/live_insert.rs`.
 
 ---
 
@@ -561,8 +536,10 @@ introduction), so record them per type only when determinable.
       Float64)`, the rest nest `Array` over it), GA and stable at
       v26.6.1.1193-stable (the `allow_experimental_geo_types` gate is an obsolete
       no-op). See "Implemented" for the full summary; type section in
-      `CODEC_CONTRACT.md`. The umbrella `Geometry` type (= `Variant(...)` of the
-      six, alias `GEOMETRY`) is in Tier 3 because it depends on `Variant`.
+      `CODEC_CONTRACT.md`.
+- [x] `Geometry` - decode AND encode done. A custom fixed name over the
+      canonical six-child geo Variant, sharing its BASIC wire body and Arrow
+      Dense Union buffers. See the Tier 3 checkpoint and `CODEC_CONTRACT.md`.
 - [x] `Interval*` (`IntervalYear` ... `IntervalNanosecond`) - decode AND encode
       done. One signed Int64 body per row, with exact logical unit preservation;
       legal Nullable/LowCardinality inners and Map keys. See "Implemented" and
@@ -673,9 +650,21 @@ where the across-release churn lives.
       `output_format_native_write_json_as_string` shipped in 24.10 and the
       FLATTENED setting `output_format_native_use_flattened_dynamic_and_json_serialization`
       in 25.6 (per `SettingsChangesHistory.cpp`).
-- [ ] `Geometry` - `Variant(Point, LineString, MultiLineString, Polygon,
-      MultiPolygon, Ring)`, alias `GEOMETRY`. Depends on `Variant` plus the geo
-      aliases. Confirmed registered and GA at v26.6.1.1193-stable.
+- [x] `Geometry` - complete at decode/encode parity at
+      v26.6.1.1193-stable. The canonical physical type is
+      `Variant(LineString, MultiLineString, MultiPolygon, Point, Polygon, Ring)`
+      after the server sorts custom names, with UInt8 discriminators 0..=5 and
+      255 for intrinsic NULL. `ChType::Geometry` preserves the custom header and
+      delegates every physical path to the existing `VariantColumn`: BASIC LE
+      UInt64 mode 0, one discriminator per row, then six dense geo bodies.
+      Arrow is one seven-child Dense Union (six named geo children plus NULL),
+      with no new buffers, remap, or per-row Geometry work. Text output is
+      canonical `Geometry` (`GEOMETRY` is an accepted input alias), and binary
+      headers use Custom tag 0x2c plus the name. Nullable, LowCardinality, and a
+      direct outer Variant are illegal; Array/Tuple/Map and typed JSON paths
+      compose. Unit plain/NULL/zero-row/multi-block/encode/Arrow/binary-depth
+      coverage, all_types real fixtures (including all alternatives through
+      `Array(Geometry)`), and live INSERT are green.
 - [ ] `QBit(T, N)` - quantized bit-packed vector type, parametric over a
       `BFloat16`/`Float32`/`Float64` element type and a dimension count. GA at
       v26.6.1.1193-stable (the `allow_experimental_qbit_type` gate is now an

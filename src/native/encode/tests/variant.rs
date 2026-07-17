@@ -18,6 +18,53 @@ fn variant_batch() -> ColBatch {
     )
 }
 
+fn geometry_child(kind: GeoKind, present: bool, seed: f64) -> Column {
+    let len = usize::from(present);
+    let point = Column::Tuple(TupleColumn::new(
+        vec![
+            Column::Float64(PrimitiveColumn::new(if present {
+                vec![seed]
+            } else {
+                Vec::new()
+            })),
+            Column::Float64(PrimitiveColumn::new(if present {
+                vec![seed + 0.5]
+            } else {
+                Vec::new()
+            })),
+        ],
+        len,
+    ));
+    let mut column = point;
+    for _ in 1..kind.expansion_depth() {
+        column = Column::Array(ArrayColumn::new(
+            if present { vec![0, 1] } else { vec![0] },
+            column,
+        ));
+    }
+    column
+}
+
+fn geometry_batch() -> ColBatch {
+    let children = crate::schema::GEOMETRY_ALTERNATIVES
+        .iter()
+        .enumerate()
+        .map(|(index, alternative)| match alternative {
+            ChType::Geo(kind) => geometry_child(*kind, true, 13.0 + index as f64),
+            other => unreachable!("Geometry alternative is always geo, got {other:?}"),
+        })
+        .collect();
+    let column = VariantColumn::try_new(&[0, 1, 2, 3, 4, 5, u8::MAX], children).unwrap();
+    ColBatch::new(
+        Schema::new(vec![Field {
+            name: "g".into(),
+            ch_type: ChType::Geometry,
+        }]),
+        vec![Column::Variant(column)],
+        7,
+    )
+}
+
 #[test]
 fn roundtrip_variant_rev0() {
     roundtrip(&variant_batch(), 0);
@@ -26,6 +73,57 @@ fn roundtrip_variant_rev0() {
 #[test]
 fn roundtrip_variant_tcp_revision() {
     roundtrip(&variant_batch(), DBMS_TCP_PROTOCOL_VERSION);
+}
+
+#[test]
+fn roundtrip_geometry_rev0() {
+    roundtrip(&geometry_batch(), 0);
+}
+
+#[test]
+fn roundtrip_geometry_tcp_revision() {
+    roundtrip(&geometry_batch(), DBMS_TCP_PROTOCOL_VERSION);
+}
+
+#[test]
+fn rev0_frames_geometry_as_basic_variant() {
+    let bytes = encode_block(&geometry_batch(), &EncodeOptions::default()).unwrap();
+    let mut expected_prefix = vec![
+        0x01, // num_cols
+        0x07, // num_rows
+        0x01, b'g', // column name
+        0x08, // canonical custom type-name length
+    ];
+    expected_prefix.extend_from_slice(b"Geometry");
+    expected_prefix.extend_from_slice(&0u64.to_le_bytes()); // BASIC mode
+    expected_prefix.extend_from_slice(&[0, 1, 2, 3, 4, 5, u8::MAX]);
+    assert!(bytes.starts_with(&expected_prefix));
+}
+
+#[test]
+fn zero_row_geometry_encodes_schema_without_body() {
+    let children = crate::schema::GEOMETRY_ALTERNATIVES
+        .iter()
+        .map(|alternative| match alternative {
+            ChType::Geo(kind) => geometry_child(*kind, false, 0.0),
+            other => unreachable!("Geometry alternative is always geo, got {other:?}"),
+        })
+        .collect();
+    let column = VariantColumn::try_new(&[], children).unwrap();
+    let batch = ColBatch::new(
+        Schema::new(vec![Field {
+            name: "g".into(),
+            ch_type: ChType::Geometry,
+        }]),
+        vec![Column::Variant(column)],
+        0,
+    );
+
+    let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+    assert_eq!(bytes, b"\x01\x00\x01g\x08Geometry");
+    let decoded = decode_all_bytes(&bytes, &DecodeOptions::default()).unwrap();
+    assert_eq!(decoded.schema, batch.schema);
+    assert_eq!(decoded.num_chunks(), 0);
 }
 
 #[test]

@@ -649,6 +649,15 @@ fn type_depth_of_alias_matches_physical_delegate() {
         // And the geo token's own charge equals its expansion_depth constant.
         assert_eq!(type_depth(&alias), kind.expansion_depth());
     }
+    let geometry = ChType::Geometry;
+    assert_eq!(
+        type_depth(&geometry),
+        type_depth(&geometry.physical_delegate().unwrap())
+    );
+    assert_eq!(
+        type_depth(&geometry),
+        crate::schema::GEOMETRY_EXPANSION_DEPTH
+    );
     let nested = ChType::Nested(vec![
         ("a".into(), ChType::UInt32),
         ("b".into(), ChType::Array(Box::new(ChType::String))),
@@ -680,6 +689,11 @@ fn decode_accept_implies_encode_accept_at_the_cap() {
     // two sides flip together.
     for (label, tip, expansion) in [
         ("geo", ChType::Geo(GeoKind::MultiPolygon), 4usize),
+        (
+            "geometry",
+            ChType::Geometry,
+            crate::schema::GEOMETRY_EXPANSION_DEPTH,
+        ),
         (
             "nested",
             ChType::Nested(vec![("a".into(), ChType::UInt32)]),

@@ -21,6 +21,7 @@
 //! element types, and `Map(K, V)` for a legal key type and any encodable
 //! key/value types, `Variant(T1, ...)` when every alternative is encodable,
 //! `Dynamic` with block-local typed children and optional SharedVariant,
+//! `Geometry` through its canonical six-child Variant delegate,
 //! plus the registered exact `AggregateFunction` state codecs:
 //! `count`, canonical `nothingUInt64` and `nothingNull`, and base `sum` over one
 //! plain or Nullable numeric or Enum argument. The plain types and `Tuple` also
@@ -36,7 +37,7 @@ use crate::column::{
     VariantColumn,
 };
 use crate::native::aggregate_function::aggregate_state_codec;
-use crate::schema::{ChType, Field};
+use crate::schema::{geometry_underlying_type, ChType, Field};
 
 use super::protocol::{
     DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION, DBMS_MIN_REVISION_WITH_OUT_OF_ORDER_BUCKETS,
@@ -358,8 +359,8 @@ fn write_state_prefix(
     // A name-decoration alias (SimpleAggregateFunction, geo, Nested) writes the
     // exact state prefix of the type it delegates to, so expand and recurse, the
     // encode-side mirror of `decode::read_state_prefix`.
-    if let Some(under) = ch_type.physical_delegate() {
-        return write_state_prefix(buf, &under, column, options, types_in_binary_format);
+    if let Some(under) = ch_type.physical_delegate_ref() {
+        return write_state_prefix(buf, under.as_ref(), column, options, types_in_binary_format);
     }
     match ch_type {
         ChType::LowCardinality(_) => {
@@ -669,8 +670,8 @@ fn write_state_suffix(
     ch_type: &ChType,
     column: &Column,
 ) -> Result<(), EncodeError> {
-    if let Some(under) = ch_type.physical_delegate() {
-        return write_state_suffix(buf, &under, column);
+    if let Some(under) = ch_type.physical_delegate_ref() {
+        return write_state_suffix(buf, under.as_ref(), column);
     }
     match ch_type {
         ChType::Array(inner) => {
@@ -778,8 +779,8 @@ fn encode_column_values(
     // `decode::decode_values`. Expand and recurse before the container dispatch
     // so a geo/Nested alias that expands to an `Array` reaches the Array
     // fast-path.
-    if let Some(under) = ch_type.physical_delegate() {
-        return encode_column_values(buf, field, &under, column, options);
+    if let Some(under) = ch_type.physical_delegate_ref() {
+        return encode_column_values(buf, field, under.as_ref(), column, options);
     }
     if let ChType::LowCardinality(inner) = ch_type {
         if let Column::Dictionary(c) = column {
@@ -829,8 +830,8 @@ fn encode_column_values(
     };
     // Expand a geo alias legal directly inside `Nullable` (only `Nullable(Point)`
     // -> `Tuple`), so the Tuple arm below writes its body after the null map.
-    let delegate = value_type.physical_delegate();
-    let value_type = delegate.as_ref().unwrap_or(value_type);
+    let delegate = value_type.physical_delegate_ref();
+    let value_type = delegate.as_deref().unwrap_or(value_type);
     // Tuple after the Nullable unwrap, mirroring the decode side: a
     // `Nullable(Tuple(...))` writes its per-row null map above, then the tuple
     // body (element bodies still carry a placeholder value for null rows).
@@ -1594,7 +1595,8 @@ fn is_encodable(ch_type: &ChType) -> bool {
         // `SimpleAggregateFunction(anyLast, Nullable(String))` is not misclassified
         // as unencodable (a bare `is_encodable(Nullable(_))` is always false).
         ChType::SimpleAggregateFunction { inner, .. } => is_encodable(inner.inner()),
-        ChType::Geo(kind) => is_encodable(&kind.underlying_type()),
+        ChType::Geo(kind) => is_encodable(kind.underlying_type_ref()),
+        ChType::Geometry => is_encodable(geometry_underlying_type()),
         ChType::Nested(fields) => fields.iter().all(|(_, t)| is_encodable(t.inner())),
         ChType::Nullable(_) => false,
     }

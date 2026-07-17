@@ -120,7 +120,7 @@ Not implemented yet:
 
 - TCP/native protocol packet framing.
 - Compression framing.
-- `JSON`, `Geometry`, and `QBit` types.
+- `QBit` type.
 - Language-specific materialization policy (bindings own this, by design).
 
 ## Supported types
@@ -142,7 +142,8 @@ Not implemented yet:
 - `Enum8(...)`, `Enum16(...)`
 - `Int128`, `UInt128`, `Int256`, `UInt256`
 - `Array(T)`, `Tuple(T1, ...)`, `Map(K, V)`, `Variant(T1, ...)`, and `Dynamic`
-- `SimpleAggregateFunction(func, T)`, the six geo aliases, and `Nested(...)`
+- `JSON`, `SimpleAggregateFunction(func, T)`, the six geo aliases, `Geometry`,
+  and `Nested(...)`
 - Exact `AggregateFunction` state codecs for `count`, canonical
   `nothingUInt64` and `nothingNull`, and base `sum` over plain or Nullable
   numeric and Enum arguments
@@ -155,7 +156,7 @@ Unsupported types raise a decode error rather than guessing.
 
 In rough priority order:
 
-1. Type coverage: `JSON`, `Geometry`, and `QBit`.
+1. Type coverage: `QBit`.
 2. Compression framing: LZ4, then ZSTD.
 3. Per-runtime zero-copy adapters: JS `TypedArray` over an external
    `ArrayBuffer`, NumPy export that does not route through Arrow.

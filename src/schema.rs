@@ -1,3 +1,6 @@
+use std::borrow::Cow;
+use std::sync::LazyLock;
+
 /// ClickHouse logical type system.
 ///
 /// Preserves ClickHouse semantics (timezone, precision, enum labels, etc.)
@@ -205,6 +208,16 @@ pub enum ChType {
     // `LowCardinality` of all six are illegal.
     Geo(GeoKind),
 
+    // `Geometry` (`DataTypeCustomGeo`) is a custom fixed name over the
+    // canonical `Variant(LineString, MultiLineString, MultiPolygon, Point,
+    // Polygon, Ring)`. It has exactly the underlying Variant's BASIC Native
+    // body and Arrow Dense Union buffers, including discriminator 255 for its
+    // intrinsic NULL. The distinct logical tag preserves the `Geometry` header
+    // for round-trip encode while [`ChType::physical_delegate`] keeps every
+    // physical path on the existing Variant implementation. `Nullable` and
+    // `LowCardinality` are illegal because the delegate is a Variant.
+    Geometry,
+
     // `Nested(name1 T1, ...)` (`DataTypeNested`): with `flatten_nested = 0` the
     // header carries the literal `Nested(a T, b U)` spelling and the body is
     // byte-identical to `Array(Tuple(named elements))`. The runtime object is a
@@ -318,6 +331,66 @@ impl GeoKind {
             )))),
         }
     }
+
+    /// Borrow the process-wide physical type tree for this geo alias.
+    ///
+    /// Bulk dispatch walks geo types several times per column for the state
+    /// prefix, body, and suffix. Caching these six immutable trees keeps those
+    /// traversals allocation-free while [`GeoKind::underlying_type`] preserves
+    /// the existing owned helper for callers that need one.
+    pub(crate) fn underlying_type_ref(self) -> &'static ChType {
+        static UNDERLYING: LazyLock<[ChType; 6]> = LazyLock::new(|| {
+            [
+                GeoKind::Point.underlying_type(),
+                GeoKind::Ring.underlying_type(),
+                GeoKind::LineString.underlying_type(),
+                GeoKind::MultiLineString.underlying_type(),
+                GeoKind::Polygon.underlying_type(),
+                GeoKind::MultiPolygon.underlying_type(),
+            ]
+        });
+        let index = match self {
+            GeoKind::Point => 0,
+            GeoKind::Ring => 1,
+            GeoKind::LineString => 2,
+            GeoKind::MultiLineString => 3,
+            GeoKind::Polygon => 4,
+            GeoKind::MultiPolygon => 5,
+        };
+        &UNDERLYING[index]
+    }
+}
+
+/// The canonical global-discriminator order of ClickHouse `Geometry`.
+///
+/// `DataTypeVariant` sorts the six custom geo names lexicographically before
+/// assigning discriminators, so this order is a wire invariant, not the order
+/// in which `registerDataTypeDomainGeo` lists the kinds. Confirmed at
+/// v26.6.1.1193-stable in `DataTypeCustomGeo.cpp` and
+/// `DataTypeVariant::DataTypeVariant`.
+pub(crate) const GEOMETRY_ALTERNATIVES: [ChType; 6] = [
+    ChType::Geo(GeoKind::LineString),
+    ChType::Geo(GeoKind::MultiLineString),
+    ChType::Geo(GeoKind::MultiPolygon),
+    ChType::Geo(GeoKind::Point),
+    ChType::Geo(GeoKind::Polygon),
+    ChType::Geo(GeoKind::Ring),
+];
+
+/// Physical nesting charged to a `Geometry` token: one Variant level plus the
+/// deepest alternative, the four-level `MultiPolygon` expansion.
+pub(crate) const GEOMETRY_EXPANSION_DEPTH: usize = 5;
+
+/// The physical Variant decorated by the `Geometry` custom name.
+///
+/// The immutable tree is initialized once per process, then every internal
+/// prefix/body/suffix, validation, and FFI traversal borrows it. The hot body
+/// remains the existing Variant discriminator pass plus one dense decode per
+/// selected geo child, with no remapping, value copies, or type-tree allocation.
+pub(crate) fn geometry_underlying_type() -> &'static ChType {
+    static UNDERLYING: LazyLock<ChType> =
+        LazyLock::new(|| ChType::Variant(Vec::from(GEOMETRY_ALTERNATIVES)));
+    &UNDERLYING
 }
 
 /// The underlying physical `ChType` a `Nested(...)` decorates: an
@@ -486,6 +559,7 @@ impl std::fmt::Display for ChType {
             }
             // The bare alias spelling, never the expanded form.
             ChType::Geo(kind) => write!(f, "{}", kind.name()),
+            ChType::Geometry => write!(f, "Geometry"),
             ChType::Nested(fields) => write_nested(f, fields),
             ChType::Json {
                 max_dynamic_paths,
@@ -752,26 +826,57 @@ impl ChType {
     /// The underlying physical type a name-decoration alias delegates to, or
     /// `None` for a type that is already physical.
     ///
-    /// `SimpleAggregateFunction`, the geo aliases, and `Nested` all attach only
-    /// a custom name to an underlying type instance whose serialization slot is
-    /// null (confirmed at v26.6.1.1193-stable), so their wire bytes, state
-    /// prefix, and Arrow shape are byte-identical to the type returned here. The
-    /// decode, encode, scan, and Arrow-export paths call this at the top of
-    /// their per-type dispatch and recurse on the delegate, so a single
-    /// expansion point keeps all four directions consistent. Returns an owned
-    /// `ChType` because the geo and `Nested` expansions are synthesized rather
-    /// than stored; the clone is bounded by the parsed type depth and never runs
+    /// `SimpleAggregateFunction`, the geo aliases, `Geometry`, and `Nested` all
+    /// attach only a custom name to an underlying type instance whose
+    /// serialization slot is null (confirmed at v26.6.1.1193-stable), so their
+    /// wire bytes, state prefix, and Arrow shape are byte-identical to the type
+    /// returned here. The decode, encode, scan, and Arrow-export paths call the
+    /// crate-private borrowed form at the top of their per-type dispatch and
+    /// recurse on the delegate, so a single expansion point keeps all four
+    /// directions consistent. This public API returns an owned `ChType` for
+    /// bindings; the clone is bounded by the parsed type depth and never runs
     /// per row.
     ///
     /// Public so a binding crate can reuse the same single expansion point when
     /// mapping decoded columns to host values or building columns for encode,
     /// rather than duplicating the geo/Nested/SAF layout and drifting from it.
     pub fn physical_delegate(&self) -> Option<ChType> {
+        self.physical_delegate_ref().map(Cow::into_owned)
+    }
+
+    /// Borrow a cached delegate when its shape is fixed, allocating only for a
+    /// `Nested` expansion whose fields are carried by this particular value.
+    ///
+    /// This is the internal hot-dispatch form. In particular, all six geo trees
+    /// and the Geometry Variant tree are initialized once and then borrowed
+    /// across state-prefix, body, suffix, validation, and Arrow traversals.
+    pub(crate) fn physical_delegate_ref(&self) -> Option<Cow<'_, ChType>> {
         match self {
-            ChType::SimpleAggregateFunction { inner, .. } => Some((**inner).clone()),
-            ChType::Geo(kind) => Some(kind.underlying_type()),
-            ChType::Nested(fields) => Some(nested_underlying_type(fields)),
+            ChType::SimpleAggregateFunction { inner, .. } => Some(Cow::Borrowed(inner)),
+            ChType::Geo(kind) => Some(Cow::Borrowed(kind.underlying_type_ref())),
+            ChType::Geometry => Some(Cow::Borrowed(geometry_underlying_type())),
+            ChType::Nested(fields) => Some(Cow::Owned(nested_underlying_type(fields))),
             _ => None,
+        }
+    }
+
+    /// Resolve the complete name-decoration chain to its physical type.
+    ///
+    /// Borrowed delegates recurse without cloning. An owned delegate currently
+    /// comes only from `Nested` and is already physical, but the loop also
+    /// handles a future owned alias-of-alias by taking an owned copy of its next
+    /// delegate before replacing the tree that borrowed it.
+    pub(crate) fn resolved_physical_delegate_ref(&self) -> Option<Cow<'_, ChType>> {
+        match self.physical_delegate_ref()? {
+            Cow::Borrowed(under) => under
+                .resolved_physical_delegate_ref()
+                .or(Some(Cow::Borrowed(under))),
+            Cow::Owned(mut under) => {
+                while let Some(next) = under.physical_delegate_ref() {
+                    under = next.into_owned();
+                }
+                Some(Cow::Owned(under))
+            }
         }
     }
 }
@@ -796,6 +901,37 @@ mod tests {
         assert_eq!(schema.fields[0].name, "id");
         assert!(!schema.fields[0].ch_type.is_nullable());
         assert!(schema.fields[1].ch_type.is_nullable());
+    }
+
+    #[test]
+    fn fixed_geo_delegates_are_cached_and_borrowed() {
+        for ch_type in [
+            ChType::Geo(GeoKind::Point),
+            ChType::Geo(GeoKind::MultiPolygon),
+            ChType::Geometry,
+        ] {
+            let first = ch_type
+                .physical_delegate_ref()
+                .expect("fixed geo alias has a delegate");
+            let second = ch_type
+                .physical_delegate_ref()
+                .expect("fixed geo alias has a delegate");
+            assert!(matches!(first, Cow::Borrowed(_)));
+            assert!(std::ptr::eq(first.as_ref(), second.as_ref()));
+        }
+
+        let chained = ChType::SimpleAggregateFunction {
+            func: "anyLast".into(),
+            inner: Box::new(ChType::Geo(GeoKind::Point)),
+        };
+        let resolved = chained
+            .resolved_physical_delegate_ref()
+            .expect("chained alias has a delegate");
+        assert!(matches!(resolved, Cow::Borrowed(_)));
+        assert!(std::ptr::eq(
+            resolved.as_ref(),
+            GeoKind::Point.underlying_type_ref()
+        ));
     }
 
     #[test]

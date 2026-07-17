@@ -13,7 +13,7 @@ use crate::column::{
     Utf8Column, VariantColumn, VariantGroup, VariantLayout, ARROW_UNION_MAX_CHILDREN,
 };
 use crate::native::decode::low_cardinality_dict_value_type;
-use crate::schema::{ChType, IntervalKind, Schema};
+use crate::schema::{geometry_underlying_type, ChType, IntervalKind, Schema};
 
 // ---------------------------------------------------------------------------
 // Arrow C Data Interface structs (repr(C) per spec)
@@ -383,8 +383,8 @@ fn build_export_plan(
     columns: &[(usize, &Column)],
     num_chunks: usize,
 ) -> Result<FieldExportPlan, ExportError> {
-    if let Some(under) = ch_type.physical_delegate() {
-        return build_export_plan(&under, columns, num_chunks);
+    if let Some(under) = ch_type.physical_delegate_ref() {
+        return build_export_plan(under.as_ref(), columns, num_chunks);
     }
     match ch_type {
         ChType::Nullable(inner) => build_export_plan(inner, columns, num_chunks),
@@ -920,7 +920,8 @@ fn arrow_format(ch_type: &ChType) -> String {
         // `Array(Tuple(...))`). The child schemas are emitted by
         // `write_field_schema`, which expands the same delegate.
         ChType::SimpleAggregateFunction { inner, .. } => arrow_format(inner),
-        ChType::Geo(kind) => arrow_format(&kind.underlying_type()),
+        ChType::Geo(kind) => arrow_format(kind.underlying_type_ref()),
+        ChType::Geometry => arrow_format(geometry_underlying_type()),
         // `Nested` is always an `Array(Tuple(...))`, so its top format is the
         // LargeList `+L` regardless of the field types (which appear in the
         // `item` struct child), matching the `Array`/`Map` arms above.
@@ -963,6 +964,13 @@ fn dictionary_value_type(ch_type: &ChType) -> &ChType {
 /// null flag through the shared `low_cardinality_dict_value_type` helper, so a
 /// `LowCardinality(SAF(anyLast, Nullable(String)))` is correctly nullable.
 fn field_is_nullable(ch_type: &ChType) -> bool {
+    // Most schema writers expand aliases before calling this helper, but keep
+    // it correct in isolation too. Geometry delegates to Variant and is
+    // intrinsically nullable; the six ordinary geo aliases remain governed by
+    // their Tuple/Array shapes.
+    if let Some(under) = ch_type.resolved_physical_delegate_ref() {
+        return field_is_nullable(under.as_ref());
+    }
     match ch_type {
         ChType::Nullable(_) => true,
         // Arrow requires Null-type fields to be nullable: every row is null.
@@ -1038,10 +1046,16 @@ unsafe fn write_field_schema_for_column(
     // once here. A `Nullable(Point)` is NOT caught here (Nullable has no
     // delegate); its inner geo alias is expanded in the children match below,
     // while `arrow_format` and `field_is_nullable` handle the Nullable wrapper.
-    if let Some(under) = ch_type.physical_delegate() {
-        write_field_schema_for_column(out, name, &under, column);
+    if let Some(under) = ch_type.physical_delegate_ref() {
+        write_field_schema_for_column(out, name, under.as_ref(), column);
         return;
     }
+    // Resolve aliases below an outer wrapper too. ClickHouse rejects wrappers
+    // such as `Nullable(Geometry)`, but `ChType` is public and a hand-built
+    // schema must still export a structurally valid Arrow union rather than a
+    // `+ud` format with no children.
+    let inner_delegate = ch_type.inner().resolved_physical_delegate_ref();
+    let inner_type = inner_delegate.as_deref().unwrap_or_else(|| ch_type.inner());
     // Variant carries its own intrinsic NULL through a dedicated Arrow Null
     // union child, and the union field is already flagged nullable, so a
     // `Nullable(Variant)` wrapper adds nothing physical: treat it exactly as a
@@ -1055,7 +1069,7 @@ unsafe fn write_field_schema_for_column(
     // a malformed union that strict consumers (pyarrow, arrow-rs) reject. The
     // array path dispatches on `Column::Variant` and is identical for both
     // wrappers, so this keeps the schema and array shapes in agreement.
-    if let ChType::Variant(alternatives) = ch_type.inner() {
+    if let ChType::Variant(alternatives) = inner_type {
         let variant = match column {
             Some(Column::Variant(col)) => Some(col),
             _ => None,
@@ -1063,7 +1077,7 @@ unsafe fn write_field_schema_for_column(
         write_variant_schema(out, name, alternatives, variant);
         return;
     }
-    if let ChType::Dynamic { .. } = ch_type.inner() {
+    if let ChType::Dynamic { .. } = inner_type {
         let dynamic = match column {
             Some(Column::Dynamic(col)) => Some(col),
             _ => None,
@@ -1077,7 +1091,7 @@ unsafe fn write_field_schema_for_column(
     // STRING-mode body is a plain utf8 column. Both wrappers (`JSON`,
     // `Nullable(JSON)`) reach this via `inner()`; the array path dispatches on
     // `Column::Json` and stays in agreement.
-    if let ChType::Json { typed_paths, .. } = ch_type.inner() {
+    if let ChType::Json { typed_paths, .. } = inner_type {
         let json = match column {
             Some(Column::Json(col)) => Some(col),
             _ => None,
@@ -1119,8 +1133,6 @@ unsafe fn write_field_schema_for_column(
     // (`Nullable(Point)` -> `Tuple`) so its element children are emitted. A
     // top-level alias was already expanded and recursed above, so this only
     // matters for the one alias legal under `Nullable`, `Point`.
-    let inner_delegate = ch_type.inner().physical_delegate();
-    let inner_type = inner_delegate.as_ref().unwrap_or_else(|| ch_type.inner());
     match inner_type {
         // An `Array(T)` LargeList field: one conventionally-named `item` child.
         ChType::Array(inner) => {
@@ -1387,22 +1399,24 @@ unsafe fn write_field_schema_with_plan(
     ch_type: &ChType,
     plan: &FieldExportPlan,
 ) {
-    if let Some(under) = ch_type.physical_delegate() {
-        write_field_schema_with_plan(out, name, &under, plan);
+    if let Some(under) = ch_type.physical_delegate_ref() {
+        write_field_schema_with_plan(out, name, under.as_ref(), plan);
         return;
     }
-    if let (ChType::Variant(alternatives), FieldExportPlan::Variant(children)) =
-        (ch_type.inner(), plan)
+    // Keep the result-wide plan path symmetric with the standalone schema
+    // writer for aliases nested below an illegal hand-built wrapper.
+    let inner_delegate = ch_type.inner().resolved_physical_delegate_ref();
+    let inner_type = inner_delegate.as_deref().unwrap_or_else(|| ch_type.inner());
+    if let (ChType::Variant(alternatives), FieldExportPlan::Variant(children)) = (inner_type, plan)
     {
         write_variant_schema_with_plan(out, name, alternatives, children);
         return;
     }
-    if let (ChType::Dynamic { .. }, FieldExportPlan::Dynamic(dynamic)) = (ch_type.inner(), plan) {
+    if let (ChType::Dynamic { .. }, FieldExportPlan::Dynamic(dynamic)) = (inner_type, plan) {
         write_dynamic_schema_with_plan(out, name, dynamic);
         return;
     }
-    if let (ChType::Json { typed_paths, .. }, FieldExportPlan::Json(json_plan)) =
-        (ch_type.inner(), plan)
+    if let (ChType::Json { typed_paths, .. }, FieldExportPlan::Json(json_plan)) = (inner_type, plan)
     {
         write_json_schema_with_plan(out, name, typed_paths, json_plan);
         return;
@@ -1416,8 +1430,6 @@ unsafe fn write_field_schema_with_plan(
         ptr::null_mut()
     };
     let mut children = Vec::new();
-    let inner_delegate = ch_type.inner().physical_delegate();
-    let inner_type = inner_delegate.as_ref().unwrap_or_else(|| ch_type.inner());
     match (inner_type, plan) {
         (ChType::Array(inner), FieldExportPlan::Array(item_plan)) => {
             let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
@@ -2499,8 +2511,8 @@ unsafe fn export_empty_column_with_plan(
     chunk: usize,
     out: *mut ArrowArray,
 ) {
-    if let Some(under) = ch_type.physical_delegate() {
-        export_empty_column_with_plan(batch, &under, plan, chunk, out);
+    if let Some(under) = ch_type.physical_delegate_ref() {
+        export_empty_column_with_plan(batch, under.as_ref(), plan, chunk, out);
         return;
     }
     if let ChType::Nullable(inner) = ch_type {

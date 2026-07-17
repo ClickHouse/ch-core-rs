@@ -15,7 +15,7 @@
 //!   null with no value bytes.
 //! - LowCardinality(T): no framing, just T's value; the decoded column is the
 //!   plain inner column, not a dictionary.
-//! - SimpleAggregateFunction/geo/Nested expand through
+//! - SimpleAggregateFunction/geo/Geometry/Nested expand through
 //!   [`ChType::physical_delegate`], like every bulk dispatcher.
 //!
 //! `Variant`, `Dynamic`, and `AggregateFunction` values (an opaque
@@ -111,8 +111,8 @@ pub fn decode_binary_value(ch_type: &ChType, bytes: &[u8]) -> Result<Column, Bin
 /// or a `Tuple` of only such types). Their element counts cannot be bounded by
 /// the remaining input.
 fn has_zero_width_values(ch_type: &ChType) -> bool {
-    if let Some(delegate) = ch_type.physical_delegate() {
-        return has_zero_width_values(&delegate);
+    if let Some(delegate) = ch_type.physical_delegate_ref() {
+        return has_zero_width_values(delegate.as_ref());
     }
     match ch_type {
         ChType::Nothing => true,
@@ -232,8 +232,8 @@ enum ValueBuilder {
 
 impl ValueBuilder {
     fn new(ch_type: &ChType) -> Result<Self, BinaryValueError> {
-        if let Some(delegate) = ch_type.physical_delegate() {
-            return Self::new(&delegate);
+        if let Some(delegate) = ch_type.physical_delegate_ref() {
+            return Self::new(delegate.as_ref());
         }
         Ok(match ch_type {
             ChType::Nothing => Self::Nothing { rows: 0 },
@@ -322,7 +322,10 @@ impl ValueBuilder {
                 return Err(BinaryValueError::Unsupported(ch_type.to_string()))
             }
             // physical_delegate expanded these above.
-            ChType::SimpleAggregateFunction { .. } | ChType::Geo(_) | ChType::Nested(_) => {
+            ChType::SimpleAggregateFunction { .. }
+            | ChType::Geo(_)
+            | ChType::Geometry
+            | ChType::Nested(_) => {
                 unreachable!("name-decoration aliases expand through physical_delegate")
             }
         })

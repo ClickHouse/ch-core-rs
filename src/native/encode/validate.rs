@@ -17,7 +17,7 @@ use crate::native::type_parser::{
     low_cardinality_dict_value_type, parse_ch_type, resolves_to_nothing,
     unsupported_header_type_name,
 };
-use crate::schema::{ChType, Field};
+use crate::schema::{ChType, Field, GEOMETRY_EXPANSION_DEPTH};
 
 use super::{column_error, is_encodable, json_uses_flattened, EncodeError, EncodeOptions};
 
@@ -124,21 +124,22 @@ fn validate_column(
     // Expand a name-decoration alias (SimpleAggregateFunction, geo, Nested) to
     // the physical type it delegates to, for every STRUCTURAL check below. The
     // header round-trip check further down stays on `field.ch_type` (the alias
-    // form), so the emitted header keeps the alias spelling. [`resolve_delegate`]
-    // follows the whole alias chain, not a fixed number of steps, mirroring the
-    // "recurse on the delegate" pattern the decoders use, so a nested alias like
+    // form), so the emitted header keeps the alias spelling.
+    // [`ChType::resolved_physical_delegate_ref`] follows the whole alias chain,
+    // not a fixed number of steps, mirroring the "recurse on the delegate"
+    // pattern the decoders use, so a nested alias like
     // `Nullable(SimpleAggregateFunction(_, Point))` resolves all the way to the
     // physical `Tuple` rather than stopping one level short.
-    let physical = resolve_delegate(&field.ch_type);
-    let physical_type = physical.as_ref().unwrap_or(&field.ch_type);
+    let physical = field.ch_type.resolved_physical_delegate_ref();
+    let physical_type = physical.as_deref().unwrap_or(&field.ch_type);
 
     // The concrete value type is the inner of a `Nullable`, else the physical
     // type itself; an alias under `Nullable` (`Nullable(Point)` -> `Tuple`,
     // `Nullable(SAF(_, T))` -> physical `T`) is resolved through the whole chain
     // here too.
     let value_inner = physical_type.inner();
-    let value = resolve_delegate(value_inner);
-    let value_type = value.as_ref().unwrap_or(value_inner);
+    let value = value_inner.resolved_physical_delegate_ref();
+    let value_type = value.as_deref().unwrap_or(value_inner);
 
     // Supported, matching (type, buffer) pair. A not-yet-encodable type, or a
     // supported type under a mismatched buffer variant, is rejected here rather
@@ -366,23 +367,6 @@ fn validate_column(
     Ok(())
 }
 
-/// Follow a name-decoration alias chain to its underlying physical type,
-/// returning `None` when `ch_type` is already physical (not an alias).
-///
-/// `SimpleAggregateFunction`, the geo aliases, and `Nested` each delegate to a
-/// physical type via [`ChType::physical_delegate`]; this resolves the whole
-/// chain (e.g. `SimpleAggregateFunction(_, Point)` -> `Geo(Point)` -> `Tuple`)
-/// rather than a fixed number of steps, so [`validate_column`] never stops one
-/// delegate short. The clone is bounded by the parsed/validated type depth and
-/// runs once per column validation, never per row.
-fn resolve_delegate(ch_type: &ChType) -> Option<ChType> {
-    let mut under = ch_type.physical_delegate()?;
-    while let Some(next) = under.physical_delegate() {
-        under = next;
-    }
-    Some(under)
-}
-
 /// Reject a `SimpleAggregateFunction` whose function-name spelling is not a bare
 /// identifier optionally followed by a single balanced parenthesized parameter
 /// suffix (`sum`, `anyLast`, `groupArrayLastArray(5)`), walking every wrapper and
@@ -514,6 +498,9 @@ pub(super) fn type_depth(ch_type: &ChType) -> usize {
             }
             ChType::Geo(kind) => {
                 max_depth = max_depth.max(depth + kind.expansion_depth());
+            }
+            ChType::Geometry => {
+                max_depth = max_depth.max(depth + GEOMETRY_EXPANSION_DEPTH);
             }
             // JSON charges one level for the JSON node itself; each typed-path
             // type is one level deeper, matching the decode parser's `depth + 1`
@@ -1670,8 +1657,8 @@ fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
     // column its physical delegate would, since decode produces the delegate's
     // Column variant (no new variant). Expand and recurse before the pair checks
     // below.
-    if let Some(under) = value_type.physical_delegate() {
-        return column_variant_matches(&under, column);
+    if let Some(under) = value_type.physical_delegate_ref() {
+        return column_variant_matches(under.as_ref(), column);
     }
     if let (ChType::AggregateFunction { .. }, Column::AggregateState(_)) = (value_type, column) {
         // Codec legality is owned by the blanket `unsupported_header_type_name`

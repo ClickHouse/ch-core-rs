@@ -20,6 +20,45 @@ fn flat_variant_batch() -> Arc<ColBatch> {
     ))
 }
 
+fn geometry_child(kind: GeoKind, seed: f64) -> Column {
+    let point = Column::Tuple(TupleColumn::new(
+        vec![
+            Column::Float64(PrimitiveColumn::new(vec![seed])),
+            Column::Float64(PrimitiveColumn::new(vec![seed + 0.5])),
+        ],
+        1,
+    ));
+    let mut column = point;
+    for _ in 1..kind.expansion_depth() {
+        column = Column::Array(ArrayColumn::new(vec![0, 1], column));
+    }
+    column
+}
+
+fn geometry_batch_with_type(ch_type: ChType) -> Arc<ColBatch> {
+    let children = crate::schema::GEOMETRY_ALTERNATIVES
+        .iter()
+        .enumerate()
+        .map(|(index, alternative)| match alternative {
+            ChType::Geo(kind) => geometry_child(*kind, 13.0 + index as f64),
+            other => unreachable!("Geometry alternative is always geo, got {other:?}"),
+        })
+        .collect();
+    let column = VariantColumn::try_new(&[0, 1, 2, 3, 4, 5, u8::MAX], children).unwrap();
+    Arc::new(ColBatch::new(
+        Schema::new(vec![Field {
+            name: "g".into(),
+            ch_type,
+        }]),
+        vec![Column::Variant(column)],
+        7,
+    ))
+}
+
+fn geometry_batch() -> Arc<ColBatch> {
+    geometry_batch_with_type(ChType::Geometry)
+}
+
 #[test]
 fn export_flat_variant_schema_and_buffers() {
     let batch = flat_variant_batch();
@@ -65,6 +104,120 @@ fn export_flat_variant_schema_and_buffers() {
         assert_eq!(null.n_buffers, 0);
         (array.release.unwrap())(&mut array);
     }
+}
+
+#[test]
+fn export_geometry_as_six_child_dense_union() {
+    let batch = geometry_batch();
+
+    // Safety: both outputs are writable zeroed C Data structs. Their borrowed
+    // buffers remain backed by `batch` until the release callbacks run.
+    unsafe {
+        let mut schema: ArrowSchema = std::mem::zeroed();
+        export_schema(&batch.schema, &mut schema);
+        let field = &**schema.children.add(0);
+        assert_eq!(
+            CStr::from_ptr(field.format).to_str().unwrap(),
+            "+ud:0,1,2,3,4,5,6"
+        );
+        assert_eq!(field.flags & 2, 2, "Geometry has intrinsic NULL");
+        assert_eq!(field.n_children, 7);
+        let expected = [
+            ("LineString", "+L"),
+            ("MultiLineString", "+L"),
+            ("MultiPolygon", "+L"),
+            ("Point", "+s"),
+            ("Polygon", "+L"),
+            ("Ring", "+L"),
+            ("NULL", "n"),
+        ];
+        for (index, (name, format)) in expected.into_iter().enumerate() {
+            let child = &**field.children.add(index);
+            assert_eq!(CStr::from_ptr(child.name).to_str().unwrap(), name);
+            assert_eq!(CStr::from_ptr(child.format).to_str().unwrap(), format);
+        }
+        let point = &**field.children.add(3);
+        assert_eq!(point.n_children, 2);
+        (schema.release.unwrap())(&mut schema);
+
+        let mut array: ArrowArray = std::mem::zeroed();
+        export_batch_array(&batch, &mut array).unwrap();
+        let field = &**array.children.add(0);
+        assert_eq!(field.length, 7);
+        assert_eq!(field.null_count, 0, "dense unions own no validity buffer");
+        assert_eq!(field.n_children, 7);
+        let type_ids = *field.buffers.add(0) as *const i8;
+        assert_eq!(
+            std::slice::from_raw_parts(type_ids, 7),
+            &[0, 1, 2, 3, 4, 5, 6]
+        );
+        for child in 0..7 {
+            assert_eq!((**field.children.add(child)).length, 1);
+        }
+        (array.release.unwrap())(&mut array);
+    }
+}
+
+#[test]
+fn export_nullable_geometry_matches_bare_geometry_in_batch_and_stream() {
+    // ClickHouse rejects Nullable(Geometry), but ChType is public. Keep this
+    // hand-built illegal wrapper structurally safe on both standalone and
+    // result-wide stream schema paths, just like Nullable(Variant).
+    let batch = geometry_batch_with_type(ChType::Nullable(Box::new(ChType::Geometry)));
+
+    // Safety: all outputs are writable zeroed C Data structs, their buffers
+    // remain backed by `batch`, and every populated output is released.
+    unsafe {
+        let mut schema: ArrowSchema = std::mem::zeroed();
+        export_schema(&batch.schema, &mut schema);
+        let field = &**schema.children.add(0);
+        assert_eq!(
+            CStr::from_ptr(field.format).to_str().unwrap(),
+            "+ud:0,1,2,3,4,5,6"
+        );
+        assert_eq!(field.flags & 2, 2);
+        assert_eq!(field.n_children, 7);
+        (schema.release.unwrap())(&mut schema);
+
+        let mut array: ArrowArray = std::mem::zeroed();
+        export_batch_array(&batch, &mut array).unwrap();
+        let field = &**array.children.add(0);
+        assert_eq!(field.n_buffers, 2);
+        assert_eq!(field.n_children, 7);
+        (array.release.unwrap())(&mut array);
+
+        let mut stream: ArrowArrayStream = std::mem::zeroed();
+        export_chunks_to_stream(batch.schema.clone(), vec![batch], &mut stream);
+
+        let mut stream_schema: ArrowSchema = std::mem::zeroed();
+        assert_eq!(
+            (stream.get_schema.unwrap())(&mut stream, &mut stream_schema),
+            0
+        );
+        let field = &**stream_schema.children.add(0);
+        assert_eq!(
+            CStr::from_ptr(field.format).to_str().unwrap(),
+            "+ud:0,1,2,3,4,5,6"
+        );
+        assert_eq!(field.n_children, 7);
+
+        let mut stream_array: ArrowArray = std::mem::zeroed();
+        assert_eq!(
+            (stream.get_next.unwrap())(&mut stream, &mut stream_array),
+            0
+        );
+        assert_eq!((**stream_array.children.add(0)).n_children, 7);
+
+        (stream_array.release.unwrap())(&mut stream_array);
+        (stream_schema.release.unwrap())(&mut stream_schema);
+        (stream.release.unwrap())(&mut stream);
+    }
+}
+
+#[test]
+fn field_nullability_resolves_fixed_aliases_defensively() {
+    assert!(field_is_nullable(&ChType::Geometry));
+    assert!(!field_is_nullable(&ChType::Geo(GeoKind::Point)));
 }
 
 #[test]

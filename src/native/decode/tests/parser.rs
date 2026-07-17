@@ -1278,6 +1278,54 @@ fn test_geo_underlying_type_expansion() {
 }
 
 #[test]
+fn test_parse_geometry_canonicalizes_alias_and_delegates() {
+    assert_eq!(parse_ch_type("Geometry"), Some(ChType::Geometry));
+    assert_eq!(parse_ch_type("GEOMETRY"), Some(ChType::Geometry));
+    assert_eq!(parse_ch_type("geometry"), None);
+    assert_eq!(ChType::Geometry.to_string(), "Geometry");
+
+    assert_eq!(
+        ChType::Geometry.physical_delegate(),
+        Some(crate::schema::geometry_underlying_type().clone())
+    );
+    assert_eq!(
+        crate::schema::geometry_underlying_type(),
+        &ChType::Variant(vec![
+            ChType::Geo(GeoKind::LineString),
+            ChType::Geo(GeoKind::MultiLineString),
+            ChType::Geo(GeoKind::MultiPolygon),
+            ChType::Geo(GeoKind::Point),
+            ChType::Geo(GeoKind::Polygon),
+            ChType::Geo(GeoKind::Ring),
+        ])
+    );
+}
+
+#[test]
+fn test_geometry_wrapper_and_container_legality() {
+    assert_eq!(parse_ch_type("Nullable(Geometry)"), None);
+    let lc = parse_ch_type("LowCardinality(Geometry)").unwrap();
+    assert!(unsupported_header_type_name(&lc).is_some());
+    assert_eq!(parse_ch_type("Variant(Geometry, String)"), None);
+
+    assert_eq!(
+        parse_ch_type("Array(Geometry)"),
+        Some(ChType::Array(Box::new(ChType::Geometry)))
+    );
+    assert_eq!(
+        parse_ch_type("Tuple(g Geometry)"),
+        Some(ChType::Tuple(vec![(Some("g".into()), ChType::Geometry)]))
+    );
+    assert_eq!(
+        parse_ch_type("Map(String, Geometry)"),
+        Some(ChType::Map(
+            Box::new(ChType::String),
+            Box::new(ChType::Geometry)
+        ))
+    );
+}
+
+#[test]
 fn test_parse_ch_type_nested() {
     assert_eq!(
         parse_ch_type("Nested(a UInt32, b String)"),

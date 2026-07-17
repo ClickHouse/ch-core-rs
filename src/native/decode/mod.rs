@@ -472,8 +472,8 @@ fn read_state_prefix(
     // Nested(a LowCardinality(String)) this reaches the leaf LowCardinality's
     // 8-byte key version through the delegated Array(Tuple(...)) chain, hoisting
     // it to the very front of the whole column, before the offsets.
-    if let Some(under) = ch_type.physical_delegate() {
-        return read_state_prefix(reader, &under, column, options, states, depth + 1);
+    if let Some(under) = ch_type.physical_delegate_ref() {
+        return read_state_prefix(reader, under.as_ref(), column, options, states, depth + 1);
     }
     match ch_type {
         ChType::LowCardinality(_) => {
@@ -577,8 +577,8 @@ fn read_state_suffix(
     states: &[StatePrefix],
     state_cursor: &mut usize,
 ) -> Result<(), DecodeError> {
-    if let Some(under) = ch_type.physical_delegate() {
-        return read_state_suffix(reader, &under, column, states, state_cursor);
+    if let Some(under) = ch_type.physical_delegate_ref() {
+        return read_state_suffix(reader, under.as_ref(), column, states, state_cursor);
     }
     match ch_type {
         ChType::Array(inner) | ChType::Nullable(inner) => {
@@ -1290,8 +1290,15 @@ fn decode_values(
     // dispatch below so a geo/Nested alias that expands to an `Array` reaches the
     // Array fast-path, and a SimpleAggregateFunction over any inner delegates to
     // that inner.
-    if let Some(under) = ch_type.physical_delegate() {
-        return decode_values(reader, &under, num_rows, column, states, state_cursor);
+    if let Some(under) = ch_type.physical_delegate_ref() {
+        return decode_values(
+            reader,
+            under.as_ref(),
+            num_rows,
+            column,
+            states,
+            state_cursor,
+        );
     }
     // LowCardinality carries its own dictionary, indexes, and (for a Nullable
     // inner type) null handling, so it is decoded as a unit rather than going
@@ -1355,8 +1362,8 @@ fn decode_values(
     // (the array-based kinds and `Nested` are rejected by the parser); expand it
     // to its `Tuple` so the Tuple arm below handles the body after the null map,
     // the ordinary `Nullable(Tuple(...))` framing.
-    let delegate = inner.physical_delegate();
-    let inner = delegate.as_ref().unwrap_or(inner);
+    let delegate = inner.physical_delegate_ref();
+    let inner = delegate.as_deref().unwrap_or(inner);
 
     // Tuple is a container of element columns decoded as a unit (each element
     // recurses back through this function), dispatched after the Nullable
@@ -2307,6 +2314,7 @@ fn decode_column_body(
         | ChType::Json { .. }
         | ChType::SimpleAggregateFunction { .. }
         | ChType::Geo(_)
+        | ChType::Geometry
         | ChType::Nested(_) => {
             return Err(DecodeError::UnsupportedType {
                 column: String::new(),
@@ -2328,8 +2336,8 @@ fn empty_column(ch_type: &ChType) -> Column {
     // `SimpleAggregateFunction(anyLast, Nullable(String))`, `SAF` over a geo/
     // `Nested` inner, or `SAF(_, Nullable(Point))` from reaching the `unreachable!`
     // arm below and panicking on untrusted wire input.
-    if let Some(under) = ch_type.physical_delegate() {
-        return empty_column(&under);
+    if let Some(under) = ch_type.physical_delegate_ref() {
+        return empty_column(under.as_ref());
     }
     let (nullable, inner) = match ch_type {
         ChType::Nullable(inner) => (true, inner.as_ref()),
@@ -2350,11 +2358,8 @@ fn empty_column(ch_type: &ChType) -> Column {
     // (SAF -> `Geo(Point)` -> `Tuple`). `empty_validity` is Some in these cases,
     // so the Tuple/primitive arm builds the matching nullable empty column, and
     // the `unreachable!` arm can never see an alias.
-    let mut resolved = inner.physical_delegate();
-    while let Some(under) = resolved.as_ref().and_then(|t| t.physical_delegate()) {
-        resolved = Some(under);
-    }
-    let inner = resolved.as_ref().unwrap_or(inner);
+    let resolved = inner.resolved_physical_delegate_ref();
+    let inner = resolved.as_deref().unwrap_or(inner);
 
     match inner {
         ChType::Nothing => Column::Nothing(match empty_validity {
@@ -2606,6 +2611,7 @@ fn empty_column(ch_type: &ChType) -> Column {
         ChType::Nullable(_)
         | ChType::SimpleAggregateFunction { .. }
         | ChType::Geo(_)
+        | ChType::Geometry
         | ChType::Nested(_) => {
             unreachable!("Nullable inner unwrapped and aliases expanded; parse_ch_type rejects nested Nullable")
         }
@@ -2919,8 +2925,8 @@ fn decode_block_body(
 /// row, so only a JSON leaf or a Tuple entirely of them returns false. Name
 /// decorations resolve through [`ChType::physical_delegate`].
 fn has_min_one_byte_per_row(ch_type: &ChType) -> bool {
-    if let Some(under) = ch_type.physical_delegate() {
-        return has_min_one_byte_per_row(&under);
+    if let Some(under) = ch_type.physical_delegate_ref() {
+        return has_min_one_byte_per_row(under.as_ref());
     }
     match ch_type {
         ChType::Json { .. } => false,
@@ -3039,8 +3045,15 @@ fn skip_values(
     // Expand a name-decoration alias to its physical delegate, the scan-side
     // mirror of `decode_values`, so a geo/Nested alias reaches the Array
     // fast-path and a SimpleAggregateFunction walks its inner.
-    if let Some(under) = ch_type.physical_delegate() {
-        return skip_values(reader, &under, num_rows, column, states, state_cursor);
+    if let Some(under) = ch_type.physical_delegate_ref() {
+        return skip_values(
+            reader,
+            under.as_ref(),
+            num_rows,
+            column,
+            states,
+            state_cursor,
+        );
     }
     if let ChType::LowCardinality(inner) = ch_type {
         // A zero-length run has no LowCardinality body bytes at all (see the
@@ -3080,8 +3093,8 @@ fn skip_values(
 
     // Expand a geo alias legal directly inside `Nullable` (only `Nullable(Point)`
     // -> `Tuple`), the scan-side mirror of `decode_values`.
-    let delegate = inner.physical_delegate();
-    let inner = delegate.as_ref().unwrap_or(inner);
+    let delegate = inner.physical_delegate_ref();
+    let inner = delegate.as_deref().unwrap_or(inner);
 
     // Tuple after the Nullable unwrap, mirroring `decode_values`: a
     // `Nullable(Tuple(...))` walks its per-row null map above, then the tuple
@@ -3419,6 +3432,7 @@ fn skip_column_body(
         | ChType::Json { .. }
         | ChType::SimpleAggregateFunction { .. }
         | ChType::Geo(_)
+        | ChType::Geometry
         | ChType::Nested(_) => {
             return Err(DecodeError::UnsupportedType {
                 column: String::new(),

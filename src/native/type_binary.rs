@@ -182,6 +182,12 @@ fn read_binary_type_inner(
             }
             0x2c => {
                 let name = reader.read_varint_string()?;
+                // ClickHouse's generic Custom decoder hands the name to a fresh
+                // DataTypeFactory text parse; it does not propagate the outer
+                // binary descriptor depth. Match that boundary here. The public
+                // `read_binary_type` still renders and reparses the complete
+                // constructed type afterward, applying this crate's aggregate
+                // MAX_TYPE_DEPTH safety cap before any body traversal.
                 parse_ch_type(&name).ok_or(BinaryTypeError::Unsupported(name))?
             }
             0x2d => ChType::Bool,
@@ -731,7 +737,8 @@ pub(crate) fn write_binary_type(buf: &mut Vec<u8>, ch_type: &ChType) {
         }
         ChType::SimpleAggregateFunction { .. }
         | ChType::AggregateFunction { .. }
-        | ChType::Geo(_) => {
+        | ChType::Geo(_)
+        | ChType::Geometry => {
             buf.push(0x2c);
             write_string(buf, ch_type.to_string().as_bytes());
         }
@@ -846,6 +853,7 @@ mod tests {
                 (Some("n".into()), ChType::Int32),
             ]),
             ChType::Variant(vec![ChType::String, ChType::UInt64]),
+            ChType::Geometry,
             ChType::Nested(vec![("n".into(), ChType::UInt32)]),
             ChType::SimpleAggregateFunction {
                 func: "anyLast".into(),
@@ -877,6 +885,34 @@ mod tests {
             read_binary_type(&mut ByteReader::new(&[0x2b, 0xff])),
             Err(BinaryTypeError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn geometry_custom_name_uses_fresh_text_depth_then_whole_type_cap() {
+        let mut geometry = Vec::new();
+        write_binary_type(&mut geometry, &ChType::Geometry);
+        assert_eq!(geometry, b"\x2c\x08Geometry");
+
+        // The server reparses a generic Custom name with a fresh text depth
+        // budget. Confirm the inner descriptor reader does the same even at the
+        // maximum enclosing structural depth.
+        let mut bytes = vec![0x1e; MAX_TYPE_DEPTH];
+        bytes.extend_from_slice(&geometry);
+        let mut reader = ByteReader::new(&bytes);
+        let mut complexity = 0;
+        assert!(read_binary_type_inner(&mut reader, 0, &mut complexity).is_ok());
+        assert_eq!(reader.remaining(), 0);
+
+        // The public reader subsequently validates the complete canonical type
+        // under this crate's aggregate cap. Geometry charges five physical
+        // levels there, so 95 enclosing Arrays land exactly at MAX_TYPE_DEPTH
+        // and one more is rejected before any body traversal.
+        for (arrays, accepted) in [(MAX_TYPE_DEPTH - 5, true), (MAX_TYPE_DEPTH - 5 + 1, false)] {
+            let mut bytes = vec![0x1e; arrays];
+            bytes.extend_from_slice(&geometry);
+            let result = read_binary_type(&mut ByteReader::new(&bytes));
+            assert_eq!(result.is_ok(), accepted, "{arrays} enclosing Arrays");
+        }
     }
 
     #[test]

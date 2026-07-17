@@ -10,6 +10,7 @@ mod containers;
 mod decimal;
 mod dynamic;
 mod framing;
+mod geometry;
 mod interval;
 mod json;
 mod low_cardinality;

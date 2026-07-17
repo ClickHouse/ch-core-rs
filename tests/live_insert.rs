@@ -908,6 +908,40 @@ fn lc_fixed_string_u16_batch() -> ColBatch {
 /// writes the alias spelling in the header and the underlying type's body; the
 /// physical `Column` shape here is exactly that underlying type. `i32` is
 /// strictly ascending so `ORDER BY i32` on readback matches insertion order.
+fn single_geo_column(kind: GeoKind, present: bool, seed: f64) -> Column {
+    fn build(ch_type: &ChType, present: bool, seed: f64) -> Column {
+        match ch_type {
+            ChType::Array(inner) => Column::Array(ArrayColumn::new(
+                if present { vec![0, 1] } else { vec![0] },
+                build(inner, present, seed),
+            )),
+            ChType::Tuple(elements) => {
+                assert_eq!(elements.len(), 2, "Point has two coordinates");
+                let values = |value| {
+                    if present {
+                        vec![value]
+                    } else {
+                        Vec::new()
+                    }
+                };
+                Column::Tuple(TupleColumn::new(
+                    vec![
+                        Column::Float64(PrimitiveColumn::new(values(seed))),
+                        Column::Float64(PrimitiveColumn::new(values(seed + 0.5))),
+                    ],
+                    usize::from(present),
+                ))
+            }
+            other => panic!("unexpected geo physical type {other:?}"),
+        }
+    }
+
+    let physical = ChType::Geo(kind)
+        .physical_delegate()
+        .expect("geo aliases always have a physical delegate");
+    build(&physical, present, seed)
+}
+
 fn geo_saf_nested_batch() -> ColBatch {
     // 0x00 = valid, 0x01 = null: valid, null, valid, null.
     let validity = || Bitmap::from_ch_null_map(&[0, 1, 0, 1]);
@@ -996,6 +1030,12 @@ fn geo_saf_nested_batch() -> ColBatch {
                 func: "anyLast".into(),
                 inner: Box::new(ChType::Nullable(Box::new(ChType::String))),
             })),
+        },
+        // Geometry is a custom name over a six-child Variant. The four rows
+        // select LineString, MultiPolygon, Point, and intrinsic NULL.
+        Field {
+            name: "geometry".into(),
+            ch_type: ChType::Geometry,
         },
     ];
 
@@ -1096,6 +1136,20 @@ fn geo_saf_nested_batch() -> ColBatch {
             Column::Utf8(utf8_column(&[b"", b"user_1", b"user_2"])),
             validity(),
         )),
+        Column::Variant(
+            VariantColumn::try_new(
+                &[0, 2, 3, u8::MAX],
+                vec![
+                    single_geo_column(GeoKind::LineString, true, 13.0),
+                    single_geo_column(GeoKind::MultiLineString, false, 0.0),
+                    single_geo_column(GeoKind::MultiPolygon, true, 21.0),
+                    single_geo_column(GeoKind::Point, true, 51.0),
+                    single_geo_column(GeoKind::Polygon, false, 0.0),
+                    single_geo_column(GeoKind::Ring, false, 0.0),
+                ],
+            )
+            .expect("Geometry child lengths match discriminators"),
+        ),
     ];
 
     ColBatch::new(Schema::new(fields), columns, 4)
@@ -2040,7 +2094,8 @@ fn geo_saf_nested_roundtrip_through_server() {
          nst Nested(x UInt32, y String), \
          nsaf Nullable(SimpleAggregateFunction(sum, UInt64)), \
          tsaf Tuple(v SimpleAggregateFunction(sum, UInt64)), \
-         lc_nsaf LowCardinality(SimpleAggregateFunction(anyLast, Nullable(String)))) ENGINE = Memory"
+         lc_nsaf LowCardinality(SimpleAggregateFunction(anyLast, Nullable(String))), \
+         geometry Geometry) ENGINE = Memory"
         ),
         "?flatten_nested=0&enable_nullable_tuple_type=1&allow_suspicious_low_cardinality_types=1",
     );
@@ -2056,7 +2111,7 @@ fn geo_saf_nested_roundtrip_through_server() {
     server.insert_native_into(GSN_TABLE, &bytes);
 
     let native = server.select(&format!(
-        "SELECT i32, saf_sum, saf_lc, point, npoint, ring, mpoly, nst, nsaf, tsaf, lc_nsaf \
+        "SELECT i32, saf_sum, saf_lc, point, npoint, ring, mpoly, nst, nsaf, tsaf, lc_nsaf, geometry \
          FROM {GSN_TABLE} ORDER BY i32 FORMAT Native"
     ));
     let decoded = decode_all_bytes(

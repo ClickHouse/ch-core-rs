@@ -287,6 +287,7 @@ than an error.
 | Registered exact `AggregateFunction` codecs: `count`, canonical `nothingUInt64` and `nothingNull`, and base `sum` over plain or Nullable numeric/Enum arguments | `AggregateFunction { function, arguments }` | `AggregateState` | `Z` (LargeBinary) | validity, i64 offsets, state data | no |
 | `Point`                                                                                | `Geo(GeoKind::Point)`                  | `Tuple`           | `+s` (struct of two `g` Float64 children)                          | validity (two Float64 children)            | yes (`Nullable(Point)` is legal)                         |
 | `Ring`, `LineString`, `MultiLineString`, `Polygon`, `MultiPolygon`                     | `Geo(GeoKind::*)`                       | `Array`           | `+L` (LargeList chain over a Point `+s` struct)                     | validity, i64 offsets (+ item child)       | no (they expand to `Array`)                              |
+| `Geometry`                                                                             | `Geometry`                              | `Variant`         | `+ud:0,1,2,3,4,5,6` Dense Union                                   | i8 type ids, i32 offsets (+ six geo children and NULL) | intrinsic NULL child; no top-level validity |
 | `Nested(name1 T1, ...)` for supported field types                                      | `Nested(Vec<(String, ChType)>)`        | `Array`           | `+L` (LargeList of a `+s` struct with the field names)             | validity, i64 offsets (+ item struct child) | no (it is an `Array`)                                    |
 | `Variant(T1, ...)` for 1 through 255 legal alternatives                               | `Variant(Vec<ChType>)`                 | `Variant`         | `+ud:...` Dense Union, nested for 128+ alternatives                | i8 type ids, i32 offsets (+ dense children) | intrinsic NULL child; no top-level validity              |
 | `Dynamic`, `Dynamic(max_types=N)`                                                     | `Dynamic { max_types }`                | `Dynamic`         | `+ud:...` result-wide Dense Union; SharedVariant child is `z`      | remapped i8 type ids, i32 offsets (+ dense children) | intrinsic NULL child; no top-level validity              |
@@ -1927,6 +1928,97 @@ GA and stable at `v26.6.1.1193-stable`.
 underlying types'; see the `Tuple`, `Array`, and fixed-width numeric sections.
 Confirmed at `v26.6.1.1193-stable`.
 
+### Geometry
+
+**Introduction version:** undetermined from the shallow `.server-src` checkout.
+The type is confirmed unconditionally registered and GA at the pinned
+`v26.6.1.1193-stable`, but this checkout has no history from which to establish
+its first release. Do not infer an earlier version from the obsolete fixed-true
+geo feature gate.
+
+**Type string(s):** canonical `Geometry`. The exact uppercase `GEOMETRY` is a
+case-sensitive MySQL-compatible input alias and normalizes to `Geometry`;
+lowercase `geometry` is not registered. Native text headers always carry the
+canonical name, never the expanded Variant spelling.
+
+**Logical type:** `ChType::Geometry`, a custom fixed name over this exact
+canonical Variant and global discriminator order:
+
+```text
+0   LineString
+1   MultiLineString
+2   MultiPolygon
+3   Point
+4   Polygon
+5   Ring
+255 NULL
+```
+
+`ChType::physical_delegate()` returns
+`Variant(LineString, MultiLineString, MultiPolygon, Point, Polygon, Ring)`.
+`DataTypeVariant` sorts by the full custom type names before assigning these
+discriminators, so the order is a wire invariant.
+
+**Wire payload:** byte-identical to that six-child Variant. Direct `FORMAT
+Native` writes one little-endian `UInt64` BASIC mode word `0`, one global
+`UInt8` discriminator per row, then one dense bulk body per alternative in the
+order above. A child contains only the rows that selected it. Discriminator
+`255` contributes no child value. The six child bodies use the ordinary geo
+layouts documented above. Geometry adds no framing, marker, version, setting,
+or remapping, and its custom-serialization marker is the generic default `0`.
+Like direct Variant, this core rejects COMPACT mode `1` because NativeWriter
+does not emit it.
+
+**Binary type descriptor:** the generic Custom tag and canonical name, exactly
+`2c 08 47 65 6f 6d 65 74 72 79`. It is not structural Variant tag `0x2a` and
+has no Geometry-specific tag.
+
+**Arrow export:** one Arrow Dense Union with format `+ud:0,1,2,3,4,5,6`.
+Children 0 through 5 retain the geo names and their zero-copy struct/LargeList
+shapes; child 6 is Arrow Null named `NULL`. The union uses the existing i8 type
+ids and i32 dense offsets, has no top-level validity buffer, and is flagged
+nullable because NULL is intrinsic.
+
+**Rust buffer:** `Column::Variant(VariantColumn)`, with six dense physical geo
+children plus the existing Null child and routing buffers. There is no Geometry
+column wrapper and no per-row Geometry branch, allocation, remap, or copy.
+The fixed Geometry Variant and six geo type trees are initialized once per
+process and borrowed by internal prefix, body, suffix, validation, and FFI
+dispatch, so repeated small blocks do not rebuild temporary type trees.
+
+**Notes:**
+
+- `Nullable(Geometry)` and `LowCardinality(Geometry)` are illegal. Geometry
+  already owns intrinsic NULL through its Variant discriminator.
+- `Array(Geometry)`, Tuple elements, and Map keys or values are legal. A direct
+  `Variant(Geometry, ...)` is illegal because Geometry's physical TypeIndex is
+  Variant.
+- Casting Geometry into Dynamic flattens its six alternatives; Dynamic does not
+  preserve Geometry as one nested child. A typed JSON path of Geometry is legal
+  and delegates to this Variant serialization.
+- Geometry charges five physical depth levels, one Variant plus the deepest
+  four-level MultiPolygon child, during text-header parsing, complete binary
+  descriptor validation, and encode validation. At the generic binary Custom
+  `0x2c` boundary, the name itself is reparsed with a fresh text-depth budget,
+  matching ClickHouse. The core then validates the complete constructed type
+  under its aggregate `MAX_TYPE_DEPTH` cap before body traversal.
+- It is unconditionally registered and GA at `v26.6.1.1193-stable`.
+  `allow_experimental_geo_types` is an obsolete fixed-true setting.
+
+**Server reference:** `DataTypeGeometryName` and
+`registerDataTypeDomainGeo` in `src/DataTypes/DataTypeCustomGeo.cpp`;
+`DataTypeVariant::DataTypeVariant` and `doGetSerialization` in
+`src/DataTypes/DataTypeVariant.cpp`; the bulk prefix/body methods in
+`src/DataTypes/Serializations/SerializationVariant.cpp`; `IDataType::getSerialization`
+in `src/DataTypes/IDataType.cpp`; and Custom descriptor encode/decode in
+`src/DataTypes/DataTypesBinaryEncoding.cpp`. The fresh Custom-name parse is
+confirmed through `DataTypeFactory::getImpl` in
+`src/DataTypes/DataTypeFactory.cpp`, `tryParseQuery` in
+`src/Parsers/parseQuery.cpp`, and `IParser::Pos` in
+`src/Parsers/IParser.h`. Native framing and BASIC-mode selection are in
+`src/Formats/NativeWriter.cpp`. All claims in this section are confirmed at
+`v26.6.1.1193-stable`.
+
 ### Nested(name1 T1, ...)
 
 **Type string(s):** `Nested(name1 T1, name2 T2, ...)` with at least one field.
@@ -2450,7 +2542,8 @@ opaque shared-data blobs, or a STRING-mode `Text` body), the non-wrapper types,
 `SimpleAggregateFunction(func, T)` (encodable when its inner `T` is, at any
 nesting position), the six geo types (`Point`, `Ring`, `LineString`,
 `MultiLineString`, `Polygon`, `MultiPolygon`, always encodable since they
-expand to `Tuple`/`Array` of `Float64`), and `Nested(name1 T1, ...)`
+expand to `Tuple`/`Array` of `Float64`), `Geometry` (the fixed six-child
+Variant), and `Nested(name1 T1, ...)`
 (encodable when every field type is) each encode as their physical delegate,
 with no new body writer: encode, like decode, recurses on
 `ChType::physical_delegate`. The exact `AggregateFunction` state codecs for
@@ -2673,6 +2766,10 @@ one valid wire form, and encode commits to these:
   checks every type id, occurrence offset, child length, and NULL child before
   writing. Alternative state suffixes are traversed in the same order after the
   bodies. A zero-row block writes no mode word or child prefix.
+- **Geometry.** Encode delegates to its canonical six-child Variant and uses
+  the exact Variant writer and validation above. The header remains `Geometry`
+  or the Custom binary descriptor, while the body is BASIC mode 0,
+  discriminators, then dense geo children in canonical order.
 - **Dynamic.** A column with SharedVariant writes direct V1 below revision
   54473 or V2 at and above it, the direct type table, BASIC mode 0, the complete
   UInt8 discriminator run, then dense children in canonical global order. A
@@ -2761,6 +2858,8 @@ directly (`empty_column` in `src/native/decode/mod.rs`), the empty shapes are:
   recursively).
 - `Variant(T1, ...)`: an empty flat or nested Dense Union layout, one recursively
   empty dense child per alternative, and an empty Null child.
+- `Geometry`: the same empty flat Dense Union with six recursively empty geo
+  children and an empty Null child; the logical `Geometry` name stays in schema.
 - `Dynamic`: empty u32 type-id and i32 offset buffers, no discovered block-local
   children, and an empty Null child. The logical `max_types` remains in schema.
 - Any registered `AggregateFunction` codec: offsets `[0]` and empty state data.
@@ -2804,7 +2903,7 @@ section). A `Map` header with an illegal key type (`Nullable` or
 the server's `DataTypeMap::isValidKeyType`.
 
 The name-decoration aliases `SimpleAggregateFunction(func, T)`, the six geo
-types, and `Nested(name1 T1, ...)` are all fully supported, decode and encode
+types, `Geometry`, and `Nested(name1 T1, ...)` are all fully supported, decode and encode
 (see their type sections). They carry no new Column variant or body writer:
 every path resolves them to their physical delegate via
 `ChType::physical_delegate`. `Nullable`/`LowCardinality` of an alias is legal
