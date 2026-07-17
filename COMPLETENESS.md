@@ -47,22 +47,18 @@ point-in-time snapshot for the next agent, not a changelog. Keep it short. Alway
 include a "Recommended next" with a one-line reason, so the next agent has a
 default; the user may override it.
 
-- **Last updated:** 2026-07-17. `Geometry` is complete at decode/encode parity
-  against `v26.6.1.1193-stable`. `ChType::Geometry` preserves the custom name
-  and delegates physically to the canonical
-  `Variant(LineString, MultiLineString, MultiPolygon, Point, Polygon, Ring)`
-  with discriminators 0 through 5 and 255 for NULL. Decode, streaming scan,
-  encode validation/writing, zero-row construction, and Arrow export all reuse
-  the existing Variant path. There is no Geometry-specific per-row work, copy,
-  remap, or Column variant. Binary type headers use Custom tag 0x2c plus
-  `Geometry`. The generic Custom name is reparsed at fresh text depth, matching
-  the server, then complete-type validation and encode both charge Geometry's
-  five physical levels under the crate's aggregate depth cap.
-  Unit coverage includes every alternative, NULL, zero rows, multi-block,
-  rev0/rev54485 encode round-trips, exact header bytes, and Arrow Dense Union
-  schema/buffers. The recaptured all_types fixtures add plain `Geometry` plus
-  `Array(Geometry)` with all six alternatives and NULL, and live Native INSERT
-  round-trips through the pinned server.
+- **Last updated:** 2026-07-17. `QBit(T, N)` is complete at decode/encode parity
+  against `v26.6.1.1193-stable`, completing the registered type set at the pin.
+  `T` is `BFloat16`, `Float32`, or `Float64`; `N` is 1 through 134,217,720.
+  Native stores one MSB-first, bit-transposed FixedString plane per scalar bit,
+  while `QBitColumn` materializes one row-major primitive child and exports it
+  as Arrow FixedSizeList. Decode allocates only the final scalar buffer. Encode
+  writes the transposed planes directly into the final output allocation and
+  canonicalizes unused padding bits to zero. Nullable validity stays at the
+  vector level. Text and binary type headers, streaming scan, zero rows,
+  RowBinary single values, all legal scalar widths, malformed inputs, Arrow
+  export, both Native protocol revisions, refreshed real-server fixtures, and a
+  live Native INSERT round trip are covered.
 - **AggregateFunction checkpoint:** decode, encode, streaming, Arrow LargeBinary
   export, real-server fixtures, and live INSERT coverage are complete for exact
   base `count` with zero or one argument, canonical
@@ -85,16 +81,16 @@ default; the user may override it.
   `encode_block` allocation as material. Further open-ended
   `AggregateFunction` work also remains paused because each signature needs a
   separately confirmed unframed state-boundary codec.
-- **Recommended next:** `QBit(T, N)`. It is the only unchecked registered type
-  at the pinned tag; confirm `SerializationQBit` through the server-reader before
-  implementing its isolated bit-transposed layout.
-- **After that:** resolve sparse column serialization before opening the binding
-  POC to outside workloads. Its marker can reach ordinary queries at negotiated
-  revisions >= 54454 and the decoder currently rejects it.
-- **Key references:** Geometry's wire, Arrow, binary-header, and encode contract
-  is in `CODEC_CONTRACT.md`. The logical delegate is in `src/schema.rs`; parser,
-  binary descriptor, decode/scan, and encode paths are under `src/native/`; Arrow
-  export is in `src/ffi/`; real-server coverage is in `scripts/gen_fixtures.sh`,
+- **Recommended next:** resolve sparse column serialization. Its marker can
+  reach ordinary queries at negotiated revisions >= 54454 and the decoder
+  currently rejects it.
+- **After that:** wire the existing compression work into an explicitly scoped
+  transport path, or begin the binding POC against real workloads.
+- **Key references:** QBit's wire, Arrow, binary-header, RowBinary, and encode
+  contract is in `CODEC_CONTRACT.md`. The logical and column models are in
+  `src/schema.rs` and `src/column.rs`; parser, binary descriptor, decode/scan,
+  RowBinary, and encode paths are under `src/native/`; Arrow export is in
+  `src/ffi/`; real-server coverage is in `scripts/gen_fixtures.sh`,
   `tests/integration.rs`, and `tests/live_insert.rs`.
 
 ---
@@ -174,6 +170,7 @@ is not done, and must not be checked off, until all of these hold:
 - [x] `UInt8`, `UInt16`, `UInt32`, `UInt64`
 - [x] `Float32`, `Float64`
 - [x] `BFloat16`
+- [x] `QBit(BFloat16|Float32|Float64, N)`
 - [x] `String`
 - [x] `FixedString(N)`
 - [x] `UUID`, `IPv4`, `IPv6`
@@ -665,15 +662,21 @@ where the across-release churn lives.
       compose. Unit plain/NULL/zero-row/multi-block/encode/Arrow/binary-depth
       coverage, all_types real fixtures (including all alternatives through
       `Array(Geometry)`), and live INSERT are green.
-- [ ] `QBit(T, N)` - quantized bit-packed vector type, parametric over a
-      `BFloat16`/`Float32`/`Float64` element type and a dimension count. GA at
-      v26.6.1.1193-stable (the `allow_experimental_qbit_type` gate is now an
-      obsolete no-op; CHANGELOG confirms the GA transition). Wire layout
-      (`SerializationQBit`) is NOT yet examined - needs a dedicated
-      `clickhouse-server-reader` read of `SerializationQBit.cpp` before tiering it
-      for implementation. Deprioritized to last or on-demand per the 2026-07-15
-      path decision: small and isolated, but niche relative to the
-      Variant/Dynamic/JSON family for real-workload POC testing.
+- [x] `QBit(T, N)` - complete at decode/encode parity at
+      v26.6.1.1193-stable for `T` in BFloat16/Float32/Float64 and dimension
+      `N` in 1..=134,217,720. Native bulk is `bit_width(T)` bit-transposed
+      FixedString planes, MSB first; the public `QBitColumn` is one row-major
+      primitive child with N values per row and optional vector-level validity,
+      exported as Arrow FixedSizeList. Decode and encode each allocate only the
+      final destination buffer and perform no per-value heap allocation.
+      Text/binary type headers, RowBinary single values, zero rows, Nullable,
+      multi-block streaming, exact transpose bytes, all legal scalar widths,
+      malformed public buffers, Arrow schema/buffers, recaptured real-server
+      fixtures, and live INSERT are covered. The server introduced QBit as
+      experimental in 25.10, promoted it to Beta and enabled it by default in
+      26.1, and made it GA in 26.2. ClickHouse 26.4 changed single-value binary
+      serialization to explicit little-endian order; the pinned Native bulk
+      call graph has no corresponding version branch.
 
 ---
 
@@ -1069,10 +1072,9 @@ outcome in `CODEC_CONTRACT.md`.
       corrections folded into the tiers above:
       (1) the "(confirm at pin)" flags are resolved - `BFloat16`, `Time`, and
       `Time64` all exist and are stable, with wire layouts recorded;
-      (2) two registered types were missing from the tiers and have been added to
-      Tier 3 - `Geometry` (= `Variant(...)`, alias `GEOMETRY`) and `QBit(T, N)`
-      (GA; its `SerializationQBit` wire layout is still unexamined, flagged before
-      tiering for implementation);
+      (2) two registered types were missing from the tiers and were added to
+      Tier 3 - `Geometry` (= `Variant(...)`, alias `GEOMETRY`) and `QBit(T, N)`;
+      both are now complete at decode/encode parity;
       (3) legacy `Object('json')` is NOT registered at this pin (only the obsolete
       `allow_experimental_object_type` setting remains) - marked do-not-implement;
       (4) every `allow_experimental_*` gate for the Tier 2/3 newest types

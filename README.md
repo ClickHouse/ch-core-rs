@@ -120,7 +120,6 @@ Not implemented yet:
 
 - TCP/native protocol packet framing.
 - Compression framing.
-- `QBit` type.
 - Language-specific materialization policy (bindings own this, by design).
 
 ## Supported types
@@ -129,6 +128,7 @@ Not implemented yet:
 - `Int8`, `Int16`, `Int32`, `Int64`
 - `UInt8`, `UInt16`, `UInt32`, `UInt64`
 - `Float32`, `Float64`, `BFloat16`
+- `QBit(BFloat16|Float32|Float64, N)`
 - `Nothing`
 - `String`
 - `FixedString(N)`
@@ -156,7 +156,7 @@ Unsupported types raise a decode error rather than guessing.
 
 In rough priority order:
 
-1. Type coverage: `QBit`.
+1. Sparse column serialization.
 2. Compression framing: LZ4, then ZSTD.
 3. Per-runtime zero-copy adapters: JS `TypedArray` over an external
    `ArrayBuffer`, NumPy export that does not route through Arrow.

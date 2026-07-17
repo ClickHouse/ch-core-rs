@@ -4,7 +4,8 @@ use ch_core_rs::column::{
 };
 use ch_core_rs::native::decode::{decode_all_bytes, DecodeOptions, DBMS_TCP_PROTOCOL_VERSION};
 use ch_core_rs::schema::{
-    ChType, GeoKind, IntervalKind, JSON_DEFAULT_MAX_DYNAMIC_PATHS, JSON_DEFAULT_MAX_DYNAMIC_TYPES,
+    ChType, GeoKind, IntervalKind, QBitElementType, JSON_DEFAULT_MAX_DYNAMIC_PATHS,
+    JSON_DEFAULT_MAX_DYNAMIC_TYPES,
 };
 
 /// Build the expected `ChType::Json` for a fixture column. `max_dynamic_types`
@@ -682,6 +683,34 @@ fn assert_all_types(batch: &ChunkedBatch) {
             ),
             Expected::Exact("geometry", ChType::Geometry),
             Expected::Exact("geometry_all", ChType::Array(Box::new(ChType::Geometry))),
+            Expected::Exact(
+                "qbit_bf",
+                ChType::QBit {
+                    element_type: QBitElementType::BFloat16,
+                    dimension: 3,
+                },
+            ),
+            Expected::Exact(
+                "qbit_f32",
+                ChType::QBit {
+                    element_type: QBitElementType::Float32,
+                    dimension: 9,
+                },
+            ),
+            Expected::Exact(
+                "qbit_f64",
+                ChType::QBit {
+                    element_type: QBitElementType::Float64,
+                    dimension: 2,
+                },
+            ),
+            Expected::Exact(
+                "qbit_nullable",
+                ChType::Nullable(Box::new(ChType::QBit {
+                    element_type: QBitElementType::Float32,
+                    dimension: 2,
+                })),
+            ),
         ],
     );
 
@@ -2077,6 +2106,80 @@ fn assert_all_types(batch: &ChunkedBatch) {
     assert_eq!(geometry_first_x(&geometry_all.variants[3], 0), 7.0);
     assert_eq!(geometry_first_x(&geometry_all.variants[4], 2), 9.0);
     assert_eq!(geometry_first_x(&geometry_all.variants[5], 1), 11.0);
+
+    // QBit (cols 111-114): these bytes come from the pinned real server, so
+    // they independently ground the bit-plane order and the row-major scalar
+    // materialization used by the synthetic transpose tests.
+    let qbit_bf = as_qbit(block.column(111));
+    assert_eq!(qbit_bf.dimension, 3);
+    assert_bfloat16_bits(
+        qbit_bf.values.as_ref(),
+        &[
+            0x3fc0, 0xc020, 0x4150, 0x3fc0, 0xc020, 0x4160, 0x3fc0, 0xc020, 0x4170, 0x3fc0, 0xc020,
+            0x4180,
+        ],
+    );
+
+    let qbit_f32 = as_qbit(block.column(112));
+    assert_eq!(qbit_f32.dimension, 9);
+    match qbit_f32.values.as_ref() {
+        Column::Float32(c) => {
+            let expected = (0..4)
+                .flat_map(|n| {
+                    [
+                        n as f32,
+                        -1.25,
+                        0.0,
+                        3.5,
+                        79.125,
+                        -0.0,
+                        13.0,
+                        -2.5,
+                        (n + 1) as f32,
+                    ]
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                c.values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
+        other => panic!("expected QBit Float32 child, got {other:?}"),
+    }
+
+    let qbit_f64 = as_qbit(block.column(113));
+    assert_eq!(qbit_f64.dimension, 2);
+    match qbit_f64.values.as_ref() {
+        Column::Float64(c) => assert_eq!(
+            c.values,
+            vec![0.5, -13.0, 1.5, -14.0, 2.5, -15.0, 3.5, -16.0]
+        ),
+        other => panic!("expected QBit Float64 child, got {other:?}"),
+    }
+
+    let qbit_nullable = as_qbit(block.column(114));
+    assert_eq!(qbit_nullable.dimension, 2);
+    let validity = qbit_nullable
+        .validity
+        .as_ref()
+        .expect("Nullable(QBit) validity");
+    assert_eq!(
+        (0..4).map(|row| validity.is_valid(row)).collect::<Vec<_>>(),
+        vec![true, false, true, false]
+    );
+    match qbit_nullable.values.as_ref() {
+        Column::Float32(c) => {
+            assert_eq!(c.values[0..2], [13.0, -0.25]);
+            assert_eq!(c.values[4..6], [79.0, -2.25]);
+        }
+        other => panic!("expected nullable QBit Float32 child, got {other:?}"),
+    }
 }
 
 /// Borrow a decoded `JsonColumn`, panicking with a useful message otherwise.
@@ -2142,6 +2245,14 @@ fn as_array(column: &Column) -> &ch_core_rs::column::ArrayColumn {
     match column {
         Column::Array(a) => a,
         other => panic!("expected Array, got {other:?}"),
+    }
+}
+
+/// Borrow the physical FixedSizeList-like QBit column.
+fn as_qbit(column: &Column) -> &ch_core_rs::column::QBitColumn {
+    match column {
+        Column::QBit(qbit) => qbit,
+        other => panic!("expected QBit, got {other:?}"),
     }
 }
 

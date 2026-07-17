@@ -258,6 +258,7 @@ than an error.
 | `Float32`                                                                              | `Float32`                              | `Float32`         | `f`                                                                 | validity, values                           | yes                                                      |
 | `Float64`                                                                              | `Float64`                              | `Float64`         | `g`                                                                 | validity, values                           | yes                                                      |
 | `BFloat16`                                                                             | `BFloat16`                             | `BFloat16`        | `w:2`                                                               | validity, data                             | yes                                                      |
+| `QBit(T, N)` for `T` = `BFloat16`/`Float32`/`Float64`                                  | `QBit { element_type, dimension }`     | `QBit`            | `+w:N` (FixedSizeList; scalar child format follows `T`)              | validity (+ one row-major scalar child)    | yes                                                      |
 | `Nothing`                                                                              | `Nothing`                              | `Nothing`         | `n`                                                                 | none                                       | yes                                                      |
 | `String`                                                                               | `String`                               | `Utf8`            | `u`                                                                 | validity, offsets, data                    | yes                                                      |
 | `FixedString(N)`                                                                       | `FixedString(N)`                       | `FixedBinary`     | `w:N`                                                               | validity, data                             | yes                                                      |
@@ -480,6 +481,109 @@ and `src/DataTypes/DataTypeMap.cpp`. The raw width and byte order are also
 covered by server tests `03269_bf16` and `03733_sparse_negative_zero`. All wire,
 wrapper, and key claims above are confirmed at `v26.6.1.1193-stable`; only the
 exact introduction release is inferred.
+
+### QBit
+
+**Type string(s):** canonical `QBit(T, N)`, where `T` is `BFloat16`,
+`Float32`, or `Float64`, and `N` is an unsigned dimension in
+`1..=134217720`. The server also accepts the case-insensitive scalar aliases
+`FLOAT`, `REAL`, and `SINGLE` for `Float32`, and `DOUBLE` and
+`DOUBLE PRECISION` for `Float64`; `ChType::Display` always emits the canonical
+scalar name and a comma followed by one space. The dimension limit follows the
+server's internal `FixedString(ceil(N / 8))` representation and its maximum
+FixedString width of `0x00ffffff` bytes.
+
+**Logical type:** `ChType::QBit { element_type: QBitElementType, dimension }`.
+
+**Native bulk wire payload:** let `R = num_rows`, `B` be the scalar bit width
+(16, 32, or 64), and `K = ceil(N / 8)`. The body is exactly `B * R * K` bytes
+with no QBit-specific prefix, suffix, per-row dimension, or offsets. It is
+ordered as B complete bit planes. Within plane `p`, each row contributes one
+K-byte FixedString. Plane `p` carries scalar word bit `B - 1 - p`, so the sign
+bit is first. Logical element `i` is stored at physical byte
+`K - 1 - floor(i / 8)`, bit `i % 8`. Thus the last physical byte holds logical
+elements 0 through 7. Each Native block transposes independently, and a zero-row
+block has no body.
+
+Decode performs the inverse transpose once into exact row-major scalar words.
+All bit patterns are preserved, including signed zero, subnormals, infinities,
+and NaN payloads. Unused padding bits in the first physical byte are ignored.
+This tolerance is part of the decode contract: Native bulk readers must accept
+nonzero padding even though every confirmed server write path and this crate's
+encoder produce canonical zero padding. A valid but noncanonical input therefore
+decodes normally and re-encodes to the canonical zero-padded body.
+
+**Nullable:** `Nullable(QBit(T, N))` writes the ordinary `R`-byte ClickHouse
+null map first, then the complete QBit body for all R rows, including null rows.
+The validity bitmap belongs to the whole vector. Nested scalar values for a null
+row are placeholders and must not be interpreted.
+
+**Rust buffer:** `Column::QBit(QBitColumn)` contains `dimension`, optional
+vector-level validity, and one boxed row-major scalar child with exactly
+`R * N` values. The child is `Column::BFloat16`, `Column::Float32`, or
+`Column::Float64` and has no child validity. Decode allocates only that final
+scalar vector, then reconstructs up to eight rows from one plane byte at a time;
+there are no intermediate planes and no per-value heap allocations. Encode
+reserves the final Native body in the destination and writes the transposed
+bytes directly, also without an intermediate plane buffer.
+
+**Arrow export:** format `+w:N` (FixedSizeList(N)), with one parent validity
+buffer and one child named `item`. The child length is `R * N`; its format is
+`w:2` for BFloat16, `f` for Float32, or `g` for Float64, with the usual child
+validity and values buffers. Child validity is always null. Parent and child
+buffers borrow the decoded allocations through the existing Arrow C Data
+ownership model, so export is zero-copy and does not transpose again. A
+zero-row QBit still exports its one empty scalar child.
+
+**Binary type descriptor and single values:** the binary Native type header is
+tag `0x36`, followed by the recursive scalar descriptor and `N` as VarUInt.
+For example, `QBit(Float32, 9)` is `36 0d 09`, and
+`QBit(Float64, 300)` is `36 0e ac 02`. The single-value binary form used by
+RowBinary and SharedVariant is different from Native bulk: it writes `N` as
+VarUInt followed by N ordinary little-endian scalar values. The decoder requires
+that in-band dimension to equal the declared type. Because a null single value
+has no nested payload bytes but Arrow-shaped output still needs placeholders,
+`decode_binary_value` caps cumulative null-default materialization at 16 MiB per
+call. This preserves a maximum-width `FixedString` placeholder. It intentionally
+rejects a null QBit when its dimension exceeds 2,097,152 for `Float64`,
+4,194,304 for `Float32`, or 8,388,608 for `BFloat16`, even when that dimension
+and value are otherwise well-formed. Top-level `Nullable(QBit(...))` cannot be a
+SharedVariant cell because Variant forbids an outer Nullable type and Dynamic
+uses its null discriminator instead. Nested forms remain reachable, for example
+an `Array(Nullable(QBit(...)))` cell, so their cumulative placeholder expansion
+is subject to the same cap and returns `Invalid` when exceeded.
+
+**Wrappers and containers:** `Nullable(QBit(...))` is legal.
+`LowCardinality(QBit(...))` is forbidden because QBit cannot be inside
+LowCardinality. QBit composes directly in `Array`, `Tuple`, `Variant`, Dynamic,
+and as a non-null Map key or value. The generic Map rule still forbids a
+nullable QBit key.
+
+**Introduction and compatibility:** QBit was introduced as experimental in
+ClickHouse 25.10, promoted to Beta and enabled by default in 26.1, and became GA
+in 26.2. ClickHouse 26.4 records a backward-incompatible change making QBit
+single-value binary serialization explicitly little-endian. The pinned call
+graph confirms that Native bulk continues to use the FixedString plane path with
+no protocol-revision or server-version branch; the 26.4 endian helpers apply
+only to single-value and text paths, not Native bulk.
+
+**Server reference:** all Native bulk, type grammar, descriptor, range, and
+wrapper claims above are **confirmed** at `v26.6.1.1193-stable` from
+`DataTypeQBit::create`, `DataTypeQBit::doGetName`, and
+`registerDataTypeQBit` in `src/DataTypes/DataTypeQBit.{h,cpp}`;
+`SerializationQBit::serializeBinaryBulkWithMultipleStreams`,
+`deserializeBinaryBulkWithMultipleStreams`, `transposeBits`,
+`serializeFloatsFromQBit`, `serializeBinary`, and `deserializeBinary` in
+`src/DataTypes/Serializations/SerializationQBit.{h,cpp}`;
+`SerializationTuple` and `SerializationFixedString` bulk methods in the same
+directory; `SerializationNullable` for null-map order; `ColumnQBit` in
+`src/Columns/ColumnQBit.{h,cpp}`; `NativeWriter` and `NativeReader` in
+`src/Formats/`; and `DataTypesBinaryEncoding.{h,cpp}`. Release milestones are
+confirmed by `docs/changelogs/v25.10.1.3832-stable.md`,
+`v26.1.1.912-stable.md`, `v26.2.1.1139-stable.md`, and
+`v26.4.1.1141-stable.md`, with setting transitions in
+`src/Core/SettingsChangesHistory.cpp` and obsolete settings at the pin in
+`src/Core/Settings.cpp`.
 
 ### Bool
 
@@ -2520,7 +2624,8 @@ defensive fall-through that validation already rules out.
 Encode coverage is kept a subset of decode coverage and grows the same
 one-type-at-a-time way; the two are currently at parity.
 Encodable today: `Nothing`, `Bool`, the fixed-width numerics (`Int8`..`Int64`,
-`UInt8`..`UInt64`, `Float32`, `Float64`, `BFloat16`), the temporals (`Date`, `Date32`,
+`UInt8`..`UInt64`, `Float32`, `Float64`, `BFloat16`), `QBit(T, N)` over each
+legal scalar type, the temporals (`Date`, `Date32`,
 `DateTime`, `DateTime64`, `Time`, `Time64`, and every `Interval*`), `UUID`,
 `IPv4`, `IPv6`, `String`,
 `FixedString(N)`,
@@ -2635,6 +2740,12 @@ would never produce.
   number of bytes on the wire. The four wide-int types map 1:1 to their `Column`
   variants, so an `Int128` type over a `UInt128` buffer (both width 16) is a
   mismatched-variant `InconsistentBatch`, caught before any bytes are written.
+- **QBit.** The declared dimension is nonzero and within the server's
+  FixedString-derived limit; the `QBitColumn` repeats that exact dimension; its
+  child variant matches the declared scalar type, has no child validity, and
+  contains exactly `num_rows * dimension` values; and all plane and body byte
+  counts fit `usize`. The per-plane `num_rows * ceil(dimension / 8)` byte count
+  may not exceed the server's 1 GiB FixedString bulk limit.
 - **Decimal.** `scale <= precision`, `precision` in `1..=76`, the column's
   `precision`/`scale`/`width` agree with the type, and the width is derived from
   precision (not trusted from `ChType`'s `bits`), with data length exactly
@@ -2837,6 +2948,9 @@ directly (`empty_column` in `src/native/decode/mod.rs`), the empty shapes are:
   retains an empty validity bitmap. Both have `null_count == 0`.
 - `BFloat16`: empty `[u8; 2]` values buffer with its distinct BFloat16 logical
   and Column tags.
+- `QBit(T, N)`: the dimension is preserved, the parent has length 0 and optional
+  empty validity, and its one scalar child has length 0 with the variant selected
+  by T.
 - `String`: `offsets == [0]` (length 1, the required leading zero) and empty
   data.
 - `FixedString(N)`: empty data, width preserved. `UUID` and `IPv6` are the same

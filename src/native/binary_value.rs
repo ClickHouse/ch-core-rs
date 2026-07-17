@@ -8,6 +8,7 @@
 //!   little-endian fixed-width bytes, the same per-value bytes as the bulk
 //!   body (UUID keeps the bulk swapped-64-bit-halves layout verbatim).
 //! - String: VarUInt length + raw bytes. FixedString(N): exactly N bytes.
+//!   QBit(T, N): VarUInt N followed by N ordinary little-endian T values.
 //! - Array: VarUInt count + each element recursively. Map: VarUInt pair
 //!   count + per pair key then value. Tuple: elements back-to-back, no
 //!   count (`Tuple()` is zero bytes, unlike its one-byte-per-row bulk form).
@@ -20,7 +21,7 @@
 //!
 //! `Variant`, `Dynamic`, and `AggregateFunction` values (an opaque
 //! per-function state) have no decoding here and report `Unsupported`, as do
-//! descriptors the crate does not parse (JSON, QBit), so a caller can keep
+//! descriptors the crate does not parse (JSON), so a caller can keep
 //! those cells as raw bytes. Truncated payloads and trailing bytes after the
 //! value are `Invalid`.
 
@@ -29,7 +30,7 @@ use std::io;
 use crate::bitmap::Bitmap;
 use crate::column::{
     ArrayColumn, BoolColumn, Column, DecimalColumn, FixedBinaryColumn, MapColumn, NothingColumn,
-    PrimitiveColumn, TupleColumn, Utf8Column,
+    PrimitiveColumn, QBitColumn, TupleColumn, Utf8Column,
 };
 use crate::native::type_binary::{read_binary_type, BinaryTypeError};
 use crate::native::varint::ByteReader;
@@ -39,11 +40,44 @@ use crate::schema::ChType;
 /// (`Tuple()`, `Nothing`); every other count is bounded by the bytes present.
 const MAX_ZERO_WIDTH_ELEMENTS: usize = 1_000_000;
 
+/// Maximum cumulative logical buffer bytes materialized for null placeholders
+/// while decoding one single value.
+///
+/// A Nullable single value carries only its one-byte null flag, but Arrow-shaped
+/// output still needs the inner type's placeholder buffers. Keep the cap at 16
+/// MiB so one maximum-width `FixedString(0x00ff_ffff)` remains representable,
+/// while nested containers cannot amplify a few null flags into unbounded QBit
+/// or FixedString allocations.
+const MAX_NULL_DEFAULT_BYTES: usize = 1 << 24;
+
+struct NullDefaultBudget {
+    remaining: usize,
+}
+
+impl NullDefaultBudget {
+    fn new() -> Self {
+        Self {
+            remaining: MAX_NULL_DEFAULT_BYTES,
+        }
+    }
+
+    fn charge(&mut self, bytes: usize) -> Result<(), BinaryValueError> {
+        if bytes > self.remaining {
+            return Err(BinaryValueError::Invalid(format!(
+                "null placeholder expansion exceeds the {MAX_NULL_DEFAULT_BYTES}-byte per-value limit"
+            )));
+        }
+        self.remaining -= bytes;
+        Ok(())
+    }
+}
+
 /// Errors from single-value binary decoding.
 #[derive(Debug)]
 pub enum BinaryValueError {
-    /// The payload disagrees with the descriptor: truncated, trailing bytes,
-    /// an out-of-range count, or an illegal type shape.
+    /// The value violates the decoding contract: truncated or trailing bytes,
+    /// a descriptor mismatch, an out-of-range count, an illegal type shape, or
+    /// a decoder resource limit.
     Invalid(String),
     /// The type has no defined or implemented single-value decoding.
     Unsupported(String),
@@ -78,7 +112,7 @@ impl std::error::Error for BinaryValueError {}
 ///
 /// Returns the type and the number of descriptor bytes consumed, so the caller
 /// can hand the rest of the cell to [`decode_binary_value`]. An unparseable
-/// server type (JSON, QBit, Set, Function) is `Unsupported`; a malformed
+/// server type (JSON, Set, Function) is `Unsupported`; a malformed
 /// descriptor is `Invalid`.
 pub fn read_binary_type_prefix(bytes: &[u8]) -> Result<(ChType, usize), BinaryValueError> {
     let mut reader = ByteReader::new(bytes);
@@ -93,11 +127,13 @@ pub fn read_binary_type_prefix(bytes: &[u8]) -> Result<(ChType, usize), BinaryVa
 /// Decode exactly one `serializeBinary` value of `ch_type` from `bytes` into a
 /// one-row [`Column`], the same column shape the bulk decoder builds for that
 /// type. `bytes` must contain the value and nothing else: truncation and
-/// trailing bytes are both `Invalid`.
+/// trailing bytes are both `Invalid`. Null placeholders that have no backing
+/// value bytes share a cumulative 16 MiB materialization budget for this call.
 pub fn decode_binary_value(ch_type: &ChType, bytes: &[u8]) -> Result<Column, BinaryValueError> {
     let mut builder = ValueBuilder::new(ch_type)?;
     let mut reader = ByteReader::new(bytes);
-    builder.append_value(&mut reader)?;
+    let mut null_budget = NullDefaultBudget::new();
+    builder.append_value(&mut reader, &mut null_budget)?;
     if reader.remaining() != 0 {
         return Err(BinaryValueError::Invalid(format!(
             "{} trailing bytes after the value",
@@ -183,6 +219,10 @@ enum ValueBuilder {
     Float32(Vec<f32>),
     Float64(Vec<f64>),
     BFloat16(Vec<[u8; 2]>),
+    QBit {
+        values: Box<ValueBuilder>,
+        dimension: usize,
+    },
     Date(Vec<u16>),
     Date32(Vec<i32>),
     DateTime(Vec<u32>),
@@ -249,6 +289,13 @@ impl ValueBuilder {
             ChType::Float32 => Self::Float32(Vec::new()),
             ChType::Float64 => Self::Float64(Vec::new()),
             ChType::BFloat16 => Self::BFloat16(Vec::new()),
+            ChType::QBit {
+                element_type,
+                dimension,
+            } => Self::QBit {
+                values: Box::new(Self::new(&element_type.ch_type())?),
+                dimension: *dimension,
+            },
             ChType::Date => Self::Date(Vec::new()),
             ChType::Date32 => Self::Date32(Vec::new()),
             ChType::DateTime { .. } => Self::DateTime(Vec::new()),
@@ -340,7 +387,11 @@ impl ValueBuilder {
     }
 
     /// Append one value from the reader.
-    fn append_value(&mut self, reader: &mut ByteReader) -> Result<(), BinaryValueError> {
+    fn append_value(
+        &mut self,
+        reader: &mut ByteReader,
+        null_budget: &mut NullDefaultBudget,
+    ) -> Result<(), BinaryValueError> {
         match self {
             // The server cannot serialize a Nothing value; only null rows
             // (which take the default path) are representable.
@@ -359,6 +410,19 @@ impl ValueBuilder {
             ValueBuilder::Float32(values) => values.push(f32::from_le_bytes(read_le(reader)?)),
             ValueBuilder::Float64(values) => values.push(f64::from_le_bytes(read_le(reader)?)),
             ValueBuilder::BFloat16(values) => values.push(read_le(reader)?),
+            ValueBuilder::QBit { values, dimension } => {
+                let encoded_dimension = usize::try_from(reader.read_varint()?).map_err(|_| {
+                    BinaryValueError::Invalid("QBit value dimension overflows usize".into())
+                })?;
+                if encoded_dimension != *dimension {
+                    return Err(BinaryValueError::Invalid(format!(
+                        "QBit value dimension {encoded_dimension} does not match type dimension {dimension}"
+                    )));
+                }
+                for _ in 0..*dimension {
+                    values.append_value(reader, null_budget)?;
+                }
+            }
             ValueBuilder::Date(values) => values.push(u16::from_le_bytes(read_le(reader)?)),
             ValueBuilder::Date32(values) => values.push(i32::from_le_bytes(read_le(reader)?)),
             ValueBuilder::DateTime(values) => values.push(u32::from_le_bytes(read_le(reader)?)),
@@ -393,10 +457,10 @@ impl ValueBuilder {
                 // Mirror the bulk null map: nonzero = null, no value bytes.
                 if reader.read_u8()? != 0 {
                     flags.push(1);
-                    inner.append_default();
+                    inner.append_default(null_budget)?;
                 } else {
                     flags.push(0);
-                    inner.append_value(reader)?;
+                    inner.append_value(reader, null_budget)?;
                 }
             }
             ValueBuilder::Array {
@@ -406,7 +470,7 @@ impl ValueBuilder {
             } => {
                 let count = read_element_count(reader, *zero_width, "Array element")?;
                 for _ in 0..count {
-                    elements.append_value(reader)?;
+                    elements.append_value(reader, null_budget)?;
                 }
                 push_end_offset(offsets, count)?;
             }
@@ -418,14 +482,14 @@ impl ValueBuilder {
             } => {
                 let count = read_element_count(reader, *zero_width, "Map entry")?;
                 for _ in 0..count {
-                    keys.append_value(reader)?;
-                    values.append_value(reader)?;
+                    keys.append_value(reader, null_budget)?;
+                    values.append_value(reader, null_budget)?;
                 }
                 push_end_offset(offsets, count)?;
             }
             ValueBuilder::Tuple { fields, rows } => {
                 for field in fields.iter_mut() {
-                    field.append_value(reader)?;
+                    field.append_value(reader, null_budget)?;
                 }
                 *rows += 1;
             }
@@ -435,52 +499,151 @@ impl ValueBuilder {
 
     /// Append the type's default placeholder for a null row, matching the
     /// placeholder values the bulk decoder stores under a null map bit.
-    fn append_default(&mut self) {
+    fn append_default(
+        &mut self,
+        null_budget: &mut NullDefaultBudget,
+    ) -> Result<(), BinaryValueError> {
         match self {
             ValueBuilder::Nothing { rows } => *rows += 1,
-            ValueBuilder::Bool(values) => values.push(0),
-            ValueBuilder::Int8(values) => values.push(0),
-            ValueBuilder::Int16(values) => values.push(0),
-            ValueBuilder::Int32(values) => values.push(0),
-            ValueBuilder::Int64(values) => values.push(0),
-            ValueBuilder::UInt8(values) => values.push(0),
-            ValueBuilder::UInt16(values) => values.push(0),
-            ValueBuilder::UInt32(values) => values.push(0),
-            ValueBuilder::UInt64(values) => values.push(0),
-            ValueBuilder::Float32(values) => values.push(0.0),
-            ValueBuilder::Float64(values) => values.push(0.0),
-            ValueBuilder::BFloat16(values) => values.push([0; 2]),
-            ValueBuilder::Date(values) => values.push(0),
-            ValueBuilder::Date32(values) => values.push(0),
-            ValueBuilder::DateTime(values) => values.push(0),
-            ValueBuilder::DateTime64(values) => values.push(0),
-            ValueBuilder::Time(values) => values.push(0),
-            ValueBuilder::Time64(values) => values.push(0),
-            ValueBuilder::Interval(values) => values.push(0),
-            ValueBuilder::Enum8(values) => values.push(0),
-            ValueBuilder::Enum16(values) => values.push(0),
-            ValueBuilder::Ipv4(values) => values.push(0),
+            ValueBuilder::Bool(values) => {
+                null_budget.charge(1)?;
+                values.push(0);
+            }
+            ValueBuilder::Int8(values) => {
+                null_budget.charge(1)?;
+                values.push(0);
+            }
+            ValueBuilder::Int16(values) => {
+                null_budget.charge(2)?;
+                values.push(0);
+            }
+            ValueBuilder::Int32(values) => {
+                null_budget.charge(4)?;
+                values.push(0);
+            }
+            ValueBuilder::Int64(values) => {
+                null_budget.charge(8)?;
+                values.push(0);
+            }
+            ValueBuilder::UInt8(values) => {
+                null_budget.charge(1)?;
+                values.push(0);
+            }
+            ValueBuilder::UInt16(values) => {
+                null_budget.charge(2)?;
+                values.push(0);
+            }
+            ValueBuilder::UInt32(values) => {
+                null_budget.charge(4)?;
+                values.push(0);
+            }
+            ValueBuilder::UInt64(values) => {
+                null_budget.charge(8)?;
+                values.push(0);
+            }
+            ValueBuilder::Float32(values) => {
+                null_budget.charge(4)?;
+                values.push(0.0);
+            }
+            ValueBuilder::Float64(values) => {
+                null_budget.charge(8)?;
+                values.push(0.0);
+            }
+            ValueBuilder::BFloat16(values) => {
+                null_budget.charge(2)?;
+                values.push([0; 2]);
+            }
+            ValueBuilder::QBit { values, dimension } => {
+                let (bytes_per_value, len) = match values.as_mut() {
+                    ValueBuilder::BFloat16(values) => (2, values.len()),
+                    ValueBuilder::Float32(values) => (4, values.len()),
+                    ValueBuilder::Float64(values) => (8, values.len()),
+                    _ => unreachable!("QBit builder always contains its declared scalar type"),
+                };
+                let bytes = dimension.checked_mul(bytes_per_value).ok_or_else(|| {
+                    BinaryValueError::Invalid("QBit null placeholder size overflows usize".into())
+                })?;
+                null_budget.charge(bytes)?;
+                let new_len = len.checked_add(*dimension).ok_or_else(|| {
+                    BinaryValueError::Invalid("QBit null placeholder length overflows usize".into())
+                })?;
+                match values.as_mut() {
+                    ValueBuilder::BFloat16(values) => values.resize(new_len, [0; 2]),
+                    ValueBuilder::Float32(values) => values.resize(new_len, 0.0),
+                    ValueBuilder::Float64(values) => values.resize(new_len, 0.0),
+                    _ => unreachable!("QBit builder always contains its declared scalar type"),
+                }
+            }
+            ValueBuilder::Date(values) => {
+                null_budget.charge(2)?;
+                values.push(0);
+            }
+            ValueBuilder::Date32(values) => {
+                null_budget.charge(4)?;
+                values.push(0);
+            }
+            ValueBuilder::DateTime(values) => {
+                null_budget.charge(4)?;
+                values.push(0);
+            }
+            ValueBuilder::DateTime64(values) => {
+                null_budget.charge(8)?;
+                values.push(0);
+            }
+            ValueBuilder::Time(values) => {
+                null_budget.charge(4)?;
+                values.push(0);
+            }
+            ValueBuilder::Time64(values) => {
+                null_budget.charge(8)?;
+                values.push(0);
+            }
+            ValueBuilder::Interval(values) => {
+                null_budget.charge(8)?;
+                values.push(0);
+            }
+            ValueBuilder::Enum8(values) => {
+                null_budget.charge(1)?;
+                values.push(0);
+            }
+            ValueBuilder::Enum16(values) => {
+                null_budget.charge(2)?;
+                values.push(0);
+            }
+            ValueBuilder::Ipv4(values) => {
+                null_budget.charge(4)?;
+                values.push(0);
+            }
             ValueBuilder::Utf8 { offsets, .. } => {
+                null_budget.charge(4)?;
                 let last = *offsets.last().expect("offsets start with 0");
                 offsets.push(last);
             }
-            ValueBuilder::Fixed { data, width, .. } => data.resize(data.len() + *width, 0),
-            ValueBuilder::Decimal { data, width, .. } => data.resize(data.len() + *width, 0),
+            ValueBuilder::Fixed { data, width, .. } | ValueBuilder::Decimal { data, width, .. } => {
+                null_budget.charge(*width)?;
+                let new_len = data.len().checked_add(*width).ok_or_else(|| {
+                    BinaryValueError::Invalid("null placeholder length overflows usize".into())
+                })?;
+                data.resize(new_len, 0);
+            }
             ValueBuilder::Nullable { flags, inner } => {
+                null_budget.charge(1)?;
                 flags.push(1);
-                inner.append_default();
+                inner.append_default(null_budget)?;
             }
             ValueBuilder::Array { offsets, .. } | ValueBuilder::Map { offsets, .. } => {
+                null_budget.charge(8)?;
                 let last = *offsets.last().expect("offsets start with 0");
                 offsets.push(last);
             }
             ValueBuilder::Tuple { fields, rows } => {
                 for field in fields.iter_mut() {
-                    field.append_default();
+                    field.append_default(null_budget)?;
                 }
                 *rows += 1;
             }
         }
+        Ok(())
     }
 
     /// Consume the builder into a Column. `validity` is supplied only by the
@@ -516,6 +679,12 @@ impl ValueBuilder {
             ValueBuilder::BFloat16(values) => {
                 Column::BFloat16(PrimitiveColumn { values, validity })
             }
+            ValueBuilder::QBit { values, dimension } => Column::QBit(match validity {
+                Some(validity) => {
+                    QBitColumn::new_nullable(values.finish(None)?, dimension, validity)
+                }
+                None => QBitColumn::new(values.finish(None)?, dimension),
+            }),
             ValueBuilder::Date(values) => Column::Date(PrimitiveColumn { values, validity }),
             ValueBuilder::Date32(values) => Column::Date32(PrimitiveColumn { values, validity }),
             ValueBuilder::DateTime(values) => {
@@ -617,7 +786,7 @@ mod tests {
     use super::*;
     use crate::native::type_binary::write_binary_type;
     use crate::native::varint::write_varint;
-    use crate::schema::GeoKind;
+    use crate::schema::{GeoKind, QBitElementType};
 
     fn parse(name: &str) -> ChType {
         crate::native::type_parser::parse_ch_type(name).expect("test type parses")
@@ -661,6 +830,69 @@ mod tests {
             panic!("expected Bool")
         };
         assert!(c.get(0));
+    }
+
+    #[test]
+    fn decodes_qbit_single_value_row_binary_layout() {
+        // Single-value QBit is intentionally different from Native bulk: a
+        // VarUInt dimension followed by ordinary little-endian scalar values.
+        let mut bytes = varint(3);
+        bytes.extend_from_slice(&1.5f32.to_le_bytes());
+        bytes.extend_from_slice(&(-2.5f32).to_le_bytes());
+        bytes.extend_from_slice(&13f32.to_le_bytes());
+        let Column::QBit(qbit) = decode_binary_value(&parse("QBit(Float32, 3)"), &bytes).unwrap()
+        else {
+            panic!("expected QBit")
+        };
+        assert_eq!(qbit.dimension, 3);
+        let Column::Float32(values) = qbit.values.as_ref() else {
+            panic!("expected Float32 child")
+        };
+        assert_eq!(values.values, vec![1.5, -2.5, 13.0]);
+
+        let mut wrong_dimension = varint(2);
+        wrong_dimension.extend_from_slice(&[0; 12]);
+        assert!(matches!(
+            decode_binary_value(&parse("QBit(Float32, 3)"), &wrong_dimension),
+            Err(BinaryValueError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn nullable_qbit_null_defaults_are_cumulatively_bounded() {
+        let Column::QBit(qbit) =
+            decode_binary_value(&parse("Nullable(QBit(Float64, 3))"), &[1]).unwrap()
+        else {
+            panic!("expected QBit")
+        };
+        assert_eq!(qbit.null_count(), 1);
+        let Column::Float64(values) = qbit.values.as_ref() else {
+            panic!("expected Float64 child")
+        };
+        assert_eq!(values.values, vec![0.0; 3]);
+
+        let over_limit = ChType::Nullable(Box::new(ChType::QBit {
+            element_type: QBitElementType::Float64,
+            dimension: MAX_NULL_DEFAULT_BYTES / std::mem::size_of::<f64>() + 1,
+        }));
+        assert!(matches!(
+            decode_binary_value(&over_limit, &[1]),
+            Err(BinaryValueError::Invalid(ref reason))
+                if reason.contains("null placeholder expansion")
+        ));
+
+        // Two null QBits each require the entire budget. The first is legal,
+        // but the second must fail against the same per-call budget rather than
+        // multiplying one input flag into another 16 MiB allocation.
+        let cumulative = ChType::Array(Box::new(ChType::Nullable(Box::new(ChType::QBit {
+            element_type: QBitElementType::Float64,
+            dimension: MAX_NULL_DEFAULT_BYTES / std::mem::size_of::<f64>(),
+        }))));
+        assert!(matches!(
+            decode_binary_value(&cumulative, &[2, 1, 1]),
+            Err(BinaryValueError::Invalid(ref reason))
+                if reason.contains("null placeholder expansion")
+        ));
     }
 
     #[test]

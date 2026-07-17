@@ -747,6 +747,10 @@ fn arrow_format(ch_type: &ChType) -> String {
         // layout differs. Export the raw little-endian word honestly as
         // FixedSizeBinary(2), preserving every bit pattern without a copy.
         ChType::BFloat16 => "w:2".into(),
+        // QBit is exposed logically as one fixed-size vector per row. The
+        // element type is described by the single child schema; no offsets
+        // buffer exists for Arrow FixedSizeList.
+        ChType::QBit { dimension, .. } => format!("+w:{dimension}"),
         // Temporal export is zero-copy: never widen or rescale a buffer. Map to
         // a real Arrow temporal type only on an exact same-width match, else
         // expose the raw integer primitive.
@@ -1134,6 +1138,20 @@ unsafe fn write_field_schema_for_column(
     // top-level alias was already expanded and recursed above, so this only
     // matters for the one alias legal under `Nullable`, `Point`.
     match inner_type {
+        // QBit(T, N) is an Arrow FixedSizeList with one non-nullable scalar
+        // child. The decoder already materialized the Native bit planes into
+        // this row-major child, so schema export adds no conversion.
+        ChType::QBit { element_type, .. } => {
+            // Safety: an all-zero ArrowSchema is a valid initial value, and the
+            // recursive writer initializes every field before it is exposed.
+            let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+            let values = match column {
+                Some(Column::QBit(col)) => Some(col.values.as_ref()),
+                _ => None,
+            };
+            write_field_schema_for_column(child, "item", &element_type.ch_type(), values);
+            children.push(child);
+        }
         // An `Array(T)` LargeList field: one conventionally-named `item` child.
         ChType::Array(inner) => {
             // Safety: an all-zero `ArrowSchema` is a valid initial value, the same
@@ -1431,6 +1449,13 @@ unsafe fn write_field_schema_with_plan(
     };
     let mut children = Vec::new();
     match (inner_type, plan) {
+        (ChType::QBit { element_type, .. }, FieldExportPlan::Plain) => {
+            // Safety: an all-zero ArrowSchema is a valid initial value, and the
+            // recursive writer initializes every field before it is exposed.
+            let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
+            write_field_schema(child, "item", &element_type.ch_type());
+            children.push(child);
+        }
         (ChType::Array(inner), FieldExportPlan::Array(item_plan)) => {
             let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowSchema>()));
             write_field_schema_with_plan(child, "item", inner, item_plan);
@@ -1921,6 +1946,20 @@ unsafe fn export_one_column(batch: &Arc<ColBatch>, col: &Column, out: *mut Arrow
         Column::Float32(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
         Column::Float64(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
         Column::BFloat16(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
+        // Arrow FixedSizeList has one parent buffer (whole-vector validity) and
+        // one flattened child of length rows * dimension, with no offsets.
+        // The child borrows the row-major buffer produced by QBit decode.
+        Column::QBit(c) => {
+            match &c.validity {
+                Some(bm) => buffers.push(bm.as_bytes().as_ptr() as *const c_void),
+                None => buffers.push(ptr::null()),
+            }
+            // Safety: an all-zero ArrowArray is a valid initial value, and
+            // export_one_column initializes every field before it is exposed.
+            let child = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+            export_one_column(batch, &c.values, child);
+            children.push(child);
+        }
         Column::Date(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
         Column::Date32(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
         Column::DateTime(c) => push_primitive_buffers(&mut buffers, &c.values, &c.validity),
@@ -2520,6 +2559,27 @@ unsafe fn export_empty_column_with_plan(
         return;
     }
     match (ch_type, plan) {
+        (ChType::QBit { element_type, .. }, FieldExportPlan::Plain) => {
+            // Safety: an all-zero ArrowArray is a valid initial value, and the
+            // recursive exporter initializes every field before it is exposed.
+            let item = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
+            export_empty_column_with_plan(
+                batch,
+                &element_type.ch_type(),
+                &FieldExportPlan::Plain,
+                chunk,
+                item,
+            );
+            write_array_node(
+                batch,
+                out,
+                0,
+                0,
+                vec![ptr::null()],
+                vec![item],
+                ptr::null_mut(),
+            );
+        }
         (ChType::Array(inner), FieldExportPlan::Array(item_plan)) => {
             let item = Box::into_raw(Box::new(std::mem::zeroed::<ArrowArray>()));
             export_empty_column_with_plan(batch, inner, item_plan, chunk, item);

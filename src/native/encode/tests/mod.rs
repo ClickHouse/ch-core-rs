@@ -2,13 +2,13 @@ use super::*;
 use crate::bitmap::Bitmap;
 use crate::column::{
     AggregateStateColumn, DecimalColumn, DictionaryColumn, DynamicChild, JsonBody, NothingColumn,
-    PrimitiveColumn,
+    PrimitiveColumn, QBitColumn,
 };
 use crate::native::decode::{decode_all_bytes, DecodeOptions, DBMS_TCP_PROTOCOL_VERSION};
 use crate::native::encode::validate::type_depth;
 use crate::native::protocol::MAX_TYPE_DEPTH;
 use crate::native::type_parser::parse_ch_type;
-use crate::schema::{GeoKind, IntervalKind, Schema};
+use crate::schema::{GeoKind, IntervalKind, QBitElementType, Schema};
 
 mod aggregate_function;
 mod bfloat16;
@@ -22,6 +22,7 @@ mod low_cardinality;
 mod nothing;
 mod nullable;
 mod numeric;
+mod qbit;
 mod saf_geo;
 mod special;
 mod string;
@@ -115,6 +116,14 @@ fn assert_columns_eq(left: &Column, right: &Column, label: &str) {
         (Column::Float32(x), Column::Float32(y)) => eq!(x, y),
         (Column::Float64(x), Column::Float64(y)) => eq!(x, y),
         (Column::BFloat16(x), Column::BFloat16(y)) => eq!(x, y),
+        (Column::QBit(x), Column::QBit(y)) => {
+            assert_eq!(x.dimension, y.dimension, "{label} QBit dimension differs");
+            assert_columns_eq(
+                x.values.as_ref(),
+                y.values.as_ref(),
+                &format!("{label} values"),
+            );
+        }
         (Column::Date(x), Column::Date(y)) => eq!(x, y),
         (Column::Date32(x), Column::Date32(y)) => eq!(x, y),
         (Column::DateTime(x), Column::DateTime(y)) => eq!(x, y),

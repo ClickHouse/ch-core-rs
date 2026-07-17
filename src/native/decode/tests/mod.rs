@@ -2,7 +2,7 @@ use super::*;
 use crate::native::protocol::{DBMS_MIN_REVISION_WITH_OUT_OF_ORDER_BUCKETS, MAX_TYPE_DEPTH};
 use crate::native::type_parser::decimal_bits_from_precision;
 use crate::native::varint::write_varint;
-use crate::schema::{GeoKind, IntervalKind};
+use crate::schema::{GeoKind, IntervalKind, QBitElementType, QBIT_MAX_DIMENSION};
 
 mod aggregate_function;
 mod bfloat16;
@@ -17,6 +17,7 @@ mod low_cardinality;
 mod nothing;
 mod numeric;
 mod parser;
+mod qbit;
 mod saf_geo;
 mod special;
 mod string;

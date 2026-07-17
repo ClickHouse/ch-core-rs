@@ -53,18 +53,15 @@ fn binary_header_rejects_illegal_nullable_before_zero_row_materialization() {
 fn test_block_end_rejects_unsupported_type() {
     // An unsupported type inside an otherwise-complete block must surface as
     // a DecodeError from the scan, not be silently skipped or reported as
-    // incomplete. Cover both a bare unknown name and an unknown parameterized
-    // header; neither `FutureType` nor `QBit` is decoded.
-    for type_name in ["FutureType", "QBit(Float32, 16)"] {
-        let data = BlockBuilder::new()
-            .header(1, 1)
-            .column_header("id", type_name)
-            .build();
-        assert!(matches!(
-            block_end(&data, &DecodeOptions::default()),
-            Err(DecodeError::UnsupportedType { .. })
-        ));
-    }
+    // incomplete.
+    let data = BlockBuilder::new()
+        .header(1, 1)
+        .column_header("id", "FutureType")
+        .build();
+    assert!(matches!(
+        block_end(&data, &DecodeOptions::default()),
+        Err(DecodeError::UnsupportedType { .. })
+    ));
 }
 
 #[test]
@@ -75,18 +72,14 @@ fn test_block_end_no_block_at_clean_boundary() {
 
 #[test]
 fn test_unsupported_type() {
-    // Cover both a bare unknown name and an unknown parameterized header;
-    // neither `FutureType` nor `QBit` is decoded.
-    for type_name in ["FutureType", "QBit(Float32, 16)"] {
-        let data = BlockBuilder::new()
-            .header(1, 1)
-            .column_header("id", type_name)
-            .build();
-        assert!(matches!(
-            decode_all_bytes(&data, &DecodeOptions::default()),
-            Err(DecodeError::UnsupportedType { .. })
-        ));
-    }
+    let data = BlockBuilder::new()
+        .header(1, 1)
+        .column_header("id", "FutureType")
+        .build();
+    assert!(matches!(
+        decode_all_bytes(&data, &DecodeOptions::default()),
+        Err(DecodeError::UnsupportedType { .. })
+    ));
 }
 
 #[test]

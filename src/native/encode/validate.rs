@@ -6,7 +6,8 @@ use crate::batch::ColBatch;
 use crate::column::{
     variant_child_counts, AggregateStateColumn, ArrayColumn, Column, DecimalColumn,
     DictionaryColumn, DynamicChild, DynamicColumn, FixedBinaryColumn, JsonBody, JsonColumn,
-    MapColumn, TupleColumn, Utf8Column, VariantColumn, VariantLayout, ARROW_UNION_MAX_CHILDREN,
+    MapColumn, QBitColumn, TupleColumn, Utf8Column, VariantColumn, VariantLayout,
+    ARROW_UNION_MAX_CHILDREN,
 };
 use crate::native::aggregate_function::{
     aggregate_state_codec, is_valid_aggregate_state, AggregateStateCodec,
@@ -17,7 +18,7 @@ use crate::native::type_parser::{
     low_cardinality_dict_value_type, parse_ch_type, resolves_to_nothing,
     unsupported_header_type_name,
 };
-use crate::schema::{ChType, Field, GEOMETRY_EXPANSION_DEPTH};
+use crate::schema::{ChType, Field, QBitElementType, GEOMETRY_EXPANSION_DEPTH};
 
 use super::{column_error, is_encodable, json_uses_flattened, EncodeError, EncodeOptions};
 
@@ -258,6 +259,17 @@ fn validate_column(
 
     if let (ChType::Array(inner), Column::Array(c)) = (value_type, column) {
         validate_array(field, inner, c, num_rows, options, depth)?;
+    }
+
+    if let (
+        ChType::QBit {
+            element_type,
+            dimension,
+        },
+        Column::QBit(c),
+    ) = (value_type, column)
+    {
+        validate_qbit(field, *element_type, *dimension, c, num_rows)?;
     }
 
     if let (ChType::Tuple(elements), Column::Tuple(c)) = (value_type, column) {
@@ -514,6 +526,89 @@ pub(super) fn type_depth(ch_type: &ChType) -> usize {
         }
     }
     max_depth
+}
+
+/// Validate the row-major Arrow child used to encode one QBit column.
+///
+/// Native carries no per-row lengths, so the stored dimension must equal the
+/// declared dimension and the child must contain exactly `rows * dimension`
+/// non-null scalar values of the declared floating-point type. The per-plane
+/// FixedString bulk limit is also enforced so bytes produced here are accepted
+/// by the pinned server reader.
+fn validate_qbit(
+    field: &Field,
+    element_type: QBitElementType,
+    dimension: usize,
+    col: &QBitColumn,
+    num_rows: usize,
+) -> Result<(), EncodeError> {
+    if col.dimension != dimension {
+        return Err(EncodeError::InconsistentBatch {
+            detail: format!(
+                "column {:?} is declared QBit({element_type}, {dimension}) but its buffer dimension is {}",
+                field.name, col.dimension
+            ),
+        });
+    }
+    let expected =
+        num_rows
+            .checked_mul(dimension)
+            .ok_or_else(|| EncodeError::InconsistentBatch {
+                detail: format!(
+                    "column {:?} QBit flattened value count overflows usize",
+                    field.name
+                ),
+            })?;
+    if col.values.len() != expected {
+        return Err(EncodeError::InconsistentBatch {
+            detail: format!(
+                "column {:?} is QBit({element_type}, {dimension}) over {num_rows} rows so its child must contain {expected} values, but it contains {}",
+                field.name,
+                col.values.len()
+            ),
+        });
+    }
+    let expected_child = element_type.ch_type();
+    if !column_variant_matches(&expected_child, col.values.as_ref()) {
+        return Err(EncodeError::InconsistentBatch {
+            detail: format!(
+                "column {:?} is QBit({element_type}, {dimension}) but its child buffer has the wrong scalar variant",
+                field.name
+            ),
+        });
+    }
+    if col.values.validity().is_some() {
+        return Err(EncodeError::InconsistentBatch {
+            detail: format!(
+                "column {:?} QBit child values must be non-nullable; nullability applies to whole vectors",
+                field.name
+            ),
+        });
+    }
+
+    let bytes_per_plane_row = dimension / 8 + usize::from(dimension % 8 != 0);
+    let plane_bytes = num_rows.checked_mul(bytes_per_plane_row).ok_or_else(|| {
+        EncodeError::InconsistentBatch {
+            detail: format!("column {:?} QBit plane size overflows usize", field.name),
+        }
+    })?;
+    if plane_bytes > 1usize << 30 {
+        return Err(EncodeError::InconsistentBatch {
+            detail: format!(
+                "column {:?} QBit plane is {plane_bytes} bytes, above ClickHouse's 1 GiB FixedString bulk limit",
+                field.name
+            ),
+        });
+    }
+    if plane_bytes.checked_mul(element_type.bit_width()).is_none() {
+        return Err(EncodeError::InconsistentBatch {
+            detail: format!(
+                "column {:?} QBit total wire size overflows usize",
+                field.name
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Shared misframe guard for fixed-width binary bodies (`FixedString(N)`,
@@ -1664,6 +1759,12 @@ fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
         // Codec legality is owned by the blanket `unsupported_header_type_name`
         // check in `validate_column`, which runs before this; only the buffer
         // variant remains to match here.
+        return true;
+    }
+    if let (ChType::QBit { .. }, Column::QBit(_)) = (value_type, column) {
+        // Dimension and scalar-child shape are checked by validate_qbit so a
+        // malformed public QBitColumn reports InconsistentBatch, not an
+        // unsupported type/variant mismatch.
         return true;
     }
     // `Array(T)` matches only if the flattened element column matches the

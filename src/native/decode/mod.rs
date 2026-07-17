@@ -6,14 +6,14 @@ use crate::bitmap::Bitmap;
 use crate::column::{
     variant_child_counts, variant_layout_from_discriminators, AggregateStateColumn, ArrayColumn,
     BoolColumn, Column, DecimalColumn, DictionaryColumn, DynamicChild, DynamicColumn,
-    FixedBinaryColumn, JsonColumn, MapColumn, NothingColumn, PrimitiveColumn, StructuredJson,
-    TupleColumn, Utf8Column, VariantColumn,
+    FixedBinaryColumn, JsonColumn, MapColumn, NothingColumn, PrimitiveColumn, QBitColumn,
+    StructuredJson, TupleColumn, Utf8Column, VariantColumn,
 };
 use crate::native::aggregate_function::{
     decode_aggregate_states, decode_state_codec, scan_aggregate_states,
 };
 use crate::native::varint::ByteReader;
-use crate::schema::{ChType, Field, Schema};
+use crate::schema::{ChType, Field, QBitElementType, Schema};
 
 pub use crate::native::protocol::{
     DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION, DBMS_TCP_PROTOCOL_VERSION,
@@ -428,6 +428,139 @@ fn decode_bfloat16_data(reader: &mut ByteReader, num_rows: usize) -> io::Result<
         values.set_len(num_rows);
     }
     Ok(values)
+}
+
+/// Checked byte counts for one QBit bulk run.
+///
+/// QBit stores `bit_width` FixedString planes, each with `num_rows` values of
+/// `ceil(dimension / 8)` bytes. The materialized Arrow child has
+/// `num_rows * dimension` scalar values. Overflow is reported as
+/// `UnexpectedEof` so the streaming decoder treats an impossible advertised
+/// run like every other truncated fixed-width body.
+fn qbit_layout(
+    num_rows: usize,
+    dimension: usize,
+    bit_width: usize,
+) -> io::Result<(usize, usize, usize)> {
+    let bytes_per_plane_row = dimension / 8 + usize::from(dimension % 8 != 0);
+    let plane_stride = num_rows.checked_mul(bytes_per_plane_row).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "QBit plane byte length overflows usize",
+        )
+    })?;
+    // SerializationFixedString rejects one bulk plane above 1 GiB. Match that
+    // fatal server limit before waiting for or allocating an impossible body.
+    if plane_stride > 1usize << 30 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "QBit plane exceeds ClickHouse's 1 GiB FixedString bulk limit",
+        ));
+    }
+    let wire_len = plane_stride.checked_mul(bit_width).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "QBit column byte length overflows usize",
+        )
+    })?;
+    let value_count = num_rows.checked_mul(dimension).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "QBit materialized value count overflows usize",
+        )
+    })?;
+    Ok((bytes_per_plane_row, wire_len, value_count))
+}
+
+/// Transpose one QBit Native body into row-major Arrow child values.
+///
+/// At v26.6.1.1193-stable,
+/// `SerializationQBit::deserializeBinaryBulkWithMultipleStreams` delegates to a
+/// Tuple of one `FixedString(ceil(N / 8))` column per scalar bit. Tuple order is
+/// most-significant bit first. Within one plane row, logical element `i` is bit
+/// `i % 8` of byte `K - 1 - i / 8`. This reads each plane byte once per eight
+/// output values and writes the final child buffer in one allocation. Server
+/// readers ignore unused padding bits in the first plane byte, so this decoder
+/// does too and truncates each final group to the declared dimension.
+fn decode_qbit_words<T, F>(
+    wire: &[u8],
+    num_rows: usize,
+    dimension: usize,
+    bit_width: usize,
+    bytes_per_plane_row: usize,
+    value_count: usize,
+    from_word: F,
+) -> Vec<T>
+where
+    F: Fn(u64) -> T,
+{
+    let plane_stride = num_rows * bytes_per_plane_row;
+    let mut values = Vec::with_capacity(value_count);
+    let mut words = [0u64; 8];
+
+    for row in 0..num_rows {
+        let row_base = row * bytes_per_plane_row;
+        for group in 0..bytes_per_plane_row {
+            words.fill(0);
+            let first_element = group * 8;
+            let lanes = (dimension - first_element).min(8);
+            let wire_byte = bytes_per_plane_row - 1 - group;
+            for plane in 0..bit_width {
+                let byte = wire[plane * plane_stride + row_base + wire_byte];
+                for (lane, word) in words[..lanes].iter_mut().enumerate() {
+                    *word = (*word << 1) | u64::from((byte >> lane) & 1);
+                }
+            }
+            values.extend(words[..lanes].iter().copied().map(&from_word));
+        }
+    }
+
+    values
+}
+
+fn decode_qbit_data(
+    reader: &mut ByteReader,
+    num_rows: usize,
+    element_type: QBitElementType,
+    dimension: usize,
+    validity: Option<Bitmap>,
+) -> Result<QBitColumn, DecodeError> {
+    let bit_width = element_type.bit_width();
+    let (bytes_per_plane_row, wire_len, value_count) = qbit_layout(num_rows, dimension, bit_width)?;
+    let wire = reader.read_slice(wire_len)?;
+    let values = match element_type {
+        QBitElementType::BFloat16 => Column::BFloat16(PrimitiveColumn::new(decode_qbit_words(
+            wire,
+            num_rows,
+            dimension,
+            bit_width,
+            bytes_per_plane_row,
+            value_count,
+            |word| (word as u16).to_le_bytes(),
+        ))),
+        QBitElementType::Float32 => Column::Float32(PrimitiveColumn::new(decode_qbit_words(
+            wire,
+            num_rows,
+            dimension,
+            bit_width,
+            bytes_per_plane_row,
+            value_count,
+            |word| f32::from_bits(word as u32),
+        ))),
+        QBitElementType::Float64 => Column::Float64(PrimitiveColumn::new(decode_qbit_words(
+            wire,
+            num_rows,
+            dimension,
+            bit_width,
+            bytes_per_plane_row,
+            value_count,
+            f64::from_bits,
+        ))),
+    };
+    Ok(match validity {
+        Some(validity) => QBitColumn::new_nullable(values, dimension, validity),
+        None => QBitColumn::new(values, dimension),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2106,6 +2239,16 @@ fn decode_column_body(
             let values = decode_bfloat16_data(reader, num_rows)?;
             Column::BFloat16(PrimitiveColumn { values, validity })
         }
+        ChType::QBit {
+            element_type,
+            dimension,
+        } => Column::QBit(decode_qbit_data(
+            reader,
+            num_rows,
+            *element_type,
+            *dimension,
+            validity,
+        )?),
         // Temporal types are plain bulk integers on the wire; timezone and
         // precision are type metadata only and do not appear in the bytes. They
         // decode through the same primitive fast path as the numerics at their
@@ -2415,6 +2558,20 @@ fn empty_column(ch_type: &ChType) -> Column {
             values: vec![],
             validity: empty_validity,
         }),
+        ChType::QBit {
+            element_type,
+            dimension,
+        } => {
+            let values = match element_type {
+                QBitElementType::BFloat16 => Column::BFloat16(PrimitiveColumn::new(vec![])),
+                QBitElementType::Float32 => Column::Float32(PrimitiveColumn::new(vec![])),
+                QBitElementType::Float64 => Column::Float64(PrimitiveColumn::new(vec![])),
+            };
+            Column::QBit(match empty_validity {
+                Some(validity) => QBitColumn::new_nullable(values, *dimension, validity),
+                None => QBitColumn::new(values, *dimension),
+            })
+        }
         ChType::Date => Column::Date(PrimitiveColumn {
             values: vec![],
             validity: empty_validity,
@@ -3372,6 +3529,13 @@ fn skip_column_body(
         | ChType::BFloat16
         | ChType::Date
         | ChType::Enum16 { .. } => reader.skip(num_rows.saturating_mul(2))?,
+        ChType::QBit {
+            element_type,
+            dimension,
+        } => {
+            let (_, wire_len, _) = qbit_layout(num_rows, *dimension, element_type.bit_width())?;
+            reader.skip(wire_len)?;
+        }
         ChType::Int32
         | ChType::UInt32
         | ChType::Float32

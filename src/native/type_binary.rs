@@ -13,7 +13,8 @@ use crate::native::protocol::MAX_TYPE_DEPTH;
 use crate::native::type_parser::{normalize_variant_alternatives, parse_ch_type};
 use crate::native::varint::{write_varint, ByteReader};
 use crate::schema::{
-    ChType, IntervalKind, JSON_MAX_DYNAMIC_PATHS, JSON_MAX_DYNAMIC_TYPES, JSON_MAX_TYPED_PATHS,
+    ChType, IntervalKind, QBitElementType, JSON_MAX_DYNAMIC_PATHS, JSON_MAX_DYNAMIC_TYPES,
+    JSON_MAX_TYPED_PATHS, QBIT_MAX_DIMENSION,
 };
 
 const MAX_BINARY_TYPE_COMPLEXITY: usize = 1_000;
@@ -204,10 +205,62 @@ fn read_binary_type_inner(
             0x34 => ChType::Time64 {
                 precision: read_precision(reader, "Time64")?,
             },
-            0x36 => return Err(BinaryTypeError::Unsupported("QBit".into())),
+            0x36 => {
+                // T is a scalar parameter, not a structural child: textual
+                // parsing and encode depth validation both treat QBit as a
+                // leaf. Read exactly one legal scalar descriptor here so a
+                // QBit at MAX_TYPE_DEPTH remains valid without allowing a
+                // hostile chain of nested QBit descriptors to evade the depth
+                // cap. The child still consumes one complexity-budget node.
+                let element_type = read_qbit_element_type(reader, complexity)?;
+                let dimension = usize_from_varint(reader.read_varint()?, "QBit dimension")?;
+                if !(1..=QBIT_MAX_DIMENSION).contains(&dimension) {
+                    return Err(BinaryTypeError::Invalid(format!(
+                        "QBit dimension {dimension} is outside 1..={QBIT_MAX_DIMENSION}"
+                    )));
+                }
+                ChType::QBit {
+                    element_type,
+                    dimension,
+                }
+            }
             _ => return Err(BinaryTypeError::Invalid(format!("unknown tag 0x{tag:02x}"))),
         };
     Ok(ty)
+}
+
+fn read_qbit_element_type(
+    reader: &mut ByteReader,
+    complexity: &mut usize,
+) -> Result<QBitElementType, BinaryTypeError> {
+    *complexity = complexity
+        .checked_add(1)
+        .ok_or_else(|| BinaryTypeError::Invalid("complexity overflow".into()))?;
+    if *complexity > MAX_BINARY_TYPE_COMPLEXITY {
+        return Err(BinaryTypeError::Invalid(format!(
+            "complexity exceeds {MAX_BINARY_TYPE_COMPLEXITY}"
+        )));
+    }
+
+    match reader.read_u8()? {
+        0x31 => Ok(QBitElementType::BFloat16),
+        0x0d => Ok(QBitElementType::Float32),
+        0x0e => Ok(QBitElementType::Float64),
+        // Preserve the generic Custom descriptor behavior without recursively
+        // parsing an arbitrary structural child. The server can resolve a
+        // custom canonical scalar name before QBit validates T.
+        0x2c => match parse_ch_type(&reader.read_varint_string()?) {
+            Some(ChType::BFloat16) => Ok(QBitElementType::BFloat16),
+            Some(ChType::Float32) => Ok(QBitElementType::Float32),
+            Some(ChType::Float64) => Ok(QBitElementType::Float64),
+            _ => Err(BinaryTypeError::Invalid(
+                "QBit Custom element is not BFloat16, Float32, or Float64".into(),
+            )),
+        },
+        tag => Err(BinaryTypeError::Invalid(format!(
+            "QBit element descriptor tag 0x{tag:02x} is not BFloat16, Float32, or Float64"
+        ))),
+    }
 }
 
 fn read_precision(reader: &mut ByteReader, type_name: &str) -> Result<u8, BinaryTypeError> {
@@ -697,6 +750,14 @@ pub(crate) fn write_binary_type(buf: &mut Vec<u8>, ch_type: &ChType) {
         ChType::BFloat16 => buf.push(0x31),
         ChType::Time => buf.push(0x32),
         ChType::Time64 { precision } => buf.extend_from_slice(&[0x34, *precision]),
+        ChType::QBit {
+            element_type,
+            dimension,
+        } => {
+            buf.push(0x36);
+            write_binary_type(buf, &element_type.ch_type());
+            write_varint(buf, *dimension as u64);
+        }
         ChType::Nested(fields) => {
             buf.push(0x2f);
             write_varint(buf, fields.len() as u64);
@@ -790,6 +851,18 @@ mod tests {
             ChType::Float32,
             ChType::Float64,
             ChType::BFloat16,
+            ChType::QBit {
+                element_type: QBitElementType::BFloat16,
+                dimension: 8,
+            },
+            ChType::QBit {
+                element_type: QBitElementType::Float32,
+                dimension: 9,
+            },
+            ChType::QBit {
+                element_type: QBitElementType::Float64,
+                dimension: 300,
+            },
             ChType::String,
             ChType::FixedString(13),
             ChType::Date,
@@ -870,6 +943,67 @@ mod tests {
             let mut reader = ByteReader::new(&bytes);
             assert_eq!(read_binary_type(&mut reader).unwrap(), ch_type);
             assert_eq!(reader.remaining(), 0);
+        }
+    }
+
+    #[test]
+    fn qbit_binary_descriptor_exact_bytes_and_rejections() {
+        let mut f32_9 = Vec::new();
+        write_binary_type(
+            &mut f32_9,
+            &ChType::QBit {
+                element_type: QBitElementType::Float32,
+                dimension: 9,
+            },
+        );
+        assert_eq!(f32_9, [0x36, 0x0d, 0x09]);
+
+        let mut f64_300 = Vec::new();
+        write_binary_type(
+            &mut f64_300,
+            &ChType::QBit {
+                element_type: QBitElementType::Float64,
+                dimension: 300,
+            },
+        );
+        assert_eq!(f64_300, [0x36, 0x0e, 0xac, 0x02]);
+
+        let mut custom_f32 = vec![0x36, 0x2c];
+        write_string(&mut custom_f32, b"Float32");
+        custom_f32.push(9);
+        assert_eq!(
+            read_binary_type(&mut ByteReader::new(&custom_f32)).unwrap(),
+            ChType::QBit {
+                element_type: QBitElementType::Float32,
+                dimension: 9,
+            }
+        );
+
+        assert!(matches!(
+            read_binary_type(&mut ByteReader::new(&[0x36, 0x09, 0x01])),
+            Err(BinaryTypeError::Invalid(_))
+        ));
+        assert!(matches!(
+            read_binary_type(&mut ByteReader::new(&[0x36, 0x0d, 0x00])),
+            Err(BinaryTypeError::Invalid(_))
+        ));
+        assert!(matches!(
+            read_binary_type(&mut ByteReader::new(&[0x36, 0x0d])),
+            Err(BinaryTypeError::Io(ref error)) if error.kind() == io::ErrorKind::UnexpectedEof
+        ));
+
+        // QBit's scalar parameter is not a structural nesting level. Keep
+        // binary descriptors in parity with the text parser and encode depth
+        // validation exactly at the shared cap, while rejecting one more
+        // enclosing Array.
+        for (arrays, accepted) in [(MAX_TYPE_DEPTH, true), (MAX_TYPE_DEPTH + 1, false)] {
+            let mut bytes = vec![0x1e; arrays];
+            bytes.extend_from_slice(&[0x36, 0x0d, 0x09]);
+            assert_eq!(
+                read_binary_type(&mut ByteReader::new(&bytes)).is_ok(),
+                accepted,
+                "{arrays} enclosing Arrays"
+            );
         }
     }
 

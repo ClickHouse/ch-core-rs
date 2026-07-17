@@ -10,7 +10,7 @@
 //! at v26.6.1.1193-stable).
 //!
 //! Scope: this encodes `Nothing`, `Bool`, the fixed-width numeric types (`Int8`..`Int64`,
-//! `UInt8`..`UInt64`, `Float32`, `Float64`, `BFloat16`), the temporal types (`Date`,
+//! `UInt8`..`UInt64`, `Float32`, `Float64`, `BFloat16`), `QBit(T, N)`, the temporal types (`Date`,
 //! `Date32`, `DateTime`, `DateTime64`, `Time`, `Time64`, and all 11
 //! `Interval*` kinds), `UUID`, `IPv4`, `IPv6`, `String`, `FixedString(N)`,
 //! `Enum8`/`Enum16`, `Decimal(P, S)`, the
@@ -33,11 +33,11 @@
 use crate::batch::{ChunkedBatch, ColBatch};
 use crate::column::{
     ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn, DynamicChild, DynamicColumn,
-    FixedBinaryColumn, JsonBody, JsonColumn, MapColumn, StructuredJson, TupleColumn, Utf8Column,
-    VariantColumn,
+    FixedBinaryColumn, JsonBody, JsonColumn, MapColumn, QBitColumn, StructuredJson, TupleColumn,
+    Utf8Column, VariantColumn,
 };
 use crate::native::aggregate_function::aggregate_state_codec;
-use crate::schema::{geometry_underlying_type, ChType, Field};
+use crate::schema::{geometry_underlying_type, ChType, Field, QBitElementType};
 
 use super::protocol::{
     DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION, DBMS_MIN_REVISION_WITH_OUT_OF_ORDER_BUCKETS,
@@ -1305,6 +1305,9 @@ fn encode_column_body(
         // BFloat16 type. Each `[u8; 2]` holds one exact little-endian wire word,
         // so write the contiguous array buffer without conversion.
         (ChType::BFloat16, Column::BFloat16(c)) => encode_bfloat16_data(buf, c),
+        (ChType::QBit { element_type, .. }, Column::QBit(c)) => {
+            encode_qbit_data(buf, c, *element_type)
+        }
         // Temporal types are plain little-endian primitives at their native width;
         // timezone and precision live only in the type string (rendered by
         // `ChType::Display`), never in the per-row data, so each is just the
@@ -1453,6 +1456,84 @@ fn encode_bfloat16_data(buf: &mut Vec<u8>, col: &crate::column::PrimitiveColumn<
     buf.extend_from_slice(col.values.as_flattened());
 }
 
+/// Transpose one row-major QBit scalar child into its Native bit planes.
+///
+/// At v26.6.1.1193-stable,
+/// `SerializationQBit::serializeBinaryBulkWithMultipleStreams` writes one
+/// `FixedString(ceil(N / 8))` run per scalar bit, most-significant plane first.
+/// Within each plane, element `i` is bit `i % 8` of byte `K - 1 - i / 8`. The
+/// destination is resized once and filled directly, with no per-row allocation
+/// or staging buffer. Unused padding bits remain zero, matching the server's
+/// canonical transposition.
+fn encode_qbit_words<T, F>(
+    buf: &mut Vec<u8>,
+    values: &[T],
+    num_rows: usize,
+    dimension: usize,
+    bit_width: usize,
+    to_word: F,
+) where
+    F: Fn(&T) -> u64,
+{
+    let bytes_per_plane_row = dimension / 8 + usize::from(dimension % 8 != 0);
+    let plane_stride = num_rows * bytes_per_plane_row;
+    let start = buf.len();
+    buf.resize(start + plane_stride * bit_width, 0);
+    let mut words = [0u64; 8];
+
+    for row in 0..num_rows {
+        let values_row = row * dimension;
+        let wire_row = row * bytes_per_plane_row;
+        for group in 0..bytes_per_plane_row {
+            let first_element = group * 8;
+            let lanes = (dimension - first_element).min(8);
+            for (lane, word) in words[..lanes].iter_mut().enumerate() {
+                *word = to_word(&values[values_row + first_element + lane]);
+            }
+            let wire_byte = bytes_per_plane_row - 1 - group;
+            for plane in 0..bit_width {
+                let shift = bit_width - 1 - plane;
+                let mut byte = 0u8;
+                for (lane, word) in words[..lanes].iter().enumerate() {
+                    byte |= (((word >> shift) & 1) as u8) << lane;
+                }
+                buf[start + plane * plane_stride + wire_row + wire_byte] = byte;
+            }
+        }
+    }
+}
+
+fn encode_qbit_data(buf: &mut Vec<u8>, col: &QBitColumn, element_type: QBitElementType) {
+    let num_rows = col.len();
+    match (element_type, col.values.as_ref()) {
+        (QBitElementType::BFloat16, Column::BFloat16(values)) => encode_qbit_words(
+            buf,
+            &values.values,
+            num_rows,
+            col.dimension,
+            element_type.bit_width(),
+            |word| u64::from(u16::from_le_bytes(*word)),
+        ),
+        (QBitElementType::Float32, Column::Float32(values)) => encode_qbit_words(
+            buf,
+            &values.values,
+            num_rows,
+            col.dimension,
+            element_type.bit_width(),
+            |value| u64::from(value.to_bits()),
+        ),
+        (QBitElementType::Float64, Column::Float64(values)) => encode_qbit_words(
+            buf,
+            &values.values,
+            num_rows,
+            col.dimension,
+            element_type.bit_width(),
+            |value| value.to_bits(),
+        ),
+        _ => unreachable!("QBit child type was validated before encoding"),
+    }
+}
+
 /// Encode a `Decimal(P, S)` column body: one contiguous fixed-width scaled
 /// integer per row, written verbatim from `DecimalColumn::data`.
 ///
@@ -1531,6 +1612,7 @@ fn is_encodable(ch_type: &ChType) -> bool {
         | ChType::Float32
         | ChType::Float64
         | ChType::BFloat16
+        | ChType::QBit { .. }
         | ChType::Date
         | ChType::Date32
         | ChType::DateTime { .. }

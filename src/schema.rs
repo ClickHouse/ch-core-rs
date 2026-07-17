@@ -1,6 +1,55 @@
 use std::borrow::Cow;
 use std::sync::LazyLock;
 
+/// Largest QBit dimension constructible by the pinned ClickHouse server.
+///
+/// QBit stores each plane as `FixedString(ceil(N / 8))`, and FixedString caps
+/// its width at `0x00ff_ffff` bytes.
+pub const QBIT_MAX_DIMENSION: usize = 0x00ff_ffff * 8;
+
+/// Element type accepted by ClickHouse `QBit(T, N)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QBitElementType {
+    BFloat16,
+    Float32,
+    Float64,
+}
+
+impl QBitElementType {
+    /// Number of bit planes in the Native representation.
+    pub const fn bit_width(self) -> usize {
+        match self {
+            Self::BFloat16 => 16,
+            Self::Float32 => 32,
+            Self::Float64 => 64,
+        }
+    }
+
+    /// Byte width of one materialized vector element.
+    pub const fn byte_width(self) -> usize {
+        self.bit_width() / 8
+    }
+
+    /// The ordinary ClickHouse scalar type represented by one vector element.
+    pub const fn ch_type(self) -> ChType {
+        match self {
+            Self::BFloat16 => ChType::BFloat16,
+            Self::Float32 => ChType::Float32,
+            Self::Float64 => ChType::Float64,
+        }
+    }
+}
+
+impl std::fmt::Display for QBitElementType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BFloat16 => f.write_str("BFloat16"),
+            Self::Float32 => f.write_str("Float32"),
+            Self::Float64 => f.write_str("Float64"),
+        }
+    }
+}
+
 /// ClickHouse logical type system.
 ///
 /// Preserves ClickHouse semantics (timezone, precision, enum labels, etc.)
@@ -28,6 +77,16 @@ pub enum ChType {
     // BFloat16 dependency or converting per value; bindings interpret the bits
     // using this logical tag.
     BFloat16,
+
+    // `QBit(T, N)` is a fixed-size vector of N floating-point values. T is
+    // restricted by the server to BFloat16, Float32, or Float64 and is kept in
+    // the compact enum below so invalid element types are not constructible.
+    // Native stores the vector as bit-transposed planes, but the decoded column
+    // materializes one row-major child buffer for Arrow FixedSizeList export.
+    QBit {
+        element_type: QBitElementType,
+        dimension: usize,
+    },
 
     // Wide integers. Each is a raw contiguous little-endian two's-complement
     // (signed) or unsigned fixed-width integer on the wire, 16 bytes for the
@@ -490,6 +549,10 @@ impl std::fmt::Display for ChType {
             ChType::Float32 => write!(f, "Float32"),
             ChType::Float64 => write!(f, "Float64"),
             ChType::BFloat16 => write!(f, "BFloat16"),
+            ChType::QBit {
+                element_type,
+                dimension,
+            } => write!(f, "QBit({element_type}, {dimension})"),
             ChType::Int128 => write!(f, "Int128"),
             ChType::UInt128 => write!(f, "UInt128"),
             ChType::Int256 => write!(f, "Int256"),

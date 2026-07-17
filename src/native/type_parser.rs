@@ -7,9 +7,9 @@
 use crate::native::aggregate_function::aggregate_state_codec;
 use crate::native::protocol::MAX_TYPE_DEPTH;
 use crate::schema::{
-    ChType, GeoKind, IntervalKind, GEOMETRY_EXPANSION_DEPTH, JSON_DEFAULT_MAX_DYNAMIC_PATHS,
-    JSON_DEFAULT_MAX_DYNAMIC_TYPES, JSON_MAX_DYNAMIC_PATHS, JSON_MAX_DYNAMIC_TYPES,
-    JSON_MAX_TYPED_PATHS,
+    ChType, GeoKind, IntervalKind, QBitElementType, GEOMETRY_EXPANSION_DEPTH,
+    JSON_DEFAULT_MAX_DYNAMIC_PATHS, JSON_DEFAULT_MAX_DYNAMIC_TYPES, JSON_MAX_DYNAMIC_PATHS,
+    JSON_MAX_DYNAMIC_TYPES, JSON_MAX_TYPED_PATHS, QBIT_MAX_DIMENSION,
 };
 
 // ---------------------------------------------------------------------------
@@ -320,6 +320,47 @@ fn parse_ch_type_depth(type_name: &str, depth: usize) -> Option<ChType> {
             let key = parse_ch_type_depth(parts[0].trim_matches(' '), depth + 1)?;
             let value = parse_ch_type_depth(parts[1].trim_matches(' '), depth + 1)?;
             return Some(ChType::Map(Box::new(key), Box::new(value)));
+        }
+    }
+
+    // QBit(T, N). DataTypeQBit::create accepts exactly two arguments. T is one
+    // of the three floating-point types below (including the aliases accepted
+    // by DataTypeFactory), and N is a positive UInt64 literal. The server's
+    // canonical Native header always spells the resolved element type and uses
+    // comma-space separation, which Display reproduces.
+    if let Some(inner) = type_name.strip_prefix("QBit(") {
+        if let Some(inner) = inner.strip_suffix(')') {
+            let parts = split_top_level_commas(inner.trim_matches(' '))?;
+            if parts.len() != 2 {
+                return None;
+            }
+            let element_name = parts[0].trim_matches(' ');
+            let element_type = if element_name == "BFloat16" {
+                QBitElementType::BFloat16
+            } else if element_name == "Float32"
+                || ["FLOAT", "REAL", "SINGLE"]
+                    .iter()
+                    .any(|alias| element_name.eq_ignore_ascii_case(alias))
+            {
+                QBitElementType::Float32
+            } else if element_name == "Float64"
+                || ["DOUBLE", "DOUBLE PRECISION"]
+                    .iter()
+                    .any(|alias| element_name.eq_ignore_ascii_case(alias))
+            {
+                QBitElementType::Float64
+            } else {
+                return None;
+            };
+            let dimension = parts[1].trim_matches(' ').parse::<u64>().ok()?;
+            let dimension = usize::try_from(dimension).ok()?;
+            if !(1..=QBIT_MAX_DIMENSION).contains(&dimension) {
+                return None;
+            }
+            return Some(ChType::QBit {
+                element_type,
+                dimension,
+            });
         }
     }
 

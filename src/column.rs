@@ -301,6 +301,51 @@ impl FixedBinaryColumn {
     }
 }
 
+/// A ClickHouse `QBit(T, N)` column in Arrow FixedSizeList layout.
+///
+/// `values` is the row-major flattened child column with exactly `N` scalar
+/// values per logical row. It is one of `Column::BFloat16`, `Column::Float32`,
+/// or `Column::Float64` and never carries child validity. A nullable QBit wraps
+/// whole vectors, so its validity bitmap lives here at the list level. Native's
+/// bit-transposed plane representation is converted once during decode; Arrow
+/// export then borrows these buffers without another transpose or copy.
+#[derive(Debug, Clone)]
+pub struct QBitColumn {
+    pub values: Box<Column>,
+    pub dimension: usize,
+    pub validity: Option<Bitmap>,
+}
+
+impl QBitColumn {
+    pub fn new(values: Column, dimension: usize) -> Self {
+        Self {
+            values: Box::new(values),
+            dimension,
+            validity: None,
+        }
+    }
+
+    pub fn new_nullable(values: Column, dimension: usize, validity: Bitmap) -> Self {
+        Self {
+            values: Box::new(values),
+            dimension,
+            validity: Some(validity),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.values.len().checked_div(self.dimension).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn null_count(&self) -> usize {
+        self.validity.as_ref().map_or(0, |b| b.null_count())
+    }
+}
+
 /// Decimal column: a contiguous little-endian two's-complement fixed-width
 /// integer buffer, the same physical shape as a `FixedSizeBinary` of width
 /// `bits / 8`.
@@ -1522,6 +1567,11 @@ pub enum Column {
     // One `[u8; 2]` per row makes the width invariant structural, keeps the
     // layout host-independent, and exports zero-copy as FixedSizeBinary(2).
     BFloat16(PrimitiveColumn<[u8; 2]>),
+    // QBit vectors materialized as one row-major scalar child buffer. The
+    // logical element type and dimension live in ChType; the column repeats the
+    // dimension so its public buffer shape is self-describing and can be
+    // validated before Native encode.
+    QBit(QBitColumn),
     // Temporal types decoded at their faithful native width. No widening or
     // rescaling happens here; the type metadata (timezone, precision) lives in
     // the schema's ChType, not in these buffers.
@@ -1609,6 +1659,7 @@ impl Column {
             Column::Float32(c) => c.len(),
             Column::Float64(c) => c.len(),
             Column::BFloat16(c) => c.len(),
+            Column::QBit(c) => c.len(),
             Column::Date(c) => c.len(),
             Column::Date32(c) => c.len(),
             Column::DateTime(c) => c.len(),
@@ -1657,6 +1708,7 @@ impl Column {
             Column::Float32(c) => c.null_count(),
             Column::Float64(c) => c.null_count(),
             Column::BFloat16(c) => c.null_count(),
+            Column::QBit(c) => c.null_count(),
             Column::Date(c) => c.null_count(),
             Column::Date32(c) => c.null_count(),
             Column::DateTime(c) => c.null_count(),
@@ -1701,6 +1753,7 @@ impl Column {
             Column::Float32(c) => c.validity.as_ref(),
             Column::Float64(c) => c.validity.as_ref(),
             Column::BFloat16(c) => c.validity.as_ref(),
+            Column::QBit(c) => c.validity.as_ref(),
             Column::Date(c) => c.validity.as_ref(),
             Column::Date32(c) => c.validity.as_ref(),
             Column::DateTime(c) => c.validity.as_ref(),

@@ -31,13 +31,13 @@ use ch_core_rs::bitmap::Bitmap;
 use ch_core_rs::column::{
     AggregateStateColumn, ArrayColumn, BoolColumn, Column, DecimalColumn, DictionaryColumn,
     DynamicChild, DynamicColumn, FixedBinaryColumn, JsonBody, JsonColumn, MapColumn, NothingColumn,
-    PrimitiveColumn, StructuredJson, TupleColumn, Utf8Column, VariantColumn,
+    PrimitiveColumn, QBitColumn, StructuredJson, TupleColumn, Utf8Column, VariantColumn,
 };
 use ch_core_rs::native::decode::{
     decode_all_bytes, decode_all_bytes_binary_types, parse_ch_type, DecodeOptions,
 };
 use ch_core_rs::native::encode::{encode_block, encode_block_binary_types, EncodeOptions};
-use ch_core_rs::schema::{ChType, Field, GeoKind, IntervalKind, Schema};
+use ch_core_rs::schema::{ChType, Field, GeoKind, IntervalKind, QBitElementType, Schema};
 
 const TABLE: &str = "ch_core_rs_encode_test";
 const LC_U16_TABLE: &str = "ch_core_rs_encode_lc_u16_test";
@@ -414,6 +414,34 @@ fn sample_batch() -> ColBatch {
         ("nbf", ChType::Nullable(Box::new(ChType::BFloat16))),
         ("lc_bf", ChType::LowCardinality(Box::new(ChType::BFloat16))),
         (
+            "qbit_bf",
+            ChType::QBit {
+                element_type: QBitElementType::BFloat16,
+                dimension: 3,
+            },
+        ),
+        (
+            "qbit_f32",
+            ChType::QBit {
+                element_type: QBitElementType::Float32,
+                dimension: 9,
+            },
+        ),
+        (
+            "qbit_f64",
+            ChType::QBit {
+                element_type: QBitElementType::Float64,
+                dimension: 2,
+            },
+        ),
+        (
+            "nqbit",
+            ChType::Nullable(Box::new(ChType::QBit {
+                element_type: QBitElementType::Float32,
+                dimension: 2,
+            })),
+        ),
+        (
             "tn",
             ChType::Tuple(vec![(None, ChType::Nullable(Box::new(ChType::Nothing)))]),
         ),
@@ -434,6 +462,13 @@ fn sample_batch() -> ColBatch {
     nu.validity = Some(validity());
     let mut nbf = bfloat16_column(&[0x4150, 0x0000, 0x429e, 0x0000]);
     nbf.validity = Some(validity());
+    let nqbit = QBitColumn::new_nullable(
+        Column::Float32(PrimitiveColumn::new(vec![
+            13.0, -0.25, 0.0, 0.0, 79.0, -2.25, 0.0, 0.0,
+        ])),
+        2,
+        validity(),
+    );
     let dec32_neg = (-13i32).to_le_bytes();
     let dec32_zero = 0i32.to_le_bytes();
     let dec32_pos = 79i32.to_le_bytes();
@@ -833,6 +868,43 @@ fn sample_batch() -> ColBatch {
             vec![1, 2, 1, 3],
             Column::BFloat16(bfloat16_column(&[0x0000, 0x4150, 0x429e, 0x4381])),
         )),
+        // QBit is materialized row-major in the public buffer and transposed to
+        // the server's bit planes once during Native encode. Cover every legal
+        // scalar width plus whole-vector nullability in the live round trip.
+        Column::QBit(QBitColumn::new(
+            Column::BFloat16(bfloat16_column(&[
+                0x3fc0, 0xc020, 0x4150, 0x3fc0, 0xc020, 0x4160, 0x3fc0, 0xc020, 0x4170, 0x3fc0,
+                0xc020, 0x4180,
+            ])),
+            3,
+        )),
+        Column::QBit(QBitColumn::new(
+            Column::Float32(PrimitiveColumn::new(
+                (0..4)
+                    .flat_map(|n| {
+                        [
+                            n as f32,
+                            -1.25,
+                            0.0,
+                            3.5,
+                            79.125,
+                            -0.0,
+                            13.0,
+                            -2.5,
+                            (n + 1) as f32,
+                        ]
+                    })
+                    .collect(),
+            )),
+            9,
+        )),
+        Column::QBit(QBitColumn::new(
+            Column::Float64(PrimitiveColumn::new(vec![
+                0.5, -13.0, 1.5, -14.0, 2.5, -15.0, 3.5, -16.0,
+            ])),
+            2,
+        )),
+        Column::QBit(nqbit),
         // Top-level Nullable(Nothing) cannot be stored in a table, but the
         // server permits it as a Tuple element. This grounds the encoder's
         // null-map-then-placeholder body against a real INSERT path.
@@ -1329,6 +1401,15 @@ fn raw_column_repr(column: &Column) -> Vec<String> {
         // here). Signedness is type metadata, not per-row data, so the four
         // wide-int variants render identically.
         Column::BFloat16(c) => c.values.iter().map(|v| format!("{v:?}")).collect(),
+        Column::QBit(c) => {
+            let values = raw_column_repr(c.values.as_ref());
+            (0..c.len())
+                .map(|row| {
+                    let start = row * c.dimension;
+                    format!("{:?}", &values[start..start + c.dimension])
+                })
+                .collect()
+        }
         Column::Uuid(c)
         | Column::Ipv6(c)
         | Column::FixedBinary(c)
@@ -1554,6 +1635,8 @@ fn insert_roundtrips_through_server() {
          nid Nullable(IntervalDay), lc_ih LowCardinality(IntervalHour), \
          bf BFloat16, nbf Nullable(BFloat16), \
          lc_bf LowCardinality(BFloat16), \
+         qbit_bf QBit(BFloat16, 3), qbit_f32 QBit(Float32, 9), \
+         qbit_f64 QBit(Float64, 2), nqbit Nullable(QBit(Float32, 2)), \
          tn Tuple(Nullable(Nothing)), \
          v Variant(String, UInt64)) ENGINE = Memory"
         ),
@@ -1589,7 +1672,7 @@ fn insert_roundtrips_through_server() {
          m, m_lc, m_nv, m_arr, arr_m, m_empty, \
          t, t64, nt, nt64, lc_time, \
          iy, iq, imo, iw, id, ih, imi, isecond, ims, ius, ins, nid, lc_ih, \
-         bf, nbf, lc_bf, tn, v \
+         bf, nbf, lc_bf, qbit_bf, qbit_f32, qbit_f64, nqbit, tn, v \
          FROM {TABLE} ORDER BY i32 FORMAT Native"
     ));
     let decoded = decode_all_bytes(

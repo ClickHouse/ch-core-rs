@@ -478,7 +478,26 @@ SELECT
         [[(9., 10.)]]::Polygon::Geometry,
         [(11., 12.)]::Ring::Geometry,
         CAST(NULL, 'Geometry')
-    ] AS geometry_all
+    ] AS geometry_all,
+    -- QBit(T, N): fixed-size logical vectors whose Native body is transposed
+    -- into one FixedString(ceil(N/8)) plane per scalar bit. Cover all three
+    -- scalar widths, a dimension crossing the 8-element byte boundary, and an
+    -- outer Nullable whose null map precedes the complete nested plane body.
+    CAST([1.5, -2.5, toFloat64(n + 13)], 'QBit(BFloat16, 3)') AS qbit_bf,
+    CAST([
+        toFloat32(n), toFloat32(-1.25), toFloat32(0),
+        toFloat32(3.5), toFloat32(79.125), toFloat32(-0.0),
+        toFloat32(13), toFloat32(-2.5), toFloat32(n + 1)
+    ], 'QBit(Float32, 9)') AS qbit_f32,
+    CAST([toFloat64(n) + 0.5, -toFloat64(n + 13)], 'QBit(Float64, 2)') AS qbit_f64,
+    CAST(
+        multiIf(
+            n = 1, NULL,
+            n = 3, NULL,
+            [toFloat32(n * 33 + 13), toFloat32(-toInt64(n) - 0.25)]
+        ),
+        'Nullable(QBit(Float32, 2))'
+    ) AS qbit_nullable
 FROM numbers(4)
 SETTINGS allow_suspicious_low_cardinality_types = 1, enable_nullable_tuple_type = 1, enable_time_time64_type = 1, flatten_nested = 0
 FORMAT Native
