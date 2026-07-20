@@ -146,6 +146,7 @@ fn zero_row_block_roundtrips_schema() {
             &bytes,
             &DecodeOptions {
                 protocol_revision: revision,
+                ..DecodeOptions::default()
             },
         )
         .unwrap();
@@ -234,7 +235,7 @@ fn over_deep_type_nesting_is_rejected() {
     // rendering the deep type (both recurse to full depth), which is why the
     // rejection is InconsistentBatch rather than UnsupportedType.
     let mut ch_type = ChType::Int32;
-    for _ in 0..(MAX_TYPE_DEPTH + 100) {
+    for _ in 0..(MAX_TYPE_DEPTH * 100) {
         ch_type = ChType::Array(Box::new(ch_type));
     }
     let batch = ColBatch {
@@ -251,6 +252,9 @@ fn over_deep_type_nesting_is_rejected() {
         }
         other => panic!("expected InconsistentBatch, got {other:?}"),
     }
+    // Dropping an adversarial caller-built recursive type is itself recursive;
+    // that caller-owned concern must not confound the encoder regression.
+    std::mem::forget(batch);
 }
 
 #[test]

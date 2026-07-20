@@ -1675,13 +1675,8 @@ fn insert_roundtrips_through_server() {
          bf, nbf, lc_bf, qbit_bf, qbit_f32, qbit_f64, nqbit, tn, v \
          FROM {TABLE} ORDER BY i32 FORMAT Native"
     ));
-    let decoded = decode_all_bytes(
-        &native,
-        &DecodeOptions {
-            protocol_revision: 0,
-        },
-    )
-    .expect("decode server Native response");
+    let decoded = decode_all_bytes(&native, &DecodeOptions::default())
+        .expect("decode server Native response");
 
     server.ddl(&format!("DROP TABLE IF EXISTS {TABLE}"));
 
@@ -1731,13 +1726,8 @@ fn low_cardinality_fixed_string_u16_dictionary_roundtrips_through_server() {
     let native = server.select(&format!(
         "SELECT k, lc FROM {LC_U16_TABLE} ORDER BY k FORMAT Native"
     ));
-    let decoded = decode_all_bytes(
-        &native,
-        &DecodeOptions {
-            protocol_revision: 0,
-        },
-    )
-    .expect("decode server Native response");
+    let decoded = decode_all_bytes(&native, &DecodeOptions::default())
+        .expect("decode server Native response");
 
     server.ddl(&format!("DROP TABLE IF EXISTS {LC_U16_TABLE}"));
 
@@ -2197,13 +2187,8 @@ fn geo_saf_nested_roundtrip_through_server() {
         "SELECT i32, saf_sum, saf_lc, point, npoint, ring, mpoly, nst, nsaf, tsaf, lc_nsaf, geometry \
          FROM {GSN_TABLE} ORDER BY i32 FORMAT Native"
     ));
-    let decoded = decode_all_bytes(
-        &native,
-        &DecodeOptions {
-            protocol_revision: 0,
-        },
-    )
-    .expect("decode server Native response");
+    let decoded = decode_all_bytes(&native, &DecodeOptions::default())
+        .expect("decode server Native response");
 
     server.ddl(&format!("DROP TABLE IF EXISTS {GSN_TABLE}"));
 

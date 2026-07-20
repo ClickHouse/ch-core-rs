@@ -1,7 +1,7 @@
 //! Arrow C Data Interface implementation for zero-copy export.
 //!
 //! Implements ArrowSchema, ArrowArray, and ArrowArrayStream per
-//! https://arrow.apache.org/docs/format/CDataInterface.html
+//! <https://arrow.apache.org/docs/format/CDataInterface.html>
 
 use std::ffi::{c_char, c_void, CString};
 use std::ptr;
@@ -204,7 +204,7 @@ const DYNAMIC_MAX_EXPORT_CHILDREN: usize =
 pub enum ExportError {
     /// A `Dynamic` column's block-local child set is too wide to route within
     /// Arrow's signed Int8 dense-union type-code space. Carries the offending
-    /// child count and the export limit ([`DYNAMIC_MAX_EXPORT_CHILDREN`]). This
+    /// child count and the export limit (`DYNAMIC_MAX_EXPORT_CHILDREN`). This
     /// is reachable from a legitimate server: a FLATTENED Dynamic block
     /// (structure word 3) bounds its runtime type count only by the row count,
     /// not by `max_types`, so a single block can carry more than the limit.
@@ -1777,7 +1777,11 @@ pub unsafe fn export_schema(schema_in: &Schema, out: *mut ArrowSchema) {
     schema.metadata = ptr::null();
     schema.flags = 0;
     schema.n_children = n_children;
-    schema.children = pd.children.as_ptr() as *mut *mut ArrowSchema;
+    schema.children = if pd.children.is_empty() {
+        ptr::null_mut()
+    } else {
+        pd.children.as_ptr() as *mut *mut ArrowSchema
+    };
     schema.dictionary = ptr::null_mut();
     schema.release = Some(release_schema);
     schema.private_data = Box::into_raw(pd) as *mut c_void;
@@ -1790,7 +1794,7 @@ pub unsafe fn export_schema(schema_in: &Schema, out: *mut ArrowSchema) {
 /// schema across all supplied chunks separately.
 ///
 /// Returns an [`ExportError`] without touching `out` when a Dynamic column's
-/// block-local child set exceeds [`DYNAMIC_MAX_EXPORT_CHILDREN`] (reachable
+/// block-local child set exceeds `DYNAMIC_MAX_EXPORT_CHILDREN` (reachable
 /// from a legitimate FLATTENED block) or carries duplicate child type names
 /// (constructible only through the public `DynamicColumn` fields); `out` is
 /// then left as the caller passed it so its release stays a no-op.
@@ -1845,7 +1849,7 @@ unsafe fn write_batch_schema(batch: &ColBatch, out: *mut ArrowSchema) {
 /// array are derived from the same block-local Dynamic child set.
 ///
 /// Returns [`ExportError::DynamicUnionTooWide`] when a Dynamic column's
-/// block-local child set exceeds [`DYNAMIC_MAX_EXPORT_CHILDREN`], or
+/// block-local child set exceeds `DYNAMIC_MAX_EXPORT_CHILDREN`, or
 /// [`ExportError::DynamicDuplicateChild`] when its child type names are not
 /// unique. The single check runs before anything is written and the writers it
 /// gates are infallible, so on error BOTH `schema_out` and `array_out` are
@@ -1867,7 +1871,7 @@ unsafe fn write_batch_schema(batch: &ColBatch, out: *mut ArrowSchema) {
 /// into an inconsistent state exports as memory-safe but semantically invalid
 /// Arrow: a row whose id indexes no child is routed to the NULL child while
 /// its dense-union offset still names the slot the id originally selected
-/// (see the fallback in [`export_dynamic_array`]).
+/// (see the fallback in `export_dynamic_array`).
 pub unsafe fn export_batch(
     batch: &Arc<ColBatch>,
     schema_out: *mut ArrowSchema,
@@ -3349,7 +3353,7 @@ fn push_offsets<T>(buffers: &mut Vec<*const c_void>, offsets: &[T], empty: *cons
 }
 
 /// Returns an [`ExportError`] without touching `out` when a Dynamic column's
-/// block-local child set exceeds [`DYNAMIC_MAX_EXPORT_CHILDREN`] or carries
+/// block-local child set exceeds `DYNAMIC_MAX_EXPORT_CHILDREN` or carries
 /// duplicate child type names, so it must be paired with the matching
 /// (also-checked) [`export_batch_schema`], preferably through [`export_batch`],
 /// which checks once for both.
@@ -3371,7 +3375,7 @@ fn push_offsets<T>(buffers: &mut Vec<*const c_void>, offsets: &[T], empty: *cons
 /// into an inconsistent state exports as memory-safe but semantically invalid
 /// Arrow: a row whose id indexes no child is routed to the NULL child while
 /// its dense-union offset still names the slot the id originally selected
-/// (see the fallback in [`export_dynamic_array`]).
+/// (see the fallback in `export_dynamic_array`).
 pub unsafe fn export_batch_array(
     batch: &Arc<ColBatch>,
     out: *mut ArrowArray,
@@ -3745,6 +3749,10 @@ unsafe extern "C" fn stream_get_schema(
     out: *mut ArrowSchema,
 ) -> i32 {
     let s = &mut *stream;
+    if s.private_data.is_null() {
+        (*out).release = None;
+        return STREAM_INIT_ERROR;
+    }
     let pd = &*(s.private_data as *const StreamPrivateData);
     if pd.init_error {
         // Do not emit a schema the per-chunk arrays could never match. Clear the
@@ -3759,6 +3767,10 @@ unsafe extern "C" fn stream_get_schema(
 
 unsafe extern "C" fn stream_get_next(stream: *mut ArrowArrayStream, out: *mut ArrowArray) -> i32 {
     let s = &mut *stream;
+    if s.private_data.is_null() {
+        (*out).release = None;
+        return STREAM_INIT_ERROR;
+    }
     let pd = &mut *(s.private_data as *mut StreamPrivateData);
     if pd.init_error {
         (*out).release = None;
@@ -3780,6 +3792,9 @@ unsafe extern "C" fn stream_get_next(stream: *mut ArrowArrayStream, out: *mut Ar
 
 unsafe extern "C" fn stream_get_last_error(stream: *mut ArrowArrayStream) -> *const c_char {
     let s = &*stream;
+    if s.private_data.is_null() {
+        return ptr::null();
+    }
     let pd = &*(s.private_data as *const StreamPrivateData);
     pd.error_msg.as_ptr()
 }
@@ -3789,7 +3804,7 @@ unsafe extern "C" fn stream_get_last_error(stream: *mut ArrowArrayStream) -> *co
 /// `chunks` is empty (a zero-row result still advertises its columns).
 ///
 /// A result-wide Dynamic child set can outgrow Arrow's signed Int8 union code
-/// space (see [`DYNAMIC_MAX_EXPORT_CHILDREN`]), and a hand-built Dynamic column
+/// space (see `DYNAMIC_MAX_EXPORT_CHILDREN`), and a hand-built Dynamic column
 /// can carry duplicate block-local child type names, which would make the
 /// name-keyed result-wide unification ambiguous. In either case the stream is
 /// still constructed but flagged failed: `get_schema` and `get_next` return a
@@ -3808,7 +3823,7 @@ unsafe extern "C" fn stream_get_last_error(stream: *mut ArrowArrayStream) -> *co
 /// were mutated into an inconsistent state exports as memory-safe but
 /// semantically invalid Arrow: an unresolved id is routed to the NULL child
 /// while its borrowed dense-union offset still indexes the child it originally
-/// named (see the fallback in [`export_dynamic_array_with_plan`]).
+/// named (see the fallback in `export_dynamic_array_with_plan`).
 pub unsafe fn export_chunks_to_stream(
     schema: Schema,
     chunks: Vec<Arc<ColBatch>>,

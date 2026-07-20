@@ -302,6 +302,10 @@ fn deeply_nested_dynamic_encode_errors_instead_of_overflowing() {
             other => panic!("expected InconsistentBatch, got {other:?}"),
         }
     }
+    // The invalid 2,000-level caller-built tree also has a recursively derived
+    // destructor. Leak this test fixture so a 512 KiB regression-test thread
+    // measures validation stack use rather than the unrelated post-test drop.
+    std::mem::forget(batch);
 }
 
 #[test]
@@ -317,6 +321,7 @@ fn binary_type_descriptors_roundtrip() {
             &bytes,
             &DecodeOptions {
                 protocol_revision: revision,
+                ..DecodeOptions::default()
             },
         )
         .unwrap();

@@ -55,19 +55,72 @@ pub(super) fn validate_block(batch: &ColBatch, options: &EncodeOptions) -> Resul
 /// [`encode_block`]).
 ///
 /// `depth` is the cumulative nesting depth from the batch column root,
-/// incremented on every recursive descent. The `type_depth` cap below bounds
+/// incremented on every worklist descent. The `type_depth` cap below bounds
 /// one declared type, but a `DynamicColumn`'s children carry their own
 /// `ChType`s, so each Dynamic level restarts that per-type budget;
 /// [`validate_dynamic`] charges every level against this one cumulative budget
-/// so a pathologically nested Dynamic column errors instead of overflowing the
-/// stack (here and in the write phase, which recurses over the same tree only
-/// after validation passes).
-fn validate_column(
-    field: &Field,
-    column: &Column,
+/// so a pathologically nested Dynamic column errors without consuming one Rust
+/// stack frame per level. The write phase only runs after this validation passes.
+fn validate_column<'a>(
+    field: &'a Field,
+    column: &'a Column,
     num_rows: usize,
     options: &EncodeOptions,
     depth: usize,
+) -> Result<(), EncodeError> {
+    // A scalar or leaf column validates without descending, so the worklist
+    // stays empty and never allocates. The root starts in `next`; only container
+    // validators push onto `work`. `next` holds the root once, is drained on the
+    // first iteration, and is never refilled, so the LIFO pop order (which the
+    // reversed child pushes rely on) is preserved exactly.
+    let mut work: Vec<ValidationTask> = Vec::new();
+    let mut next = Some(ValidationTask {
+        field: ValidationField::Borrowed(field),
+        column,
+        num_rows,
+        depth,
+    });
+    while let Some(task) = next.take().or_else(|| work.pop()) {
+        validate_column_once(
+            task.field.as_ref(),
+            task.column,
+            task.num_rows,
+            options,
+            task.depth,
+            &mut work,
+        )?;
+    }
+    Ok(())
+}
+
+enum ValidationField<'a> {
+    Borrowed(&'a Field),
+    Owned(Field),
+}
+
+impl ValidationField<'_> {
+    fn as_ref(&self) -> &Field {
+        match self {
+            Self::Borrowed(field) => field,
+            Self::Owned(field) => field,
+        }
+    }
+}
+
+struct ValidationTask<'a> {
+    field: ValidationField<'a>,
+    column: &'a Column,
+    num_rows: usize,
+    depth: usize,
+}
+
+fn validate_column_once<'a>(
+    field: &Field,
+    column: &'a Column,
+    num_rows: usize,
+    options: &EncodeOptions,
+    depth: usize,
+    work: &mut Vec<ValidationTask<'a>>,
 ) -> Result<(), EncodeError> {
     // Bound the declared type's nesting depth before anything walks it.
     // Encode input is caller-constructed and never passes through
@@ -254,11 +307,11 @@ fn validate_column(
     }
 
     if let (ChType::LowCardinality(inner), Column::Dictionary(c)) = (physical_type, column) {
-        validate_low_cardinality(field, inner, c, num_rows, options, depth)?;
+        validate_low_cardinality(field, inner, c, num_rows, depth, work)?;
     }
 
     if let (ChType::Array(inner), Column::Array(c)) = (value_type, column) {
-        validate_array(field, inner, c, num_rows, options, depth)?;
+        validate_array(field, inner, c, num_rows, depth, work)?;
     }
 
     if let (
@@ -273,19 +326,19 @@ fn validate_column(
     }
 
     if let (ChType::Tuple(elements), Column::Tuple(c)) = (value_type, column) {
-        validate_tuple(field, elements, c, num_rows, options, depth)?;
+        validate_tuple(field, elements, c, num_rows, depth, work)?;
     }
 
     if let (ChType::Map(key, value), Column::Map(c)) = (value_type, column) {
-        validate_map(field, key, value, c, num_rows, options, depth)?;
+        validate_map(field, key, value, c, num_rows, depth, work)?;
     }
 
     if let (ChType::Variant(alternatives), Column::Variant(c)) = (value_type, column) {
-        validate_variant(field, alternatives, c, num_rows, options, depth)?;
+        validate_variant(field, alternatives, c, num_rows, depth, work)?;
     }
 
     if let (ChType::Dynamic { max_types }, Column::Dynamic(c)) = (value_type, column) {
-        validate_dynamic(field, *max_types, c, num_rows, options, depth)?;
+        validate_dynamic(field, *max_types, c, num_rows, options, depth, work)?;
     }
 
     if let (
@@ -307,6 +360,7 @@ fn validate_column(
             num_rows,
             options,
             depth,
+            work,
         )?;
     }
 
@@ -834,13 +888,13 @@ fn validate_offsets<O: Offset>(
 /// NULL sentinel; the dictionary body itself is serialized as the non-nullable
 /// removeNullable inner type with no null map. This encoder preserves the decoded
 /// representation: nullable rows must have index 0, and valid rows must not.
-fn validate_low_cardinality(
+fn validate_low_cardinality<'a>(
     field: &Field,
     inner: &ChType,
-    col: &DictionaryColumn,
+    col: &'a DictionaryColumn,
     num_rows: usize,
-    options: &EncodeOptions,
     depth: usize,
+    work: &mut Vec<ValidationTask<'a>>,
 ) -> Result<(), EncodeError> {
     // Resolve the inner through the shared helper (full SAF chain + optional
     // removeNullable Nullable + inner SAF chain), so the dictionary body and index
@@ -884,13 +938,12 @@ fn validate_low_cardinality(
         name: format!("{} dictionary", field.name),
         ch_type: dict_value_type.clone(),
     };
-    validate_column(
-        &dict_field,
-        col.values.as_ref(),
-        num_keys,
-        options,
-        depth + 1,
-    )?;
+    work.push(ValidationTask {
+        field: ValidationField::Owned(dict_field),
+        column: col.values.as_ref(),
+        num_rows: num_keys,
+        depth: depth + 1,
+    });
 
     for (row, &idx) in col.indices.iter().enumerate() {
         if idx < 0 {
@@ -952,13 +1005,13 @@ fn validate_low_cardinality(
 /// `Nullable` element's validity length, `LowCardinality` invariants, string
 /// offsets, fixed-binary widths, a nested `Array`) applies to the flattened
 /// buffer too.
-fn validate_array(
+fn validate_array<'a>(
     field: &Field,
     inner: &ChType,
-    col: &ArrayColumn,
+    col: &'a ArrayColumn,
     num_rows: usize,
-    options: &EncodeOptions,
     depth: usize,
+    work: &mut Vec<ValidationTask<'a>>,
 ) -> Result<(), EncodeError> {
     // Arrow LargeList offset invariants (shape, leading 0, monotonic, final
     // offset == flattened element count). Equal adjacent offsets (empty rows)
@@ -981,13 +1034,13 @@ fn validate_array(
         name: format!("{} element", field.name),
         ch_type: inner.clone(),
     };
-    validate_column(
-        &element_field,
-        col.values.as_ref(),
-        element_rows,
-        options,
-        depth + 1,
-    )
+    work.push(ValidationTask {
+        field: ValidationField::Owned(element_field),
+        column: col.values.as_ref(),
+        num_rows: element_rows,
+        depth: depth + 1,
+    });
+    Ok(())
 }
 
 /// Validate a `Tuple(T1, ...)` column before any bytes are written.
@@ -1011,13 +1064,13 @@ fn validate_array(
 /// is owned by the blanket `unsupported_header_type_name` check in
 /// [`validate_column`], which reports it as `UnsupportedType`; only buffer shape
 /// is checked here.
-fn validate_tuple(
+fn validate_tuple<'a>(
     field: &Field,
     elements: &[(Option<String>, ChType)],
-    col: &TupleColumn,
+    col: &'a TupleColumn,
     num_rows: usize,
-    options: &EncodeOptions,
     depth: usize,
+    work: &mut Vec<ValidationTask<'a>>,
 ) -> Result<(), EncodeError> {
     if elements.len() != col.fields.len() {
         return Err(EncodeError::InconsistentBatch {
@@ -1029,7 +1082,9 @@ fn validate_tuple(
             ),
         });
     }
-    for (i, ((name, element_type), element_col)) in elements.iter().zip(&col.fields).enumerate() {
+    for (i, ((name, element_type), element_col)) in
+        elements.iter().zip(&col.fields).enumerate().rev()
+    {
         let element_field = Field {
             name: match name {
                 Some(n) => format!("{} element {n:?}", field.name),
@@ -1037,7 +1092,12 @@ fn validate_tuple(
             },
             ch_type: element_type.clone(),
         };
-        validate_column(&element_field, element_col, num_rows, options, depth + 1)?;
+        work.push(ValidationTask {
+            field: ValidationField::Owned(element_field),
+            column: element_col,
+            num_rows,
+            depth: depth + 1,
+        });
     }
     Ok(())
 }
@@ -1056,14 +1116,14 @@ fn validate_tuple(
 /// fields are validated recursively as their own columns of
 /// `offsets[num_rows]` rows, so every key/value-level guard applies to the
 /// flattened buffers.
-fn validate_map(
+fn validate_map<'a>(
     field: &Field,
     key: &ChType,
     value: &ChType,
-    col: &MapColumn,
+    col: &'a MapColumn,
     num_rows: usize,
-    options: &EncodeOptions,
     depth: usize,
+    work: &mut Vec<ValidationTask<'a>>,
 ) -> Result<(), EncodeError> {
     let reject = |detail: String| Err(EncodeError::InconsistentBatch { detail });
 
@@ -1115,24 +1175,23 @@ fn validate_map(
         name: format!("{} key", field.name),
         ch_type: key.clone(),
     };
-    validate_column(
-        &key_field,
-        &entries.fields[0],
-        entry_rows,
-        options,
-        depth + 1,
-    )?;
     let value_field = Field {
         name: format!("{} value", field.name),
         ch_type: value.clone(),
     };
-    validate_column(
-        &value_field,
-        &entries.fields[1],
-        entry_rows,
-        options,
-        depth + 1,
-    )
+    work.push(ValidationTask {
+        field: ValidationField::Owned(value_field),
+        column: &entries.fields[1],
+        num_rows: entry_rows,
+        depth: depth + 1,
+    });
+    work.push(ValidationTask {
+        field: ValidationField::Owned(key_field),
+        column: &entries.fields[0],
+        num_rows: entry_rows,
+        depth: depth + 1,
+    });
+    Ok(())
 }
 
 /// Validate a Variant's discriminator run, Arrow Dense Union tree, and dense
@@ -1151,13 +1210,13 @@ fn validate_map(
 /// type ids, offsets that are not occurrence ordinals, and malformed groups.
 /// Client-side rejection stays deliberately stricter than the server, whose
 /// bulk deserialize path has no discriminator range check at all.
-fn validate_variant(
+fn validate_variant<'a>(
     field: &Field,
     alternatives: &[ChType],
-    col: &VariantColumn,
+    col: &'a VariantColumn,
     num_rows: usize,
-    options: &EncodeOptions,
     depth: usize,
+    work: &mut Vec<ValidationTask<'a>>,
 ) -> Result<(), EncodeError> {
     let reject = |detail: String| Err(EncodeError::InconsistentBatch { detail });
 
@@ -1220,6 +1279,7 @@ fn validate_variant(
         .zip(&col.variants)
         .zip(counts)
         .enumerate()
+        .rev()
     {
         if child.len() != expected {
             return reject(format!(
@@ -1232,7 +1292,12 @@ fn validate_variant(
             name: format!("{} alternative {alternative}", field.name),
             ch_type: ch_type.clone(),
         };
-        validate_column(&child_field, child, expected, options, depth + 1)?;
+        work.push(ValidationTask {
+            field: ValidationField::Owned(child_field),
+            column: child,
+            num_rows: expected,
+            depth: depth + 1,
+        });
     }
     Ok(())
 }
@@ -1387,13 +1452,14 @@ fn validate_variant_layout(
 /// SharedVariant, so the V1/V2 count limits apply to it too. Both shapes use
 /// occurrence-ordinal dense offsets, permitting the body writer to emit one
 /// routing run followed by one bulk body per child with no materialization.
-fn validate_dynamic(
+fn validate_dynamic<'a>(
     field: &Field,
     max_types: u8,
-    col: &DynamicColumn,
+    col: &'a DynamicColumn,
     num_rows: usize,
     options: &EncodeOptions,
     depth: usize,
+    work: &mut Vec<ValidationTask<'a>>,
 ) -> Result<(), EncodeError> {
     let reject = |detail: String| Err(EncodeError::InconsistentBatch { detail });
 
@@ -1554,6 +1620,13 @@ fn validate_dynamic(
         ));
     }
 
+    // Collect the Typed children and push them reversed so the worklist pops
+    // them in forward declaration order, matching validate_tuple/validate_variant.
+    // Only the push order is reversed: unlike variant's pure length guard, the
+    // Shared arm here runs a substantive inline Utf8 validation, so reversing the
+    // whole loop would change which sibling error surfaces first. Keeping the
+    // inline length/validity/Utf8 checks in forward order preserves that precedence.
+    let mut typed_children = Vec::new();
     for (child_index, (child, expected)) in col.children.iter().zip(counts).enumerate() {
         if child.len() != expected {
             return reject(format!(
@@ -1568,7 +1641,12 @@ fn validate_dynamic(
                     name: format!("{} Dynamic child {ch_type}", field.name),
                     ch_type: ch_type.clone(),
                 };
-                validate_column(&child_field, values, expected, options, depth + 1)?;
+                typed_children.push(ValidationTask {
+                    field: ValidationField::Owned(child_field),
+                    column: values,
+                    num_rows: expected,
+                    depth: depth + 1,
+                });
             }
             DynamicChild::Shared(values) => {
                 if values.validity.is_some() {
@@ -1580,6 +1658,9 @@ fn validate_dynamic(
                 validate_utf8_column(field, values, expected)?;
             }
         }
+    }
+    for task in typed_children.into_iter().rev() {
+        work.push(task);
     }
     Ok(())
 }
@@ -1599,15 +1680,16 @@ fn validate_dynamic(
 /// typed-path or dynamic-path children carry fresh types that restart the
 /// per-type cap) errors rather than overflowing the stack.
 #[allow(clippy::too_many_arguments)]
-fn validate_json(
+fn validate_json<'a>(
     field: &Field,
     max_dynamic_paths: u32,
     max_dynamic_types: u8,
     typed_paths: &[(String, ChType)],
-    col: &JsonColumn,
+    col: &'a JsonColumn,
     num_rows: usize,
     options: &EncodeOptions,
     depth: usize,
+    work: &mut Vec<ValidationTask<'a>>,
 ) -> Result<(), EncodeError> {
     let reject = |detail: String| Err(EncodeError::InconsistentBatch { detail });
 
@@ -1640,8 +1722,12 @@ fn validate_json(
             structured.typed.len()
         ));
     }
+    // Push reversed so typed paths pop in forward declaration order, matching
+    // validate_tuple/validate_variant. The inline path-name guard mirrors
+    // variant's length guard, so reversing it only reorders which of multiple
+    // simultaneous mismatches surfaces first, not whether the column is rejected.
     for ((declared_path, declared_type), (buffer_path, buffer_column)) in
-        typed_paths.iter().zip(&structured.typed)
+        typed_paths.iter().zip(&structured.typed).rev()
     {
         if declared_path != buffer_path {
             return reject(format!(
@@ -1653,7 +1739,12 @@ fn validate_json(
             name: format!("{} JSON path {declared_path}", field.name),
             ch_type: declared_type.clone(),
         };
-        validate_column(&typed_field, buffer_column, num_rows, options, depth + 1)?;
+        work.push(ValidationTask {
+            field: ValidationField::Owned(typed_field),
+            column: buffer_column,
+            num_rows,
+            depth: depth + 1,
+        });
     }
 
     // Dynamic paths: strictly sorted and unique, each a valid Dynamic column at
@@ -1698,6 +1789,7 @@ fn validate_json(
             num_rows,
             options,
             depth + 1,
+            work,
         )?;
     }
 

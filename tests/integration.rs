@@ -37,9 +37,10 @@ macro_rules! fixture_tests {
         $(
             #[test]
             fn $name() {
-                let options = DecodeOptions {
-                    protocol_revision: $revision,
-                };
+                // `DecodeOptions` is `#[non_exhaustive]`, so construct it via
+                // `default()` and set fields rather than a struct literal.
+                let mut options = DecodeOptions::default();
+                options.protocol_revision = $revision;
                 let bytes = include_bytes!(concat!("fixtures/", $file));
                 let batch = decode_all_bytes(bytes, &options)
                     .unwrap_or_else(|err| panic!("failed to decode {}: {err}", $file));

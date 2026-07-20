@@ -126,6 +126,7 @@ fn structured_selects_v1_or_v2_by_revision() {
         &v2,
         &DecodeOptions {
             protocol_revision: DBMS_TCP_PROTOCOL_VERSION,
+            ..DecodeOptions::default()
         },
     )
     .unwrap();
@@ -598,6 +599,7 @@ fn binary_type_descriptors_roundtrip() {
             &bytes,
             &DecodeOptions {
                 protocol_revision: revision,
+                ..DecodeOptions::default()
             },
         )
         .unwrap();

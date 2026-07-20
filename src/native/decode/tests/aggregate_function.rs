@@ -510,7 +510,7 @@ fn decode_nullable_sum_state_widths_preserve_flags_bytes_and_next_column_boundar
     {
         let type_name = format!("AggregateFunction(sum, Nullable({argument}))");
         let mut states = vec![0x00, 0x02];
-        states.extend(std::iter::repeat_n((case + 1) as u8, width));
+        states.extend(std::iter::repeat((case + 1) as u8).take(width));
         let data = BlockBuilder::new()
             .header(2, 2)
             .column_header("s", &type_name)

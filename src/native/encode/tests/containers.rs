@@ -827,6 +827,7 @@ fn encode_chunked_roundtrips_array_blocks() {
             &bytes,
             &DecodeOptions {
                 protocol_revision: revision,
+                ..DecodeOptions::default()
             },
         )
         .unwrap_or_else(|e| panic!("decode at rev {revision} failed: {e}"));

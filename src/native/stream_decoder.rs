@@ -19,8 +19,8 @@ use std::io;
 
 use crate::batch::ColBatch;
 use crate::native::decode::{
-    block_end, block_end_binary_types, decode_next_block, decode_next_block_binary_types,
-    DecodeError, DecodeOptions,
+    block_end, block_end_binary_types, decode_next_block_binary_types_with_budget,
+    decode_next_block_with_budget, AllocationBudget, DecodeError, DecodeOptions,
 };
 use crate::native::varint::ByteReader;
 use crate::schema::Schema;
@@ -47,6 +47,8 @@ pub struct StreamDecoder {
     /// coordinates: compaction lowers it by the number of bytes drained.
     scanned: usize,
     options: DecodeOptions,
+    /// Cumulative budget shared by every block decoded in this stream session.
+    allocation_budget: AllocationBudget,
     binary_types: bool,
     finished: bool,
     /// First block's schema; later blocks must match it.
@@ -57,11 +59,13 @@ pub struct StreamDecoder {
 
 impl StreamDecoder {
     pub fn new(options: DecodeOptions) -> Self {
+        let allocation_budget = AllocationBudget::new(options.max_synthetic_allocation_bytes);
         Self {
             buffer: Vec::new(),
             pos: 0,
             scanned: 0,
             options,
+            allocation_budget,
             binary_types: false,
             finished: false,
             schema: None,
@@ -161,9 +165,17 @@ impl StreamDecoder {
                     // the same framing, so it cannot hit EOF.
                     let mut reader = ByteReader::new(&data[..end]);
                     let decoded = if self.binary_types {
-                        decode_next_block_binary_types(&mut reader, &self.options)
+                        decode_next_block_binary_types_with_budget(
+                            &mut reader,
+                            &self.options,
+                            &mut self.allocation_budget,
+                        )
                     } else {
-                        decode_next_block(&mut reader, &self.options)
+                        decode_next_block_with_budget(
+                            &mut reader,
+                            &self.options,
+                            &mut self.allocation_budget,
+                        )
                     }?;
                     match decoded {
                         Some(batch) => {

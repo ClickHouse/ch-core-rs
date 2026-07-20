@@ -129,6 +129,7 @@ fn test_decode_low_cardinality_saf_nullable_string() {
 
         let options = DecodeOptions {
             protocol_revision: revision,
+            ..DecodeOptions::default()
         };
         let cb = decode_all_bytes(&data, &options).unwrap();
         assert_eq!(cb.schema.fields[0].ch_type, expected_type);
@@ -309,6 +310,7 @@ fn test_low_cardinality_modern_framing_roundtrip() {
 
     let options = DecodeOptions {
         protocol_revision: DBMS_TCP_PROTOCOL_VERSION,
+        ..DecodeOptions::default()
     };
     let cb = decode_all_bytes(&data, &options).unwrap();
     let batch = &cb.chunks[0];

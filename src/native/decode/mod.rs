@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io;
 use std::sync::Arc;
 
@@ -32,6 +33,7 @@ pub use crate::native::type_parser::{low_cardinality_dict_value_type, parse_ch_t
 
 /// Errors that can occur during Native format decoding.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum DecodeError {
     Io(io::Error),
     UnsupportedType {
@@ -99,6 +101,12 @@ pub enum DecodeError {
         column: String,
         reason: String,
     },
+    /// Decoding would exceed a session-scoped resource ceiling.
+    ResourceLimit {
+        limit: usize,
+        requested: usize,
+        what: &'static str,
+    },
 }
 
 impl From<io::Error> for DecodeError {
@@ -153,6 +161,14 @@ impl std::fmt::Display for DecodeError {
             DecodeError::InvalidJson { column, reason } => {
                 write!(f, "Invalid JSON layout for column '{column}': {reason}")
             }
+            DecodeError::ResourceLimit {
+                limit,
+                requested,
+                what,
+            } => write!(
+                f,
+                "Resource limit exceeded for {what}: requested {requested} bytes cumulatively, limit is {limit} bytes"
+            ),
         }
     }
 }
@@ -160,7 +176,7 @@ impl std::fmt::Display for DecodeError {
 impl std::error::Error for DecodeError {}
 
 /// Options for Native format decoding.
-#[derive(Default)]
+#[non_exhaustive]
 pub struct DecodeOptions {
     /// Negotiated server protocol revision the Native stream was produced with.
     ///
@@ -169,13 +185,68 @@ pub struct DecodeOptions {
     ///
     /// - A `BlockInfo` preamble precedes every block when this is > 0.
     /// - A per-column custom-serialization marker byte is present when this is
-    ///   >= [`DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION`].
+    ///   \>= [`DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION`].
     ///
     /// Use [`DBMS_TCP_PROTOCOL_VERSION`] for a stream from a current server over
     /// the native TCP protocol. Use 0 for a bare Native stream with no protocol
     /// framing, for example HTTP `FORMAT Native` with no `client_protocol_version`
     /// set.
     pub protocol_revision: u64,
+    /// Maximum cumulative bytes that one decode session may allocate for
+    /// buffers synthesized without corresponding input bytes.
+    ///
+    /// This currently covers the all-zero shared offsets synthesized for
+    /// PATHLESS FLATTENED JSON blocks, whose wire body carries zero bytes per
+    /// row and so cannot bound the offset allocation from the input. A FLATTENED
+    /// column that has typed or dynamic paths is input-bounded and does not
+    /// charge this budget. The limit is shared across every column and block decoded by
+    /// [`decode_all_bytes`] or one
+    /// [`StreamDecoder`](crate::native::stream_decoder::StreamDecoder), so a
+    /// small payload cannot amplify allocation by repeating pathless JSON
+    /// columns. Set this explicitly only when a trusted workload legitimately
+    /// needs more than the default 256 MiB.
+    pub max_synthetic_allocation_bytes: usize,
+}
+
+impl Default for DecodeOptions {
+    fn default() -> Self {
+        Self {
+            protocol_revision: 0,
+            max_synthetic_allocation_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
+/// Cumulative allowance for allocations whose size is not bounded by input.
+pub(crate) struct AllocationBudget {
+    limit: usize,
+    used: usize,
+}
+
+impl AllocationBudget {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self { limit, used: 0 }
+    }
+
+    fn charge(&mut self, bytes: usize, what: &'static str) -> Result<(), DecodeError> {
+        let requested = self
+            .used
+            .checked_add(bytes)
+            .ok_or(DecodeError::ResourceLimit {
+                limit: self.limit,
+                requested: usize::MAX,
+                what,
+            })?;
+        if requested > self.limit {
+            return Err(DecodeError::ResourceLimit {
+                limit: self.limit,
+                requested,
+                what,
+            });
+        }
+        self.used = requested;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -573,6 +644,13 @@ fn decode_qbit_data(
 // Bulk-state prefix
 // ---------------------------------------------------------------------------
 
+/// One pending step in the iterative state-prefix traversal.
+enum PrefixWork<'a> {
+    Borrowed(&'a ChType, usize),
+    Owned(ChType, usize),
+    Dynamic { max_types: u8, depth: usize },
+}
+
 /// Consume a column's per-block `deserializeBinaryBulkStatePrefix` bytes.
 ///
 /// In the Native format the server runs `readData` once per column per block,
@@ -584,20 +662,13 @@ fn decode_qbit_data(
 /// Centralizing these bytes here keeps nested prefix order identical to the
 /// server instead of special-casing the per-column loop.
 ///
-/// Returns the parsed key version for `LowCardinality` (so the decoder does not
-/// re-read it), `None` for every other type.
-///
-/// `depth` is the cumulative nesting depth from the column root, incremented on
-/// every structural descent. The parser bounds a single type string at
-/// [`MAX_TYPE_DEPTH`], but Dynamic's runtime type table is column DATA parsed
-/// fresh at each Dynamic level, so each level would restart that budget: a
-/// hostile stream nesting `Array(Dynamic)` tens of thousands of levels deep
-/// would otherwise overflow the stack here. Charging every level against one
-/// cumulative budget and checking it at the Dynamic arm turns that into an
-/// [`DecodeError::InvalidDynamic`]. This gate also bounds the body and suffix
-/// traversals ([`decode_values`], [`skip_values`], [`read_state_suffix`]): they
-/// recurse over exactly the prefix traversal's tree, consuming the
-/// `states` this function retained, so no deeper state can exist.
+/// The traversal uses an explicit worklist. This matters for Dynamic and JSON:
+/// their runtime type tables arrive as column data, so each level restarts the
+/// ordinary parser's per-type depth budget. Keeping one cumulative `depth` on
+/// work items rejects a hostile cross-table chain without consuming one Rust
+/// stack frame per level. Borrowed header types stay borrowed; runtime child
+/// types are cloned once into owned work items because their originals remain
+/// in `states` for the body traversal.
 fn read_state_prefix(
     reader: &mut ByteReader,
     ch_type: &ChType,
@@ -605,102 +676,157 @@ fn read_state_prefix(
     options: &DecodeSettings,
     states: &mut Vec<StatePrefix>,
     depth: usize,
-) -> Result<Option<u64>, DecodeError> {
-    // A name-decoration alias (SimpleAggregateFunction, geo, Nested) has the
-    // exact state prefix of the type it delegates to, so expand and recurse. For
-    // Nested(a LowCardinality(String)) this reaches the leaf LowCardinality's
-    // 8-byte key version through the delegated Array(Tuple(...)) chain, hoisting
-    // it to the very front of the whole column, before the offsets.
-    if let Some(under) = ch_type.physical_delegate_ref() {
-        return read_state_prefix(reader, under.as_ref(), column, options, states, depth + 1);
+) -> Result<(), DecodeError> {
+    // A scalar or leaf column reads its prefix without ever descending, so the
+    // worklist stays empty and never allocates. The root starts in `next`; only
+    // container arms push onto `work`. `next` holds the root once, is drained on
+    // the first iteration, and is never refilled, so LIFO pop order (which the
+    // reversed container pushes rely on) is preserved exactly.
+    let mut work: Vec<PrefixWork> = Vec::new();
+    let mut next = Some(PrefixWork::Borrowed(ch_type, depth));
+    while let Some(item) = next.take().or_else(|| work.pop()) {
+        match item {
+            PrefixWork::Borrowed(current, depth) => {
+                // Aliases have the exact state prefix of their physical type.
+                // A Nested expansion is owned; fixed aliases and SAF borrow.
+                if let Some(under) = current.physical_delegate_ref() {
+                    match under {
+                        Cow::Borrowed(under) => work.push(PrefixWork::Borrowed(under, depth + 1)),
+                        Cow::Owned(under) => work.push(PrefixWork::Owned(under, depth + 1)),
+                    }
+                    continue;
+                }
+                match current {
+                    ChType::LowCardinality(_) => read_low_cardinality_state(reader, column)?,
+                    ChType::Array(inner) | ChType::Nullable(inner) => {
+                        work.push(PrefixWork::Borrowed(inner, depth + 1));
+                    }
+                    ChType::Tuple(elements) => {
+                        for (_, element_type) in elements.iter().rev() {
+                            work.push(PrefixWork::Borrowed(element_type, depth + 1));
+                        }
+                    }
+                    ChType::Map(key, value) => {
+                        work.push(PrefixWork::Borrowed(value, depth + 1));
+                        work.push(PrefixWork::Borrowed(key, depth + 1));
+                    }
+                    ChType::Variant(alternatives) => {
+                        read_variant_state(reader, column)?;
+                        for alternative in alternatives.iter().rev() {
+                            work.push(PrefixWork::Borrowed(alternative, depth + 1));
+                        }
+                    }
+                    ChType::Dynamic { max_types } => read_dynamic_state_prefix(
+                        reader, *max_types, column, options, states, depth, &mut work,
+                    )?,
+                    ChType::Json {
+                        max_dynamic_paths,
+                        max_dynamic_types,
+                        typed_paths,
+                        ..
+                    } => {
+                        let state = read_json_state(reader, *max_dynamic_paths, column, depth)?;
+                        let kind = state.kind;
+                        let num_dynamic = state.dynamic_paths.len();
+                        states.push(StatePrefix::Json(state));
+                        if kind != JsonWireKind::Text {
+                            for _ in 0..num_dynamic {
+                                work.push(PrefixWork::Dynamic {
+                                    max_types: *max_dynamic_types,
+                                    depth: depth + 1,
+                                });
+                            }
+                            for (_, element_type) in typed_paths.iter().rev() {
+                                work.push(PrefixWork::Borrowed(element_type, depth + 1));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            PrefixWork::Owned(current, depth) => {
+                if let Some(under) = current.physical_delegate() {
+                    work.push(PrefixWork::Owned(under, depth + 1));
+                    continue;
+                }
+                match current {
+                    ChType::LowCardinality(_) => read_low_cardinality_state(reader, column)?,
+                    ChType::Array(inner) | ChType::Nullable(inner) => {
+                        work.push(PrefixWork::Owned(*inner, depth + 1));
+                    }
+                    ChType::Tuple(elements) => {
+                        for (_, element_type) in elements.into_iter().rev() {
+                            work.push(PrefixWork::Owned(element_type, depth + 1));
+                        }
+                    }
+                    ChType::Map(key, value) => {
+                        work.push(PrefixWork::Owned(*value, depth + 1));
+                        work.push(PrefixWork::Owned(*key, depth + 1));
+                    }
+                    ChType::Variant(alternatives) => {
+                        read_variant_state(reader, column)?;
+                        for alternative in alternatives.into_iter().rev() {
+                            work.push(PrefixWork::Owned(alternative, depth + 1));
+                        }
+                    }
+                    ChType::Dynamic { max_types } => read_dynamic_state_prefix(
+                        reader, max_types, column, options, states, depth, &mut work,
+                    )?,
+                    ChType::Json {
+                        max_dynamic_paths,
+                        max_dynamic_types,
+                        typed_paths,
+                        ..
+                    } => {
+                        let state = read_json_state(reader, max_dynamic_paths, column, depth)?;
+                        let kind = state.kind;
+                        let num_dynamic = state.dynamic_paths.len();
+                        states.push(StatePrefix::Json(state));
+                        if kind != JsonWireKind::Text {
+                            for _ in 0..num_dynamic {
+                                work.push(PrefixWork::Dynamic {
+                                    max_types: max_dynamic_types,
+                                    depth: depth + 1,
+                                });
+                            }
+                            for (_, element_type) in typed_paths.into_iter().rev() {
+                                work.push(PrefixWork::Owned(element_type, depth + 1));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            PrefixWork::Dynamic { max_types, depth } => read_dynamic_state_prefix(
+                reader, max_types, column, options, states, depth, &mut work,
+            )?,
+        }
     }
-    match ch_type {
-        ChType::LowCardinality(_) => {
-            let key_version = reader.read_u64_le()?;
-            if key_version != LOW_CARDINALITY_KEY_VERSION {
-                return Err(DecodeError::InvalidLowCardinality {
-                    column: column.to_string(),
-                    reason: "key version is not 1 (SharedDictionariesWithAdditionalKeys)",
-                });
-            }
-            Ok(Some(key_version))
-        }
-        // Array writes no prefix of its own; `SerializationArray`'s
-        // `deserializeBinaryBulkStatePrefix` recurses into the element type's
-        // prefix (confirmed at v26.6.1.1193-stable). This is how a leaf
-        // `LowCardinality`'s 8-byte key version is consumed here, at the front of
-        // the whole Array column, before the offsets.
-        ChType::Array(inner) => {
-            read_state_prefix(reader, inner, column, options, states, depth + 1)
-        }
-        // Tuple writes no prefix of its own; `SerializationTuple`'s
-        // `deserializeBinaryBulkStatePrefix` loops over the elements in
-        // declaration order and delegates to each (confirmed at
-        // v26.6.1.1193-stable). So Tuple(LowCardinality(String), Int32) has the
-        // LC 8-byte key version here, at the front of the whole Tuple column,
-        // and nothing for the Int32.
-        ChType::Tuple(elements) => {
-            for (_, element_type) in elements {
-                read_state_prefix(reader, element_type, column, options, states, depth + 1)?;
-            }
-            Ok(None)
-        }
-        // Map writes no prefix of its own; its prefix chain is
-        // Map -> Array (nothing) -> Tuple -> key's prefix then value's prefix,
-        // in that order (confirmed at v26.6.1.1193-stable, `SerializationMap`
-        // delegating to the nested `Array(Tuple(...))` serialization). So
-        // Map(LowCardinality(String), Int32) has the LC 8-byte key version at
-        // the very front of the whole column, before the offsets.
-        ChType::Map(key, value) => {
-            read_state_prefix(reader, key, column, options, states, depth + 1)?;
-            read_state_prefix(reader, value, column, options, states, depth + 1)
-        }
-        // Direct FORMAT Native always uses BASIC Variant discriminators at the
-        // pinned server tag. The prefix starts with one fixed-width LE UInt64
-        // mode word (0 = BASIC, 1 = COMPACT), followed by every alternative's
-        // state prefix in canonical/global discriminator order. COMPACT is a
-        // MergeTree serialization and is not emitted by NativeWriter, so reject
-        // it rather than misreading its granule framing as one byte per row.
-        ChType::Variant(alternatives) => {
-            let mode = reader.read_u64_le()?;
-            if mode != 0 {
-                return Err(DecodeError::InvalidVariant {
-                    column: column.to_string(),
-                    reason: format!(
-                        "discriminator mode {mode} is not BASIC mode 0 emitted by FORMAT Native"
-                    ),
-                });
-            }
-            for alternative in alternatives {
-                read_state_prefix(reader, alternative, column, options, states, depth + 1)?;
-            }
-            Ok(None)
-        }
-        ChType::Dynamic { max_types } => {
-            read_dynamic_state_prefix(reader, *max_types, column, options, states, depth)?;
-            Ok(None)
-        }
-        // JSON's structure prefix mirrors Dynamic's: it is charged the cumulative
-        // depth budget (its dynamic paths arrive as data, restarting the
-        // per-type cap), its state is read once here and reused in the body, and
-        // its JsonState is inserted ahead of the states its typed-path and
-        // dynamic-path prefixes append, so the preorder walk stays aligned.
-        ChType::Json { .. } => {
-            read_json_state_prefix(reader, ch_type, column, options, states, depth)?;
-            Ok(None)
-        }
-        // Nullable writes no prefix of its own either;
-        // `SerializationNullable::deserializeBinaryBulkStatePrefix` delegates to
-        // the nested type (confirmed at v26.6.1.1193-stable,
-        // `src/DataTypes/Serializations/SerializationNullable.cpp`). Only a
-        // `Nullable(Tuple(...))` can nest a prefix-bearing type today (a
-        // LowCardinality element), but recursing unconditionally keeps this
-        // faithful to the server for any future nullable-wrappable container.
-        ChType::Nullable(inner) => {
-            read_state_prefix(reader, inner, column, options, states, depth + 1)
-        }
-        _ => Ok(None),
+    Ok(())
+}
+
+fn read_low_cardinality_state(reader: &mut ByteReader, column: &str) -> Result<(), DecodeError> {
+    let key_version = reader.read_u64_le()?;
+    if key_version != LOW_CARDINALITY_KEY_VERSION {
+        return Err(DecodeError::InvalidLowCardinality {
+            column: column.to_string(),
+            reason: "key version is not 1 (SharedDictionariesWithAdditionalKeys)",
+        });
     }
+    Ok(())
+}
+
+fn read_variant_state(reader: &mut ByteReader, column: &str) -> Result<(), DecodeError> {
+    let mode = reader.read_u64_le()?;
+    if mode != 0 {
+        return Err(DecodeError::InvalidVariant {
+            column: column.to_string(),
+            reason: format!(
+                "discriminator mode {mode} is not BASIC mode 0 emitted by FORMAT Native"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Consume a column's `deserializeBinaryBulkStateSuffix` bytes after its body.
@@ -951,17 +1077,16 @@ fn next_json_state<'a>(
     }
 }
 
-/// Read one Dynamic column's structure prefix, recurse into its runtime typed
-/// children's prefixes, and insert its state ahead of them in the preorder
-/// state vector (the shared insertion trick that keeps the prefix and body
-/// traversals aligned without cloning the runtime type table).
-fn read_dynamic_state_prefix(
+/// Read one Dynamic column's structure prefix, retain its state in preorder,
+/// and schedule its runtime typed children's prefixes on the shared worklist.
+fn read_dynamic_state_prefix<'a>(
     reader: &mut ByteReader,
     max_types: u8,
     column: &str,
     options: &DecodeSettings,
     states: &mut Vec<StatePrefix>,
     depth: usize,
+    work: &mut Vec<PrefixWork<'a>>,
 ) -> Result<(), DecodeError> {
     // Charge the cumulative budget HERE, before parsing this level's runtime
     // type table: Dynamic is one of the two constructs (with JSON) whose nested
@@ -974,25 +1099,21 @@ fn read_dynamic_state_prefix(
         ));
     }
     let state = read_dynamic_state(reader, max_types, column, options)?;
-    // Recurse while `state` is still local, then insert this parent ahead of the
-    // nested states. This avoids cloning the type table and its ChType trees just
-    // to satisfy Vec's mutable-borrow rules; the bounded insertion moves only
-    // small state records.
-    let state_index = states.len();
-    for child in &state.children {
+    // Retain the parent before scheduling children, yielding the same preorder
+    // state vector the body consumes. Runtime child types are cloned once for
+    // owned work items; the originals stay in this state for body decoding.
+    for child in state.children.iter().rev() {
         if let DynamicStateChild::Typed(ch_type) = child {
-            read_state_prefix(reader, ch_type, column, options, states, depth + 1)?;
+            work.push(PrefixWork::Owned(ch_type.clone(), depth + 1));
         }
     }
-    states.insert(state_index, StatePrefix::Dynamic(state));
+    states.push(StatePrefix::Dynamic(state));
     Ok(())
 }
 
-/// Read one JSON column's structure prefix. Mirrors
-/// [`read_dynamic_state_prefix`]: the JSON structure word, dynamic-path list,
-/// typed-path prefixes, and per-dynamic-path full Dynamic prefixes are read, and
-/// the JsonState is inserted ahead of the states its children appended so the
-/// preorder walk stays aligned.
+/// Read one JSON column's own structure word and dynamic-path list. The caller
+/// retains the returned state in preorder, then schedules the typed-path and
+/// per-dynamic-path Dynamic prefixes on the shared worklist.
 ///
 /// Wire layout (`SerializationObject::serializeBinaryBulkStatePrefix` /
 /// `deserializeObjectStructureStatePrefix`, confirmed at v26.6.1.1193-stable):
@@ -1006,30 +1127,18 @@ fn read_dynamic_state_prefix(
 /// then one full `SerializationDynamic` state prefix per dynamic path in sorted
 /// order (each a `Dynamic` at `max_dynamic_types`). The shared-data child
 /// (`Array(Tuple(String, String))`, V1/V2 only) contributes no prefix bytes.
-fn read_json_state_prefix(
+fn read_json_state(
     reader: &mut ByteReader,
-    ch_type: &ChType,
+    max_dynamic_paths: u32,
     column: &str,
-    options: &DecodeSettings,
-    states: &mut Vec<StatePrefix>,
     depth: usize,
-) -> Result<(), DecodeError> {
+) -> Result<JsonState, DecodeError> {
     if depth >= MAX_TYPE_DEPTH {
         return Err(invalid_json(
             column,
             format!("JSON nesting exceeds the maximum type depth {MAX_TYPE_DEPTH}"),
         ));
     }
-    let ChType::Json {
-        max_dynamic_paths,
-        max_dynamic_types,
-        typed_paths,
-        ..
-    } = ch_type
-    else {
-        return Err(invalid_json(column, "not a JSON type"));
-    };
-
     let version = reader.read_u64_le()?;
     let kind = match version {
         0 => JsonWireKind::Structured, // V1
@@ -1074,7 +1183,7 @@ fn read_json_state_prefix(
         // would reject valid data. It is protected purely by the read-before-
         // allocate discipline below (a hostile count fails on the truncated path
         // reads), the same as any other untrusted count.
-        if kind == JsonWireKind::Structured && count > *max_dynamic_paths as usize {
+        if kind == JsonWireKind::Structured && count > max_dynamic_paths as usize {
             return Err(invalid_json(
                 column,
                 format!("dynamic path count {count} exceeds max_dynamic_paths={max_dynamic_paths}"),
@@ -1100,35 +1209,10 @@ fn read_json_state_prefix(
         }
     }
 
-    let state_index = states.len();
-    if kind != JsonWireKind::Text {
-        // Typed-path prefixes, in the ChType's sorted path order.
-        for (_, element_type) in typed_paths {
-            read_state_prefix(reader, element_type, column, options, states, depth + 1)?;
-        }
-        // Per dynamic path: a full SerializationDynamic prefix, in sorted order.
-        for _ in 0..dynamic_paths.len() {
-            read_dynamic_state_prefix(
-                reader,
-                *max_dynamic_types,
-                column,
-                options,
-                states,
-                depth + 1,
-            )?;
-        }
-        // Shared data (V1/V2 only) is an Array(Tuple(String, String)) whose
-        // default serialization contributes no prefix bytes, so there is nothing
-        // to read here.
-    }
-    states.insert(
-        state_index,
-        StatePrefix::Json(JsonState {
-            kind,
-            dynamic_paths,
-        }),
-    );
-    Ok(())
+    Ok(JsonState {
+        kind,
+        dynamic_paths,
+    })
 }
 
 fn invalid_dynamic(column: &str, reason: impl Into<String>) -> DecodeError {
@@ -1379,6 +1463,7 @@ fn decode_column(
     num_rows: usize,
     column: &str,
     options: &DecodeSettings,
+    allocation_budget: &mut AllocationBudget,
 ) -> Result<Column, DecodeError> {
     // Per-column bulk-state prefix. Zero bytes for every type except
     // LowCardinality, which reads its key version here; Array recurses into its
@@ -1394,6 +1479,7 @@ fn decode_column(
         column,
         &states,
         &mut state_cursor,
+        allocation_budget,
     )?;
     if state_cursor != states.len() {
         // Report under the kind of the first unconsumed state.
@@ -1422,6 +1508,7 @@ fn decode_values(
     column: &str,
     states: &[StatePrefix],
     state_cursor: &mut usize,
+    allocation_budget: &mut AllocationBudget,
 ) -> Result<Column, DecodeError> {
     // A name-decoration alias (SimpleAggregateFunction, geo, Nested) decodes
     // exactly as the physical type it delegates to, producing the underlying
@@ -1437,6 +1524,7 @@ fn decode_values(
             column,
             states,
             state_cursor,
+            allocation_budget,
         );
     }
     // LowCardinality carries its own dictionary, indexes, and (for a Nullable
@@ -1463,7 +1551,15 @@ fn decode_values(
     // element type's prefix was already consumed by the caller's
     // `read_state_prefix`.
     if let ChType::Array(inner) = ch_type {
-        return decode_array(reader, inner, num_rows, column, states, state_cursor);
+        return decode_array(
+            reader,
+            inner,
+            num_rows,
+            column,
+            states,
+            state_cursor,
+            allocation_budget,
+        );
     }
 
     // Map is the Array(Tuple(keys, values)) wire layout decoded as a unit; like
@@ -1471,19 +1567,44 @@ fn decode_values(
     // Nullable unwrap. The key/value prefixes were consumed by the caller's
     // `read_state_prefix`.
     if let ChType::Map(key, value) = ch_type {
-        return decode_map(reader, key, value, num_rows, column, states, state_cursor);
+        return decode_map(
+            reader,
+            key,
+            value,
+            num_rows,
+            column,
+            states,
+            state_cursor,
+            allocation_budget,
+        );
     }
 
     // Variant is one discriminator byte per row followed by dense alternative
     // bodies. It has intrinsic NULL semantics and cannot be wrapped in Nullable,
     // so dispatch it before the ordinary Nullable unwrap.
     if let ChType::Variant(alternatives) = ch_type {
-        return decode_variant(reader, alternatives, num_rows, column, states, state_cursor);
+        return decode_variant(
+            reader,
+            alternatives,
+            num_rows,
+            column,
+            states,
+            state_cursor,
+            allocation_budget,
+        );
     }
 
     if matches!(ch_type, ChType::Dynamic { .. }) {
         let state = next_dynamic_state(states, state_cursor, column)?;
-        return decode_dynamic(reader, state, num_rows, column, states, state_cursor);
+        return decode_dynamic(
+            reader,
+            state,
+            num_rows,
+            column,
+            states,
+            state_cursor,
+            allocation_budget,
+        );
     }
 
     let (nullable, inner) = match ch_type {
@@ -1517,6 +1638,7 @@ fn decode_values(
             validity,
             states,
             state_cursor,
+            allocation_budget,
         );
     }
 
@@ -1533,6 +1655,7 @@ fn decode_values(
             validity,
             states,
             state_cursor,
+            allocation_budget,
         );
     }
 
@@ -1556,6 +1679,7 @@ fn decode_variant(
     column: &str,
     states: &[StatePrefix],
     state_cursor: &mut usize,
+    allocation_budget: &mut AllocationBudget,
 ) -> Result<Column, DecodeError> {
     let discriminators = reader.read_slice(num_rows)?;
     let (layout, counts, null_count) =
@@ -1575,6 +1699,7 @@ fn decode_variant(
             column,
             states,
             state_cursor,
+            allocation_budget,
         )?);
     }
 
@@ -1602,6 +1727,7 @@ fn decode_dynamic(
     column: &str,
     states: &[StatePrefix],
     state_cursor: &mut usize,
+    allocation_budget: &mut AllocationBudget,
 ) -> Result<Column, DecodeError> {
     let num_children = state.children.len();
     if num_rows > i32::MAX as usize {
@@ -1705,7 +1831,15 @@ fn decode_dynamic(
     for (state_child, count) in state.children.iter().zip(counts) {
         match state_child {
             DynamicStateChild::Typed(ch_type) => {
-                let values = decode_values(reader, ch_type, count, column, states, state_cursor)?;
+                let values = decode_values(
+                    reader,
+                    ch_type,
+                    count,
+                    column,
+                    states,
+                    state_cursor,
+                    allocation_budget,
+                )?;
                 children.push(DynamicChild::Typed {
                     ch_type: ch_type.clone(),
                     values,
@@ -1747,6 +1881,7 @@ const MAX_PATHLESS_JSON_ROWS: usize = 1 << 24;
 /// typed-path columns then one full Dynamic column per flattened path, with NO
 /// shared-data stream. `validity` is the `Nullable(JSON)` null map already
 /// decoded by the caller.
+#[allow(clippy::too_many_arguments)]
 fn decode_json(
     reader: &mut ByteReader,
     ch_type: &ChType,
@@ -1755,6 +1890,7 @@ fn decode_json(
     validity: Option<Bitmap>,
     states: &[StatePrefix],
     state_cursor: &mut usize,
+    allocation_budget: &mut AllocationBudget,
 ) -> Result<Column, DecodeError> {
     let ChType::Json { typed_paths, .. } = ch_type else {
         return Err(invalid_json(column, "not a JSON type"));
@@ -1784,7 +1920,15 @@ fn decode_json(
     // Typed-path columns, in the ChType's sorted path order.
     let mut typed = Vec::with_capacity(typed_paths.len());
     for (path, element_type) in typed_paths {
-        let values = decode_values(reader, element_type, num_rows, column, states, state_cursor)?;
+        let values = decode_values(
+            reader,
+            element_type,
+            num_rows,
+            column,
+            states,
+            state_cursor,
+            allocation_budget,
+        )?;
         typed.push((path.clone(), values));
     }
 
@@ -1802,7 +1946,15 @@ fn decode_json(
                 ))
             }
         };
-        match decode_dynamic(reader, state, num_rows, column, states, state_cursor)? {
+        match decode_dynamic(
+            reader,
+            state,
+            num_rows,
+            column,
+            states,
+            state_cursor,
+            allocation_budget,
+        )? {
             Column::Dynamic(dynamic_col) => dynamic.push((path.clone(), dynamic_col)),
             _ => {
                 return Err(invalid_json(
@@ -1839,17 +1991,27 @@ fn decode_json(
         // its one placeholder byte, `Tuple()` likewise, `FixedString(0)` is
         // parser-rejected), except a typed path that is itself a pathless
         // FLATTENED JSON, which rejects the same row count through this guard
-        // recursively. Cap the pathless row count so a tiny buffer cannot
-        // drive an enormous allocation.
-        if typed_paths.is_empty() && dynamic_paths.is_empty() && num_rows > MAX_PATHLESS_JSON_ROWS {
-            return Err(invalid_json(
-                column,
-                format!(
-                    "row count {num_rows} exceeds the pathless FLATTENED block limit {MAX_PATHLESS_JSON_ROWS}"
-                ),
-            ));
+        // recursively.
+        //
+        // Because only the pathless case is unbounded by input, only it caps the
+        // row count and charges the session budget for the all-zero shared
+        // offsets it synthesizes. A with-paths FLATTENED column is input-bounded
+        // (>= 1 byte/row through its path columns), so it must neither cap nor
+        // charge: charging it would let a legitimate large flattened stream trip
+        // the ResourceLimit ceiling on offsets its own input already paid for.
+        if typed_paths.is_empty() && dynamic_paths.is_empty() {
+            if num_rows > MAX_PATHLESS_JSON_ROWS {
+                return Err(invalid_json(
+                    column,
+                    format!(
+                        "row count {num_rows} exceeds the pathless FLATTENED block limit {MAX_PATHLESS_JSON_ROWS}"
+                    ),
+                ));
+            }
+            // num_rows <= i32::MAX (checked above), so this is bounded.
+            let offset_bytes = (num_rows + 1) * std::mem::size_of::<i64>();
+            allocation_budget.charge(offset_bytes, "FLATTENED JSON shared offsets")?;
         }
-        // num_rows <= i32::MAX (checked above), so `+ 1` cannot overflow.
         (
             vec![0i64; num_rows + 1],
             Utf8Column::new(vec![0], Vec::new()),
@@ -1901,6 +2063,7 @@ fn decode_json(
 /// `validity` is the tuple-level null map of a `Nullable(Tuple(...))`, already
 /// decoded by the caller; a null tuple row still carries placeholder values in
 /// every element body.
+#[allow(clippy::too_many_arguments)]
 fn decode_tuple(
     reader: &mut ByteReader,
     elements: &[(Option<String>, ChType)],
@@ -1909,6 +2072,7 @@ fn decode_tuple(
     validity: Option<Bitmap>,
     states: &[StatePrefix],
     state_cursor: &mut usize,
+    allocation_budget: &mut AllocationBudget,
 ) -> Result<Column, DecodeError> {
     if elements.is_empty() {
         // Tuple(): one placeholder byte per row, values not validated (the
@@ -1920,7 +2084,15 @@ fn decode_tuple(
 
     let mut fields = Vec::with_capacity(elements.len());
     for (_, element_type) in elements {
-        let element = decode_values(reader, element_type, num_rows, column, states, state_cursor)?;
+        let element = decode_values(
+            reader,
+            element_type,
+            num_rows,
+            column,
+            states,
+            state_cursor,
+            allocation_budget,
+        )?;
         // Mirror the server's equal-sizes assert. Unreachable in practice:
         // every element decode above is driven by the same num_rows.
         if element.len() != num_rows {
@@ -1976,6 +2148,7 @@ fn decode_array(
     column: &str,
     states: &[StatePrefix],
     state_cursor: &mut usize,
+    allocation_budget: &mut AllocationBudget,
 ) -> Result<Column, DecodeError> {
     // Offsets: the shared walk reads and validates the run and builds the
     // Arrow-shaped offsets (leading 0, each wire offset widened to i64),
@@ -1986,7 +2159,15 @@ fn decode_array(
 
     // Element body: the flattened element column. The state prefix was consumed
     // by the caller's `read_state_prefix`, so decode the values only.
-    let values = decode_values(reader, inner, total_elements, column, states, state_cursor)?;
+    let values = decode_values(
+        reader,
+        inner,
+        total_elements,
+        column,
+        states,
+        state_cursor,
+        allocation_budget,
+    )?;
     Ok(Column::Array(ArrayColumn::new(offsets, values)))
 }
 
@@ -2012,6 +2193,7 @@ fn decode_array(
 /// [`decode_values`], so a `LowCardinality` key, a `Nullable` or container
 /// value, and a nested `Map` all compose, including the `limit == 0` gates for
 /// an all-empty-maps block.
+#[allow(clippy::too_many_arguments)]
 fn decode_map(
     reader: &mut ByteReader,
     key: &ChType,
@@ -2020,6 +2202,7 @@ fn decode_map(
     column: &str,
     states: &[StatePrefix],
     state_cursor: &mut usize,
+    allocation_budget: &mut AllocationBudget,
 ) -> Result<Column, DecodeError> {
     // Offsets: the shared Array walk (a Map's offsets are byte-identical to an
     // Array's), building the Arrow-shaped run with the leading 0 and bounding
@@ -2030,8 +2213,24 @@ fn decode_map(
     // Flattened entries: the keys' full run then the values' full run, the
     // Tuple(K, V) body with prefixes already consumed. Both decodes are driven
     // by the same total, so the two fields cannot come out ragged.
-    let keys = decode_values(reader, key, total_entries, column, states, state_cursor)?;
-    let values = decode_values(reader, value, total_entries, column, states, state_cursor)?;
+    let keys = decode_values(
+        reader,
+        key,
+        total_entries,
+        column,
+        states,
+        state_cursor,
+        allocation_budget,
+    )?;
+    let values = decode_values(
+        reader,
+        value,
+        total_entries,
+        column,
+        states,
+        state_cursor,
+        allocation_budget,
+    )?;
     // The entries tuple never carries validity: the wire has no null map here
     // (a map is never nullable at the entries level), so it goes through the
     // shared constructor with `None`.
@@ -2846,27 +3045,66 @@ fn read_block_info(reader: &mut ByteReader) -> Result<bool, DecodeError> {
 /// entry point. `StreamDecoder` first runs [`block_end`] to confirm a full
 /// block is buffered, so it never reaches the allocating decode for a partial
 /// block.
+///
+/// Each call creates a fresh
+/// [`max_synthetic_allocation_bytes`](DecodeOptions::max_synthetic_allocation_bytes)
+/// budget, so that ceiling is per call, not per stream. A caller decoding many
+/// blocks in a loop should use [`StreamDecoder`](crate::native::stream_decoder::StreamDecoder)
+/// or [`decode_all_bytes`] so one budget spans the whole session.
 pub fn decode_next_block(
     reader: &mut ByteReader,
     options: &DecodeOptions,
 ) -> Result<Option<ColBatch>, DecodeError> {
-    decode_next_block_with_settings(reader, &DecodeSettings::text(options))
+    let mut allocation_budget = AllocationBudget::new(options.max_synthetic_allocation_bytes);
+    decode_next_block_with_settings(
+        reader,
+        &DecodeSettings::text(options),
+        &mut allocation_budget,
+    )
+}
+
+pub(crate) fn decode_next_block_with_budget(
+    reader: &mut ByteReader,
+    options: &DecodeOptions,
+    allocation_budget: &mut AllocationBudget,
+) -> Result<Option<ColBatch>, DecodeError> {
+    decode_next_block_with_settings(reader, &DecodeSettings::text(options), allocation_budget)
 }
 
 /// Decode one block whose type headers and Dynamic runtime type tables use the
 /// server's binary data-type descriptor grammar. The framing revision remains
 /// supplied through [`DecodeOptions`]; only the out-of-band type encoding
 /// setting differs from [`decode_next_block`].
+///
+/// Like [`decode_next_block`], each call creates a fresh
+/// [`max_synthetic_allocation_bytes`](DecodeOptions::max_synthetic_allocation_bytes)
+/// budget, so that ceiling is per call, not per stream. A caller decoding many
+/// blocks in a loop should use [`StreamDecoder`](crate::native::stream_decoder::StreamDecoder)
+/// or [`decode_all_bytes`] so one budget spans the whole session.
 pub fn decode_next_block_binary_types(
     reader: &mut ByteReader,
     options: &DecodeOptions,
 ) -> Result<Option<ColBatch>, DecodeError> {
-    decode_next_block_with_settings(reader, &DecodeSettings::binary(options))
+    let mut allocation_budget = AllocationBudget::new(options.max_synthetic_allocation_bytes);
+    decode_next_block_with_settings(
+        reader,
+        &DecodeSettings::binary(options),
+        &mut allocation_budget,
+    )
+}
+
+pub(crate) fn decode_next_block_binary_types_with_budget(
+    reader: &mut ByteReader,
+    options: &DecodeOptions,
+    allocation_budget: &mut AllocationBudget,
+) -> Result<Option<ColBatch>, DecodeError> {
+    decode_next_block_with_settings(reader, &DecodeSettings::binary(options), allocation_budget)
 }
 
 fn decode_next_block_with_settings(
     reader: &mut ByteReader,
     options: &DecodeSettings,
+    allocation_budget: &mut AllocationBudget,
 ) -> Result<Option<ColBatch>, DecodeError> {
     // A BlockInfo preamble precedes each block when the producer used a protocol
     // revision > 0. Its first byte is also where a clean end-of-stream boundary
@@ -2878,7 +3116,11 @@ fn decode_next_block_with_settings(
         let num_cols = varint_usize(reader.read_varint()?, "column count")?;
         let num_rows = varint_usize(reader.read_varint()?, "row count")?;
         return Ok(Some(decode_block_body(
-            reader, options, num_cols, num_rows,
+            reader,
+            options,
+            num_cols,
+            num_rows,
+            allocation_budget,
         )?));
     }
 
@@ -2890,7 +3132,11 @@ fn decode_next_block_with_settings(
     };
     let num_rows = varint_usize(reader.read_varint()?, "row count")?;
     Ok(Some(decode_block_body(
-        reader, options, num_cols, num_rows,
+        reader,
+        options,
+        num_cols,
+        num_rows,
+        allocation_budget,
     )?))
 }
 
@@ -3023,6 +3269,7 @@ fn decode_block_body(
     options: &DecodeSettings,
     num_cols: usize,
     num_rows: usize,
+    allocation_budget: &mut AllocationBudget,
 ) -> Result<ColBatch, DecodeError> {
     check_header_count(num_cols, "column count", reader)?;
 
@@ -3061,7 +3308,12 @@ fn decode_block_body(
                 check_header_count(num_rows, "row count", reader)?;
             }
             columns.push(decode_column(
-                reader, &ch_type, num_rows, &col_name, options,
+                reader,
+                &ch_type,
+                num_rows,
+                &col_name,
+                options,
+                allocation_budget,
             )?);
         }
 
@@ -3119,8 +3371,8 @@ fn has_min_one_byte_per_row(ch_type: &ChType) -> bool {
 ///
 /// The streaming decoder calls this before [`decode_next_block`] so it never
 /// allocates and discards column buffers for a block that has not fully arrived.
-/// It shares [`read_block_info`] and [`read_column_header`] with the real
-/// decode; only [`skip_column_data`] is scan specific, and it walks the exact
+/// It shares `read_block_info` and `read_column_header` with the real
+/// decode; only `skip_column_data` is scan specific, and it walks the exact
 /// same wire bytes the per-type decoders consume.
 pub fn block_end(data: &[u8], options: &DecodeOptions) -> Result<Option<usize>, DecodeError> {
     block_end_with_settings(data, &DecodeSettings::text(options))
@@ -3189,6 +3441,13 @@ fn skip_column_data(
         &states,
         &mut state_cursor,
     )?;
+    if state_cursor != states.len() {
+        let reason = "body traversal did not consume every prefix state";
+        return Err(match states.get(state_cursor) {
+            Some(StatePrefix::Json(_)) => invalid_json(column, reason),
+            _ => invalid_dynamic(column, reason),
+        });
+    }
     let mut suffix_index = 0usize;
     read_state_suffix(reader, ch_type, column, &states, &mut suffix_index)
 }
@@ -3417,6 +3676,19 @@ fn skip_json_data(
 
     if kind == JsonWireKind::Text {
         return skip_column_body(reader, &ChType::String, num_rows);
+    }
+
+    if kind == JsonWireKind::Flattened
+        && typed_paths.is_empty()
+        && num_dynamic == 0
+        && num_rows > MAX_PATHLESS_JSON_ROWS
+    {
+        return Err(invalid_json(
+            column,
+            format!(
+                "row count {num_rows} exceeds the pathless FLATTENED block limit {MAX_PATHLESS_JSON_ROWS}"
+            ),
+        ));
     }
 
     for (_, element_type) in typed_paths {
@@ -3697,7 +3969,8 @@ fn skip_low_cardinality_data(
 /// schema but are dropped from the chunk list to keep the chunk stream free
 /// of empty batches.
 pub fn decode_all_bytes(data: &[u8], options: &DecodeOptions) -> Result<ChunkedBatch, DecodeError> {
-    decode_all_bytes_with_settings(data, &DecodeSettings::text(options))
+    let mut allocation_budget = AllocationBudget::new(options.max_synthetic_allocation_bytes);
+    decode_all_bytes_with_settings(data, &DecodeSettings::text(options), &mut allocation_budget)
 }
 
 /// Decode a complete Native stream whose type headers and Dynamic runtime type
@@ -3708,19 +3981,27 @@ pub fn decode_all_bytes_binary_types(
     data: &[u8],
     options: &DecodeOptions,
 ) -> Result<ChunkedBatch, DecodeError> {
-    decode_all_bytes_with_settings(data, &DecodeSettings::binary(options))
+    let mut allocation_budget = AllocationBudget::new(options.max_synthetic_allocation_bytes);
+    decode_all_bytes_with_settings(
+        data,
+        &DecodeSettings::binary(options),
+        &mut allocation_budget,
+    )
 }
 
 fn decode_all_bytes_with_settings(
     data: &[u8],
     settings: &DecodeSettings,
+    allocation_budget: &mut AllocationBudget,
 ) -> Result<ChunkedBatch, DecodeError> {
     let mut reader = ByteReader::new(data);
     let mut schema: Option<Schema> = None;
     let mut chunks: Vec<Arc<ColBatch>> = Vec::new();
     let mut block_index: usize = 0;
 
-    while let Some(batch) = decode_next_block_with_settings(&mut reader, settings)? {
+    while let Some(batch) =
+        decode_next_block_with_settings(&mut reader, settings, allocation_budget)?
+    {
         match &schema {
             None => schema = Some(batch.schema.clone()),
             Some(first) => {

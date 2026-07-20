@@ -90,6 +90,7 @@ fn encode_chunked_roundtrips_interval_blocks() {
             &bytes,
             &DecodeOptions {
                 protocol_revision: revision,
+                ..DecodeOptions::default()
             },
         )
         .unwrap();

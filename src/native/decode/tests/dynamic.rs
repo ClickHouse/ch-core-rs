@@ -127,6 +127,7 @@ fn decode_dynamic_v2_and_flattened() {
         .build();
     let options = DecodeOptions {
         protocol_revision: DBMS_TCP_PROTOCOL_VERSION,
+        ..DecodeOptions::default()
     };
     let decoded = decode_all_bytes(&v2, &options).unwrap();
     let direct = as_dynamic(decoded.chunks[0].column(0));

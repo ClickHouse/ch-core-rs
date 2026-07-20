@@ -47,6 +47,30 @@ fn test_stream_release_if_set_is_idempotent() {
 }
 
 #[test]
+fn test_stream_callbacks_fail_cleanly_after_release() {
+    let batch = make_test_batch();
+    let schema = batch.schema.clone();
+    unsafe {
+        let mut stream: ArrowArrayStream = std::mem::zeroed();
+        export_chunks_to_stream(schema, vec![batch], &mut stream);
+        let get_schema = stream.get_schema.unwrap();
+        let get_next = stream.get_next.unwrap();
+        let get_last_error = stream.get_last_error.unwrap();
+
+        stream.release_if_set();
+
+        let mut schema_out: ArrowSchema = std::mem::zeroed();
+        assert_eq!(get_schema(&mut stream, &mut schema_out), STREAM_INIT_ERROR);
+        assert!(schema_out.release.is_none());
+
+        let mut array_out: ArrowArray = std::mem::zeroed();
+        assert_eq!(get_next(&mut stream, &mut array_out), STREAM_INIT_ERROR);
+        assert!(array_out.release.is_none());
+        assert!(get_last_error(&mut stream).is_null());
+    }
+}
+
+#[test]
 fn test_stream_yields_multiple_chunks() {
     // Three separate chunks must come out as three record batches.
     let schema = make_test_batch().schema.clone();

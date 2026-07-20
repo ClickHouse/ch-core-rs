@@ -118,9 +118,9 @@ fn nullable_sum_states(width: usize) -> AggregateStateColumn {
     // noncanonical true flag proves the decoder and encoder mirror the server's
     // any-nonzero bool reader while preserving state bytes exactly.
     let mut data = vec![0x00, 0x01];
-    data.extend(std::iter::repeat_n(0x0d, width));
+    data.extend(std::iter::repeat(0x0d).take(width));
     data.push(0x80);
-    data.extend(std::iter::repeat_n(0x4f, width));
+    data.extend(std::iter::repeat(0x4f).take(width));
     AggregateStateColumn::new(vec![0, 1, (width + 2) as i64, (2 * width + 3) as i64], data)
 }
 

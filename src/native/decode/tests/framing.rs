@@ -240,6 +240,7 @@ fn test_modern_framing_roundtrip() {
 
     let options = DecodeOptions {
         protocol_revision: DBMS_TCP_PROTOCOL_VERSION,
+        ..DecodeOptions::default()
     };
     let cb = decode_all_bytes(&data, &options).unwrap();
     assert_eq!(cb.num_rows(), 2);
@@ -265,6 +266,7 @@ fn test_two_field_block_info_parses() {
 
     let options = DecodeOptions {
         protocol_revision: revision,
+        ..DecodeOptions::default()
     };
     let cb = decode_all_bytes(&data, &options).unwrap();
     match cb.chunks[0].column(0) {
@@ -294,6 +296,7 @@ fn test_multi_block_modern_framing() {
 
     let options = DecodeOptions {
         protocol_revision: DBMS_TCP_PROTOCOL_VERSION,
+        ..DecodeOptions::default()
     };
     let cb = decode_all_bytes(&data, &options).unwrap();
     assert_eq!(cb.num_chunks(), 2);
@@ -313,6 +316,7 @@ fn test_zero_row_modern_block() {
 
     let options = DecodeOptions {
         protocol_revision: DBMS_TCP_PROTOCOL_VERSION,
+        ..DecodeOptions::default()
     };
     let cb = decode_all_bytes(&data, &options).unwrap();
     assert_eq!(cb.num_rows(), 0);
@@ -332,6 +336,7 @@ fn test_custom_serialization_rejected() {
 
     let options = DecodeOptions {
         protocol_revision: DBMS_TCP_PROTOCOL_VERSION,
+        ..DecodeOptions::default()
     };
     assert!(matches!(
         decode_all_bytes(&data, &options),
@@ -350,6 +355,7 @@ fn test_unknown_block_info_field_rejected() {
 
     let options = DecodeOptions {
         protocol_revision: DBMS_TCP_PROTOCOL_VERSION,
+        ..DecodeOptions::default()
     };
     assert!(matches!(
         decode_all_bytes(&data, &options),
@@ -529,6 +535,7 @@ fn test_block_info_out_of_order_buckets_skipped() {
 
     let options = DecodeOptions {
         protocol_revision: DBMS_TCP_PROTOCOL_VERSION,
+        ..DecodeOptions::default()
     };
     let cb = decode_all_bytes(&data, &options).unwrap();
     match cb.chunks[0].column(0) {

@@ -348,6 +348,7 @@ fn roundtrip_opts(batch: &ColBatch, options: &EncodeOptions) {
         &bytes,
         &DecodeOptions {
             protocol_revision: revision,
+            ..DecodeOptions::default()
         },
     )
     .unwrap_or_else(|e| panic!("decode at rev {revision} failed: {e}"));

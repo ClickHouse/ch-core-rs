@@ -330,7 +330,7 @@ pub const JSON_MAX_TYPED_PATHS: usize = 1000;
 
 /// The six ClickHouse geo alias kinds. Each renders its bare alias name and
 /// expands to a fixed `Tuple`/`Array`-of-`Float64` nesting via
-/// [`GeoKind::underlying_type`]; the wire layout and Arrow shape are exactly
+/// `GeoKind::underlying_type`; the wire layout and Arrow shape are exactly
 /// that of the underlying nesting (confirmed at v26.6.1.1193-stable,
 /// `DataTypeCustomGeo.{h,cpp}`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -127,6 +127,7 @@ fn encode_chunked_roundtrips_bfloat16_blocks() {
             &bytes,
             &DecodeOptions {
                 protocol_revision: revision,
+                ..DecodeOptions::default()
             },
         )
         .unwrap();

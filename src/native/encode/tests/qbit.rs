@@ -136,6 +136,7 @@ fn qbit_chunked_and_zero_row_roundtrip() {
             &bytes,
             &DecodeOptions {
                 protocol_revision: revision,
+                ..DecodeOptions::default()
             },
         )
         .unwrap();

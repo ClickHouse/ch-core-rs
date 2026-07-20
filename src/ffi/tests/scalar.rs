@@ -683,6 +683,17 @@ fn test_export_schema_tolerates_nul_in_wire_names() {
 }
 
 #[test]
+fn export_empty_schema_uses_null_children_pointer() {
+    unsafe {
+        let mut out: ArrowSchema = std::mem::zeroed();
+        export_schema(&Schema::new(Vec::new()), &mut out);
+        assert_eq!(out.n_children, 0);
+        assert!(out.children.is_null());
+        (out.release.unwrap())(&mut out);
+    }
+}
+
+#[test]
 fn export_empty_offsets_utf8_has_valid_leading_zero_offset() {
     // A hand-built String column with an empty offsets Vec is a zero-row column
     // (Utf8Column::len is offsets.len().saturating_sub(1)). The decoder always
