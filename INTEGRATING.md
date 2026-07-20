@@ -85,6 +85,16 @@ Candidate bridge choices:
 | C#      | Client-owned native component plus managed facade         |
 | Go      | Client-owned native component with Go packaging decisions |
 
+### Depending On The Crate
+
+Pin the crate by release tag, for example
+`ch-core-rs = { git = "https://github.com/ClickHouse/ch-core-rs.git", tag = "v0.1.0" }`.
+Releases are semver git tags, each documented in `CHANGELOG.md`; watch the
+changelog when you repin. Commit `Cargo.lock` in the binding repo so wheel and
+native-extension builds are reproducible. The crate is not on crates.io by
+design. See `README.md` for the local-path and commit-pin forms used during
+development.
+
 ## Getting Native Bytes
 
 The core decodes the `Native` format.
@@ -142,22 +152,7 @@ The physical column buffers are Arrow-shaped:
 - `String`: `i32` offsets plus one data buffer.
 - `FixedString(N)`: one contiguous fixed-width byte buffer.
 
-Supported types today:
-
-- `Bool`
-- `Int8`, `Int16`, `Int32`, `Int64`
-- `UInt8`, `UInt16`, `UInt32`, `UInt64`
-- `Float32`, `Float64`
-- `String`
-- `FixedString(N)`
-- `Date`, `Date32`, `DateTime`, `DateTime64(P[, tz])`
-- `Decimal(P, S)`
-- `UUID`, `IPv4`, `IPv6`
-- `Enum8(...)`, `Enum16(...)`
-- `LowCardinality(T)` for the allowed inner types
-- `Nullable(T)` where `T` is one of the supported inner types
-
-Not yet supported: `Array`, `Tuple`, `Map`, and wide integers. Unsupported types fail with `DecodeError::UnsupportedType` on decode (and `EncodeError::UnsupportedType` on encode).
+The core covers the full ClickHouse scalar set plus containers (`Array`, `Tuple`, `Map`, `Nested`), `Variant`, `Dynamic`, `JSON`, wide integers, `LowCardinality(T)`, the geo types, `QBit`, a set of `AggregateFunction`/`SimpleAggregateFunction` states, and `Nullable(T)` over the supported inner types. The "Supported types" list in `README.md` is the current enumeration, and `CODEC_CONTRACT.md` is the per-type wire and buffer contract; this guide does not repeat the list so it cannot drift. Unsupported types fail with `DecodeError::UnsupportedType` on decode (and `EncodeError::UnsupportedType` on encode).
 
 ClickHouse `String` is arbitrary bytes, not guaranteed UTF-8. The core stores the raw bytes. The current Arrow export uses Arrow utf8 format because the physical layout is offsets plus data, but strict Arrow consumers may reject invalid UTF-8 when importing or later validating the array. A binding that needs byte-faithful behavior should validate first, choose a bytes/binary fallback, or return a clear unsupported-for-Arrow error for invalid strings.
 
@@ -177,7 +172,12 @@ The Rust call shape is intentionally small:
 use ch_core_rs::native::decode::{decode_all_bytes, DecodeOptions};
 use ch_core_rs::native::stream_decoder::StreamDecoder;
 
-let options = DecodeOptions { protocol_revision };
+// `DecodeOptions` is `#[non_exhaustive]`, so construct it with `default()` and
+// then assign fields rather than using a struct literal.
+// `max_synthetic_allocation_bytes` is the decode-session allocation ceiling
+// (default 256 MiB) that a memory-constrained binding can lower.
+let mut options = DecodeOptions::default();
+options.protocol_revision = protocol_revision;
 
 // Complete buffer.
 let result = decode_all_bytes(native_bytes, &options)?;
@@ -201,7 +201,11 @@ The core also runs the inverse direction: it encodes the same `Column` buffers b
 ```rust
 use ch_core_rs::native::encode::{encode_block, encode_chunked, EncodeOptions};
 
-let options = EncodeOptions { protocol_revision: 0 }; // 0 for the HTTP INSERT body
+// `EncodeOptions` is `#[non_exhaustive]`, so construct it with `default()` and
+// then assign fields rather than using a struct literal. Its `protocol_revision`
+// defaults to 0, the value the HTTP INSERT body wants, so `default()` is enough
+// here.
+let options = EncodeOptions::default();
 
 // One Native block from one ColBatch.
 let bytes = encode_block(&col_batch, &options)?;
@@ -213,7 +217,7 @@ let body = encode_chunked(&chunked_batch, &options)?;
 Send those bytes as the body of an `INSERT INTO t FORMAT Native` request. Notes for a binding:
 
 - Protocol revision: use `0` for the HTTP `INSERT ... FORMAT Native` path. The server parses that body at revision 0, so encode writes no `BlockInfo` preamble and no per-column marker, and the stream ends at EOF. It must match the revision the server reads with, the same rule as decode. There is no TCP insert engine and no compression framing in the core yet, so the binding still owns transport, request framing, and any compression.
-- Coverage: encode covers the same scalar and `LowCardinality` set decode supports (`Bool`, the numerics, the temporals, `UUID`/`IPv4`/`IPv6`, `String`, `FixedString`, `Enum8`/`Enum16`, `Decimal`, each optionally `Nullable`). Any other type returns `EncodeError::UnsupportedType`.
+- Coverage: encode is at full type parity with decode. Every type the crate decodes it also encodes, so a batch the core produced round-trips back to Native bytes. Only a type the decoder itself does not support returns `EncodeError::UnsupportedType`.
 - Validation: the input is your in-memory buffers, not wire bytes, but encode still validates the whole batch before writing anything and returns `EncodeError::InconsistentBatch` on a malformed column (wrong length, bad offsets, width mismatch, out-of-range `LowCardinality` index, a null in a non-nullable column). A rejected batch produces no partial bytes.
 - Round trip: `decode(encode(x))` reproduces the buffers. The "Encoding" section of `CODEC_CONTRACT.md` has the precise preconditions, encoder choices, and round-trip guarantees.
 
@@ -227,7 +231,7 @@ The core stops at typed buffers plus ClickHouse logical type metadata. The bindi
 - Temporal presentation, for example how to apply a `DateTime` timezone or whether `DateTime64` becomes a host datetime object.
 - Null representation, for example `None`, `null`, optional values, masked arrays, or Arrow validity.
 - Row vs column result shaping.
-- Future type policy as the core grows, for example containers (`Array`, `Tuple`, `Map`) and wide integers.
+- Future type policy as the core grows.
 - Unsupported-type fallback policy, for example returning a clear error or retrying through the existing client path.
 
 The Python POC may be a useful reference for this split. The core decodes `DateTime64` as `i64` ticks plus schema metadata. The PyO3 binding decides how to turn that into Python `datetime` objects, how to handle UTC-equivalent timezones, how to expose rows and columns, and how to package the Arrow C Stream as a Python capsule.
@@ -247,7 +251,7 @@ For each client, if you decide to try consuming this and build a POC, a reasonab
 
 The following docs were agent generated and mostly intended to be read by agents if you decide to pursue a POC bind in your client.
 
-- `README.md` for the data model, current scope, and measured results.
+- `README.md` for the data model and current scope.
 - `ARCHITECTURE.md` for the decode path, streaming, Arrow C Data export, and the encode path.
 - `CODEC_CONTRACT.md` for the per-type wire, decoded-buffer, and Arrow contract,
   plus the encode-side contract for the insert path.

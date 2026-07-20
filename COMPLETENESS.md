@@ -1047,12 +1047,10 @@ These are decisions, not implementations. Resolve with the user, then record the
 outcome in `CODEC_CONTRACT.md`.
 
 - [ ] `String` export as Arrow `u` (Utf8) vs `z` (Binary), or a binding-selected
-      option. ClickHouse `String` is arbitrary bytes; current export is `u`. See
-      `FINDINGS.md`.
+      option. ClickHouse `String` is arbitrary bytes; current export is `u`.
 - [ ] Numeric effective-protocol-revision API. The Python POC used a stale
       `has_block_info` boolean; the core now takes `protocol_revision: u64`. Any
-      production binding must compute/expose the numeric revision. See
-      `FINDINGS.md`.
+      production binding must compute/expose the numeric revision.
 - [ ] Server version as a decode input. `protocol_revision` gates block framing,
       but a few types' layouts are tied to the ClickHouse release, not the
       revision. Decide whether `DecodeOptions` should also carry the negotiated

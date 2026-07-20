@@ -362,10 +362,10 @@ Two things differ from decode by nature:
   `decode(encode(x))` reproduces `x` and re-encoding canonical server bytes is
   byte-for-byte, though byte-identity is not guaranteed for non-canonical input.
 
-Encode coverage is a subset of decode coverage (the full scalar and
-`LowCardinality` set today) and targets the HTTP `INSERT` path at
-`protocol_revision = 0`; there is no TCP engine or compression framing yet. The
-per-type encode contract is the "Encoding" section of `CODEC_CONTRACT.md`.
+Encode is at full type parity with decode (every type the crate decodes it also
+encodes) and targets the HTTP `INSERT` path at `protocol_revision = 0`; there is
+no TCP engine or compression framing yet. The per-type encode contract is the
+"Encoding" section of `CODEC_CONTRACT.md`.
 
 ### Error handling
 
@@ -399,13 +399,15 @@ with the code.
 
 ### Current scope and direction
 
-Supported today: `Bool`, `Int8..64`, `UInt8..64`, `Float32/64`, `String`,
-`FixedString(N)`, `Date`, `Date32`, `DateTime`, `DateTime64`, `Decimal(P, S)`,
-`UUID`, `IPv4`, `IPv6`, `Enum8`/`Enum16`, and `LowCardinality(T)` for the
-allowed inner types, plus `Nullable(T)` over any of them; whole-buffer and
-streaming decode; Arrow C Data export; and encode back to Native block bytes for
-that same scalar and `LowCardinality` set (the HTTP `INSERT` path). Not yet:
-compression framing, the native TCP protocol, `Array`/`Tuple`/`Map`, and wide
-ints. The growth model is fixed: implement a type once here, following the
-documented confirm-against-server-source workflow in `AGENTS.md`, and every
-binding gets it for free. The roadmap lives in `README.md`.
+Supported today: the full ClickHouse scalar set plus containers
+(`Array`/`Tuple`/`Map`/`Nested`), `Variant`, `Dynamic`, `JSON`, wide integers,
+`QBit`, the geo types, a set of `AggregateFunction`/`SimpleAggregateFunction`
+states, and `LowCardinality(T)` for the allowed inner types, plus `Nullable(T)`
+over the supported inner types. The "Supported types" list in `README.md` is the
+current enumeration, and `CODEC_CONTRACT.md` is the per-type contract. Decode and
+encode are at type parity across all of this: whole-buffer and streaming decode,
+Arrow C Data export, and encode back to Native block bytes for the HTTP `INSERT`
+path. Not yet: compression framing and the native TCP protocol. The growth model
+is fixed: implement a type once here, following the documented
+confirm-against-server-source workflow in `AGENTS.md`, and every binding gets it
+for free. The roadmap lives in `README.md`.

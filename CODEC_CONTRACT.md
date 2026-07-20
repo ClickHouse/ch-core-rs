@@ -2013,7 +2013,7 @@ columns; the others are `ArrayColumn` chains over it. No new Column variant.
   `Nullable` of the five `Array`-based kinds is illegal, and `LowCardinality` is
   illegal for all six. All six are legal as `Array`/`Tuple` elements and as `Map`
   keys and values; the key case is accepted leniently, resolving through the
-  delegate to the underlying `Tuple`/`Array` (see FINDINGS.md).
+  delegate to the underlying `Tuple`/`Array`.
 - Custom-serialization marker: the five `Array`-based kinds are always `0`.
   `Point` could in principle carry a nonzero marker via the generic `Tuple`
   sparse path, which the decoder rejects as `UnsupportedSerialization`

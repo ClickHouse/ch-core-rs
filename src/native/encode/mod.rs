@@ -57,6 +57,7 @@ use validate::validate_block;
 /// Options for Native format encoding, the mirror of
 /// [`super::decode::DecodeOptions`].
 #[derive(Default)]
+#[non_exhaustive]
 pub struct EncodeOptions {
     /// Negotiated protocol revision the produced Native stream targets. It gates
     /// the same framing the decoder's `protocol_revision` gates and must match
@@ -89,6 +90,7 @@ pub struct EncodeOptions {
 /// are structural: a batch whose columns disagree with its schema or row count,
 /// or a column type the encoder does not yet support.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum EncodeError {
     /// A column this encoder cannot write: an unsupported physical type, a
     /// `Nullable(T)` whose inner type is not yet encodable, or a type the

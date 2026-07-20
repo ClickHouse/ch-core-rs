@@ -170,18 +170,29 @@ In rough priority order:
 Bindings live in the language client repos and depend on this crate.
 See `INTEGRATING.md` for guidance aimed at downstream client maintainers.
 
-Local development:
+The canonical way to depend on the crate is a git dependency pinned to a
+release tag:
 
 ```toml
 [dependencies]
-ch-core-rs = { path = "/path/to/ch-core-rs" }
+ch-core-rs = { git = "https://github.com/ClickHouse/ch-core-rs.git", tag = "v0.1.0" }
 ```
 
-Pinned git dependency:
+Releases are semver git tags: patch and minor tags carry no breaking changes,
+and every release is documented in `CHANGELOG.md`. The crate is not published to
+crates.io by design, so pin the tag directly. The MSRV (`rust-version = 1.81`)
+is enforced for git dependencies too, so a consuming crate must build on Rust
+1.81 or newer.
+
+For development you can point at a local checkout or pin an exact commit:
 
 ```toml
 [dependencies]
-ch-core-rs = { git = "ssh://git@github.com/ClickHouse/ch-core-rs.git", rev = "<commit>" }
+# Local checkout.
+ch-core-rs = { path = "/path/to/ch-core-rs" }
+
+# Exact commit, for bisecting or tracking an unreleased fix.
+ch-core-rs = { git = "https://github.com/ClickHouse/ch-core-rs.git", rev = "<commit>" }
 ```
 
 Use a local `[patch]` in `.cargo/config.toml` to override a pinned git
@@ -190,8 +201,8 @@ dependency with a local checkout during development.
 Decode a complete buffer with `native::decode::decode_all_bytes`, or stream
 with `native::stream_decoder::StreamDecoder`. Encode a batch back to Native
 block bytes for `INSERT` with `native::encode::encode_block` or
-`native::encode::encode_chunked` (the full scalar and `LowCardinality` set; see
-`COMPLETENESS.md` for the insert-path progress). Server output configured with
+`native::encode::encode_chunked` (every type the crate decodes it also encodes;
+`COMPLETENESS.md` is the per-type tracker). Server output configured with
 `output_format_native_encode_types_in_binary_format=1` uses the explicit
 `decode_*_binary_types` entry points. Bytes from `encode_*_binary_types` require
 `input_format_native_decode_types_in_binary_format=1` on the receiving INSERT.
@@ -230,8 +241,13 @@ version and first-byte hexdumps.
 
 ## Status
 
-A working core under active development. The API is not yet stable. The read
-path (Native decode, streaming, Arrow export) is implemented and verified
-against live-server fixtures. Type coverage, compression, and the insert path
-are in progress. `ARCHITECTURE.md` describes how the pieces fit together.
-Deferred correctness and integration follow-ups are tracked in `FINDINGS.md`.
+A working core under active development. The API is not yet stable. Decode and
+encode are at type parity, both verified against a live ClickHouse server. Not
+yet implemented: compression framing and the native TCP protocol; a
+streaming/sink encode API is future work. Releases are tagged and semver'd, each
+recorded in `CHANGELOG.md`. `ARCHITECTURE.md` describes how the pieces fit
+together.
+
+## License
+
+Apache-2.0. See `LICENSE`.

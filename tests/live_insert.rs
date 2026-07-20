@@ -1648,14 +1648,7 @@ fn insert_roundtrips_through_server() {
 
     // Encode at revision 0: HTTP INSERT parses the body with server_revision 0,
     // so no BlockInfo preamble and no custom-serialization marker.
-    let bytes = encode_block(
-        &batch,
-        &EncodeOptions {
-            protocol_revision: 0,
-            ..EncodeOptions::default()
-        },
-    )
-    .expect("encode numeric batch");
+    let bytes = encode_block(&batch, &EncodeOptions::default()).expect("encode numeric batch");
     server.insert_native(&bytes);
 
     // Read back as Native (HTTP output is revision 0 too) and decode with this
@@ -1713,14 +1706,8 @@ fn low_cardinality_fixed_string_u16_dictionary_roundtrips_through_server() {
          k UInt16, lc LowCardinality(FixedString(4))) ENGINE = Memory"
     ));
 
-    let bytes = encode_block(
-        &batch,
-        &EncodeOptions {
-            protocol_revision: 0,
-            ..EncodeOptions::default()
-        },
-    )
-    .expect("encode LowCardinality FixedString batch");
+    let bytes = encode_block(&batch, &EncodeOptions::default())
+        .expect("encode LowCardinality FixedString batch");
     server.insert_native_into(LC_U16_TABLE, &bytes);
 
     let native = server.select(&format!(
@@ -2173,14 +2160,8 @@ fn geo_saf_nested_roundtrip_through_server() {
         "?flatten_nested=0&enable_nullable_tuple_type=1&allow_suspicious_low_cardinality_types=1",
     );
 
-    let bytes = encode_block(
-        &batch,
-        &EncodeOptions {
-            protocol_revision: 0,
-            ..EncodeOptions::default()
-        },
-    )
-    .expect("encode geo/SAF/Nested batch");
+    let bytes =
+        encode_block(&batch, &EncodeOptions::default()).expect("encode geo/SAF/Nested batch");
     server.insert_native_into(GSN_TABLE, &bytes);
 
     let native = server.select(&format!(
