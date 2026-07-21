@@ -174,8 +174,9 @@ use ch_core_rs::native::stream_decoder::StreamDecoder;
 
 // `DecodeOptions` is `#[non_exhaustive]`, so construct it with `default()` and
 // then assign fields rather than using a struct literal.
-// `max_synthetic_allocation_bytes` is the decode-session allocation ceiling
-// (default 256 MiB) that a memory-constrained binding can lower.
+// `max_synthetic_allocation_bytes` is the per-block cumulative ceiling shared
+// by synthetic allocations across all columns. It resets for every block and
+// defaults to 256 MiB; lower it only for a memory-constrained binding.
 let mut options = DecodeOptions::default();
 options.protocol_revision = protocol_revision;
 
