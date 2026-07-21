@@ -47,7 +47,7 @@ pub struct StreamDecoder {
     /// coordinates: compaction lowers it by the number of bytes drained.
     scanned: usize,
     options: DecodeOptions,
-    /// Cumulative budget shared by every block decoded in this stream session.
+    /// Per-allocation bound for buffers synthesized without input bytes.
     allocation_budget: AllocationBudget,
     binary_types: bool,
     finished: bool,
@@ -168,13 +168,13 @@ impl StreamDecoder {
                         decode_next_block_binary_types_with_budget(
                             &mut reader,
                             &self.options,
-                            &mut self.allocation_budget,
+                            &self.allocation_budget,
                         )
                     } else {
                         decode_next_block_with_budget(
                             &mut reader,
                             &self.options,
-                            &mut self.allocation_budget,
+                            &self.allocation_budget,
                         )
                     }?;
                     match decoded {

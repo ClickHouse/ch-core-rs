@@ -367,20 +367,21 @@ fn reject_unbounded_pathless_flattened_row_counts() {
 }
 
 #[test]
-fn pathless_flattened_json_uses_one_session_allocation_budget() {
+fn pathless_flattened_json_offsets_are_bounded_per_allocation() {
     use crate::native::stream_decoder::StreamDecoder;
 
     let mut prefix = 3u64.to_le_bytes().to_vec(); // FLATTENED
     write_varint(&mut prefix, 0); // zero flattened paths
     let num_rows = 4usize;
     let one_offsets_run = (num_rows + 1) * std::mem::size_of::<i64>();
-    let options = || DecodeOptions {
-        max_synthetic_allocation_bytes: one_offsets_run,
+    let options = |limit: usize| DecodeOptions {
+        max_synthetic_allocation_bytes: limit,
         ..DecodeOptions::default()
     };
 
-    // Two pathless columns share the same block/session budget. The first 40
-    // bytes fit exactly; the second must fail before allocating another run.
+    // The limit bounds each synthesized offsets run individually, never
+    // cumulatively: two pathless columns whose runs each fit exactly both
+    // decode under a limit of one run.
     let two_columns = BlockBuilder::new()
         .header(2, num_rows)
         .column_header("j1", "JSON")
@@ -389,55 +390,80 @@ fn pathless_flattened_json_uses_one_session_allocation_budget() {
         .raw_bytes(&prefix)
         .build();
     assert_eq!(
-        block_end(&two_columns, &options()).unwrap(),
+        block_end(&two_columns, &options(one_offsets_run)).unwrap(),
         Some(two_columns.len())
     );
-    assert!(matches!(
-        decode_all_bytes(&two_columns, &options()),
-        Err(DecodeError::ResourceLimit {
-            limit,
-            requested,
-            what: "FLATTENED JSON shared offsets",
-        }) if limit == one_offsets_run && requested == one_offsets_run * 2
-    ));
+    let decoded = decode_all_bytes(&two_columns, &options(one_offsets_run)).unwrap();
+    assert_eq!(as_json(decoded.chunks[0].column(0)).len(), num_rows);
+    assert_eq!(as_json(decoded.chunks[0].column(1)).len(), num_rows);
 
-    // The complete and streaming decoders also retain one budget across blocks.
+    // Likewise across blocks in the complete and streaming decoders.
     let one_block = BlockBuilder::new()
         .header(1, num_rows)
         .column_header("j", "JSON")
         .raw_bytes(&prefix)
         .build();
     let two_blocks = [one_block.as_slice(), one_block.as_slice()].concat();
-    assert!(matches!(
-        decode_all_bytes(&two_blocks, &options()),
-        Err(DecodeError::ResourceLimit {
-            limit,
-            requested,
-            ..
-        }) if limit == one_offsets_run && requested == one_offsets_run * 2
-    ));
+    assert_eq!(
+        decode_all_bytes(&two_blocks, &options(one_offsets_run))
+            .unwrap()
+            .chunks
+            .len(),
+        2
+    );
+    let mut stream = StreamDecoder::new(options(one_offsets_run));
+    assert_eq!(stream.feed(&two_blocks).unwrap().len(), 2);
+    assert!(stream.finish().unwrap().is_empty());
 
-    let mut stream = StreamDecoder::new(options());
+    // A single run past the limit still fails.
     assert!(matches!(
-        stream.feed(&two_blocks),
+        decode_all_bytes(&one_block, &options(one_offsets_run - 1)),
         Err(DecodeError::ResourceLimit {
             limit,
             requested,
-            ..
-        }) if limit == one_offsets_run && requested == one_offsets_run * 2
+            what: "FLATTENED JSON shared offsets",
+        }) if limit == one_offsets_run - 1 && requested == one_offsets_run
     ));
 }
 
 #[test]
-fn with_paths_flattened_json_does_not_charge_allocation_budget() {
+fn many_pathless_flattened_blocks_decode_with_no_cumulative_ceiling() {
+    use crate::native::stream_decoder::StreamDecoder;
+
+    // 520 blocks of 65536 rows synthesize ~273 MB of offsets in total, past
+    // the old 256 MiB session-cumulative ceiling. Under default options every
+    // block must decode.
+    let mut prefix = 3u64.to_le_bytes().to_vec(); // FLATTENED
+    write_varint(&mut prefix, 0); // zero flattened paths
+    let num_rows = 65536usize;
+    let one_block = BlockBuilder::new()
+        .header(1, num_rows)
+        .column_header("j", "JSON")
+        .raw_bytes(&prefix)
+        .build();
+
+    let num_blocks = 520usize;
+    assert!((num_rows + 1) * std::mem::size_of::<i64>() * num_blocks > 256 * 1024 * 1024);
+
+    let mut stream = StreamDecoder::new(DecodeOptions::default());
+    let mut total_rows = 0usize;
+    for _ in 0..num_blocks {
+        for batch in stream.feed(&one_block).unwrap() {
+            total_rows += batch.num_rows;
+        }
+    }
+    assert!(stream.finish().unwrap().is_empty());
+    assert_eq!(total_rows, num_rows * num_blocks);
+}
+
+#[test]
+fn with_paths_flattened_json_is_not_checked_against_the_allocation_limit() {
     // A FLATTENED column WITH a dynamic path is input-bounded (>= 1 byte/row
-    // through its path columns), so it must NOT charge the synthetic-allocation
-    // budget for its all-zero shared offsets. Only the PATHLESS case, whose body
-    // carries zero bytes per row, charges the budget. This column decodes even
-    // under a budget one byte short of the (num_rows + 1) * 8 those offsets
-    // occupy, proving the charge is skipped for with-paths columns. (Before the
-    // gate fix the charge fired unconditionally and this decode returned
-    // ResourceLimit.)
+    // through its path columns), so its all-zero shared offsets are never
+    // checked against the synthetic-allocation limit. Only the PATHLESS case,
+    // whose body carries zero bytes per row, is checked. This column decodes
+    // even under a limit one byte short of the (num_rows + 1) * 8 those
+    // offsets occupy, proving the check is skipped for with-paths columns.
     let num_rows = 4usize;
     let mut prefix = 3u64.to_le_bytes().to_vec(); // FLATTENED structure word
     write_varint(&mut prefix, 1); // one flattened (dynamic) path
@@ -460,7 +486,7 @@ fn with_paths_flattened_json_does_not_charge_allocation_budget() {
         .build();
 
     // One byte short of a full offsets run: a pathless column would trip this,
-    // a with-paths column must not charge it at all.
+    // a with-paths column is never checked against it.
     let shared_offsets_bytes = (num_rows + 1) * std::mem::size_of::<i64>();
     let options = DecodeOptions {
         max_synthetic_allocation_bytes: shared_offsets_bytes - 1,
@@ -474,7 +500,7 @@ fn with_paths_flattened_json_does_not_charge_allocation_budget() {
     assert_eq!(s.dynamic[0].0, "q");
     assert_eq!(s.dynamic[0].1.type_ids, vec![1, 1, 1, 1]);
     // The synthetic empty shared offsets are still present (Arrow leading 0 plus
-    // one entry per row); they simply did not charge the session budget.
+    // one entry per row); they were never checked against the limit.
     assert_eq!(s.shared_offsets, vec![0i64; num_rows + 1]);
     assert!(s.shared_paths.is_empty());
     assert!(s.shared_values.is_empty());
@@ -539,7 +565,7 @@ fn json_state_exhaustion_is_a_json_error() {
     // A JSON body traversal that runs past the retained prefix states reports
     // an InvalidJson error, not an InvalidDynamic one.
     let mut cursor = 0usize;
-    let mut allocation_budget = AllocationBudget::new(usize::MAX);
+    let allocation_budget = AllocationBudget::new(usize::MAX);
     let err = decode_json(
         &mut ByteReader::new(&[]),
         &parse_ch_type("JSON").unwrap(),
@@ -548,7 +574,7 @@ fn json_state_exhaustion_is_a_json_error() {
         None,
         &[],
         &mut cursor,
-        &mut allocation_budget,
+        &allocation_budget,
     )
     .unwrap_err();
     assert!(matches!(err, DecodeError::InvalidJson { .. }), "{err}");

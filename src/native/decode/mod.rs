@@ -101,7 +101,7 @@ pub enum DecodeError {
         column: String,
         reason: String,
     },
-    /// Decoding would exceed a session-scoped resource ceiling.
+    /// A single synthesized buffer would exceed a resource ceiling.
     ResourceLimit {
         limit: usize,
         requested: usize,
@@ -167,7 +167,7 @@ impl std::fmt::Display for DecodeError {
                 what,
             } => write!(
                 f,
-                "Resource limit exceeded for {what}: requested {requested} bytes cumulatively, limit is {limit} bytes"
+                "Resource limit exceeded for {what}: requested {requested} bytes, limit is {limit} bytes"
             ),
         }
     }
@@ -192,19 +192,18 @@ pub struct DecodeOptions {
     /// framing, for example HTTP `FORMAT Native` with no `client_protocol_version`
     /// set.
     pub protocol_revision: u64,
-    /// Maximum cumulative bytes that one decode session may allocate for
-    /// buffers synthesized without corresponding input bytes.
+    /// Maximum bytes for any single buffer synthesized without corresponding
+    /// input bytes.
     ///
-    /// This currently covers the all-zero shared offsets synthesized for
-    /// PATHLESS FLATTENED JSON blocks, whose wire body carries zero bytes per
+    /// This currently covers the all-zero shared offsets synthesized for a
+    /// PATHLESS FLATTENED JSON column, whose wire body carries zero bytes per
     /// row and so cannot bound the offset allocation from the input. A FLATTENED
-    /// column that has typed or dynamic paths is input-bounded and does not
-    /// charge this budget. The limit is shared across every column and block decoded by
-    /// [`decode_all_bytes`] or one
-    /// [`StreamDecoder`](crate::native::stream_decoder::StreamDecoder), so a
-    /// small payload cannot amplify allocation by repeating pathless JSON
-    /// columns. Set this explicitly only when a trusted workload legitimately
-    /// needs more than the default 256 MiB.
+    /// column that has typed or dynamic paths is input-bounded and is not
+    /// checked against this limit. The bound is per synthesized buffer, never
+    /// cumulative across columns or blocks, so a legitimate stream of any total
+    /// size decodes; single-buffer amplification is already capped by the
+    /// pathless block-row ceiling (about 128 MiB of offsets), so the default
+    /// 256 MiB only takes effect when lowered explicitly.
     pub max_synthetic_allocation_bytes: usize,
 }
 
@@ -217,34 +216,24 @@ impl Default for DecodeOptions {
     }
 }
 
-/// Cumulative allowance for allocations whose size is not bounded by input.
+/// Per-allocation bound for buffers whose size is not bounded by input.
 pub(crate) struct AllocationBudget {
     limit: usize,
-    used: usize,
 }
 
 impl AllocationBudget {
     pub(crate) fn new(limit: usize) -> Self {
-        Self { limit, used: 0 }
+        Self { limit }
     }
 
-    fn charge(&mut self, bytes: usize, what: &'static str) -> Result<(), DecodeError> {
-        let requested = self
-            .used
-            .checked_add(bytes)
-            .ok_or(DecodeError::ResourceLimit {
-                limit: self.limit,
-                requested: usize::MAX,
-                what,
-            })?;
-        if requested > self.limit {
+    fn check(&self, bytes: usize, what: &'static str) -> Result<(), DecodeError> {
+        if bytes > self.limit {
             return Err(DecodeError::ResourceLimit {
                 limit: self.limit,
-                requested,
+                requested: bytes,
                 what,
             });
         }
-        self.used = requested;
         Ok(())
     }
 }
@@ -1463,7 +1452,7 @@ fn decode_column(
     num_rows: usize,
     column: &str,
     options: &DecodeSettings,
-    allocation_budget: &mut AllocationBudget,
+    allocation_budget: &AllocationBudget,
 ) -> Result<Column, DecodeError> {
     // Per-column bulk-state prefix. Zero bytes for every type except
     // LowCardinality, which reads its key version here; Array recurses into its
@@ -1508,7 +1497,7 @@ fn decode_values(
     column: &str,
     states: &[StatePrefix],
     state_cursor: &mut usize,
-    allocation_budget: &mut AllocationBudget,
+    allocation_budget: &AllocationBudget,
 ) -> Result<Column, DecodeError> {
     // A name-decoration alias (SimpleAggregateFunction, geo, Nested) decodes
     // exactly as the physical type it delegates to, producing the underlying
@@ -1679,7 +1668,7 @@ fn decode_variant(
     column: &str,
     states: &[StatePrefix],
     state_cursor: &mut usize,
-    allocation_budget: &mut AllocationBudget,
+    allocation_budget: &AllocationBudget,
 ) -> Result<Column, DecodeError> {
     let discriminators = reader.read_slice(num_rows)?;
     let (layout, counts, null_count) =
@@ -1727,7 +1716,7 @@ fn decode_dynamic(
     column: &str,
     states: &[StatePrefix],
     state_cursor: &mut usize,
-    allocation_budget: &mut AllocationBudget,
+    allocation_budget: &AllocationBudget,
 ) -> Result<Column, DecodeError> {
     let num_children = state.children.len();
     if num_rows > i32::MAX as usize {
@@ -1890,7 +1879,7 @@ fn decode_json(
     validity: Option<Bitmap>,
     states: &[StatePrefix],
     state_cursor: &mut usize,
-    allocation_budget: &mut AllocationBudget,
+    allocation_budget: &AllocationBudget,
 ) -> Result<Column, DecodeError> {
     let ChType::Json { typed_paths, .. } = ch_type else {
         return Err(invalid_json(column, "not a JSON type"));
@@ -1994,11 +1983,10 @@ fn decode_json(
         // recursively.
         //
         // Because only the pathless case is unbounded by input, only it caps the
-        // row count and charges the session budget for the all-zero shared
-        // offsets it synthesizes. A with-paths FLATTENED column is input-bounded
-        // (>= 1 byte/row through its path columns), so it must neither cap nor
-        // charge: charging it would let a legitimate large flattened stream trip
-        // the ResourceLimit ceiling on offsets its own input already paid for.
+        // row count and checks the all-zero shared offsets it synthesizes
+        // against the per-allocation limit. A with-paths FLATTENED column is
+        // input-bounded (>= 1 byte/row through its path columns), so it is not
+        // checked: its own input already paid for these offsets.
         if typed_paths.is_empty() && dynamic_paths.is_empty() {
             if num_rows > MAX_PATHLESS_JSON_ROWS {
                 return Err(invalid_json(
@@ -2008,9 +1996,10 @@ fn decode_json(
                     ),
                 ));
             }
-            // num_rows <= i32::MAX (checked above), so this is bounded.
+            // num_rows <= MAX_PATHLESS_JSON_ROWS (checked above), so the
+            // multiply cannot overflow.
             let offset_bytes = (num_rows + 1) * std::mem::size_of::<i64>();
-            allocation_budget.charge(offset_bytes, "FLATTENED JSON shared offsets")?;
+            allocation_budget.check(offset_bytes, "FLATTENED JSON shared offsets")?;
         }
         (
             vec![0i64; num_rows + 1],
@@ -2072,7 +2061,7 @@ fn decode_tuple(
     validity: Option<Bitmap>,
     states: &[StatePrefix],
     state_cursor: &mut usize,
-    allocation_budget: &mut AllocationBudget,
+    allocation_budget: &AllocationBudget,
 ) -> Result<Column, DecodeError> {
     if elements.is_empty() {
         // Tuple(): one placeholder byte per row, values not validated (the
@@ -2148,7 +2137,7 @@ fn decode_array(
     column: &str,
     states: &[StatePrefix],
     state_cursor: &mut usize,
-    allocation_budget: &mut AllocationBudget,
+    allocation_budget: &AllocationBudget,
 ) -> Result<Column, DecodeError> {
     // Offsets: the shared walk reads and validates the run and builds the
     // Arrow-shaped offsets (leading 0, each wire offset widened to i64),
@@ -2202,7 +2191,7 @@ fn decode_map(
     column: &str,
     states: &[StatePrefix],
     state_cursor: &mut usize,
-    allocation_budget: &mut AllocationBudget,
+    allocation_budget: &AllocationBudget,
 ) -> Result<Column, DecodeError> {
     // Offsets: the shared Array walk (a Map's offsets are byte-identical to an
     // Array's), building the Arrow-shaped run with the leading 0 and bounding
@@ -3046,27 +3035,21 @@ fn read_block_info(reader: &mut ByteReader) -> Result<bool, DecodeError> {
 /// block is buffered, so it never reaches the allocating decode for a partial
 /// block.
 ///
-/// Each call creates a fresh
 /// [`max_synthetic_allocation_bytes`](DecodeOptions::max_synthetic_allocation_bytes)
-/// budget, so that ceiling is per call, not per stream. A caller decoding many
-/// blocks in a loop should use [`StreamDecoder`](crate::native::stream_decoder::StreamDecoder)
-/// or [`decode_all_bytes`] so one budget spans the whole session.
+/// bounds each single synthesized buffer; nothing accumulates across calls or
+/// blocks.
 pub fn decode_next_block(
     reader: &mut ByteReader,
     options: &DecodeOptions,
 ) -> Result<Option<ColBatch>, DecodeError> {
-    let mut allocation_budget = AllocationBudget::new(options.max_synthetic_allocation_bytes);
-    decode_next_block_with_settings(
-        reader,
-        &DecodeSettings::text(options),
-        &mut allocation_budget,
-    )
+    let allocation_budget = AllocationBudget::new(options.max_synthetic_allocation_bytes);
+    decode_next_block_with_settings(reader, &DecodeSettings::text(options), &allocation_budget)
 }
 
 pub(crate) fn decode_next_block_with_budget(
     reader: &mut ByteReader,
     options: &DecodeOptions,
-    allocation_budget: &mut AllocationBudget,
+    allocation_budget: &AllocationBudget,
 ) -> Result<Option<ColBatch>, DecodeError> {
     decode_next_block_with_settings(reader, &DecodeSettings::text(options), allocation_budget)
 }
@@ -3076,27 +3059,22 @@ pub(crate) fn decode_next_block_with_budget(
 /// supplied through [`DecodeOptions`]; only the out-of-band type encoding
 /// setting differs from [`decode_next_block`].
 ///
-/// Like [`decode_next_block`], each call creates a fresh
+/// Like [`decode_next_block`],
 /// [`max_synthetic_allocation_bytes`](DecodeOptions::max_synthetic_allocation_bytes)
-/// budget, so that ceiling is per call, not per stream. A caller decoding many
-/// blocks in a loop should use [`StreamDecoder`](crate::native::stream_decoder::StreamDecoder)
-/// or [`decode_all_bytes`] so one budget spans the whole session.
+/// bounds each single synthesized buffer; nothing accumulates across calls or
+/// blocks.
 pub fn decode_next_block_binary_types(
     reader: &mut ByteReader,
     options: &DecodeOptions,
 ) -> Result<Option<ColBatch>, DecodeError> {
-    let mut allocation_budget = AllocationBudget::new(options.max_synthetic_allocation_bytes);
-    decode_next_block_with_settings(
-        reader,
-        &DecodeSettings::binary(options),
-        &mut allocation_budget,
-    )
+    let allocation_budget = AllocationBudget::new(options.max_synthetic_allocation_bytes);
+    decode_next_block_with_settings(reader, &DecodeSettings::binary(options), &allocation_budget)
 }
 
 pub(crate) fn decode_next_block_binary_types_with_budget(
     reader: &mut ByteReader,
     options: &DecodeOptions,
-    allocation_budget: &mut AllocationBudget,
+    allocation_budget: &AllocationBudget,
 ) -> Result<Option<ColBatch>, DecodeError> {
     decode_next_block_with_settings(reader, &DecodeSettings::binary(options), allocation_budget)
 }
@@ -3104,7 +3082,7 @@ pub(crate) fn decode_next_block_binary_types_with_budget(
 fn decode_next_block_with_settings(
     reader: &mut ByteReader,
     options: &DecodeSettings,
-    allocation_budget: &mut AllocationBudget,
+    allocation_budget: &AllocationBudget,
 ) -> Result<Option<ColBatch>, DecodeError> {
     // A BlockInfo preamble precedes each block when the producer used a protocol
     // revision > 0. Its first byte is also where a clean end-of-stream boundary
@@ -3269,7 +3247,7 @@ fn decode_block_body(
     options: &DecodeSettings,
     num_cols: usize,
     num_rows: usize,
-    allocation_budget: &mut AllocationBudget,
+    allocation_budget: &AllocationBudget,
 ) -> Result<ColBatch, DecodeError> {
     check_header_count(num_cols, "column count", reader)?;
 
@@ -3969,8 +3947,8 @@ fn skip_low_cardinality_data(
 /// schema but are dropped from the chunk list to keep the chunk stream free
 /// of empty batches.
 pub fn decode_all_bytes(data: &[u8], options: &DecodeOptions) -> Result<ChunkedBatch, DecodeError> {
-    let mut allocation_budget = AllocationBudget::new(options.max_synthetic_allocation_bytes);
-    decode_all_bytes_with_settings(data, &DecodeSettings::text(options), &mut allocation_budget)
+    let allocation_budget = AllocationBudget::new(options.max_synthetic_allocation_bytes);
+    decode_all_bytes_with_settings(data, &DecodeSettings::text(options), &allocation_budget)
 }
 
 /// Decode a complete Native stream whose type headers and Dynamic runtime type
@@ -3981,18 +3959,14 @@ pub fn decode_all_bytes_binary_types(
     data: &[u8],
     options: &DecodeOptions,
 ) -> Result<ChunkedBatch, DecodeError> {
-    let mut allocation_budget = AllocationBudget::new(options.max_synthetic_allocation_bytes);
-    decode_all_bytes_with_settings(
-        data,
-        &DecodeSettings::binary(options),
-        &mut allocation_budget,
-    )
+    let allocation_budget = AllocationBudget::new(options.max_synthetic_allocation_bytes);
+    decode_all_bytes_with_settings(data, &DecodeSettings::binary(options), &allocation_budget)
 }
 
 fn decode_all_bytes_with_settings(
     data: &[u8],
     settings: &DecodeSettings,
-    allocation_budget: &mut AllocationBudget,
+    allocation_budget: &AllocationBudget,
 ) -> Result<ChunkedBatch, DecodeError> {
     let mut reader = ByteReader::new(data);
     let mut schema: Option<Schema> = None;

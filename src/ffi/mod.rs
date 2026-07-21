@@ -3419,7 +3419,11 @@ unsafe fn write_batch_array(batch: &Arc<ColBatch>, out: *mut ArrowArray) {
     array.n_buffers = 1;
     array.buffers = pd.buffers.as_ptr() as *mut *const c_void;
     array.n_children = n_children;
-    array.children = pd.children.as_ptr() as *mut *mut ArrowArray;
+    array.children = if pd.children.is_empty() {
+        ptr::null_mut()
+    } else {
+        pd.children.as_ptr() as *mut *mut ArrowArray
+    };
     array.dictionary = ptr::null_mut();
     array.release = Some(release_array);
     array.private_data = Box::into_raw(pd) as *mut c_void;

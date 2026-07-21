@@ -723,3 +723,27 @@ fn export_empty_offsets_utf8_has_valid_leading_zero_offset() {
         (array.release.unwrap())(&mut array);
     }
 }
+
+#[test]
+fn export_zero_column_batch_has_null_children() {
+    // A zero-column batch must not export the dangling as_ptr of an empty
+    // children Vec; both the schema and the array set children to null when
+    // n_children == 0.
+    let batch = Arc::new(ColBatch::new(Schema::new(Vec::new()), Vec::new(), 5));
+
+    // Safety: outputs are writable zeroed C Data structs, released below.
+    unsafe {
+        let mut schema: ArrowSchema = std::mem::zeroed();
+        export_batch_schema(&batch, &mut schema).unwrap();
+        assert_eq!(schema.n_children, 0);
+        assert!(schema.children.is_null());
+        (schema.release.unwrap())(&mut schema);
+
+        let mut array: ArrowArray = std::mem::zeroed();
+        export_batch_array(&batch, &mut array).unwrap();
+        assert_eq!(array.length, 5);
+        assert_eq!(array.n_children, 0);
+        assert!(array.children.is_null());
+        (array.release.unwrap())(&mut array);
+    }
+}
