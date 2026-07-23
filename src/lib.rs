@@ -1,8 +1,8 @@
 // chc-core: columnar memory + ClickHouse Native codec
 
-pub mod bitmap;
-pub mod schema;
-pub mod column;
 pub mod batch;
-pub mod native;
+pub mod bitmap;
+pub mod column;
 pub mod ffi;
+pub mod native;
+pub mod schema;

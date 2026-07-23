@@ -1,0 +1,375 @@
+use super::*;
+use crate::column::VariantLayout;
+
+fn variant_batch() -> ColBatch {
+    let variants = vec![
+        Column::Utf8(utf8_column(&[b"user_1", b"x"])),
+        Column::UInt64(PrimitiveColumn::new(vec![13])),
+    ];
+    ColBatch::new(
+        Schema::new(vec![Field {
+            name: "v".into(),
+            ch_type: ChType::Variant(vec![ChType::String, ChType::UInt64]),
+        }]),
+        vec![Column::Variant(
+            VariantColumn::try_new(&[u8::MAX, 0, 1, 0], variants).unwrap(),
+        )],
+        4,
+    )
+}
+
+fn geometry_child(kind: GeoKind, present: bool, seed: f64) -> Column {
+    let len = usize::from(present);
+    let point = Column::Tuple(TupleColumn::new(
+        vec![
+            Column::Float64(PrimitiveColumn::new(if present {
+                vec![seed]
+            } else {
+                Vec::new()
+            })),
+            Column::Float64(PrimitiveColumn::new(if present {
+                vec![seed + 0.5]
+            } else {
+                Vec::new()
+            })),
+        ],
+        len,
+    ));
+    let mut column = point;
+    for _ in 1..kind.expansion_depth() {
+        column = Column::Array(ArrayColumn::new(
+            if present { vec![0, 1] } else { vec![0] },
+            column,
+        ));
+    }
+    column
+}
+
+fn geometry_batch() -> ColBatch {
+    let children = crate::schema::GEOMETRY_ALTERNATIVES
+        .iter()
+        .enumerate()
+        .map(|(index, alternative)| match alternative {
+            ChType::Geo(kind) => geometry_child(*kind, true, 13.0 + index as f64),
+            other => unreachable!("Geometry alternative is always geo, got {other:?}"),
+        })
+        .collect();
+    let column = VariantColumn::try_new(&[0, 1, 2, 3, 4, 5, u8::MAX], children).unwrap();
+    ColBatch::new(
+        Schema::new(vec![Field {
+            name: "g".into(),
+            ch_type: ChType::Geometry,
+        }]),
+        vec![Column::Variant(column)],
+        7,
+    )
+}
+
+#[test]
+fn roundtrip_variant_rev0() {
+    roundtrip(&variant_batch(), 0);
+}
+
+#[test]
+fn roundtrip_variant_tcp_revision() {
+    roundtrip(&variant_batch(), DBMS_TCP_PROTOCOL_VERSION);
+}
+
+#[test]
+fn roundtrip_geometry_rev0() {
+    roundtrip(&geometry_batch(), 0);
+}
+
+#[test]
+fn roundtrip_geometry_tcp_revision() {
+    roundtrip(&geometry_batch(), DBMS_TCP_PROTOCOL_VERSION);
+}
+
+#[test]
+fn rev0_frames_geometry_as_basic_variant() {
+    let bytes = encode_block(&geometry_batch(), &EncodeOptions::default()).unwrap();
+    let mut expected_prefix = vec![
+        0x01, // num_cols
+        0x07, // num_rows
+        0x01, b'g', // column name
+        0x08, // canonical custom type-name length
+    ];
+    expected_prefix.extend_from_slice(b"Geometry");
+    expected_prefix.extend_from_slice(&0u64.to_le_bytes()); // BASIC mode
+    expected_prefix.extend_from_slice(&[0, 1, 2, 3, 4, 5, u8::MAX]);
+    assert!(bytes.starts_with(&expected_prefix));
+}
+
+#[test]
+fn zero_row_geometry_encodes_schema_without_body() {
+    let children = crate::schema::GEOMETRY_ALTERNATIVES
+        .iter()
+        .map(|alternative| match alternative {
+            ChType::Geo(kind) => geometry_child(*kind, false, 0.0),
+            other => unreachable!("Geometry alternative is always geo, got {other:?}"),
+        })
+        .collect();
+    let column = VariantColumn::try_new(&[], children).unwrap();
+    let batch = ColBatch::new(
+        Schema::new(vec![Field {
+            name: "g".into(),
+            ch_type: ChType::Geometry,
+        }]),
+        vec![Column::Variant(column)],
+        0,
+    );
+
+    let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+    assert_eq!(bytes, b"\x01\x00\x01g\x08Geometry");
+    let decoded = decode_all_bytes(&bytes, &DecodeOptions::default()).unwrap();
+    assert_eq!(decoded.schema, batch.schema);
+    assert_eq!(decoded.num_chunks(), 0);
+}
+
+#[test]
+fn roundtrip_array_of_variant() {
+    let values = VariantColumn::try_new(
+        &[0, 1, u8::MAX],
+        vec![
+            Column::Utf8(utf8_column(&[b"user_1"])),
+            Column::UInt64(PrimitiveColumn::new(vec![13])),
+        ],
+    )
+    .unwrap();
+    let batch = ColBatch::new(
+        Schema::new(vec![Field {
+            name: "v".into(),
+            ch_type: ChType::Array(Box::new(ChType::Variant(vec![
+                ChType::String,
+                ChType::UInt64,
+            ]))),
+        }]),
+        vec![Column::Array(ArrayColumn::new(
+            vec![0, 2, 3],
+            Column::Variant(values),
+        ))],
+        2,
+    );
+
+    roundtrip(&batch, 0);
+}
+
+#[test]
+fn rev0_frames_variant_basic_mode_and_dense_children() {
+    let bytes = encode_block(&variant_batch(), &EncodeOptions::default()).unwrap();
+
+    let mut expected_body = 0u64.to_le_bytes().to_vec();
+    expected_body.extend_from_slice(&[u8::MAX, 0, 1, 0]);
+    expected_body.extend_from_slice(&[6]);
+    expected_body.extend_from_slice(b"user_1");
+    expected_body.extend_from_slice(&[1, b'x']);
+    expected_body.extend_from_slice(&13u64.to_le_bytes());
+    assert!(bytes.ends_with(&expected_body));
+}
+
+#[test]
+fn zero_row_variant_encodes_schema_without_body() {
+    let column = VariantColumn::try_new(
+        &[],
+        vec![
+            Column::Utf8(utf8_column(&[])),
+            Column::UInt64(PrimitiveColumn::new(Vec::new())),
+        ],
+    )
+    .unwrap();
+    let batch = ColBatch::new(
+        Schema::new(vec![Field {
+            name: "v".into(),
+            ch_type: ChType::Variant(vec![ChType::String, ChType::UInt64]),
+        }]),
+        vec![Column::Variant(column)],
+        0,
+    );
+
+    let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+    let decoded = decode_all_bytes(&bytes, &DecodeOptions::default()).unwrap();
+    assert_eq!(decoded.num_chunks(), 0);
+    assert_eq!(decoded.schema, batch.schema);
+}
+
+#[test]
+fn malformed_variant_routing_is_rejected_before_writing() {
+    let mut batch = variant_batch();
+    let Column::Variant(column) = &mut batch.columns[0] else {
+        unreachable!("variant_batch always constructs a Variant column");
+    };
+    let VariantLayout::Flat { offsets, .. } = &mut column.layout else {
+        unreachable!("two alternatives always use a flat union");
+    };
+    offsets[3] = 7;
+
+    assert!(matches!(
+        encode_block(&batch, &EncodeOptions::default()),
+        Err(EncodeError::InconsistentBatch { .. })
+    ));
+}
+
+#[test]
+fn malformed_nested_variant_group_routing_is_rejected() {
+    // >= 128 alternatives force the Nested layout; tamper with a group's dense
+    // routing and with a group's buffer length, each of which the incremental
+    // layout validation must catch before any bytes are written.
+    let mut names: Vec<String> = (1..=130).map(|w| format!("FixedString({w})")).collect();
+    names.sort();
+    let type_name = format!("Variant({})", names.join(", "));
+    let ch_type = parse_ch_type(&type_name).expect("canonical Variant header parses");
+    let ChType::Variant(alternatives) = &ch_type else {
+        unreachable!("parsed a Variant header");
+    };
+    let widths: Vec<usize> = alternatives
+        .iter()
+        .map(|a| match a {
+            ChType::FixedString(w) => *w,
+            other => panic!("expected FixedString alternative, got {other:?}"),
+        })
+        .collect();
+    let discriminators = [0u8, 129];
+    let children: Vec<Column> = widths
+        .iter()
+        .enumerate()
+        .map(|(alt, &width)| {
+            let count = discriminators
+                .iter()
+                .filter(|&&d| d as usize == alt)
+                .count();
+            Column::FixedBinary(FixedBinaryColumn::new(vec![0x13; width * count], width))
+        })
+        .collect();
+    let column = VariantColumn::try_new(&discriminators, children).unwrap();
+    let make_batch = |column: VariantColumn| {
+        ColBatch::new(
+            Schema::new(vec![Field {
+                name: "v".into(),
+                ch_type: ch_type.clone(),
+            }]),
+            vec![Column::Variant(column)],
+            discriminators.len(),
+        )
+    };
+
+    let mut bad_offset = column.clone();
+    let VariantLayout::Nested { groups, .. } = &mut bad_offset.layout else {
+        panic!("130 alternatives must use the nested union layout");
+    };
+    groups[1].offsets[0] = 5;
+    assert!(matches!(
+        encode_block(&make_batch(bad_offset), &EncodeOptions::default()),
+        Err(EncodeError::InconsistentBatch { .. })
+    ));
+
+    let mut oversized_group = column;
+    let VariantLayout::Nested { groups, .. } = &mut oversized_group.layout else {
+        panic!("130 alternatives must use the nested union layout");
+    };
+    groups[0].type_ids.push(0);
+    groups[0].offsets.push(1);
+    assert!(matches!(
+        encode_block(&make_batch(oversized_group), &EncodeOptions::default()),
+        Err(EncodeError::InconsistentBatch { .. })
+    ));
+}
+
+#[test]
+fn roundtrip_nested_variant_128_plus_alternatives() {
+    // A Variant with >= 128 alternatives forces the two-level (Nested) Arrow
+    // union layout. Use FixedString(1..=200) so canonicalization spreads the
+    // alternatives across two groups, then route rows through both groups plus
+    // NULLs. This drives encode_variant_data's nested-discriminator
+    // reconstruction and validate_variant's Nested branch end to end.
+    let mut names: Vec<String> = (1..=200).map(|w| format!("FixedString({w})")).collect();
+    names.sort();
+    let type_name = format!("Variant({})", names.join(", "));
+    let ch_type = parse_ch_type(&type_name).expect("canonical Variant header parses");
+    let ChType::Variant(alternatives) = &ch_type else {
+        unreachable!("parsed a Variant header");
+    };
+    // Canonical alternative `i` is `FixedString(widths[i])`, derived from the
+    // normalized order the parser produced (not from `names`), so the children
+    // below line up with the discriminators regardless of sort details.
+    let widths: Vec<usize> = alternatives
+        .iter()
+        .map(|a| match a {
+            ChType::FixedString(w) => *w,
+            other => panic!("expected FixedString alternative, got {other:?}"),
+        })
+        .collect();
+    assert!(widths.len() >= 128, "must exceed the flat-union cap");
+
+    // Route rows through both groups (discriminators below and above 128) plus
+    // the NULL discriminator 255, including repeats within one child.
+    let discriminators: Vec<u8> = vec![0, 5, 127, 128, 199, 255, 0, 128, 255, 63];
+
+    let children: Vec<Column> = widths
+        .iter()
+        .enumerate()
+        .map(|(alt, &width)| {
+            let count = discriminators
+                .iter()
+                .filter(|&&d| d as usize == alt)
+                .count();
+            let mut data = Vec::with_capacity(width * count);
+            for occurrence in 0..count {
+                // A distinct fill byte per (alternative, occurrence) keeps the
+                // decoded child data a meaningful round-trip subject.
+                let fill = (alt as u8).wrapping_add(occurrence as u8).wrapping_add(1);
+                data.resize(data.len() + width, fill);
+            }
+            Column::FixedBinary(FixedBinaryColumn::new(data, width))
+        })
+        .collect();
+
+    let column = VariantColumn::try_new(&discriminators, children)
+        .expect("child lengths match the discriminator counts");
+    let batch = ColBatch::new(
+        Schema::new(vec![Field {
+            name: "v".into(),
+            ch_type: ch_type.clone(),
+        }]),
+        vec![Column::Variant(column)],
+        discriminators.len(),
+    );
+
+    // Value-level round-trip: decode(encode(batch)) reproduces every buffer,
+    // including the reconstructed Nested layout.
+    roundtrip(&batch, 0);
+    roundtrip(&batch, DBMS_TCP_PROTOCOL_VERSION);
+
+    // Byte-level round-trip: the decoded batch re-encodes to identical bytes.
+    let bytes = encode_block(&batch, &EncodeOptions::default()).unwrap();
+    let decoded = decode_all_bytes(&bytes, &DecodeOptions::default()).unwrap();
+    let reencoded = encode_block(&decoded.chunks[0], &EncodeOptions::default()).unwrap();
+    assert_eq!(
+        bytes, reencoded,
+        "nested Variant must re-encode byte-identically"
+    );
+}
+
+#[test]
+fn variant_child_type_mismatch_is_rejected() {
+    let column = VariantColumn::try_new(
+        &[0],
+        vec![
+            Column::UInt64(PrimitiveColumn::new(vec![13])),
+            Column::UInt64(PrimitiveColumn::new(Vec::new())),
+        ],
+    )
+    .unwrap();
+    let batch = ColBatch::new(
+        Schema::new(vec![Field {
+            name: "v".into(),
+            ch_type: ChType::Variant(vec![ChType::String, ChType::UInt64]),
+        }]),
+        vec![Column::Variant(column)],
+        1,
+    );
+
+    assert!(matches!(
+        encode_block(&batch, &EncodeOptions::default()),
+        Err(EncodeError::InconsistentBatch { .. })
+    ));
+}

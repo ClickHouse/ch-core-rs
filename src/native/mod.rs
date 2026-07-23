@@ -1,3 +1,10 @@
-pub mod varint;
+pub(crate) mod aggregate_function;
+pub mod binary_value;
 pub mod decode;
+pub mod encode;
+pub(crate) mod protocol;
+pub(crate) mod qbit;
 pub mod stream_decoder;
+pub(crate) mod type_binary;
+pub(crate) mod type_parser;
+pub mod varint;

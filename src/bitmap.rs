@@ -8,7 +8,7 @@ pub struct Bitmap {
 impl Bitmap {
     /// Create a bitmap where all values are valid.
     pub fn all_valid(len: usize) -> Self {
-        let num_bytes = (len + 7) / 8;
+        let num_bytes = len.div_ceil(8);
         Self {
             buffer: vec![0xFF; num_bytes],
             len,
@@ -21,15 +21,32 @@ impl Bitmap {
     /// Arrow uses bit-packed: 1 = valid, 0 = null.
     pub fn from_ch_null_map(null_bytes: &[u8]) -> Self {
         let len = null_bytes.len();
-        let num_bytes = (len + 7) / 8;
-        let mut buffer = vec![0u8; num_bytes];
+        let mut buffer = Vec::with_capacity(len.div_ceil(8));
 
-        for (i, &b) in null_bytes.iter().enumerate() {
-            if b == 0x00 {
-                // valid → set bit to 1
-                buffer[i / 8] |= 1 << (i % 8);
+        // Pack 8 wire bytes into one bitmap byte at a time. Building each output
+        // byte in a register from 8 inputs (branchless `(b == 0) as u8`) avoids
+        // the per-row index-divide, index-modulo, and load-or-store of a
+        // byte-at-a-time loop, which the data-dependent branch also kept from
+        // vectorizing. Bit order stays LSB-first, valid (0x00) -> bit 1.
+        let mut chunks = null_bytes.chunks_exact(8);
+        for c in &mut chunks {
+            let byte = (c[0] == 0) as u8
+                | (((c[1] == 0) as u8) << 1)
+                | (((c[2] == 0) as u8) << 2)
+                | (((c[3] == 0) as u8) << 3)
+                | (((c[4] == 0) as u8) << 4)
+                | (((c[5] == 0) as u8) << 5)
+                | (((c[6] == 0) as u8) << 6)
+                | (((c[7] == 0) as u8) << 7);
+            buffer.push(byte);
+        }
+        let rem = chunks.remainder();
+        if !rem.is_empty() {
+            let mut byte = 0u8;
+            for (k, &b) in rem.iter().enumerate() {
+                byte |= ((b == 0) as u8) << k;
             }
-            // null (b != 0) → bit stays 0
+            buffer.push(byte);
         }
 
         Self { buffer, len }
@@ -84,7 +101,7 @@ impl Bitmap {
 
     /// Create a bitmap from a pre-built byte buffer.
     pub fn from_raw(buffer: Vec<u8>, len: usize) -> Self {
-        debug_assert!((len + 7) / 8 <= buffer.len());
+        debug_assert!(len.div_ceil(8) <= buffer.len());
         Self { buffer, len }
     }
 }

@@ -1,2 +1,8 @@
 /target
-.claude
+
+# Local Claude settings (keep shared agent definitions tracked)
+.claude/settings.local.json
+
+# Local ClickHouse server source checkout for agent reference (see AGENTS.md)
+/.server-src/
+.server-ref
