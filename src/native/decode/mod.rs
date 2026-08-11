@@ -3372,27 +3372,224 @@ fn block_end_with_settings(
     data: &[u8],
     options: &DecodeSettings,
 ) -> Result<Option<usize>, DecodeError> {
-    let mut reader = ByteReader::new(data);
+    block_end_resume_with_settings(data, options, &mut ScanProgress::default())
+}
 
-    if options.protocol_revision > 0 {
-        if !read_block_info(&mut reader)? {
-            return Ok(None);
+/// Verified completeness-scan progress into the current partial block, held by
+/// [`StreamDecoder`](crate::native::stream_decoder::StreamDecoder) between
+/// feeds so the scan resumes where it stopped instead of re-walking the block
+/// from its start on every feed. All offsets are relative to the block start
+/// (byte 0 of the `data` slice passed to the scan), which keeps them valid
+/// across the stream decoder's buffer compaction: compaction only drops bytes
+/// before the block start.
+///
+/// A checkpoint survives only a "need more bytes" outcome (`Io(UnexpectedEof)`).
+/// A complete block, a clean boundary, and a real decode error all clear it, so
+/// stale progress can never leak into the next block or past an error.
+#[derive(Debug, Default)]
+pub(crate) struct ScanProgress {
+    /// Column count and row count, once the block header (BlockInfo preamble
+    /// plus the two count varints) has been fully parsed.
+    header: Option<(usize, usize)>,
+    /// Fully scanned top-level columns (header, state prefix, body, and state
+    /// suffix all verified) and the offset just past the last one, initialized
+    /// to the offset just past the block header.
+    columns_done: usize,
+    columns_end: usize,
+    /// Mid-body checkpoint inside the current column, recorded only for the
+    /// flat-resumable String and Nullable(String) bodies.
+    string_body: Option<StringScanState>,
+    /// Cumulative bytes the scan advanced over, across resumes. Backs the
+    /// O(n) linearity guard in the stream decoder tests.
+    #[cfg(test)]
+    pub(crate) bytes_walked: u64,
+}
+
+impl ScanProgress {
+    /// Offset the next scan resumes from, which is also the largest saved
+    /// offset (checkpoints only move forward within a block).
+    fn resume_offset(&self) -> usize {
+        match &self.string_body {
+            Some(body) => body.offset,
+            None => self.columns_end,
         }
-    } else if reader.remaining() == 0 {
-        return Ok(None);
     }
 
-    let num_cols = varint_usize(reader.read_varint()?, "column count")?;
-    let num_rows = varint_usize(reader.read_varint()?, "row count")?;
+    /// Drop all saved progress so the next scan restarts from the block start.
+    fn reset(&mut self) {
+        self.header = None;
+        self.columns_done = 0;
+        self.columns_end = 0;
+        self.string_body = None;
+    }
+}
 
-    for _ in 0..num_cols {
-        let (name, ch_type) = read_column_header(&mut reader, options)?;
-        if num_rows > 0 {
-            skip_column_data(&mut reader, &ch_type, num_rows, &name, options)?;
+/// Mid-body scan checkpoint for a String or Nullable(String) column.
+#[derive(Debug)]
+struct StringScanState {
+    /// Whether the Nullable null map has been skipped. Starts true for plain
+    /// String, which carries none.
+    null_map_done: bool,
+    /// Rows whose length varint and payload are fully verified.
+    rows_done: usize,
+    /// Offset of the first unverified byte, relative to the block start.
+    offset: usize,
+}
+
+/// Resumable [`block_end`]: on "need more bytes" the verified progress is kept
+/// in `progress`, and the next call continues from it instead of re-walking
+/// the block from its start. Accepts and rejects exactly the same streams as
+/// [`block_end`]; `progress` only changes where the walk starts.
+pub(crate) fn block_end_resume(
+    data: &[u8],
+    options: &DecodeOptions,
+    progress: &mut ScanProgress,
+) -> Result<Option<usize>, DecodeError> {
+    block_end_resume_with_settings(data, &DecodeSettings::text(options), progress)
+}
+
+/// Binary-descriptor counterpart of [`block_end_resume`].
+pub(crate) fn block_end_binary_types_resume(
+    data: &[u8],
+    options: &DecodeOptions,
+    progress: &mut ScanProgress,
+) -> Result<Option<usize>, DecodeError> {
+    block_end_resume_with_settings(data, &DecodeSettings::binary(options), progress)
+}
+
+fn block_end_resume_with_settings(
+    data: &[u8],
+    settings: &DecodeSettings,
+    progress: &mut ScanProgress,
+) -> Result<Option<usize>, DecodeError> {
+    // A saved offset past the data cannot describe this buffer; that is a
+    // caller wiring bug, so fail loudly in debug builds, then drop the
+    // checkpoint and rescan from the block start.
+    debug_assert!(
+        progress.resume_offset() <= data.len(),
+        "scan checkpoint offset {} exceeds data length {}",
+        progress.resume_offset(),
+        data.len()
+    );
+    if progress.resume_offset() > data.len() {
+        progress.reset();
+    }
+
+    #[cfg(test)]
+    let resume_from = progress.resume_offset();
+
+    let mut reader = ByteReader::new(data);
+    let result = scan_block_resume(&mut reader, settings, progress);
+
+    #[cfg(test)]
+    {
+        progress.bytes_walked += reader.position().saturating_sub(resume_from) as u64;
+    }
+
+    // Keep the checkpoint only across "need more bytes".
+    match &result {
+        Err(DecodeError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {}
+        _ => progress.reset(),
+    }
+    result
+}
+
+/// Body of the resumable completeness scan. Jumps to the finest checkpoint in
+/// `progress`, then records new progress after the header, after each fully
+/// scanned column, and per row inside a flat-resumable String body.
+fn scan_block_resume(
+    reader: &mut ByteReader,
+    settings: &DecodeSettings,
+    progress: &mut ScanProgress,
+) -> Result<Option<usize>, DecodeError> {
+    let (num_cols, num_rows) = if let Some((num_cols, num_rows)) = progress.header {
+        if let Some(body) = progress.string_body.as_mut() {
+            // The wrapper verified `body.offset` lies within the data.
+            reader.skip(body.offset)?;
+            skip_string_body_resumable(reader, num_rows, body)?;
+            progress.string_body = None;
+            progress.columns_done += 1;
+        } else {
+            reader.skip(progress.columns_end)?;
         }
+        (num_cols, num_rows)
+    } else {
+        if settings.protocol_revision > 0 {
+            if !read_block_info(reader)? {
+                return Ok(None);
+            }
+        } else if reader.remaining() == 0 {
+            return Ok(None);
+        }
+        let num_cols = varint_usize(reader.read_varint()?, "column count")?;
+        let num_rows = varint_usize(reader.read_varint()?, "row count")?;
+        progress.header = Some((num_cols, num_rows));
+        (num_cols, num_rows)
+    };
+    progress.columns_end = reader.position();
+
+    while progress.columns_done < num_cols {
+        let (name, ch_type) = read_column_header(reader, settings)?;
+        if num_rows > 0 {
+            if let Some(nullable) = flat_string_body(&ch_type) {
+                let mut body = StringScanState {
+                    null_map_done: !nullable,
+                    rows_done: 0,
+                    offset: reader.position(),
+                };
+                if let Err(err) = skip_string_body_resumable(reader, num_rows, &mut body) {
+                    if matches!(&err, DecodeError::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof)
+                    {
+                        progress.string_body = Some(body);
+                    }
+                    return Err(err);
+                }
+            } else {
+                skip_column_data(reader, &ch_type, num_rows, &name, settings)?;
+            }
+        }
+        progress.columns_done += 1;
+        progress.columns_end = reader.position();
     }
 
     Ok(Some(reader.position()))
+}
+
+/// Whether `ch_type` has a flat-resumable body for the streaming scan: no
+/// state prefix or suffix bytes and a flat per-row walk. True only for the
+/// exact `String` and `Nullable(String)` spellings; returns the nullability,
+/// since a `Nullable(String)` body leads with its null map. Every other type,
+/// including aliases that physically delegate to String, keeps the general
+/// column-boundary checkpointing.
+fn flat_string_body(ch_type: &ChType) -> Option<bool> {
+    match ch_type {
+        ChType::String => Some(false),
+        ChType::Nullable(inner) if matches!(inner.as_ref(), ChType::String) => Some(true),
+        _ => None,
+    }
+}
+
+/// Walk a String body row loop, recording verified progress in `state` so an
+/// `UnexpectedEof` resumes at the last row boundary. The walk is byte-for-byte
+/// the `ChType::String` arm of [`skip_column_body`], preceded by the Nullable
+/// null map skip from [`skip_values`] when the column is `Nullable(String)`.
+fn skip_string_body_resumable(
+    reader: &mut ByteReader,
+    num_rows: usize,
+    state: &mut StringScanState,
+) -> Result<(), DecodeError> {
+    if !state.null_map_done {
+        reader.skip(num_rows)?; // null map: 1 byte per row
+        state.null_map_done = true;
+        state.offset = reader.position();
+    }
+    while state.rows_done < num_rows {
+        let len = varint_usize(reader.read_varint()?, "String value length")?;
+        reader.skip(len)?;
+        state.rows_done += 1;
+        state.offset = reader.position();
+    }
+    Ok(())
 }
 
 /// Advance `reader` past one column's data without materializing it.

@@ -19,8 +19,8 @@ use std::io;
 
 use crate::batch::ColBatch;
 use crate::native::decode::{
-    block_end, block_end_binary_types, decode_next_block, decode_next_block_binary_types,
-    DecodeError, DecodeOptions,
+    block_end_binary_types_resume, block_end_resume, decode_next_block,
+    decode_next_block_binary_types, DecodeError, DecodeOptions, ScanProgress,
 };
 use crate::native::varint::ByteReader;
 use crate::schema::Schema;
@@ -46,6 +46,11 @@ pub struct StreamDecoder {
     /// as empty feeds and the `finish()` re-drain. Held in current buffer
     /// coordinates: compaction lowers it by the number of bytes drained.
     scanned: usize,
+    /// Verified scan progress into the current partial block, so a re-scan
+    /// resumes where the last one stopped instead of restarting from the block
+    /// start. Its offsets are relative to `pos`, and compaction drains exactly
+    /// `..pos`, so they stay valid without adjustment.
+    scan: ScanProgress,
     options: DecodeOptions,
     binary_types: bool,
     finished: bool,
@@ -61,6 +66,7 @@ impl StreamDecoder {
             buffer: Vec::new(),
             pos: 0,
             scanned: 0,
+            scan: ScanProgress::default(),
             options,
             binary_types: false,
             finished: false,
@@ -126,12 +132,14 @@ impl StreamDecoder {
 
     /// Try to decode as many complete blocks as possible from the buffer.
     ///
-    /// Each iteration first runs the allocation-free [`block_end`] completeness
-    /// scan over the unconsumed bytes. Only when it confirms a whole block is
-    /// buffered do we run the allocating [`decode_next_block`]. A block that
-    /// arrives over several feeds therefore allocates its column buffers exactly
-    /// once, when the last byte lands, instead of allocating and discarding them
-    /// on every partial feed.
+    /// Each iteration first runs the allocation-free [`block_end_resume`]
+    /// completeness scan over the unconsumed bytes. Only when it confirms a
+    /// whole block is buffered do we run the allocating [`decode_next_block`].
+    /// A block that arrives over several feeds therefore allocates its column
+    /// buffers exactly once, when the last byte lands, instead of allocating
+    /// and discarding them on every partial feed. The scan checkpoints its
+    /// progress in `self.scan`, so a block fed in many chunks is walked once
+    /// overall rather than re-walked from its start on every feed.
     fn drain_blocks(&mut self) -> Result<Vec<ColBatch>, DecodeError> {
         let mut blocks = Vec::new();
 
@@ -149,10 +157,13 @@ impl StreamDecoder {
                 break;
             }
 
+            // The scan keeps its checkpoint only across "need more bytes"; any
+            // other outcome clears `self.scan`, so a checkpoint never carries
+            // into the next block or past an error.
             let scanned_end = if self.binary_types {
-                block_end_binary_types(data, &self.options)
+                block_end_binary_types_resume(data, &self.options, &mut self.scan)
             } else {
-                block_end(data, &self.options)
+                block_end_resume(data, &self.options, &mut self.scan)
             };
             match scanned_end {
                 Ok(Some(end)) => {
@@ -221,6 +232,8 @@ impl StreamDecoder {
 mod tests {
     use super::*;
     use crate::column::Column;
+    use crate::native::decode::DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION;
+    use crate::native::protocol::LC_HAS_ADDITIONAL_KEYS_BIT;
     use crate::native::varint::write_varint;
 
     /// Helper: build a Native format block with one Int64 column.
@@ -287,6 +300,201 @@ mod tests {
         buf.extend_from_slice(type_name);
         buf.extend_from_slice(states);
         buf
+    }
+
+    /// Helper: build one Nullable(String) column block (no framing).
+    fn make_nullable_string_block(name: &str, values: &[Option<&str>]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_varint(&mut buf, 1);
+        write_varint(&mut buf, values.len() as u64);
+        write_varint(&mut buf, name.len() as u64);
+        buf.extend_from_slice(name.as_bytes());
+        let type_name = b"Nullable(String)";
+        write_varint(&mut buf, type_name.len() as u64);
+        buf.extend_from_slice(type_name);
+        for v in values {
+            buf.push(if v.is_none() { 0x01 } else { 0x00 });
+        }
+        for v in values {
+            let s = v.unwrap_or("");
+            write_varint(&mut buf, s.len() as u64);
+            buf.extend_from_slice(s.as_bytes());
+        }
+        buf
+    }
+
+    /// Helper: build one LowCardinality(String) column block with u8 indexes
+    /// (no framing).
+    fn make_lc_string_block(name: &str, dictionary: &[&str], indices: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_varint(&mut buf, 1);
+        write_varint(&mut buf, indices.len() as u64);
+        write_varint(&mut buf, name.len() as u64);
+        buf.extend_from_slice(name.as_bytes());
+        let type_name = b"LowCardinality(String)";
+        write_varint(&mut buf, type_name.len() as u64);
+        buf.extend_from_slice(type_name);
+        buf.extend_from_slice(&1u64.to_le_bytes()); // key version
+        buf.extend_from_slice(&LC_HAS_ADDITIONAL_KEYS_BIT.to_le_bytes()); // width tag 0 = u8
+        buf.extend_from_slice(&(dictionary.len() as u64).to_le_bytes());
+        for s in dictionary {
+            write_varint(&mut buf, s.len() as u64);
+            buf.extend_from_slice(s.as_bytes());
+        }
+        buf.extend_from_slice(&(indices.len() as u64).to_le_bytes());
+        buf.extend_from_slice(indices);
+        buf
+    }
+
+    /// Helper: build one Array(String) column block (no framing).
+    fn make_array_string_block(name: &str, rows: &[&[&str]]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_varint(&mut buf, 1);
+        write_varint(&mut buf, rows.len() as u64);
+        write_varint(&mut buf, name.len() as u64);
+        buf.extend_from_slice(name.as_bytes());
+        let type_name = b"Array(String)";
+        write_varint(&mut buf, type_name.len() as u64);
+        buf.extend_from_slice(type_name);
+        let mut end = 0u64;
+        for row in rows {
+            end += row.len() as u64;
+            buf.extend_from_slice(&end.to_le_bytes());
+        }
+        for row in rows {
+            for s in *row {
+                write_varint(&mut buf, s.len() as u64);
+                buf.extend_from_slice(s.as_bytes());
+            }
+        }
+        buf
+    }
+
+    /// Helper: build one two-column block, Int64 then String (no framing).
+    fn make_mixed_block(ids: &[i64], names: &[&str]) -> Vec<u8> {
+        assert_eq!(ids.len(), names.len());
+        let mut buf = Vec::new();
+        write_varint(&mut buf, 2);
+        write_varint(&mut buf, ids.len() as u64);
+        write_varint(&mut buf, 2);
+        buf.extend_from_slice(b"id");
+        write_varint(&mut buf, 5);
+        buf.extend_from_slice(b"Int64");
+        for &v in ids {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        write_varint(&mut buf, 4);
+        buf.extend_from_slice(b"name");
+        write_varint(&mut buf, 6);
+        buf.extend_from_slice(b"String");
+        for &s in names {
+            write_varint(&mut buf, s.len() as u64);
+            buf.extend_from_slice(s.as_bytes());
+        }
+        buf
+    }
+
+    /// Helper: one String column body, a varint length plus raw bytes per row.
+    fn string_body(values: &[&str]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for &s in values {
+            write_varint(&mut buf, s.len() as u64);
+            buf.extend_from_slice(s.as_bytes());
+        }
+        buf
+    }
+
+    /// Helper: frame one single-column block for a revision >=
+    /// DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION: BlockInfo preamble, counts,
+    /// column header with the default custom-serialization marker, then `body`.
+    fn make_framed_block(name: &str, type_name: &str, num_rows: usize, body: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_varint(&mut buf, 1);
+        buf.push(0x00); // is_overflows = false
+        write_varint(&mut buf, 2);
+        buf.extend_from_slice(&(-1i32).to_le_bytes()); // bucket_num = -1
+        write_varint(&mut buf, 0); // BlockInfo terminator
+        write_varint(&mut buf, 1); // num_cols
+        write_varint(&mut buf, num_rows as u64);
+        write_varint(&mut buf, name.len() as u64);
+        buf.extend_from_slice(name.as_bytes());
+        write_varint(&mut buf, type_name.len() as u64);
+        buf.extend_from_slice(type_name.as_bytes());
+        buf.push(0x00); // default serialization
+        buf.extend_from_slice(body);
+        buf
+    }
+
+    /// Helper: build one String column block with a binary type header
+    /// (no framing).
+    fn make_binary_string_block(name: &str, values: &[&str]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_varint(&mut buf, 1);
+        write_varint(&mut buf, values.len() as u64);
+        write_varint(&mut buf, name.len() as u64);
+        buf.extend_from_slice(name.as_bytes());
+        buf.push(0x15); // DataTypesBinaryEncoding String
+        buf.extend(string_body(values));
+        buf
+    }
+
+    fn framed_options() -> DecodeOptions {
+        DecodeOptions {
+            protocol_revision: DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION,
+            ..DecodeOptions::default()
+        }
+    }
+
+    /// Feed `data` in `chunk_size` pieces (the whole buffer when zero) through
+    /// a decoder from `make`, returning all blocks including `finish()`'s.
+    fn decode_chunked_with(
+        data: &[u8],
+        chunk_size: usize,
+        make: impl Fn() -> StreamDecoder,
+    ) -> Result<Vec<ColBatch>, DecodeError> {
+        let mut dec = make();
+        let mut blocks = Vec::new();
+        if chunk_size == 0 {
+            blocks.extend(dec.feed(data)?);
+        } else {
+            for chunk in data.chunks(chunk_size) {
+                blocks.extend(dec.feed(chunk)?);
+            }
+        }
+        blocks.extend(dec.finish()?);
+        Ok(blocks)
+    }
+
+    /// Assert that every chunking of `data` decodes to the same blocks as one
+    /// whole-buffer feed, and that dropping the final byte fails with
+    /// UnexpectedEof at every chunking. Decoders come from `make`.
+    fn assert_chunking_parity_with(
+        data: &[u8],
+        expected_blocks: usize,
+        make: impl Fn() -> StreamDecoder,
+    ) {
+        let whole = decode_chunked_with(data, 0, &make).unwrap();
+        assert_eq!(whole.len(), expected_blocks);
+        let reference = format!("{whole:?}");
+        for chunk_size in [1, 7, 64 * 1024] {
+            let blocks = decode_chunked_with(data, chunk_size, &make).unwrap();
+            assert_eq!(format!("{blocks:?}"), reference, "chunk size {chunk_size}");
+        }
+        let truncated = &data[..data.len() - 1];
+        for chunk_size in [0, 1, 7, 64 * 1024] {
+            let err = decode_chunked_with(truncated, chunk_size, &make).unwrap_err();
+            assert!(
+                matches!(err, DecodeError::Io(ref e) if e.kind() == io::ErrorKind::UnexpectedEof),
+                "chunk size {chunk_size}: {err:?}"
+            );
+        }
+    }
+
+    /// Chunking parity with the default text-header decoder.
+    fn assert_chunking_parity(data: &[u8], expected_blocks: usize) {
+        assert_chunking_parity_with(data, expected_blocks, || {
+            StreamDecoder::new(DecodeOptions::default())
+        });
     }
 
     #[test]
@@ -646,6 +854,135 @@ mod tests {
 
         let result = dec.feed(&data);
         assert!(matches!(result, Err(DecodeError::UnsupportedType { .. })));
+    }
+
+    #[test]
+    fn test_chunking_parity_string() {
+        // 300 rows (2-byte row-count varint) and one >= 128 byte value (2-byte
+        // length varint), so the 1-byte chunk sweep splits inside both.
+        let long = "x".repeat(200);
+        let owned: Vec<String> = (0..300).map(|i| format!("user_{i}")).collect();
+        let mut values: Vec<&str> = owned.iter().map(String::as_str).collect();
+        values[13] = &long;
+        values[79] = "";
+        let mut data = make_string_block("s", &values);
+        data.extend(make_string_block("s", &["user_300", "seventy nine"]));
+        assert_chunking_parity(&data, 2);
+    }
+
+    #[test]
+    fn test_chunking_parity_nullable_string() {
+        // Same multi-byte varint coverage as the plain String case: 300 rows
+        // and one >= 128 byte value, with nulls interleaved.
+        let long = "y".repeat(150);
+        let owned: Vec<String> = (0..300).map(|i| format!("user_{i}")).collect();
+        let mut values: Vec<Option<&str>> = owned
+            .iter()
+            .enumerate()
+            .map(|(i, s)| if i % 7 == 0 { None } else { Some(s.as_str()) })
+            .collect();
+        values[13] = Some(&long);
+        values[79] = Some("");
+        let mut data = make_nullable_string_block("s", &values);
+        data.extend(make_nullable_string_block("s", &[None, Some("13")]));
+        assert_chunking_parity(&data, 2);
+    }
+
+    #[test]
+    fn test_chunking_parity_framed_string() {
+        // Revision framing: BlockInfo preamble and the per-column
+        // custom-serialization marker byte, split at every byte boundary.
+        let mut data = make_framed_block("s", "String", 3, &string_body(&["user_1", "", "user_2"]));
+        data.extend(make_framed_block(
+            "s",
+            "String",
+            2,
+            &string_body(&["user_3", "13"]),
+        ));
+        assert_chunking_parity_with(&data, 2, || StreamDecoder::new(framed_options()));
+    }
+
+    #[test]
+    fn test_chunking_parity_framed_nullable_string() {
+        let mut body = vec![0x00, 0x01, 0x00];
+        body.extend(string_body(&["user_1", "", "user_2"]));
+        let mut data = make_framed_block("s", "Nullable(String)", 3, &body);
+        let mut body2 = vec![0x01, 0x00];
+        body2.extend(string_body(&["", "13"]));
+        data.extend(make_framed_block("s", "Nullable(String)", 2, &body2));
+        assert_chunking_parity_with(&data, 2, || StreamDecoder::new(framed_options()));
+    }
+
+    #[test]
+    fn test_chunking_parity_binary_types_string() {
+        // The String parity corpus again, with binary type headers, covering
+        // the binary-descriptor resume path.
+        let long = "z".repeat(160);
+        let owned: Vec<String> = (0..300).map(|i| format!("user_{i}")).collect();
+        let mut values: Vec<&str> = owned.iter().map(String::as_str).collect();
+        values[13] = &long;
+        values[79] = "";
+        let mut data = make_binary_string_block("s", &values);
+        data.extend(make_binary_string_block("s", &["user_300", ""]));
+        assert_chunking_parity_with(&data, 2, || {
+            StreamDecoder::new_binary_types(DecodeOptions::default())
+        });
+    }
+
+    #[test]
+    fn test_chunking_parity_low_cardinality_string() {
+        let mut data = make_lc_string_block("lc", &["", "user_1", "user_2"], &[1, 2, 1, 0]);
+        data.extend(make_lc_string_block("lc", &["", "user_3"], &[1, 1]));
+        assert_chunking_parity(&data, 2);
+    }
+
+    #[test]
+    fn test_chunking_parity_array_string() {
+        let mut data = make_array_string_block("a", &[&["user_1", "user_2"], &[], &["13"]]);
+        data.extend(make_array_string_block("a", &[&["user_3"]]));
+        assert_chunking_parity(&data, 2);
+    }
+
+    #[test]
+    fn test_chunking_parity_mixed_columns() {
+        let mut data = make_mixed_block(&[13, 79], &["user_1", "user_2"]);
+        data.extend(make_mixed_block(&[80], &["user_3"]));
+        assert_chunking_parity(&data, 2);
+    }
+
+    #[test]
+    fn test_chunking_parity_zero_row_block() {
+        // A zero-row block (headers only, no column data) followed by a
+        // row-bearing block.
+        let mut data = make_string_block("s", &[]);
+        data.extend(make_string_block("s", &["user_1", "user_2"]));
+        assert_chunking_parity(&data, 2);
+    }
+
+    #[test]
+    fn test_string_scan_walks_linear_bytes_across_small_feeds() {
+        // Linearity guard: a large String block fed in small chunks must be
+        // walked a bounded number of times overall, not re-walked from the
+        // block start on every feed.
+        let owned: Vec<String> = (0..30_000).map(|i| format!("user_{i}")).collect();
+        let values: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let data = make_string_block("s", &values);
+
+        let mut dec = StreamDecoder::new(DecodeOptions::default());
+        let mut blocks = Vec::new();
+        for chunk in data.chunks(256) {
+            blocks.extend(dec.feed(chunk).unwrap());
+        }
+        blocks.extend(dec.finish().unwrap());
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].num_rows, 30_000);
+        assert!(
+            dec.scan.bytes_walked < 3 * data.len() as u64,
+            "scan walked {} bytes for a {}-byte block",
+            dec.scan.bytes_walked,
+            data.len()
+        );
     }
 
     #[test]
