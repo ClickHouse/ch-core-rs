@@ -5,6 +5,29 @@ pub struct Bitmap {
     len: usize,
 }
 
+/// Compares the `len` meaningful bits only. Trailing bits in the last byte
+/// differ between constructors (`all_valid` sets them, `from_ch_null_map`
+/// leaves them clear) and carry no meaning.
+impl PartialEq for Bitmap {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len != other.len {
+            return false;
+        }
+        let full = self.len / 8;
+        if self.buffer[..full] != other.buffer[..full] {
+            return false;
+        }
+        let rem = self.len % 8;
+        if rem == 0 {
+            return true;
+        }
+        let mask = (1u8 << rem) - 1;
+        (self.buffer[full] & mask) == (other.buffer[full] & mask)
+    }
+}
+
+impl Eq for Bitmap {}
+
 impl Bitmap {
     /// Create a bitmap where all values are valid.
     pub fn all_valid(len: usize) -> Self {
@@ -161,5 +184,23 @@ mod tests {
         assert_eq!(bm.len(), 0);
         assert!(bm.is_empty());
         assert_eq!(bm.null_count(), 0);
+    }
+
+    #[test]
+    fn test_eq_ignores_trailing_bits() {
+        // all_valid sets trailing bits in the last byte, from_ch_null_map
+        // leaves them clear. Equality masks them out.
+        assert_eq!(Bitmap::all_valid(5), Bitmap::from_ch_null_map(&[0x00; 5]));
+        assert_eq!(Bitmap::all_valid(8), Bitmap::from_ch_null_map(&[0x00; 8]));
+        assert_eq!(Bitmap::from_ch_null_map(&[]), Bitmap::from_ch_null_map(&[]));
+        assert_ne!(Bitmap::all_valid(5), Bitmap::all_valid(6));
+        assert_ne!(
+            Bitmap::all_valid(5),
+            Bitmap::from_ch_null_map(&[0, 0, 1, 0, 0])
+        );
+        assert_ne!(
+            Bitmap::from_ch_null_map(&[1; 9]),
+            Bitmap::from_ch_null_map(&[1, 1, 1, 1, 1, 1, 1, 1, 0])
+        );
     }
 }

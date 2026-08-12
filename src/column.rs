@@ -7,7 +7,7 @@ use crate::schema::ChType;
 /// retains the structural null map of `Nullable(Nothing)` for Native
 /// decode-to-encode fidelity. Arrow exports both forms as its Null type and
 /// therefore ignores this bitmap.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NothingColumn {
     pub len: usize,
     pub validity: Option<Bitmap>,
@@ -45,7 +45,7 @@ impl NothingColumn {
 }
 
 /// A fixed-width column of primitive values.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PrimitiveColumn<T: Clone> {
     pub values: Vec<T>,
     pub validity: Option<Bitmap>,
@@ -83,7 +83,7 @@ impl<T: Clone> PrimitiveColumn<T> {
 ///
 /// Each bit represents one row. Bit order is LSB within each byte.
 /// This matches Arrow's boolean array layout for zero-copy export.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BoolColumn {
     pub bitmap: Vec<u8>,
     pub len: usize,
@@ -171,7 +171,7 @@ impl BoolColumn {
 ///
 /// Row `i` data is `data[offsets[i]..offsets[i+1]]`.
 /// `offsets` has length `num_rows + 1`, with `offsets[0] == 0`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Utf8Column {
     pub offsets: Vec<i32>,
     pub data: Vec<u8>,
@@ -226,7 +226,7 @@ impl Utf8Column {
 /// have no generic size bound and Arrow LargeBinary (`Z`) is the honest
 /// zero-copy representation. The logical aggregate function, arguments, and
 /// state version remain in [`crate::schema::ChType`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AggregateStateColumn {
     pub offsets: Vec<i64>,
     pub data: Vec<u8>,
@@ -259,7 +259,7 @@ impl AggregateStateColumn {
 /// Fixed-size binary column. Each row is exactly `width` bytes.
 ///
 /// Arrow layout: contiguous buffer of `width * num_rows` bytes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FixedBinaryColumn {
     pub data: Vec<u8>,
     pub width: usize,
@@ -309,7 +309,7 @@ impl FixedBinaryColumn {
 /// whole vectors, so its validity bitmap lives here at the list level. Native's
 /// bit-transposed plane representation is converted once during decode; Arrow
 /// export then borrows these buffers without another transpose or copy.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct QBitColumn {
     pub values: Box<Column>,
     pub dimension: usize,
@@ -361,7 +361,7 @@ impl QBitColumn {
 ///
 /// `precision` and `scale` are the type metadata; `width` is the byte width
 /// derived from the precision (`bits / 8`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DecimalColumn {
     pub data: Vec<u8>,
     pub width: usize,
@@ -434,7 +434,7 @@ impl DecimalColumn {
 ///   for `LowCardinality(String)`). Each Native block carries its own
 ///   dictionary, and blocks stay separate chunks, so the values column is local
 ///   to this chunk.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DictionaryColumn {
     pub indices: Vec<i32>,
     pub validity: Option<Bitmap>,
@@ -494,7 +494,7 @@ impl DictionaryColumn {
 /// The array itself is never nullable (ClickHouse forbids `Nullable(Array(T))`),
 /// so `ArrayColumn` carries no validity bitmap; a nullable *element* type keeps
 /// its nulls in `values`' own validity (an `Array(Nullable(T))`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ArrayColumn {
     pub offsets: Vec<i64>,
     pub values: Box<Column>,
@@ -539,7 +539,7 @@ impl ArrayColumn {
 /// struct's validity is independent of its children; a null tuple row still
 /// carries placeholder (default) values in every child column, exactly as the
 /// server serializes it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TupleColumn {
     pub fields: Vec<Column>,
     pub len: usize,
@@ -597,7 +597,7 @@ impl TupleColumn {
 /// is false), so there is no map-level validity bitmap; a nullable VALUE type
 /// keeps its nulls on the values column inside `entries`, and a nullable key
 /// type is illegal.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MapColumn {
     pub offsets: Vec<i64>,
     pub entries: Box<Column>,
@@ -749,7 +749,7 @@ impl std::error::Error for VariantColumnError {}
 /// contains only its selected rows. `layout` is flat for at most 127
 /// alternatives and a two-level union for 128 through 255, preserving both
 /// ClickHouse's full range and Arrow's 128-code-per-node limit.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct VariantColumn {
     pub discriminators: Vec<u8>,
     pub layout: VariantLayout,
@@ -764,7 +764,7 @@ pub struct VariantColumn {
 /// cell is an opaque binary blob containing a binary type descriptor followed
 /// by one value's `serializeBinary` payload. It deliberately stays binary here;
 /// parsing or materializing those row payloads is not part of the hot bulk path.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DynamicChild {
     Typed { ch_type: ChType, values: Column },
     Shared(Utf8Column),
@@ -857,7 +857,7 @@ impl std::error::Error for DynamicColumnError {}
 /// only, in its transmitted list order. This distinction is enough for the
 /// encoder to preserve the accepted Native representation without storing a
 /// wire-version flag on the public buffer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DynamicColumn {
     pub type_ids: Vec<u32>,
     pub offsets: Vec<i32>,
@@ -1335,7 +1335,7 @@ impl std::error::Error for JsonColumnError {}
 /// kept as raw bytes and never materialized. A `FLATTENED`-wire block carries no
 /// shared data, so it decodes with empty shared columns (`shared_offsets` is
 /// `[0]`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StructuredJson {
     pub typed: Vec<(String, Column)>,
     pub dynamic: Vec<(String, DynamicColumn)>,
@@ -1466,7 +1466,7 @@ impl StructuredJson {
 /// [`StructuredJson`] is boxed because it is several times larger than a
 /// `Utf8Column`; keeping it behind a pointer stops the size of the whole
 /// [`Column`] enum (and every enum that embeds a `Column`) from ballooning.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum JsonBody {
     Structured(Box<StructuredJson>),
     Text(Utf8Column),
@@ -1480,7 +1480,7 @@ pub enum JsonBody {
 /// a bare `JSON` column always leaves it `None`. This mirrors how
 /// [`TupleColumn`] carries `Nullable(Tuple(...))` validity independent of its
 /// children.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct JsonColumn {
     pub body: JsonBody,
     pub validity: Option<Bitmap>,
@@ -1549,7 +1549,7 @@ impl JsonColumn {
 }
 
 /// Enum over all supported column types.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Column {
     Nothing(NothingColumn),
     Bool(BoolColumn),
