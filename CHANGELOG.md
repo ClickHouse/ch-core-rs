@@ -6,9 +6,11 @@ Release tags follow semver. No breaking changes on patch or minor releases.
 
 ## Unreleased
 
+## v0.1.1, 2026-08-12
+
 - StreamDecoder's block completeness scan is now resumable. Previously it restarted from the start of the partial block on every feed, costing O(block bytes x chunks) on large String blocks fed in transport-sized chunks. Scan progress is checkpointed per column for all types and per row for String and Nullable(String). No API or behavior change.
 
-## v0.1.0
+## v0.1.0, 2026-07-23
 
 Initial release.
 
