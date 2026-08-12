@@ -4,7 +4,7 @@ use crate::column::Column;
 use crate::schema::Schema;
 
 /// A batch of columnar data with schema.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ColBatch {
     pub schema: Schema,
     pub columns: Vec<Column>,
@@ -23,7 +23,7 @@ pub struct ColBatch {
 /// share the same schema. Empty (zero-row) blocks are dropped from `chunks`
 /// but still contribute the schema, so a zero-row result has a valid schema
 /// with no chunks.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChunkedBatch {
     pub schema: Schema,
     pub chunks: Vec<Arc<ColBatch>>,

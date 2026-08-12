@@ -475,10 +475,9 @@ mod tests {
     ) {
         let whole = decode_chunked_with(data, 0, &make).unwrap();
         assert_eq!(whole.len(), expected_blocks);
-        let reference = format!("{whole:?}");
         for chunk_size in [1, 7, 64 * 1024] {
             let blocks = decode_chunked_with(data, chunk_size, &make).unwrap();
-            assert_eq!(format!("{blocks:?}"), reference, "chunk size {chunk_size}");
+            assert_eq!(blocks, whole, "chunk size {chunk_size}");
         }
         let truncated = &data[..data.len() - 1];
         for chunk_size in [0, 1, 7, 64 * 1024] {
