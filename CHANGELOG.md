@@ -5,7 +5,9 @@ All notable changes to ch-core-rs are recorded here, one section per release tag
 Release tags follow semver. Before 1.0, breaking changes increment the minor
 version; patch releases remain backward compatible.
 
-## v0.2.0, Unreleased
+## Unreleased
+
+## v0.2.0, 2026-09-01
 
 - Add standalone `MultiPoint` decode, encode, and Arrow export for ClickHouse
   26.8. Extend `Geometry` with the server's appended discriminator 6 while

@@ -178,11 +178,11 @@ release tag:
 ch-core-rs = { git = "https://github.com/ClickHouse/ch-core-rs.git", tag = "v0.1.0" }
 ```
 
-Releases are semver git tags: patch and minor tags carry no breaking changes,
-and every release is documented in `CHANGELOG.md`. The crate is not published to
-crates.io by design, so pin the tag directly. The MSRV (`rust-version = 1.81`)
-is enforced for git dependencies too, so a consuming crate must build on Rust
-1.81 or newer.
+Releases are semver git tags. Before 1.0, breaking changes increment the minor
+version and patch releases remain backward compatible. Every release is
+documented in `CHANGELOG.md`. The crate is not published to crates.io by design,
+so pin the tag directly. The MSRV (`rust-version = 1.81`) is enforced for git
+dependencies too, so a consuming crate must build on Rust 1.81 or newer.
 
 For development you can point at a local checkout or pin an exact commit:
 
