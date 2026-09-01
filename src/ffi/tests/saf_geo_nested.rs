@@ -24,6 +24,8 @@ fn test_arrow_format_name_decoration_delegates() {
     assert_eq!(arrow_format(&ChType::Geo(GeoKind::Point)), "+s");
     assert_eq!(arrow_format(&ChType::Geo(GeoKind::Ring)), "+L");
     assert_eq!(arrow_format(&ChType::Geo(GeoKind::MultiPolygon)), "+L");
+    assert_eq!(arrow_format(&ChType::Geo(GeoKind::MultiPoint)), "+L");
+    assert!(!field_is_nullable(&ChType::Geo(GeoKind::MultiPoint)));
     assert_eq!(
         arrow_format(&ChType::Nested(vec![("a".into(), ChType::UInt32)])),
         "+L"
@@ -66,6 +68,72 @@ fn test_export_point_schema_and_array() {
         assert_eq!(p.length, 2);
         assert_eq!(p.n_children, 2);
         (array.release.unwrap())(&mut array);
+    }
+}
+
+#[test]
+fn test_export_multi_point_schema_and_array_zero_copy() {
+    // MultiPoint delegates to Array(Point): one LargeList child containing an
+    // unnamed two-Float64 struct. Keep the physical Vec pointers so the export
+    // can pin that every buffer is borrowed directly from the owning batch.
+    let offsets = vec![0, 2, 3];
+    let x_values = vec![1.0, 3.0, 5.0];
+    let y_values = vec![2.0, 4.0, 6.0];
+    let offsets_ptr = offsets.as_ptr();
+    let x_ptr = x_values.as_ptr();
+    let y_ptr = y_values.as_ptr();
+    let points = Column::Tuple(TupleColumn::new(
+        vec![
+            Column::Float64(PrimitiveColumn::new(x_values)),
+            Column::Float64(PrimitiveColumn::new(y_values)),
+        ],
+        3,
+    ));
+    let batch = Arc::new(ColBatch::new(
+        Schema::new(vec![Field {
+            name: "mp".into(),
+            ch_type: ChType::Geo(GeoKind::MultiPoint),
+        }]),
+        vec![Column::Array(ArrayColumn::new(offsets, points))],
+        2,
+    ));
+
+    // Safety: both outputs are writable zeroed C Data structs. The exported
+    // buffers remain owned by `batch` until each release callback runs.
+    unsafe {
+        let mut schema_out: ArrowSchema = std::mem::zeroed();
+        export_schema(&batch.schema, &mut schema_out);
+        let multi_point = &**schema_out.children.add(0);
+        assert_eq!(CStr::from_ptr(multi_point.format).to_str().unwrap(), "+L");
+        assert_eq!(multi_point.flags & 2, 0);
+        assert_eq!(multi_point.n_children, 1);
+        let item = &**multi_point.children.add(0);
+        assert_eq!(CStr::from_ptr(item.name).to_str().unwrap(), "item");
+        assert_eq!(CStr::from_ptr(item.format).to_str().unwrap(), "+s");
+        assert_eq!(item.n_children, 2);
+        for (index, name) in ["1", "2"].into_iter().enumerate() {
+            let coordinate = &**item.children.add(index);
+            assert_eq!(CStr::from_ptr(coordinate.name).to_str().unwrap(), name);
+            assert_eq!(CStr::from_ptr(coordinate.format).to_str().unwrap(), "g");
+        }
+        (schema_out.release.unwrap())(&mut schema_out);
+
+        let mut array_out: ArrowArray = std::mem::zeroed();
+        export_batch_array(&batch, &mut array_out).unwrap();
+        let multi_point = &**array_out.children.add(0);
+        assert_eq!(multi_point.length, 2);
+        assert_eq!(multi_point.n_buffers, 2);
+        assert!((*multi_point.buffers.add(0)).is_null());
+        assert_eq!(*multi_point.buffers.add(1) as *const i64, offsets_ptr);
+        let item = &**multi_point.children.add(0);
+        assert_eq!(item.length, 3);
+        assert_eq!(item.n_buffers, 1);
+        assert!((*item.buffers).is_null());
+        let x = &**item.children.add(0);
+        let y = &**item.children.add(1);
+        assert_eq!(*x.buffers.add(1) as *const f64, x_ptr);
+        assert_eq!(*y.buffers.add(1) as *const f64, y_ptr);
+        (array_out.release.unwrap())(&mut array_out);
     }
 }
 

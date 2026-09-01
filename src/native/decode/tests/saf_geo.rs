@@ -186,6 +186,39 @@ fn test_decode_ring() {
 }
 
 #[test]
+fn test_decode_multi_point() {
+    // MultiPoint = Array(Point): one offset run followed by the flattened
+    // field-major Point body. Row 0 has two points and row 1 has one.
+    let data = BlockBuilder::new()
+        .header(1, 2)
+        .column_header("mp", "MultiPoint")
+        .array_offsets(&[2, 3])
+        .float64_data(&[1.0, 3.0, 5.0])
+        .float64_data(&[2.0, 4.0, 6.0])
+        .build();
+
+    assert_eq!(
+        block_end(&data, &DecodeOptions::default()).unwrap(),
+        Some(data.len())
+    );
+    let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
+    assert_eq!(
+        cb.schema.fields[0].ch_type,
+        ChType::Geo(GeoKind::MultiPoint)
+    );
+    let points = as_array(cb.chunks[0].column(0));
+    assert_eq!(points.offsets, vec![0i64, 2, 3]);
+    let point = as_tuple(points.values.as_ref());
+    match (&point.fields[0], &point.fields[1]) {
+        (Column::Float64(x), Column::Float64(y)) => {
+            assert_eq!(x.values, vec![1.0, 3.0, 5.0]);
+            assert_eq!(y.values, vec![2.0, 4.0, 6.0]);
+        }
+        other => panic!("expected Point tuple fields, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_decode_multi_polygon() {
     // MultiPolygon = Array(Array(Array(Point))): three offset levels then the
     // Point body. One row holding one polygon of one ring of two points.
@@ -221,17 +254,22 @@ fn test_decode_name_decoration_zero_rows() {
     // A zero-row block carrying the three alias groups contributes the schema
     // but no chunks; the empty columns delegate to the physical layout.
     let data = BlockBuilder::new()
-        .header(3, 0)
+        .header(4, 0)
         .column_header("s", "SimpleAggregateFunction(sum, Float64)")
         .column_header("p", "Point")
+        .column_header("mp", "MultiPoint")
         .column_header("n", "Nested(a UInt32, b String)")
         .build();
 
     let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
     assert_eq!(cb.num_rows(), 0);
     assert_eq!(cb.num_chunks(), 0);
-    assert_eq!(cb.num_columns(), 3);
+    assert_eq!(cb.num_columns(), 4);
     assert_eq!(cb.schema.fields[1].ch_type, ChType::Geo(GeoKind::Point));
+    assert_eq!(
+        cb.schema.fields[2].ch_type,
+        ChType::Geo(GeoKind::MultiPoint)
+    );
 }
 
 #[test]

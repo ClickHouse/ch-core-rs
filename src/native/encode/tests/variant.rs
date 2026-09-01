@@ -54,14 +54,14 @@ fn geometry_batch() -> ColBatch {
             other => unreachable!("Geometry alternative is always geo, got {other:?}"),
         })
         .collect();
-    let column = VariantColumn::try_new(&[0, 1, 2, 3, 4, 5, u8::MAX], children).unwrap();
+    let column = VariantColumn::try_new(&[0, 1, 2, 3, 4, 5, 6, u8::MAX], children).unwrap();
     ColBatch::new(
         Schema::new(vec![Field {
             name: "g".into(),
             ch_type: ChType::Geometry,
         }]),
         vec![Column::Variant(column)],
-        7,
+        8,
     )
 }
 
@@ -90,13 +90,13 @@ fn rev0_frames_geometry_as_basic_variant() {
     let bytes = encode_block(&geometry_batch(), &EncodeOptions::default()).unwrap();
     let mut expected_prefix = vec![
         0x01, // num_cols
-        0x07, // num_rows
+        0x08, // num_rows
         0x01, b'g', // column name
         0x08, // canonical custom type-name length
     ];
     expected_prefix.extend_from_slice(b"Geometry");
     expected_prefix.extend_from_slice(&0u64.to_le_bytes()); // BASIC mode
-    expected_prefix.extend_from_slice(&[0, 1, 2, 3, 4, 5, u8::MAX]);
+    expected_prefix.extend_from_slice(&[0, 1, 2, 3, 4, 5, 6, u8::MAX]);
     assert!(bytes.starts_with(&expected_prefix));
 }
 

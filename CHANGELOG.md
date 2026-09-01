@@ -2,9 +2,22 @@
 
 All notable changes to ch-core-rs are recorded here, one section per release tag. Downstream language bindings pin this crate by git tag and rely on this file when repinning.
 
-Release tags follow semver. No breaking changes on patch or minor releases.
+Release tags follow semver. Before 1.0, breaking changes increment the minor
+version; patch releases remain backward compatible.
 
-## Unreleased
+## v0.2.0, Unreleased
+
+- Add standalone `MultiPoint` decode, encode, and Arrow export for ClickHouse
+  26.8. Extend `Geometry` with the server's appended discriminator 6 while
+  preserving the existing discriminator assignments 0 through 5. Downstream
+  matches on the public `GeoKind` enum must handle its new `#[non_exhaustive]`
+  contract, and Geometry Arrow consumers now see seven geo children plus NULL.
+  These public API and Arrow schema changes make this a breaking release from
+  the 0.1 line.
+- Reject decode or encode options above protocol revision 54485, the highest
+  revision whose Native layout this crate supports. ClickHouse 26.8 advertises
+  revision 54492, which enables a newer String size-stream layout, so bindings
+  must cap negotiation at the exported `DBMS_TCP_PROTOCOL_VERSION`.
 
 ## v0.1.1, 2026-08-12
 

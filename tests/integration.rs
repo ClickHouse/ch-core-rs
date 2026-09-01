@@ -684,6 +684,7 @@ fn assert_all_types(batch: &ChunkedBatch) {
             ),
             Expected::Exact("geometry", ChType::Geometry),
             Expected::Exact("geometry_all", ChType::Array(Box::new(ChType::Geometry))),
+            Expected::Exact("multipoint", ChType::Geo(GeoKind::MultiPoint)),
             Expected::Exact(
                 "qbit_bf",
                 ChType::QBit {
@@ -2073,31 +2074,32 @@ fn assert_all_types(batch: &ChunkedBatch) {
     assert_eq!(geometry.value_position(1), Some((2, 0)));
     assert_eq!(geometry.value_position(2), Some((3, 0)));
     assert_eq!(geometry.value_position(3), Some((u8::MAX, 0)));
-    assert_eq!(geometry.variants.len(), 6);
+    assert_eq!(geometry.variants.len(), 7);
     assert_eq!(geometry_first_x(&geometry.variants[0], 1), 13.0);
     assert!(geometry.variants[1].is_empty());
     assert_eq!(geometry_first_x(&geometry.variants[2], 3), 21.0);
     assert_eq!(geometry_first_x(&geometry.variants[3], 0), 51.0);
     assert!(geometry.variants[4].is_empty());
     assert!(geometry.variants[5].is_empty());
+    assert!(geometry.variants[6].is_empty());
 
-    // Array(Geometry) (col 110): every one of the four rows carries all six
+    // Array(Geometry) (col 110): every one of the four rows carries all seven
     // alternatives followed by NULL, grounding all child layouts against one
     // real Native fixture without changing the all_types row count.
     let geometry_all = as_array(block.column(110));
-    assert_eq!(geometry_all.offsets, vec![0, 7, 14, 21, 28]);
+    assert_eq!(geometry_all.offsets, vec![0, 8, 16, 24, 32]);
     let geometry_all = as_variant(geometry_all.values.as_ref());
-    assert_eq!(geometry_all.len(), 28);
+    assert_eq!(geometry_all.len(), 32);
     assert_eq!(geometry_all.null_count(), 4);
     for row in 0..4 {
-        for discriminator in 0..6u8 {
+        for discriminator in 0..7u8 {
             assert_eq!(
-                geometry_all.value_position(row * 7 + discriminator as usize),
+                geometry_all.value_position(row * 8 + discriminator as usize),
                 Some((discriminator, row as i32))
             );
         }
         assert_eq!(
-            geometry_all.value_position(row * 7 + 6),
+            geometry_all.value_position(row * 8 + 7),
             Some((u8::MAX, row as i32))
         );
     }
@@ -2107,11 +2109,24 @@ fn assert_all_types(batch: &ChunkedBatch) {
     assert_eq!(geometry_first_x(&geometry_all.variants[3], 0), 7.0);
     assert_eq!(geometry_first_x(&geometry_all.variants[4], 2), 9.0);
     assert_eq!(geometry_first_x(&geometry_all.variants[5], 1), 11.0);
+    assert_eq!(geometry_first_x(&geometry_all.variants[6], 1), 13.0);
 
-    // QBit (cols 111-114): these bytes come from the pinned real server, so
+    // MultiPoint (col 111): the standalone alias delegates to Array(Point).
+    let multipoint = as_array(block.column(111));
+    assert_eq!(multipoint.offsets, vec![0, 0, 1, 3, 4]);
+    let points = as_tuple(multipoint.values.as_ref());
+    match (&points.fields[0], &points.fields[1]) {
+        (Column::Float64(x), Column::Float64(y)) => {
+            assert_eq!(x.values.as_slice(), &[13.0, 1.0, 3.0, -1.5]);
+            assert_eq!(y.values.as_slice(), &[79.0, 2.0, 4.0, -2.5]);
+        }
+        other => panic!("expected (Float64, Float64) MultiPoint elements, got {other:?}"),
+    }
+
+    // QBit (cols 112-115): these bytes come from the pinned real server, so
     // they independently ground the bit-plane order and the row-major scalar
     // materialization used by the synthetic transpose tests.
-    let qbit_bf = as_qbit(block.column(111));
+    let qbit_bf = as_qbit(block.column(112));
     assert_eq!(qbit_bf.dimension, 3);
     assert_bfloat16_bits(
         qbit_bf.values.as_ref(),
@@ -2121,7 +2136,7 @@ fn assert_all_types(batch: &ChunkedBatch) {
         ],
     );
 
-    let qbit_f32 = as_qbit(block.column(112));
+    let qbit_f32 = as_qbit(block.column(113));
     assert_eq!(qbit_f32.dimension, 9);
     match qbit_f32.values.as_ref() {
         Column::Float32(c) => {
@@ -2154,7 +2169,7 @@ fn assert_all_types(batch: &ChunkedBatch) {
         other => panic!("expected QBit Float32 child, got {other:?}"),
     }
 
-    let qbit_f64 = as_qbit(block.column(113));
+    let qbit_f64 = as_qbit(block.column(114));
     assert_eq!(qbit_f64.dimension, 2);
     match qbit_f64.values.as_ref() {
         Column::Float64(c) => assert_eq!(
@@ -2164,7 +2179,7 @@ fn assert_all_types(batch: &ChunkedBatch) {
         other => panic!("expected QBit Float64 child, got {other:?}"),
     }
 
-    let qbit_nullable = as_qbit(block.column(114));
+    let qbit_nullable = as_qbit(block.column(115));
     assert_eq!(qbit_nullable.dimension, 2);
     let validity = qbit_nullable
         .validity

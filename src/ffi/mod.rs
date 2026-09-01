@@ -970,7 +970,7 @@ fn dictionary_value_type(ch_type: &ChType) -> &ChType {
 fn field_is_nullable(ch_type: &ChType) -> bool {
     // Most schema writers expand aliases before calling this helper, but keep
     // it correct in isolation too. Geometry delegates to Variant and is
-    // intrinsically nullable; the six ordinary geo aliases remain governed by
+    // intrinsically nullable; the seven ordinary geo aliases remain governed by
     // their Tuple/Array shapes.
     if let Some(under) = ch_type.resolved_physical_delegate_ref() {
         return field_is_nullable(under.as_ref());

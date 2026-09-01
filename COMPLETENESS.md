@@ -47,18 +47,19 @@ point-in-time snapshot for the next agent, not a changelog. Keep it short. Alway
 include a "Recommended next" with a one-line reason, so the next agent has a
 default; the user may override it.
 
-- **Last updated:** 2026-07-17. `QBit(T, N)` is complete at decode/encode parity
-  against `v26.6.1.1193-stable`, completing the registered type set at the pin.
-  `T` is `BFloat16`, `Float32`, or `Float64`; `N` is 1 through 134,217,720.
-  Native stores one MSB-first, bit-transposed FixedString plane per scalar bit,
-  while `QBitColumn` materializes one row-major primitive child and exports it
-  as Arrow FixedSizeList. Decode allocates only the final scalar buffer. Encode
-  writes the transposed planes directly into the final output allocation and
-  canonicalizes unused padding bits to zero. Nullable validity stays at the
-  vector level. Text and binary type headers, streaming scan, zero rows,
-  RowBinary single values, all legal scalar widths, malformed inputs, Arrow
-  export, both Native protocol revisions, refreshed real-server fixtures, and a
-  live Native INSERT round trip are covered.
+- **Last updated:** 2026-08-31. `MultiPoint` is complete at decode/encode parity
+  against `v26.8.1.2041-lts`. It is a custom name over `Array(Point)`, with no
+  new column buffer or body codec. Geometry now uses the server's explicit fixed
+  order `LineString`, `MultiLineString`, `MultiPolygon`, `Point`, `Polygon`,
+  `Ring`, `MultiPoint`: existing discriminators 0 through 5 remain unchanged,
+  MultiPoint is 6, and intrinsic NULL is 255. Standalone and Geometry decode,
+  encode, zero-row, multi-block, Arrow, captured-fixture, and live INSERT
+  coverage are present.
+- **Protocol checkpoint:** the 26.8 server advertises revision 54492, which
+  enables cumulative-offset String size-stream serialization throughout nested
+  types. This crate does not implement that separate layout yet, so
+  `DBMS_TCP_PROTOCOL_VERSION` and the framed fixture intentionally remain at
+  negotiated revision 54485. BlockInfo and Geometry framing are unchanged.
 - **AggregateFunction checkpoint:** decode, encode, streaming, Arrow LargeBinary
   export, real-server fixtures, and live INSERT coverage are complete for exact
   base `count` with zero or one argument, canonical
@@ -81,13 +82,13 @@ default; the user may override it.
   `encode_block` allocation as material. Further open-ended
   `AggregateFunction` work also remains paused because each signature needs a
   separately confirmed unframed state-boundary codec.
-- **Recommended next:** resolve sparse column serialization. Its marker can
-  reach ordinary queries at negotiated revisions >= 54454 and the decoder
-  currently rejects it.
-- **After that:** wire the existing compression work into an explicitly scoped
-  transport path, or begin the binding POC against real workloads.
-- **Key references:** QBit's wire, Arrow, binary-header, RowBinary, and encode
-  contract is in `CODEC_CONTRACT.md`. The logical and column models are in
+- **Recommended next:** implement revision-54492 String size-stream decode and
+  encode so the core can negotiate the pinned server's current revision without
+  misframing direct or nested String values.
+- **After that:** resolve sparse column serialization, whose nonzero marker can
+  reach ordinary queries at negotiated revisions >= 54454.
+- **Key references:** the MultiPoint and Geometry contract is in
+  `CODEC_CONTRACT.md`. The logical and column models are in
   `src/schema.rs` and `src/column.rs`; parser, binary descriptor, decode/scan,
   RowBinary, and encode paths are under `src/native/`; Arrow export is in
   `src/ffi/`; real-server coverage is in `scripts/gen_fixtures.sh`,
@@ -101,7 +102,7 @@ The ClickHouse type system grew across releases, so a complete decoder spans man
 versions. This has concrete consequences for how work is done here:
 
 - **The pinned tag bounds what is confirmable now.** `.server-ref` pins the
-  reference version (currently v26.6.1.1193-stable) and the local `.server-src/`
+  reference version (currently v26.8.1.2041-lts) and the local `.server-src/`
   checkout is at that tag. A type that exists at the pin can have its layout
   confirmed against the source today. A type introduced in a *later* release than
   the pin cannot be confirmed against the current checkout. Bump `.server-ref`
@@ -343,28 +344,31 @@ is not done, and must not be checked off, until all of these hold:
         `saf_sum`/`saf_lc`/`saf_grp`/`nsaf`/`lc_saf`/`lc_nsaf` live-server fixture
         columns; encode runs green in the live INSERT test.
 - [x] Geo types: `Point`, `Ring`, `LineString`, `MultiLineString`, `Polygon`,
-      `MultiPolygon` (decode and encode)
+      `MultiPolygon`, `MultiPoint` (decode and encode)
       - Tier 2 name-decoration aliases (`DataTypeCustomGeo`), registered
         case-sensitive with no aliases over: `Point` = unnamed
         `Tuple(Float64, Float64)`; `Ring`/`LineString` = `Array(Point)`;
         `Polygon`/`MultiLineString` = `Array(Array(Point))`; `MultiPolygon` =
-        `Array(Array(Array(Point)))`. Wire bytes are byte-identical to the
-        underlying nesting (no custom serialization, no extra prefix); the Native
+        `Array(Array(Array(Point)))`; `MultiPoint` = `Array(Point)`. Wire bytes
+        are byte-identical to the underlying nesting (no custom serialization,
+        no extra prefix); the Native
         header carries the bare alias spelling, and the mapping is
         one-directional (a structural `Array(Tuple(Float64, Float64))` header
         stays plain Array/Tuple). GA at v26.6.1.1193-stable (the
-        `allow_experimental_geo_types` gate is an obsolete no-op). `Nullable(Point)`
-        is legal (Tuple is nullable-able); `Nullable` of the five Array-based
-        kinds and `LowCardinality` of all six are illegal; all six are legal as
+        `allow_experimental_geo_types` gate is an obsolete no-op). `MultiPoint`
+        is added and GA at `v26.8.1.2041-lts`. `Nullable(Point)` is legal (Tuple
+        is nullable-able); `Nullable` of the six Array-based kinds and
+        `LowCardinality` of all seven are illegal; all seven are legal as
         `Array`/`Tuple` elements and `Map` keys/values (the key case leniently,
         through the delegate). Arrow export = the underlying export: `Point` as a
         `+s` struct of two `g` (Float64) children, the others as `+L` LargeList
         chains above it, zero-copy with no new buffers. Each kind charges its
         physical expansion depth (`GeoKind::expansion_depth`, `Point` 1 through
         `MultiPolygon` 4) on both sides. Confirmed against the server source
-        (`DataTypeCustomGeo`, v26.6.1.1193-stable) and verified with the
-        `point`/`npoint`/`ring`/`mpoly` live-server fixture columns; encode runs
-        green in the live INSERT test.
+        (`DataTypeCustomGeo`, original aliases at v26.6.1.1193-stable and
+        MultiPoint at v26.8.1.2041-lts) and verified with the
+        `point`/`npoint`/`ring`/`mpoly`/`multipoint` live-server fixture columns;
+        encode runs green in the live INSERT test.
 - [x] `Nested(name1 T1, ...)` (decode and encode)
       - Tier 2 name-decoration alias (`DataTypeNested`) over
         `Array(Tuple(named fields))`; there is no `SerializationNested` and the
@@ -528,14 +532,15 @@ introduction), so record them per type only when determinable.
       enforced on either side. See "Implemented" for the full summary; type
       section in `CODEC_CONTRACT.md`.
 - [x] Geo types: `Point`, `Ring`, `LineString`, `MultiLineString`, `Polygon`,
-      `MultiPolygon` - decode AND encode done. `DataTypeCustomGeo` name-decoration
+      `MultiPolygon`, `MultiPoint` - decode AND encode done. `DataTypeCustomGeo` name-decoration
       aliases over `Tuple`/`Array` of `Float64` (`Point` = `Tuple(Float64,
       Float64)`, the rest nest `Array` over it), GA and stable at
-      v26.6.1.1193-stable (the `allow_experimental_geo_types` gate is an obsolete
+      v26.6.1.1193-stable, with `MultiPoint = Array(Point)` added at
+      v26.8.1.2041-lts (the `allow_experimental_geo_types` gate is an obsolete
       no-op). See "Implemented" for the full summary; type section in
       `CODEC_CONTRACT.md`.
 - [x] `Geometry` - decode AND encode done. A custom fixed name over the
-      canonical six-child geo Variant, sharing its BASIC wire body and Arrow
+      canonical seven-child geo Variant, sharing its BASIC wire body and Arrow
       Dense Union buffers. See the Tier 3 checkpoint and `CODEC_CONTRACT.md`.
 - [x] `Interval*` (`IntervalYear` ... `IntervalNanosecond`) - decode AND encode
       done. One signed Int64 body per row, with exact logical unit preservation;
@@ -648,20 +653,21 @@ where the across-release churn lives.
       FLATTENED setting `output_format_native_use_flattened_dynamic_and_json_serialization`
       in 25.6 (per `SettingsChangesHistory.cpp`).
 - [x] `Geometry` - complete at decode/encode parity at
-      v26.6.1.1193-stable. The canonical physical type is
-      `Variant(LineString, MultiLineString, MultiPolygon, Point, Polygon, Ring)`
-      after the server sorts custom names, with UInt8 discriminators 0..=5 and
-      255 for intrinsic NULL. `ChType::Geometry` preserves the custom header and
-      delegates every physical path to the existing `VariantColumn`: BASIC LE
-      UInt64 mode 0, one discriminator per row, then six dense geo bodies.
-      Arrow is one seven-child Dense Union (six named geo children plus NULL),
+      v26.8.1.2041-lts. The canonical physical type is
+      `Variant(LineString, MultiLineString, MultiPolygon, Point, Polygon, Ring,
+      MultiPoint)` with fixed UInt8 discriminators 0..=6 and 255 for intrinsic
+      NULL. The original 0..=5 values remain unchanged and MultiPoint is appended
+      at 6. `ChType::Geometry` preserves the custom header and delegates every
+      physical path to the existing `VariantColumn`: BASIC LE UInt64 mode 0, one
+      discriminator per row, then seven dense geo bodies. Arrow is one
+      eight-child Dense Union (seven named geo children plus NULL),
       with no new buffers, remap, or per-row Geometry work. Text output is
       canonical `Geometry` (`GEOMETRY` is an accepted input alias), and binary
       headers use Custom tag 0x2c plus the name. Nullable, LowCardinality, and a
       direct outer Variant are illegal; Array/Tuple/Map and typed JSON paths
       compose. Unit plain/NULL/zero-row/multi-block/encode/Arrow/binary-depth
       coverage, all_types real fixtures (including all alternatives through
-      `Array(Geometry)`), and live INSERT are green.
+      `Array(Geometry)`), standalone MultiPoint, and live INSERT are green.
 - [x] `QBit(T, N)` - complete at decode/encode parity at
       v26.6.1.1193-stable for `T` in BFloat16/Float32/Float64 and dimension
       `N` in 1..=134,217,720. Native bulk is `bit_width(T)` bit-transposed
@@ -943,8 +949,8 @@ bring encode to parity with what the decoder already supports.
       `ChType::physical_delegate`; no new body writer). Always encodable (the
       `Float64` nesting always is). Each kind charges its `expansion_depth` in
       `type_depth`, so a geo-tipped type that decodes is re-encodable. Verified by
-      round-trips (`Point`, `Nullable(Point)`, `MultiPolygon`), exact-byte pins,
-      and the live INSERT test.
+      round-trips (`Point`, `Nullable(Point)`, `MultiPolygon`, `MultiPoint`),
+      exact-byte pins, and the live INSERT test.
 - [x] `Nested(name1 T1, ...)` (encode as `Array(Tuple(named fields))` via
       `ChType::physical_delegate`; no new body writer). Field names are validated
       through the Tuple delegation (`checkTupleNames`: an empty name, the
@@ -1093,9 +1099,11 @@ outcome in `CODEC_CONTRACT.md`.
 - [~] **V3: Re-confirm on server-tag bumps.** Ongoing item, re-run on every
       `.server-ref` move: re-confirm the per-type server-source layouts, re-check
       introduction versions and version-dependent layouts, and recapture fixtures,
-      per `AGENTS.md`. Last executed for the v26.2.4.23-stable / rev 54483 ->
-      v26.6.1.1193-stable / rev 54485 bump (framing and per-type layout confirmed
-      unchanged; constant bumped, fixtures recaptured at 54485, contract re-cited).
+      per `AGENTS.md`. Last executed for the focused Geometry/MultiPoint change at
+      v26.8.1.2041-lts. The server appends MultiPoint at Geometry discriminator 6;
+      fixtures were recaptured from 26.8 at negotiated revision 54485. Do not bump
+      to the server's current revision 54492 until the separate String size-stream
+      serialization is implemented.
 
 ---
 

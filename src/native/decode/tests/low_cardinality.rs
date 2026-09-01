@@ -956,20 +956,22 @@ fn test_low_cardinality_tuple_inner_rejected() {
 
 #[test]
 fn test_decode_rejects_low_cardinality_geo() {
-    // LowCardinality is illegal for all six geo kinds (no canBeInsideLowCardinality
+    // LowCardinality is illegal for all seven geo kinds (no canBeInsideLowCardinality
     // override), rejected at header time regardless of row count.
-    for num_rows in [0usize, 1] {
-        let data = BlockBuilder::new()
-            .header(1, num_rows)
-            .column_header("lc", "LowCardinality(Point)")
-            .build();
-        assert!(matches!(
-            decode_all_bytes(&data, &DecodeOptions::default()),
-            Err(DecodeError::UnsupportedType { .. })
-        ));
-        assert!(matches!(
-            block_end(&data, &DecodeOptions::default()),
-            Err(DecodeError::UnsupportedType { .. })
-        ));
+    for type_name in ["Point", "MultiPoint"] {
+        for num_rows in [0usize, 1] {
+            let data = BlockBuilder::new()
+                .header(1, num_rows)
+                .column_header("lc", &format!("LowCardinality({type_name})"))
+                .build();
+            assert!(matches!(
+                decode_all_bytes(&data, &DecodeOptions::default()),
+                Err(DecodeError::UnsupportedType { .. })
+            ));
+            assert!(matches!(
+                block_end(&data, &DecodeOptions::default()),
+                Err(DecodeError::UnsupportedType { .. })
+            ));
+        }
     }
 }

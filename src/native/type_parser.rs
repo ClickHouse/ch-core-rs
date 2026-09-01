@@ -63,10 +63,11 @@ fn parse_ch_type_depth(type_name: &str, depth: usize) -> Option<ChType> {
         if let Some(inner) = inner.strip_suffix(')') {
             let inner_type = parse_ch_type_depth(inner, depth + 1)?;
             // `Nested` is an `Array` and the array-based geo kinds
-            // (`Ring`/`LineString`/`Polygon`/`MultiLineString`/`MultiPolygon`)
-            // expand to `Array`, so `Nullable` over any of them is as illegal as
-            // `Nullable(Array(T))` (`DataTypeArray::canBeInsideNullable()` is
-            // false). `Nullable(Point)` IS legal (Point is a `Tuple`, and
+            // (`Ring`/`LineString`/`Polygon`/`MultiLineString`/`MultiPolygon`/
+            // `MultiPoint`) expand to `Array`, so `Nullable` over any of them is
+            // as illegal as `Nullable(Array(T))`
+            // (`DataTypeArray::canBeInsideNullable()` is false).
+            // `Nullable(Point)` IS legal (Point is a `Tuple`, and
             // `DataTypeTuple::canBeInsideNullable()` is true). A
             // `SimpleAggregateFunction` inner delegates to its physical type, so
             // `Nullable(SAF(T))` is legal iff `Nullable(T)` is:
@@ -519,7 +520,7 @@ fn parse_ch_type_depth(type_name: &str, depth: usize) -> Option<ChType> {
         "UUID" => Some(ChType::Uuid),
         "IPv4" => Some(ChType::Ipv4),
         "IPv6" => Some(ChType::Ipv6),
-        // Geometry is a custom fixed name over a six-alternative Variant. The
+        // Geometry is a custom fixed name over a seven-alternative Variant. The
         // exact uppercase `GEOMETRY` spelling is a case-sensitive MySQL input
         // alias registered by the server; both normalize to the canonical
         // `Geometry` header. Lowercase `geometry` remains unsupported. Charge
@@ -530,7 +531,7 @@ fn parse_ch_type_depth(type_name: &str, depth: usize) -> Option<ChType> {
         // aliases and emits the bare spelling in the header (never the expanded
         // `Array(Tuple(...))` form); a wrong-case `point` is not a geo type and
         // falls through to `None` (`DataTypeCustomGeo`, confirmed at
-        // v26.6.1.1193-stable). A geo token is a leaf here but expands to a fixed
+        // v26.8.1.2041-lts). A geo token is a leaf here but expands to a fixed
         // `Tuple`/`Array`-of-`Float64` nesting, so `geo_within_depth` charges its
         // expansion depth against `MAX_TYPE_DEPTH`, keeping the decode cap aligned
         // with the encoder's `type_depth` (a geo-tipped header that decodes is
@@ -541,6 +542,7 @@ fn parse_ch_type_depth(type_name: &str, depth: usize) -> Option<ChType> {
         "MultiLineString" => geo_within_depth(GeoKind::MultiLineString, depth),
         "Polygon" => geo_within_depth(GeoKind::Polygon, depth),
         "MultiPolygon" => geo_within_depth(GeoKind::MultiPolygon, depth),
+        "MultiPoint" => geo_within_depth(GeoKind::MultiPoint, depth),
         _ => None,
     }
 }
@@ -618,7 +620,7 @@ fn can_be_inside_nullable(inner: &ChType) -> bool {
 pub(crate) fn unsupported_header_type_name(ch_type: &ChType) -> Option<String> {
     // Geometry is one fixed, server-defined Variant with no user-supplied
     // alternatives. Its parser and depth gate already establish the complete
-    // shape, so avoid normalizing six known-canonical alternatives into a
+    // shape, so avoid normalizing seven known-canonical alternatives into a
     // temporary BTreeMap on every small-block scan and decode validation.
     if matches!(ch_type, ChType::Geometry) {
         return None;
@@ -697,6 +699,11 @@ pub(crate) fn unsupported_header_type_name(ch_type: &ChType) -> Option<String> {
 
 /// Normalize Variant alternatives exactly as `DataTypeVariant` does before it
 /// assigns global discriminators.
+///
+/// This applies to ordinary `Variant(...)` construction. `Geometry` uses the
+/// server's `FixedDiscriminatorOrder` constructor and the explicit
+/// [`crate::schema::GEOMETRY_ALTERNATIVES`] table instead of this name-sorted
+/// normalization.
 ///
 /// Full canonical type names are the sort/dedup keys. Direct `Nothing` is
 /// discarded; direct `Nullable`, `LowCardinality(Nullable)`, and `Variant` are

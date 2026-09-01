@@ -1062,6 +1062,11 @@ fn geo_saf_nested_batch() -> ColBatch {
             name: "mpoly".into(),
             ch_type: ChType::Geo(GeoKind::MultiPolygon),
         },
+        // MultiPoint = Array(Point), one Array level over the Point tuple.
+        Field {
+            name: "multipoint".into(),
+            ch_type: ChType::Geo(GeoKind::MultiPoint),
+        },
         // Nested(x UInt32, y String) = Array(Tuple(named x, y)).
         Field {
             name: "nst".into(),
@@ -1103,8 +1108,8 @@ fn geo_saf_nested_batch() -> ColBatch {
                 inner: Box::new(ChType::Nullable(Box::new(ChType::String))),
             })),
         },
-        // Geometry is a custom name over a six-child Variant. The four rows
-        // select LineString, MultiPolygon, Point, and intrinsic NULL.
+        // Geometry is a custom name over a seven-child Variant. The four rows
+        // select LineString, MultiPolygon, MultiPoint, and intrinsic NULL.
         Field {
             name: "geometry".into(),
             ch_type: ChType::Geometry,
@@ -1176,6 +1181,18 @@ fn geo_saf_nested_batch() -> ColBatch {
                 )),
             )),
         )),
+        // multipoint -> Array(Tuple). Rows [(13, 79)] / [] /
+        // [(1, 2), (3, 4)] / [(-1.5, -2.5)].
+        Column::Array(ArrayColumn::new(
+            vec![0, 1, 1, 3, 4],
+            Column::Tuple(TupleColumn::new(
+                vec![
+                    Column::Float64(PrimitiveColumn::new(vec![13.0, 1.0, 3.0, -1.5])),
+                    Column::Float64(PrimitiveColumn::new(vec![79.0, 2.0, 4.0, -2.5])),
+                ],
+                4,
+            )),
+        )),
         // nst -> Array(Tuple(UInt32, String)). Rows [(13, user_1)] / [] /
         // [(79, a), (1, user_2)] / [(2, x)] -> offsets [0, 1, 1, 3, 4].
         Column::Array(ArrayColumn::new(
@@ -1210,14 +1227,15 @@ fn geo_saf_nested_batch() -> ColBatch {
         )),
         Column::Variant(
             VariantColumn::try_new(
-                &[0, 2, 3, u8::MAX],
+                &[0, 2, 6, u8::MAX],
                 vec![
                     single_geo_column(GeoKind::LineString, true, 13.0),
                     single_geo_column(GeoKind::MultiLineString, false, 0.0),
                     single_geo_column(GeoKind::MultiPolygon, true, 21.0),
-                    single_geo_column(GeoKind::Point, true, 51.0),
+                    single_geo_column(GeoKind::Point, false, 0.0),
                     single_geo_column(GeoKind::Polygon, false, 0.0),
                     single_geo_column(GeoKind::Ring, false, 0.0),
+                    single_geo_column(GeoKind::MultiPoint, true, 51.0),
                 ],
             )
             .expect("Geometry child lengths match discriminators"),
@@ -2150,7 +2168,7 @@ fn geo_saf_nested_roundtrip_through_server() {
          i32 Int32, \
          saf_sum SimpleAggregateFunction(sum, Float64), \
          saf_lc SimpleAggregateFunction(anyLast, LowCardinality(Nullable(String))), \
-         point Point, npoint Nullable(Point), ring Ring, mpoly MultiPolygon, \
+         point Point, npoint Nullable(Point), ring Ring, mpoly MultiPolygon, multipoint MultiPoint, \
          nst Nested(x UInt32, y String), \
          nsaf Nullable(SimpleAggregateFunction(sum, UInt64)), \
          tsaf Tuple(v SimpleAggregateFunction(sum, UInt64)), \
@@ -2165,7 +2183,7 @@ fn geo_saf_nested_roundtrip_through_server() {
     server.insert_native_into(GSN_TABLE, &bytes);
 
     let native = server.select(&format!(
-        "SELECT i32, saf_sum, saf_lc, point, npoint, ring, mpoly, nst, nsaf, tsaf, lc_nsaf, geometry \
+        "SELECT i32, saf_sum, saf_lc, point, npoint, ring, mpoly, multipoint, nst, nsaf, tsaf, lc_nsaf, geometry \
          FROM {GSN_TABLE} ORDER BY i32 FORMAT Native"
     ));
     let decoded = decode_all_bytes(&native, &DecodeOptions::default())

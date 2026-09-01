@@ -18,7 +18,8 @@ use crate::native::varint::ByteReader;
 use crate::schema::{ChType, Field, QBitElementType, Schema};
 
 pub use crate::native::protocol::{
-    DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION, DBMS_TCP_PROTOCOL_VERSION,
+    DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION,
+    DBMS_MIN_REVISION_WITH_STRING_WITH_SIZE_STREAM_SERIALIZATION, DBMS_TCP_PROTOCOL_VERSION,
 };
 use crate::native::protocol::{
     LC_HAS_ADDITIONAL_KEYS_BIT, LC_NEED_GLOBAL_DICTIONARY_BIT, LOW_CARDINALITY_KEY_VERSION,
@@ -36,6 +37,12 @@ pub use crate::native::type_parser::{low_cardinality_dict_value_type, parse_ch_t
 #[non_exhaustive]
 pub enum DecodeError {
     Io(io::Error),
+    /// The caller supplied a protocol revision newer than the highest revision
+    /// whose Native framing this decoder fully supports.
+    UnsupportedProtocolRevision {
+        revision: u64,
+        max_supported: u64,
+    },
     UnsupportedType {
         column: String,
         type_name: String,
@@ -120,6 +127,13 @@ impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DecodeError::Io(e) => write!(f, "IO error: {e}"),
+            DecodeError::UnsupportedProtocolRevision {
+                revision,
+                max_supported,
+            } => write!(
+                f,
+                "Unsupported protocol revision {revision}; maximum supported revision is {max_supported}"
+            ),
             DecodeError::UnsupportedType { column, type_name } => {
                 write!(
                     f,
@@ -176,6 +190,17 @@ impl std::fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
+#[inline]
+fn ensure_supported_protocol_revision(revision: u64) -> Result<(), DecodeError> {
+    if revision > DBMS_TCP_PROTOCOL_VERSION {
+        return Err(DecodeError::UnsupportedProtocolRevision {
+            revision,
+            max_supported: DBMS_TCP_PROTOCOL_VERSION,
+        });
+    }
+    Ok(())
+}
+
 /// Options for Native format decoding.
 #[non_exhaustive]
 pub struct DecodeOptions {
@@ -188,10 +213,12 @@ pub struct DecodeOptions {
     /// - A per-column custom-serialization marker byte is present when this is
     ///   \>= [`DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION`].
     ///
-    /// Use [`DBMS_TCP_PROTOCOL_VERSION`] for a stream from a current server over
-    /// the native TCP protocol. Use 0 for a bare Native stream with no protocol
-    /// framing, for example HTTP `FORMAT Native` with no `client_protocol_version`
-    /// set.
+    /// For the native TCP protocol, the client must advertise at most
+    /// [`DBMS_TCP_PROTOCOL_VERSION`] and pass the resulting effective revision
+    /// here. Higher revisions are not supported: ClickHouse revision 54492, for
+    /// example, enables a different String body layout. Use 0 for a bare Native
+    /// stream with no protocol framing, for example HTTP `FORMAT Native` with no
+    /// `client_protocol_version` set.
     pub protocol_revision: u64,
     /// Maximum cumulative bytes that one block may allocate for buffers
     /// synthesized without corresponding input bytes.
@@ -1512,6 +1539,12 @@ fn decode_column(
 /// element column WITHOUT re-consuming a state prefix: `SerializationArray` emits
 /// the element type's prefix once, at the very front of the Array column (before
 /// the offsets), not again per element run.
+///
+/// At v26.8.1.2041-lts, `MultiPoint` is the custom name over `Array(Point)`
+/// registered by `registerDataTypeDomainGeo` in
+/// `src/DataTypes/DataTypeCustomGeo.cpp`. Its payload therefore uses
+/// `SerializationArray` offsets followed by the flattened
+/// `SerializationTuple` Point body, with no MultiPoint-specific framing.
 fn decode_values(
     reader: &mut ByteReader,
     ch_type: &ChType,
@@ -1521,12 +1554,12 @@ fn decode_values(
     state_cursor: &mut usize,
     allocation_budget: &mut AllocationBudget,
 ) -> Result<Column, DecodeError> {
-    // A name-decoration alias (SimpleAggregateFunction, geo, Nested) decodes
-    // exactly as the physical type it delegates to, producing the underlying
-    // Column variant (no new variant). Expand and recurse before the container
-    // dispatch below so a geo/Nested alias that expands to an `Array` reaches the
-    // Array fast-path, and a SimpleAggregateFunction over any inner delegates to
-    // that inner.
+    // A name-decoration alias (SimpleAggregateFunction, geo, Geometry, Nested)
+    // decodes exactly as the physical type it delegates to, producing the
+    // underlying Column variant (no new variant). Expand and recurse before the
+    // container dispatch below so a geo/Nested alias that expands to an `Array`
+    // reaches the Array fast-path, and a SimpleAggregateFunction over any inner
+    // delegates to that inner.
     if let Some(under) = ch_type.physical_delegate_ref() {
         return decode_values(
             reader,
@@ -3095,6 +3128,30 @@ fn decode_next_block_with_settings(
     reader: &mut ByteReader,
     options: &DecodeSettings,
 ) -> Result<Option<ColBatch>, DecodeError> {
+    ensure_supported_protocol_revision(options.protocol_revision)?;
+    decode_next_block_with_settings_unchecked(reader, options)
+}
+
+/// Decode the block that a completeness scan has already accepted with the
+/// same options. The scan validates the protocol revision, so repeating that
+/// comparison here would make streaming pay twice per block.
+pub(crate) fn decode_scanned_block(
+    reader: &mut ByteReader,
+    options: &DecodeOptions,
+    binary_types: bool,
+) -> Result<Option<ColBatch>, DecodeError> {
+    let settings = if binary_types {
+        DecodeSettings::binary(options)
+    } else {
+        DecodeSettings::text(options)
+    };
+    decode_next_block_with_settings_unchecked(reader, &settings)
+}
+
+fn decode_next_block_with_settings_unchecked(
+    reader: &mut ByteReader,
+    options: &DecodeSettings,
+) -> Result<Option<ColBatch>, DecodeError> {
     // A BlockInfo preamble precedes each block when the producer used a protocol
     // revision > 0. Its first byte is also where a clean end-of-stream boundary
     // falls, so `read_block_info` reports that case as `Ok(false)`.
@@ -3388,6 +3445,10 @@ fn block_end_with_settings(
 /// stale progress can never leak into the next block or past an error.
 #[derive(Debug, Default)]
 pub(crate) struct ScanProgress {
+    /// Whether this block's protocol revision has passed the supported-revision
+    /// ceiling. Retained across partial feeds so streaming pays one comparison
+    /// per block, then cleared with the rest of the checkpoint.
+    revision_validated: bool,
     /// Column count and row count, once the block header (BlockInfo preamble
     /// plus the two count varints) has been fully parsed.
     header: Option<(usize, usize)>,
@@ -3417,6 +3478,7 @@ impl ScanProgress {
 
     /// Drop all saved progress so the next scan restarts from the block start.
     fn reset(&mut self) {
+        self.revision_validated = false;
         self.header = None;
         self.columns_done = 0;
         self.columns_end = 0;
@@ -3462,6 +3524,14 @@ fn block_end_resume_with_settings(
     settings: &DecodeSettings,
     progress: &mut ScanProgress,
 ) -> Result<Option<usize>, DecodeError> {
+    if !progress.revision_validated {
+        if let Err(error) = ensure_supported_protocol_revision(settings.protocol_revision) {
+            progress.reset();
+            return Err(error);
+        }
+        progress.revision_validated = true;
+    }
+
     // A saved offset past the data cannot describe this buffer; that is a
     // caller wiring bug, so fail loudly in debug builds, then drop the
     // checkpoint and rescan from the block start.

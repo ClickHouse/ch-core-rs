@@ -1,5 +1,44 @@
 use super::*;
 
+fn assert_unsupported_revision<T>(result: Result<T, EncodeError>, revision: u64) {
+    assert!(matches!(
+        result,
+        Err(EncodeError::UnsupportedProtocolRevision {
+            revision: actual,
+            max_supported: DBMS_TCP_PROTOCOL_VERSION,
+        }) if actual == revision
+    ));
+}
+
+#[test]
+fn protocol_revision_above_supported_ceiling_is_rejected_by_every_entry_point() {
+    let batch = ColBatch::new(
+        Schema::new(vec![Field {
+            name: "n".into(),
+            ch_type: ChType::Int32,
+        }]),
+        vec![Column::Int32(PrimitiveColumn::new(vec![13]))],
+        1,
+    );
+    let empty_chunked = ChunkedBatch {
+        schema: batch.schema.clone(),
+        chunks: vec![],
+    };
+    let revision = DBMS_TCP_PROTOCOL_VERSION + 1;
+    let options = EncodeOptions {
+        protocol_revision: revision,
+        ..EncodeOptions::default()
+    };
+
+    assert_unsupported_revision(encode_block(&batch, &options), revision);
+    assert_unsupported_revision(encode_block_binary_types(&batch, &options), revision);
+    assert_unsupported_revision(encode_chunked(&empty_chunked, &options), revision);
+    assert_unsupported_revision(
+        encode_chunked_binary_types(&empty_chunked, &options),
+        revision,
+    );
+}
+
 #[test]
 fn zero_row_block_roundtrips_schema() {
     // A zero-row block still carries full column headers. The decoder keeps

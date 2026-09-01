@@ -281,7 +281,8 @@ SELECT
     -- Geo aliases (DataTypeCustomGeo): a custom name over a fixed Tuple/Array-of-
     -- Float64 nesting whose serialization slot is null, so wire bytes and Arrow
     -- shape are byte-identical to that nesting and the bare alias spelling reaches
-    -- the header. CAST(... AS Point/Ring/MultiPolygon) is expressible in a SELECT.
+    -- the header. CAST(... AS Point/Ring/MultiPolygon/MultiPoint) is expressible
+    -- in a SELECT.
     -- Point = Tuple(Float64, Float64) (unnamed): decodes as a two-field Float64
     -- Tuple. field0 (x) 13, -1.5, 0, 79.125; field1 (y) 79, 2.5, 0, -13.25.
     CAST(multiIf(n = 0, (13., 79.), n = 1, (-1.5, 2.5), n = 2, (0., 0.), (79.125, -13.25)), 'Point') AS point,
@@ -459,8 +460,9 @@ SELECT
     CAST(multiIf(n = 1, NULL, n = 3, NULL, n = 0, '{"m":13}', '{"m":79}'), 'Nullable(JSON)') AS j_null,
     -- Geometry is a custom fixed name over the canonical Variant alternatives
     -- LineString(0), MultiLineString(1), MultiPolygon(2), Point(3), Polygon(4),
-    -- Ring(5), with 255 for intrinsic NULL. The plain column covers three
-    -- different shapes plus NULL without changing this fixture's four-row size.
+    -- Ring(5), MultiPoint(6), with 255 for intrinsic NULL. The plain column covers
+    -- three different shapes plus NULL without changing this fixture's four-row
+    -- size.
     multiIf(
         n = 0, [(13., 79.)]::LineString::Geometry,
         n = 1, [[[(21., 31.)]]]::MultiPolygon::Geometry,
@@ -469,7 +471,7 @@ SELECT
     ) AS geometry,
     -- One Array(Geometry) per row covers every Geometry alternative and NULL
     -- against real server bytes while keeping the all_types query row-aligned.
-    -- Each row's flattened discriminator sequence is 0,1,2,3,4,5,255.
+    -- Each row's flattened discriminator sequence is 0,1,2,3,4,5,6,255.
     [
         [(1., 2.)]::LineString::Geometry,
         [[(3., 4.)]]::MultiLineString::Geometry,
@@ -477,8 +479,13 @@ SELECT
         (7., 8.)::Point::Geometry,
         [[(9., 10.)]]::Polygon::Geometry,
         [(11., 12.)]::Ring::Geometry,
+        [(13., 14.)]::MultiPoint::Geometry,
         CAST(NULL, 'Geometry')
     ] AS geometry_all,
+    -- MultiPoint = Array(Point), appended as a standalone column as well as the
+    -- Geometry discriminator-6 child above. Rows [] / [(13, 79)] /
+    -- [(1, 2), (3, 4)] / [(-1.5, -2.5)].
+    CAST(multiIf(n = 0, [], n = 1, [(13., 79.)], n = 2, [(1., 2.), (3., 4.)], [(-1.5, -2.5)]), 'MultiPoint') AS multipoint,
     -- QBit(T, N): fixed-size logical vectors whose Native body is transposed
     -- into one FixedString(ceil(N/8)) plane per scalar bit. Cover all three
     -- scalar widths, a dimension crossing the 8-element byte boundary, and an

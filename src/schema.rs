@@ -186,12 +186,14 @@ pub enum ChType {
     // (`DataTypeMap::isValidKeyType`); the value type is unrestricted. The map
     // itself is never inside `Nullable` or `LowCardinality`.
     Map(Box<ChType>, Box<ChType>),
-    // `Variant(T1, ...)`: alternatives are stored in the server's canonical
-    // order, lexicographically by each type's full canonical name. The Native
-    // body carries one UInt8 global discriminator per row (`0..=254`), with 255
-    // reserved for Variant's intrinsic NULL, followed by one dense body per
-    // alternative. A Variant therefore must contain 1..=255 distinct, normalized
-    // alternatives. Direct Nothing alternatives are dropped by the server;
+    // `Variant(T1, ...)`: ordinary Variant alternatives are stored in the
+    // server's canonical order, lexicographically by each type's full canonical
+    // name. Geometry is the deliberate exception: its custom type uses the fixed
+    // discriminator order in [`GEOMETRY_ALTERNATIVES`]. The Native body carries
+    // one UInt8 global discriminator per row (`0..=254`), with 255 reserved for
+    // Variant's intrinsic NULL, followed by one dense body per alternative. A
+    // Variant therefore must contain 1..=255 distinct, normalized alternatives.
+    // Direct Nothing alternatives are dropped by the server;
     // direct Nullable, LowCardinality(Nullable), Variant, and Dynamic alternatives
     // are forbidden. Variant itself cannot sit in Nullable or LowCardinality,
     // but it composes inside Array/Tuple and as either Map key or value.
@@ -259,22 +261,24 @@ pub enum ChType {
     // Geo aliases (`DataTypeCustomGeo`): `Point` = `Tuple(Float64, Float64)`
     // (unnamed elements), `Ring`/`LineString` = `Array(Point)`,
     // `Polygon`/`MultiLineString` = `Array(Array(Point))`, `MultiPolygon` =
-    // `Array(Array(Array(Point)))`. The Native header carries the bare alias
+    // `Array(Array(Array(Point)))`, and `MultiPoint` = `Array(Point)`. The
+    // Native header carries the bare alias
     // spelling, never the expanded form, and the mapping is one-directional: a
     // structural `Array(Tuple(Float64, Float64))` header stays spelled that way
     // and decodes as a plain Array/Tuple. `Nullable(Point)` is legal (Tuple is
-    // nullable-able); `Nullable` of the five Array-based kinds and
-    // `LowCardinality` of all six are illegal.
+    // nullable-able); `Nullable` of the six Array-based kinds and
+    // `LowCardinality` of all seven are illegal.
     Geo(GeoKind),
 
     // `Geometry` (`DataTypeCustomGeo`) is a custom fixed name over the
     // canonical `Variant(LineString, MultiLineString, MultiPolygon, Point,
-    // Polygon, Ring)`. It has exactly the underlying Variant's BASIC Native
-    // body and Arrow Dense Union buffers, including discriminator 255 for its
-    // intrinsic NULL. The distinct logical tag preserves the `Geometry` header
-    // for round-trip encode while [`ChType::physical_delegate`] keeps every
-    // physical path on the existing Variant implementation. `Nullable` and
-    // `LowCardinality` are illegal because the delegate is a Variant.
+    // Polygon, Ring, MultiPoint)`. It has exactly the underlying Variant's
+    // BASIC Native body and Arrow Dense Union buffers, including discriminator
+    // 255 for its intrinsic NULL. The distinct logical tag preserves the
+    // `Geometry` header for round-trip encode while [`ChType::physical_delegate`]
+    // keeps every physical path on the existing Variant implementation.
+    // `Nullable` and `LowCardinality` are illegal because the delegate is a
+    // Variant.
     Geometry,
 
     // `Nested(name1 T1, ...)` (`DataTypeNested`): with `flatten_nested = 0` the
@@ -328,12 +332,13 @@ pub const JSON_MAX_DYNAMIC_TYPES: u8 = 254;
 /// Largest number of typed paths a `JSON` type may declare (`MAX_TYPED_PATHS`).
 pub const JSON_MAX_TYPED_PATHS: usize = 1000;
 
-/// The six ClickHouse geo alias kinds. Each renders its bare alias name and
+/// The seven ClickHouse geo alias kinds. Each renders its bare alias name and
 /// expands to a fixed `Tuple`/`Array`-of-`Float64` nesting via
 /// `GeoKind::underlying_type`; the wire layout and Arrow shape are exactly
-/// that of the underlying nesting (confirmed at v26.6.1.1193-stable,
+/// that of the underlying nesting (confirmed at v26.8.1.2041-lts,
 /// `DataTypeCustomGeo.{h,cpp}`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GeoKind {
     Point,
     Ring,
@@ -341,6 +346,7 @@ pub enum GeoKind {
     MultiLineString,
     Polygon,
     MultiPolygon,
+    MultiPoint,
 }
 
 impl GeoKind {
@@ -353,6 +359,7 @@ impl GeoKind {
             GeoKind::MultiLineString => "MultiLineString",
             GeoKind::Polygon => "Polygon",
             GeoKind::MultiPolygon => "MultiPolygon",
+            GeoKind::MultiPoint => "MultiPoint",
         }
     }
 
@@ -360,14 +367,15 @@ impl GeoKind {
     /// `type_depth`/`parse_ch_type_depth` charge for the alias token. It equals
     /// the depth of [`GeoKind::underlying_type`]: `Point` is a `Tuple` one level
     /// deep (1), each `Array` level adds one, so `Ring`/`LineString` are 2,
-    /// `Polygon`/`MultiLineString` are 3, and `MultiPolygon` is 4. Both the
+    /// `MultiPoint` is 2, `Polygon`/`MultiLineString` are 3, and
+    /// `MultiPolygon` is 4. Both the
     /// decoder's parse-time depth cap and the encoder's `type_depth` charge a geo
     /// token this many levels so a geo-tipped type that decodes is always
     /// re-encodable (the two sides agree on the physical depth).
     pub(crate) fn expansion_depth(self) -> usize {
         match self {
             GeoKind::Point => 1,
-            GeoKind::Ring | GeoKind::LineString => 2,
+            GeoKind::Ring | GeoKind::LineString | GeoKind::MultiPoint => 2,
             GeoKind::Polygon | GeoKind::MultiLineString => 3,
             GeoKind::MultiPolygon => 4,
         }
@@ -381,7 +389,9 @@ impl GeoKind {
         }
         match self {
             GeoKind::Point => point(),
-            GeoKind::Ring | GeoKind::LineString => ChType::Array(Box::new(point())),
+            GeoKind::Ring | GeoKind::LineString | GeoKind::MultiPoint => {
+                ChType::Array(Box::new(point()))
+            }
             GeoKind::Polygon | GeoKind::MultiLineString => {
                 ChType::Array(Box::new(ChType::Array(Box::new(point()))))
             }
@@ -394,11 +404,11 @@ impl GeoKind {
     /// Borrow the process-wide physical type tree for this geo alias.
     ///
     /// Bulk dispatch walks geo types several times per column for the state
-    /// prefix, body, and suffix. Caching these six immutable trees keeps those
+    /// prefix, body, and suffix. Caching these seven immutable trees keeps those
     /// traversals allocation-free while [`GeoKind::underlying_type`] preserves
     /// the existing owned helper for callers that need one.
     pub(crate) fn underlying_type_ref(self) -> &'static ChType {
-        static UNDERLYING: LazyLock<[ChType; 6]> = LazyLock::new(|| {
+        static UNDERLYING: LazyLock<[ChType; 7]> = LazyLock::new(|| {
             [
                 GeoKind::Point.underlying_type(),
                 GeoKind::Ring.underlying_type(),
@@ -406,6 +416,7 @@ impl GeoKind {
                 GeoKind::MultiLineString.underlying_type(),
                 GeoKind::Polygon.underlying_type(),
                 GeoKind::MultiPolygon.underlying_type(),
+                GeoKind::MultiPoint.underlying_type(),
             ]
         });
         let index = match self {
@@ -415,6 +426,7 @@ impl GeoKind {
             GeoKind::MultiLineString => 3,
             GeoKind::Polygon => 4,
             GeoKind::MultiPolygon => 5,
+            GeoKind::MultiPoint => 6,
         };
         &UNDERLYING[index]
     }
@@ -422,18 +434,19 @@ impl GeoKind {
 
 /// The canonical global-discriminator order of ClickHouse `Geometry`.
 ///
-/// `DataTypeVariant` sorts the six custom geo names lexicographically before
-/// assigning discriminators, so this order is a wire invariant, not the order
-/// in which `registerDataTypeDomainGeo` lists the kinds. Confirmed at
-/// v26.6.1.1193-stable in `DataTypeCustomGeo.cpp` and
-/// `DataTypeVariant::DataTypeVariant`.
-pub(crate) const GEOMETRY_ALTERNATIVES: [ChType; 6] = [
+/// This explicit order is a wire invariant. ClickHouse 26.8 appended
+/// `MultiPoint` at discriminator 6 without changing the existing 0 through 5
+/// assignments, so it is deliberately not derived by sorting the names.
+/// Confirmed at v26.8.1.2041-lts in `DataTypeCustomGeo.cpp`,
+/// `registerDataTypeDomainGeo`, and `DataTypeVariant.cpp`.
+pub(crate) const GEOMETRY_ALTERNATIVES: [ChType; 7] = [
     ChType::Geo(GeoKind::LineString),
     ChType::Geo(GeoKind::MultiLineString),
     ChType::Geo(GeoKind::MultiPolygon),
     ChType::Geo(GeoKind::Point),
     ChType::Geo(GeoKind::Polygon),
     ChType::Geo(GeoKind::Ring),
+    ChType::Geo(GeoKind::MultiPoint),
 ];
 
 /// Physical nesting charged to a `Geometry` token: one Variant level plus the
@@ -910,7 +923,7 @@ impl ChType {
     /// Borrow a cached delegate when its shape is fixed, allocating only for a
     /// `Nested` expansion whose fields are carried by this particular value.
     ///
-    /// This is the internal hot-dispatch form. In particular, all six geo trees
+    /// This is the internal hot-dispatch form. In particular, all seven geo trees
     /// and the Geometry Variant tree are initialized once and then borrowed
     /// across state-prefix, body, suffix, validation, and Arrow traversals.
     pub(crate) fn physical_delegate_ref(&self) -> Option<Cow<'_, ChType>> {
@@ -971,6 +984,7 @@ mod tests {
         for ch_type in [
             ChType::Geo(GeoKind::Point),
             ChType::Geo(GeoKind::MultiPolygon),
+            ChType::Geo(GeoKind::MultiPoint),
             ChType::Geometry,
         ] {
             let first = ch_type
@@ -995,6 +1009,30 @@ mod tests {
             resolved.as_ref(),
             GeoKind::Point.underlying_type_ref()
         ));
+    }
+
+    #[test]
+    fn geometry_alternatives_contain_each_geo_kind_once() {
+        let expected = [
+            GeoKind::Point,
+            GeoKind::Ring,
+            GeoKind::LineString,
+            GeoKind::MultiLineString,
+            GeoKind::Polygon,
+            GeoKind::MultiPolygon,
+            GeoKind::MultiPoint,
+        ];
+        assert_eq!(GEOMETRY_ALTERNATIVES.len(), expected.len());
+        for kind in expected {
+            let occurrences = GEOMETRY_ALTERNATIVES
+                .iter()
+                .filter(|alternative| matches!(alternative, ChType::Geo(candidate) if *candidate == kind))
+                .count();
+            assert_eq!(
+                occurrences, 1,
+                "Geometry contains {kind:?} {occurrences} times"
+            );
+        }
     }
 
     #[test]
