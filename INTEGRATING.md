@@ -121,12 +121,27 @@ Not all clients have a ready-to-use `FORMAT Native` result path today. Part of t
 Native block framing is partly controlled by the negotiated protocol revision, and that revision is not carried in the block bytes. The binding must pass the right `DecodeOptions.protocol_revision`:
 
 - Use `0` for bare HTTP `FORMAT Native` responses with no `client_protocol_version` setting.
-- Use the negotiated native TCP revision for Native payloads received through the native TCP protocol.
-- Use the effective `client_protocol_version` for HTTP responses where the client sets that ClickHouse setting. The server can cap the revision, so use the revision the response was actually produced with.
+- For native TCP, advertise at most `DBMS_TCP_PROTOCOL_VERSION`, then pass the
+  effective negotiated revision for Native payloads received through that
+  connection.
+- For HTTP, request a `client_protocol_version` no greater than
+  `DBMS_TCP_PROTOCOL_VERSION`, then pass the effective revision the response was
+  actually produced with. The server can cap the requested value further.
+
+Do not negotiate a higher revision and merely clamp the value passed to the
+core afterward. The server would already have serialized the bytes using the
+newer layout. Decode and encode reject revisions above
+`DBMS_TCP_PROTOCOL_VERSION` so an unsupported negotiation fails explicitly
+instead of silently misframing String columns.
 
 This matters because framed Native blocks can include a `BlockInfo` preamble, and modern revisions include a per-column custom-serialization marker. Passing the wrong revision can shift the decoder by one or more bytes and corrupt the whole block.
 
-The repo's `all_types_rev54485.native` fixture is an HTTP `FORMAT Native` capture with `client_protocol_version=54485` against the pinned `v26.6.1.1193-stable` server; it exercises both the `BlockInfo` preamble and the modern per-column marker. That is the concrete shape bindings should reproduce when they request protocol-framed Native over HTTP at that revision.
+The repo's `all_types_rev54485.native` fixture is an HTTP `FORMAT Native` capture
+with `client_protocol_version=54485` against the pinned
+`v26.8.1.2041-lts` server. It exercises both the `BlockInfo` preamble and the
+modern per-column marker while staying below revision 54492's unsupported
+String size-stream layout. That is the concrete shape bindings should reproduce
+when they request protocol-framed Native over HTTP at that revision.
 
 ## Output Model
 

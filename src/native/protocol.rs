@@ -3,11 +3,20 @@
 //! Only these constants live here; the decode and encode logic itself lives in
 //! `decode/` and `encode/`.
 
-/// Server protocol revision this crate has been validated against
-/// (ClickHouse v26.6.1.1193-stable). Pass this as `DecodeOptions::protocol_revision`
-/// when decoding a Native stream produced by a current server over the native
-/// TCP protocol.
+/// Highest server protocol revision this crate fully supports.
+///
+/// ClickHouse v26.8.1.2041-lts advertises revision 54492, but revision 54492
+/// enables String size-stream serialization, which needs a separate codec
+/// implementation. Negotiate 54485 until that layout is supported.
 pub const DBMS_TCP_PROTOCOL_VERSION: u64 = 54485;
+
+/// Protocol revision at which String columns may use separate size and data
+/// streams (`DBMS_MIN_REVISION_WITH_STRING_WITH_SIZE_STREAM_SERIALIZATION`).
+///
+/// This crate does not implement that layout yet, so callers must negotiate a
+/// revision below this threshold. The decode and encode entry points enforce
+/// [`DBMS_TCP_PROTOCOL_VERSION`] as their current ceiling.
+pub const DBMS_MIN_REVISION_WITH_STRING_WITH_SIZE_STREAM_SERIALIZATION: u64 = 54492;
 
 /// Protocol revision at which every column header carries a one-byte
 /// custom-serialization marker before its data (server constant

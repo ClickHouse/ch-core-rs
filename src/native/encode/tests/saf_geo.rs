@@ -174,6 +174,24 @@ fn nullable_point_batch() -> ColBatch {
     ColBatch::new(Schema::new(fields), columns, 2)
 }
 
+/// `MultiPoint` over two rows. Row 0 holds two points and row 1 holds one,
+/// using the ordinary `Array(Point)` offsets plus field-major Point body.
+fn multi_point_batch() -> ColBatch {
+    let point = Column::Tuple(TupleColumn::new(
+        vec![
+            Column::Float64(PrimitiveColumn::new(vec![1.0, 3.0, 5.0])),
+            Column::Float64(PrimitiveColumn::new(vec![2.0, 4.0, 6.0])),
+        ],
+        3,
+    ));
+    let multi_point = Column::Array(ArrayColumn::new(vec![0, 2, 3], point));
+    let fields = vec![Field {
+        name: "mp".into(),
+        ch_type: ChType::Geo(GeoKind::MultiPoint),
+    }];
+    ColBatch::new(Schema::new(fields), vec![multi_point], 2)
+}
+
 /// `MultiPolygon` over two rows, exercising all four expanded Array/Tuple
 /// levels. Row 0 holds one polygon of one ring of two points; row 1 is empty.
 fn multi_polygon_batch() -> ColBatch {
@@ -557,6 +575,16 @@ fn roundtrip_nullable_point_tcp_revision() {
 }
 
 #[test]
+fn roundtrip_multi_point_rev0() {
+    roundtrip(&multi_point_batch(), 0);
+}
+
+#[test]
+fn roundtrip_multi_point_tcp_revision() {
+    roundtrip(&multi_point_batch(), DBMS_TCP_PROTOCOL_VERSION);
+}
+
+#[test]
 fn roundtrip_multi_polygon_rev0() {
     roundtrip(&multi_polygon_batch(), 0);
 }
@@ -567,9 +595,27 @@ fn roundtrip_multi_polygon_tcp_revision() {
 }
 
 #[test]
-fn multi_block_name_decoration_roundtrips() {
-    // Two blocks of the same schema stay separate chunks through encode ->
-    // decode.
+fn multi_block_multi_point_roundtrips() {
+    // Two standalone MultiPoint blocks stay separate chunks through encode ->
+    // decode, preserving the Array(Point) buffers in each chunk.
+    let batch = ChunkedBatch {
+        schema: multi_point_batch().schema.clone(),
+        chunks: vec![
+            std::sync::Arc::new(multi_point_batch()),
+            std::sync::Arc::new(multi_point_batch()),
+        ],
+    };
+    let bytes = encode_chunked(&batch, &EncodeOptions::default()).unwrap();
+    let decoded = decode_all_bytes(&bytes, &DecodeOptions::default()).unwrap();
+    assert_eq!(decoded.num_chunks(), 2);
+    assert_batches_eq(&multi_point_batch(), &decoded.chunks[0]);
+    assert_batches_eq(&multi_point_batch(), &decoded.chunks[1]);
+}
+
+#[test]
+fn multi_block_point_roundtrips() {
+    // Two standalone Point blocks stay separate chunks through encode ->
+    // decode, preserving the Tuple(Float64, Float64) buffers in each chunk.
     let batch = ChunkedBatch {
         schema: point_batch().schema.clone(),
         chunks: vec![
@@ -625,6 +671,26 @@ fn rev0_frames_point_bytes() {
 }
 
 #[test]
+fn rev0_frames_multi_point_bytes() {
+    // MultiPoint is the ordinary Array(Point) body: cumulative UInt64 offsets,
+    // then all X coordinates, then all Y coordinates.
+    let bytes = encode_block(&multi_point_batch(), &EncodeOptions::default()).unwrap();
+    let mut expected = vec![
+        0x01, // num_cols = 1
+        0x02, // num_rows = 2
+        0x02, b'm', b'p', // name "mp"
+        0x0a, // type-name length
+    ];
+    expected.extend_from_slice(b"MultiPoint");
+    expected.extend_from_slice(&2u64.to_le_bytes());
+    expected.extend_from_slice(&3u64.to_le_bytes());
+    for value in [1.0f64, 3.0, 5.0, 2.0, 4.0, 6.0] {
+        expected.extend_from_slice(&value.to_le_bytes());
+    }
+    assert_eq!(bytes, expected);
+}
+
+#[test]
 fn type_depth_of_alias_matches_physical_delegate() {
     // The encoder's depth cap must count a name-decoration alias at its
     // physical depth so a geo/Nested type near the cap is not under-counted,
@@ -639,6 +705,7 @@ fn type_depth_of_alias_matches_physical_delegate() {
         GeoKind::MultiLineString,
         GeoKind::Polygon,
         GeoKind::MultiPolygon,
+        GeoKind::MultiPoint,
     ] {
         let alias = ChType::Geo(kind);
         assert_eq!(

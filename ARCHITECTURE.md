@@ -199,10 +199,13 @@ in via `DecodeOptions.protocol_revision`:
 
 Use revision 0 for bare HTTP `FORMAT Native` responses and the effective
 negotiated protocol revision for protocol-framed HTTP or native TCP payloads.
-`DBMS_TCP_PROTOCOL_VERSION` is the revision this crate has validated against at
-the pinned server tag, not a substitute for negotiation. Wire-format behavior is
-confirmed against the actual server C++ source at a pinned tag (cited in the doc
-comments), per the repo's "server behavior is authoritative" rule.
+`DBMS_TCP_PROTOCOL_VERSION` is the highest revision whose complete Native layout
+this crate supports. Bindings must advertise or request no more than that value
+during negotiation, and decode and encode reject a higher revision. It can be
+lower than the revision advertised by the pinned server tag. Wire-format
+behavior is confirmed against the actual server C++ source at a pinned tag
+(cited in the doc comments), per the repo's "server behavior is authoritative"
+rule.
 
 **Type headers.** The default APIs read the server's type name string
 (`Nullable(DateTime64(3, 'UTC'))`) and `parse_ch_type` converts it into a

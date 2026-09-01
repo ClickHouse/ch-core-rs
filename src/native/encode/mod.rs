@@ -21,7 +21,7 @@
 //! element types, and `Map(K, V)` for a legal key type and any encodable
 //! key/value types, `Variant(T1, ...)` when every alternative is encodable,
 //! `Dynamic` with block-local typed children and optional SharedVariant,
-//! `Geometry` through its canonical six-child Variant delegate,
+//! `Geometry` through its canonical seven-child Variant delegate,
 //! plus the registered exact `AggregateFunction` state codecs:
 //! `count`, canonical `nothingUInt64` and `nothingNull`, and base `sum` over one
 //! plain or Nullable numeric or Enum argument. The plain types and `Tuple` also
@@ -42,8 +42,8 @@ use crate::schema::{geometry_underlying_type, ChType, Field, QBitElementType};
 
 use super::protocol::{
     DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION, DBMS_MIN_REVISION_WITH_OUT_OF_ORDER_BUCKETS,
-    DBMS_MIN_REVISION_WITH_V2_DYNAMIC_AND_JSON_SERIALIZATION, LC_HAS_ADDITIONAL_KEYS_BIT,
-    LC_NEED_UPDATE_DICTIONARY_BIT, LOW_CARDINALITY_KEY_VERSION,
+    DBMS_MIN_REVISION_WITH_V2_DYNAMIC_AND_JSON_SERIALIZATION, DBMS_TCP_PROTOCOL_VERSION,
+    LC_HAS_ADDITIONAL_KEYS_BIT, LC_NEED_UPDATE_DICTIONARY_BIT, LOW_CARDINALITY_KEY_VERSION,
 };
 use super::type_binary::write_binary_type;
 use super::type_parser::{
@@ -70,8 +70,10 @@ pub struct EncodeOptions {
     /// Use 0 for HTTP `INSERT ... FORMAT Native`: the server parses the request
     /// body with `server_revision = 0` (its `NativeInputFormat` constructs the
     /// `NativeReader` with revision 0), so it expects neither the preamble nor the
-    /// marker byte, and the stream simply ends at EOF. Use the negotiated TCP
-    /// revision for the native protocol path.
+    /// marker byte, and the stream simply ends at EOF. For the native protocol
+    /// path, advertise at most [`super::protocol::DBMS_TCP_PROTOCOL_VERSION`] and
+    /// use the resulting effective revision. Higher revisions are unsupported;
+    /// revision 54492, for example, requires a different String body layout.
     pub protocol_revision: u64,
     /// Opt in to Dynamic's FLATTENED serialization (structure word 3) for a
     /// column with no `SharedVariant` child. Servers before ClickHouse 25.6 do
@@ -92,6 +94,9 @@ pub struct EncodeOptions {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum EncodeError {
+    /// The caller supplied a protocol revision newer than the highest revision
+    /// whose Native framing this encoder fully supports.
+    UnsupportedProtocolRevision { revision: u64, max_supported: u64 },
     /// A column this encoder cannot write: an unsupported physical type, a
     /// `Nullable(T)` whose inner type is not yet encodable, or a type the
     /// server itself cannot construct (an illegal `Map` key type; tuple
@@ -106,6 +111,13 @@ pub enum EncodeError {
 impl std::fmt::Display for EncodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            EncodeError::UnsupportedProtocolRevision {
+                revision,
+                max_supported,
+            } => write!(
+                f,
+                "unsupported protocol revision {revision}; maximum supported revision is {max_supported}"
+            ),
             EncodeError::UnsupportedType { column, ch_type } => {
                 write!(f, "cannot encode column {column:?} of type {ch_type}")
             }
@@ -117,6 +129,17 @@ impl std::fmt::Display for EncodeError {
 }
 
 impl std::error::Error for EncodeError {}
+
+#[inline]
+fn ensure_supported_protocol_revision(revision: u64) -> Result<(), EncodeError> {
+    if revision > DBMS_TCP_PROTOCOL_VERSION {
+        return Err(EncodeError::UnsupportedProtocolRevision {
+            revision,
+            max_supported: DBMS_TCP_PROTOCOL_VERSION,
+        });
+    }
+    Ok(())
+}
 
 /// Encode a single batch as one Native block, framed for `options.protocol_revision`.
 ///
@@ -162,6 +185,8 @@ pub fn encode_chunked(
     batch: &ChunkedBatch,
     options: &EncodeOptions,
 ) -> Result<Vec<u8>, EncodeError> {
+    ensure_supported_protocol_revision(options.protocol_revision)?;
+
     // Validate every chunk before writing anything: each chunk must carry the
     // batch's schema (an inconsistent chunk would encode a stream the server
     // rejects mid-insert) and pass its own per-column checks. Doing this up front
@@ -187,6 +212,8 @@ pub fn encode_chunked_binary_types(
     batch: &ChunkedBatch,
     options: &EncodeOptions,
 ) -> Result<Vec<u8>, EncodeError> {
+    ensure_supported_protocol_revision(options.protocol_revision)?;
+
     for (i, chunk) in batch.chunks.iter().enumerate() {
         if chunk.schema != batch.schema {
             return Err(EncodeError::InconsistentBatch {
@@ -213,6 +240,7 @@ fn encode_block_into(
     options: &EncodeOptions,
     types_in_binary_format: bool,
 ) -> Result<(), EncodeError> {
+    ensure_supported_protocol_revision(options.protocol_revision)?;
     validate_block(batch, options)?;
     write_block_into(buf, batch, options, types_in_binary_format)
 }

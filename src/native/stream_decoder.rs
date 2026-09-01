@@ -19,8 +19,8 @@ use std::io;
 
 use crate::batch::ColBatch;
 use crate::native::decode::{
-    block_end_binary_types_resume, block_end_resume, decode_next_block,
-    decode_next_block_binary_types, DecodeError, DecodeOptions, ScanProgress,
+    block_end_binary_types_resume, block_end_resume, decode_scanned_block, DecodeError,
+    DecodeOptions, ScanProgress, DBMS_TCP_PROTOCOL_VERSION,
 };
 use crate::native::varint::ByteReader;
 use crate::schema::Schema;
@@ -108,6 +108,20 @@ impl StreamDecoder {
         }
         self.finished = true;
 
+        // A truly empty stream never enters the completeness scan, so enforce
+        // the revision ceiling here too. Nonempty streams validate in their
+        // first scan, and completed streams have `blocks_seen > 0`, avoiding a
+        // second comparison on either normal path.
+        if self.blocks_seen == 0
+            && self.buffer.is_empty()
+            && self.options.protocol_revision > DBMS_TCP_PROTOCOL_VERSION
+        {
+            return Err(DecodeError::UnsupportedProtocolRevision {
+                revision: self.options.protocol_revision,
+                max_supported: DBMS_TCP_PROTOCOL_VERSION,
+            });
+        }
+
         let blocks = self.drain_blocks()?;
 
         // After finishing, any remaining bytes are either empty or a
@@ -171,11 +185,8 @@ impl StreamDecoder {
                     // exactly `data[..end]`; completeness was just verified with
                     // the same framing, so it cannot hit EOF.
                     let mut reader = ByteReader::new(&data[..end]);
-                    let decoded = if self.binary_types {
-                        decode_next_block_binary_types(&mut reader, &self.options)
-                    } else {
-                        decode_next_block(&mut reader, &self.options)
-                    }?;
+                    let decoded =
+                        decode_scanned_block(&mut reader, &self.options, self.binary_types)?;
                     match decoded {
                         Some(batch) => {
                             match &self.schema {
@@ -1002,6 +1013,47 @@ mod tests {
         match blocks[0].column(0) {
             Column::UInt64(column) => assert_eq!(column.values, vec![79]),
             other => panic!("expected UInt64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unsupported_protocol_revision_rejected_by_streaming_scans() {
+        let options = || DecodeOptions {
+            protocol_revision: DBMS_TCP_PROTOCOL_VERSION + 1,
+            ..DecodeOptions::default()
+        };
+        for mut decoder in [
+            StreamDecoder::new(options()),
+            StreamDecoder::new_binary_types(options()),
+        ] {
+            assert!(matches!(
+                decoder.feed(&[0]),
+                Err(DecodeError::UnsupportedProtocolRevision {
+                    revision,
+                    max_supported: DBMS_TCP_PROTOCOL_VERSION,
+                }) if revision == DBMS_TCP_PROTOCOL_VERSION + 1
+            ));
+        }
+    }
+
+    #[test]
+    fn test_unsupported_protocol_revision_rejected_for_empty_stream() {
+        let options = || DecodeOptions {
+            protocol_revision: DBMS_TCP_PROTOCOL_VERSION + 1,
+            ..DecodeOptions::default()
+        };
+        for mut decoder in [
+            StreamDecoder::new(options()),
+            StreamDecoder::new_binary_types(options()),
+        ] {
+            assert!(decoder.feed(&[]).unwrap().is_empty());
+            assert!(matches!(
+                decoder.finish(),
+                Err(DecodeError::UnsupportedProtocolRevision {
+                    revision,
+                    max_supported: DBMS_TCP_PROTOCOL_VERSION,
+                }) if revision == DBMS_TCP_PROTOCOL_VERSION + 1
+            ));
         }
     }
 }

@@ -25,14 +25,18 @@ fn first_x(mut column: &Column, array_depth: usize) -> f64 {
 
 #[test]
 fn test_decode_geometry_all_alternatives_and_null() {
-    // Geometry is the BASIC Variant body in canonical name order:
-    // LineString, MultiLineString, MultiPolygon, Point, Polygon, Ring, NULL.
+    // Geometry is the BASIC Variant body in the server's fixed discriminator
+    // order: LineString, MultiLineString, MultiPolygon, Point, Polygon, Ring,
+    // MultiPoint, NULL. MultiPoint was appended at 6, preserving 0 through 5.
     // Each dense child below has one selected row.
+    // Ring and MultiPoint are both Array(Point), so synthetic body bytes cannot
+    // distinguish those two names. Their fixed positions are pinned by the FFI
+    // child-name test and the real-server all_types integration fixture.
     let data = BlockBuilder::new()
-        .header(1, 7)
+        .header(1, 8)
         .column_header("g", "Geometry")
         .raw_bytes(&0u64.to_le_bytes())
-        .raw_bytes(&[0, 1, 2, 3, 4, 5, u8::MAX])
+        .raw_bytes(&[0, 1, 2, 3, 4, 5, 6, u8::MAX])
         // LineString: one line with two points.
         .array_offsets(&[2])
         .float64_data(&[13.0, 14.0])
@@ -60,6 +64,10 @@ fn test_decode_geometry_all_alternatives_and_null() {
         .array_offsets(&[1])
         .float64_data(&[91.0])
         .float64_data(&[101.0])
+        // MultiPoint: two points.
+        .array_offsets(&[2])
+        .float64_data(&[111.0, 112.0])
+        .float64_data(&[121.0, 122.0])
         .build();
 
     assert_eq!(
@@ -69,22 +77,23 @@ fn test_decode_geometry_all_alternatives_and_null() {
     let decoded = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
     assert_eq!(decoded.schema.fields[0].ch_type, ChType::Geometry);
     let geometry = as_variant(decoded.chunks[0].column(0));
-    assert_eq!(geometry.len(), 7);
+    assert_eq!(geometry.len(), 8);
     assert_eq!(geometry.null_count(), 1);
-    for discriminator in 0..6u8 {
+    for discriminator in 0..7u8 {
         assert_eq!(
             geometry.value_position(discriminator as usize),
             Some((discriminator, 0))
         );
     }
-    assert_eq!(geometry.value_position(6), Some((u8::MAX, 0)));
-    assert_eq!(geometry.variants.len(), 6);
+    assert_eq!(geometry.value_position(7), Some((u8::MAX, 0)));
+    assert_eq!(geometry.variants.len(), 7);
     assert_eq!(first_x(&geometry.variants[0], 1), 13.0);
     assert_eq!(first_x(&geometry.variants[1], 2), 21.0);
     assert_eq!(first_x(&geometry.variants[2], 3), 33.0);
     assert_eq!(first_x(&geometry.variants[3], 0), 51.0);
     assert_eq!(first_x(&geometry.variants[4], 2), 71.0);
     assert_eq!(first_x(&geometry.variants[5], 1), 91.0);
+    assert_eq!(first_x(&geometry.variants[6], 1), 111.0);
 }
 
 #[test]
@@ -102,7 +111,7 @@ fn test_decode_geometry_zero_rows() {
     let empty = empty_column(&ChType::Geometry);
     let geometry = as_variant(&empty);
     assert!(geometry.is_empty());
-    assert_eq!(geometry.variants.len(), 6);
+    assert_eq!(geometry.variants.len(), 7);
     assert!(geometry.variants.iter().all(Column::is_empty));
 }
 
@@ -121,15 +130,15 @@ fn test_decode_geometry_multi_block() {
         .header(1, 2)
         .column_header("g", "Geometry")
         .raw_bytes(&0u64.to_le_bytes())
-        .raw_bytes(&[0, 5])
+        .raw_bytes(&[0, 6])
         // LineString child.
         .array_offsets(&[1])
         .float64_data(&[21.0])
         .float64_data(&[31.0])
-        // Ring child.
-        .array_offsets(&[1])
-        .float64_data(&[41.0])
-        .float64_data(&[51.0])
+        // MultiPoint child.
+        .array_offsets(&[2])
+        .float64_data(&[41.0, 42.0])
+        .float64_data(&[51.0, 52.0])
         .build();
     let mut data = first;
     data.extend_from_slice(&second);
@@ -141,5 +150,6 @@ fn test_decode_geometry_multi_block() {
     assert_eq!(first.value_position(1), Some((u8::MAX, 0)));
     let second = as_variant(decoded.chunks[1].column(0));
     assert_eq!(second.value_position(0), Some((0, 0)));
-    assert_eq!(second.value_position(1), Some((5, 0)));
+    assert_eq!(second.value_position(1), Some((6, 0)));
+    assert_eq!(first_x(&second.variants[6], 1), 41.0);
 }

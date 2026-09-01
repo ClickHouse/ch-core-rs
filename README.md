@@ -142,7 +142,7 @@ Not implemented yet:
 - `Enum8(...)`, `Enum16(...)`
 - `Int128`, `UInt128`, `Int256`, `UInt256`
 - `Array(T)`, `Tuple(T1, ...)`, `Map(K, V)`, `Variant(T1, ...)`, and `Dynamic`
-- `JSON`, `SimpleAggregateFunction(func, T)`, the six geo aliases, `Geometry`,
+- `JSON`, `SimpleAggregateFunction(func, T)`, the seven geo aliases, `Geometry`,
   and `Nested(...)`
 - Exact `AggregateFunction` state codecs for `count`, canonical
   `nothingUInt64` and `nothingNull`, and base `sum` over plain or Nullable

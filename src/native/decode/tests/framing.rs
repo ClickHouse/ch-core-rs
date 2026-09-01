@@ -1,6 +1,41 @@
 use super::*;
 use crate::native::varint::write_varint;
 
+fn assert_unsupported_revision<T>(result: Result<T, DecodeError>, revision: u64) {
+    assert!(matches!(
+        result,
+        Err(DecodeError::UnsupportedProtocolRevision {
+            revision: actual,
+            max_supported: DBMS_TCP_PROTOCOL_VERSION,
+        }) if actual == revision
+    ));
+}
+
+#[test]
+fn test_protocol_revision_above_supported_ceiling_is_rejected() {
+    assert_eq!(
+        DBMS_MIN_REVISION_WITH_STRING_WITH_SIZE_STREAM_SERIALIZATION,
+        54492
+    );
+    let revision = DBMS_TCP_PROTOCOL_VERSION + 1;
+    let options = DecodeOptions {
+        protocol_revision: revision,
+        ..DecodeOptions::default()
+    };
+
+    let mut reader = ByteReader::new(&[]);
+    assert_unsupported_revision(decode_next_block(&mut reader, &options), revision);
+    let mut binary_reader = ByteReader::new(&[]);
+    assert_unsupported_revision(
+        decode_next_block_binary_types(&mut binary_reader, &options),
+        revision,
+    );
+    assert_unsupported_revision(block_end(&[], &options), revision);
+    assert_unsupported_revision(block_end_binary_types(&[], &options), revision);
+    assert_unsupported_revision(decode_all_bytes(&[], &options), revision);
+    assert_unsupported_revision(decode_all_bytes_binary_types(&[], &options), revision);
+}
+
 #[test]
 fn test_block_end_scans_string_column() {
     // The completeness scan must return the exact end offset of a block whose

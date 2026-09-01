@@ -1211,6 +1211,10 @@ fn test_parse_ch_type_geo() {
         parse_ch_type("MultiPolygon"),
         Some(ChType::Geo(GeoKind::MultiPolygon))
     );
+    assert_eq!(
+        parse_ch_type("MultiPoint"),
+        Some(ChType::Geo(GeoKind::MultiPoint))
+    );
 }
 
 #[test]
@@ -1222,6 +1226,7 @@ fn test_geo_display_round_trips() {
         "MultiLineString",
         "Polygon",
         "MultiPolygon",
+        "MultiPoint",
     ] {
         assert_eq!(parse_ch_type(spelling).unwrap().to_string(), spelling);
     }
@@ -1245,6 +1250,7 @@ fn test_parse_geo_rejects_bad_casing() {
     assert_eq!(parse_ch_type("ring"), None);
     assert_eq!(parse_ch_type("POLYGON"), None);
     assert_eq!(parse_ch_type("multipolygon"), None);
+    assert_eq!(parse_ch_type("multipoint"), None);
 }
 
 #[test]
@@ -1259,6 +1265,10 @@ fn test_geo_underlying_type_expansion() {
     );
     assert_eq!(
         GeoKind::LineString.underlying_type(),
+        ChType::Array(Box::new(point.clone()))
+    );
+    assert_eq!(
+        GeoKind::MultiPoint.underlying_type(),
         ChType::Array(Box::new(point.clone()))
     );
     assert_eq!(
@@ -1297,6 +1307,7 @@ fn test_parse_geometry_canonicalizes_alias_and_delegates() {
             ChType::Geo(GeoKind::Point),
             ChType::Geo(GeoKind::Polygon),
             ChType::Geo(GeoKind::Ring),
+            ChType::Geo(GeoKind::MultiPoint),
         ])
     );
 }
@@ -1374,13 +1385,19 @@ fn test_parse_nullable_geo_legality() {
         parse_ch_type("Nullable(Point)"),
         Some(ChType::Nullable(Box::new(ChType::Geo(GeoKind::Point))))
     );
-    // Nullable of the five Array-based geo kinds is illegal (Array is not
+    // Nullable of the six Array-based geo kinds is illegal (Array is not
     // nullable-able).
     assert_eq!(parse_ch_type("Nullable(Ring)"), None);
     assert_eq!(parse_ch_type("Nullable(LineString)"), None);
     assert_eq!(parse_ch_type("Nullable(Polygon)"), None);
     assert_eq!(parse_ch_type("Nullable(MultiLineString)"), None);
     assert_eq!(parse_ch_type("Nullable(MultiPolygon)"), None);
+    assert_eq!(parse_ch_type("Nullable(MultiPoint)"), None);
+    let low_cardinality_multi_point = parse_ch_type("LowCardinality(MultiPoint)").unwrap();
+    assert_eq!(
+        unsupported_header_type_name(&low_cardinality_multi_point).as_deref(),
+        Some("LowCardinality(MultiPoint)")
+    );
     // Nullable(Nested) is illegal (it is an Array).
     assert_eq!(parse_ch_type("Nullable(Nested(a UInt32))"), None);
 }

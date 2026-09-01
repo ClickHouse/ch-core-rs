@@ -44,14 +44,14 @@ fn geometry_batch_with_type(ch_type: ChType) -> Arc<ColBatch> {
             other => unreachable!("Geometry alternative is always geo, got {other:?}"),
         })
         .collect();
-    let column = VariantColumn::try_new(&[0, 1, 2, 3, 4, 5, u8::MAX], children).unwrap();
+    let column = VariantColumn::try_new(&[0, 1, 2, 3, 4, 5, 6, u8::MAX], children).unwrap();
     Arc::new(ColBatch::new(
         Schema::new(vec![Field {
             name: "g".into(),
             ch_type,
         }]),
         vec![Column::Variant(column)],
-        7,
+        8,
     ))
 }
 
@@ -107,7 +107,7 @@ fn export_flat_variant_schema_and_buffers() {
 }
 
 #[test]
-fn export_geometry_as_six_child_dense_union() {
+fn export_geometry_as_seven_child_dense_union() {
     let batch = geometry_batch();
 
     // Safety: both outputs are writable zeroed C Data structs. Their borrowed
@@ -118,10 +118,10 @@ fn export_geometry_as_six_child_dense_union() {
         let field = &**schema.children.add(0);
         assert_eq!(
             CStr::from_ptr(field.format).to_str().unwrap(),
-            "+ud:0,1,2,3,4,5,6"
+            "+ud:0,1,2,3,4,5,6,7"
         );
         assert_eq!(field.flags & 2, 2, "Geometry has intrinsic NULL");
-        assert_eq!(field.n_children, 7);
+        assert_eq!(field.n_children, 8);
         let expected = [
             ("LineString", "+L"),
             ("MultiLineString", "+L"),
@@ -129,6 +129,7 @@ fn export_geometry_as_six_child_dense_union() {
             ("Point", "+s"),
             ("Polygon", "+L"),
             ("Ring", "+L"),
+            ("MultiPoint", "+L"),
             ("NULL", "n"),
         ];
         for (index, (name, format)) in expected.into_iter().enumerate() {
@@ -138,20 +139,35 @@ fn export_geometry_as_six_child_dense_union() {
         }
         let point = &**field.children.add(3);
         assert_eq!(point.n_children, 2);
+        let multi_point = &**field.children.add(6);
+        assert_eq!(multi_point.n_children, 1);
+        let multi_point_item = &**multi_point.children.add(0);
+        assert_eq!(
+            CStr::from_ptr(multi_point_item.format).to_str().unwrap(),
+            "+s"
+        );
+        assert_eq!(multi_point_item.n_children, 2);
+        for coordinate in 0..2 {
+            let child = &**multi_point_item.children.add(coordinate);
+            assert_eq!(CStr::from_ptr(child.format).to_str().unwrap(), "g");
+        }
         (schema.release.unwrap())(&mut schema);
 
         let mut array: ArrowArray = std::mem::zeroed();
         export_batch_array(&batch, &mut array).unwrap();
         let field = &**array.children.add(0);
-        assert_eq!(field.length, 7);
+        assert_eq!(field.length, 8);
         assert_eq!(field.null_count, 0, "dense unions own no validity buffer");
-        assert_eq!(field.n_children, 7);
+        assert_eq!(field.n_buffers, 2, "type ids plus dense child offsets");
+        assert_eq!(field.n_children, 8);
         let type_ids = *field.buffers.add(0) as *const i8;
         assert_eq!(
-            std::slice::from_raw_parts(type_ids, 7),
-            &[0, 1, 2, 3, 4, 5, 6]
+            std::slice::from_raw_parts(type_ids, 8),
+            &[0, 1, 2, 3, 4, 5, 6, 7]
         );
-        for child in 0..7 {
+        let offsets = *field.buffers.add(1) as *const i32;
+        assert_eq!(std::slice::from_raw_parts(offsets, 8), &[0; 8]);
+        for child in 0..8 {
             assert_eq!((**field.children.add(child)).length, 1);
         }
         (array.release.unwrap())(&mut array);
@@ -173,17 +189,17 @@ fn export_nullable_geometry_matches_bare_geometry_in_batch_and_stream() {
         let field = &**schema.children.add(0);
         assert_eq!(
             CStr::from_ptr(field.format).to_str().unwrap(),
-            "+ud:0,1,2,3,4,5,6"
+            "+ud:0,1,2,3,4,5,6,7"
         );
         assert_eq!(field.flags & 2, 2);
-        assert_eq!(field.n_children, 7);
+        assert_eq!(field.n_children, 8);
         (schema.release.unwrap())(&mut schema);
 
         let mut array: ArrowArray = std::mem::zeroed();
         export_batch_array(&batch, &mut array).unwrap();
         let field = &**array.children.add(0);
         assert_eq!(field.n_buffers, 2);
-        assert_eq!(field.n_children, 7);
+        assert_eq!(field.n_children, 8);
         (array.release.unwrap())(&mut array);
 
         let mut stream: ArrowArrayStream = std::mem::zeroed();
@@ -197,16 +213,16 @@ fn export_nullable_geometry_matches_bare_geometry_in_batch_and_stream() {
         let field = &**stream_schema.children.add(0);
         assert_eq!(
             CStr::from_ptr(field.format).to_str().unwrap(),
-            "+ud:0,1,2,3,4,5,6"
+            "+ud:0,1,2,3,4,5,6,7"
         );
-        assert_eq!(field.n_children, 7);
+        assert_eq!(field.n_children, 8);
 
         let mut stream_array: ArrowArray = std::mem::zeroed();
         assert_eq!(
             (stream.get_next.unwrap())(&mut stream, &mut stream_array),
             0
         );
-        assert_eq!((**stream_array.children.add(0)).n_children, 7);
+        assert_eq!((**stream_array.children.add(0)).n_children, 8);
 
         (stream_array.release.unwrap())(&mut stream_array);
         (stream_schema.release.unwrap())(&mut stream_schema);
