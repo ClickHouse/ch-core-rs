@@ -7,6 +7,8 @@ version; patch releases remain backward compatible.
 
 ## Unreleased
 
+## v0.2.1
+
 - Expose ClickHouse compression framing with CityHash128 1.0.2 verification,
   LZ4/NONE decode, and a pure Rust LZ4 writer. The frame reader reports bytes
   consumed so TCP engines can stop at the next packet and check that a block
