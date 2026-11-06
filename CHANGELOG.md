@@ -7,6 +7,16 @@ version; patch releases remain backward compatible.
 
 ## Unreleased
 
+- Expose ClickHouse compression framing with CityHash128 1.0.2 verification,
+  LZ4/NONE decode, and a pure Rust LZ4 writer. The frame reader reports bytes
+  consumed so TCP engines can stop at the next packet and check that a block
+  consumed all plaintext in its final frame. An into-buffer reader appends
+  directly to caller-owned storage and returns frame metadata for that check.
+  ZSTD remains unsupported.
+- Add real-server HTTP and TCP compression fixtures at revision 54460,
+  including a TCP Native block spanning multiple compression frames. Document
+  the existing one-block decode entry for the planned packet engine.
+
 ## v0.2.0, 2026-09-01
 
 - Add standalone `MultiPoint` decode, encode, and Arrow export for ClickHouse

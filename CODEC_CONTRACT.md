@@ -48,6 +48,83 @@ serialization class and method it was confirmed against. When the pinned tag
 moves, reconfirm the affected layouts and update their citations as `AGENTS.md`
 describes.
 
+## Compression envelope
+
+The `compression` module handles ClickHouse's internal compressed stream, used
+by HTTP `compress=1` and compressed TCP Native bodies. Native decode entry
+points still take plaintext. HTTP transport compression such as gzip is outside
+this contract.
+
+Confirmed at `v26.8.1.2041-lts`, a frame contains a 16-byte CityHash128 1.0.2
+checksum, followed by a 9-byte header and a codec payload. The checksum stores
+low64 then high64 as little-endian u64s and covers the header plus payload.
+The header is a method byte, a little-endian u32 compressed size that includes
+the header but excludes the checksum, and a little-endian u32 plaintext size.
+Compressed size must be at least 9 and at most 1 GiB. Plaintext size must be
+nonzero and at most 1 GiB. Both bounds are checked before checksum verification
+or output allocation. Rejecting zero plaintext is a core reader policy: the
+server writer never emits it, although the server's release reader only has
+a debug assertion for that case.
+
+Decode accepts NONE (`0x02`, payload length must equal plaintext size) and
+standard LZ4 (`0x82`, also used by LZ4HC). ZSTD (`0x90`) and unknown methods
+return `CompressionError::UnsupportedCodec` as soon as a complete, size-valid
+header is available, without waiting for the payload. Checksums are verified
+by default; callers can explicitly select `ChecksumMode::Skip`.
+`CompressionError` and `ChecksumMode` are non-exhaustive. Checksum errors carry
+native `u128` values with the wire's low64 in the low bits.
+
+`decompress_frame` decodes exactly one frame and returns its plaintext and
+compressed bytes consumed, leaving a following frame or packet untouched.
+NONE plaintext borrows the input; LZ4 plaintext owns a newly allocated buffer.
+`decompress_frame_into` appends one frame directly to a caller's `Vec<u8>`,
+reuses its capacity, and restores its contents on error. Its `FrameInfo`
+reports compressed bytes consumed and plaintext bytes appended without
+retaining a borrow of either buffer.
+LZ4 rejects output sizes exceeding the conservative `payload_len * 255 + 24`
+expansion bound before allocation. Output reservations are fallible and return
+`CompressionError::AllocationFailed` if capacity cannot be obtained.
+`CompressionError::Truncated` reports how many bytes the caller needs to buffer
+before retrying; malformed headers and codec payloads return other errors.
+`decompress_native_stream` concatenates frames for a complete HTTP response.
+`compress_lz4_frame` returns one frame, `write_lz4_frame` appends one frame to
+a caller's buffer, and `compress_lz4_frames` splits plaintext at an explicit
+maximum frame size. Writers reject empty plaintext and frame limits outside
+`1..=MAX_LZ4_FRAME_PLAINTEXT`, currently `1..=1_069_547_496` bytes. This bound
+ensures even incompressible input fits the 1 GiB compressed-size limit.
+They accept plaintext Native bytes independently of revision or
+type layout and write payloads directly after the reserved header, avoiding a
+separate payload copy. The LZ4 encoder keeps its 16 KiB match table on the
+stack, so it allocates nothing per frame beyond the output.
+
+TCP flushes compression at each Native block boundary. A block may occupy many
+frames, but a frame never spans blocks. Readers therefore finish a TCP body
+only when the block decoder has consumed all plaintext in its final frame.
+`FrameInfo::finish_block` checks that final-frame count, and `DecodedFrame`
+forwards the same check for the convenience reader. This check is an
+inferred reader constraint from confirmed server flush behavior, and does not
+apply to HTTP. HTTP output normally auto-flushes after each chunk, so captured
+Native frames align with blocks. Confirmed HTTP response buffering through
+`wait_end_of_query=1` or `http_response_buffer_size>0` can merge chunks before
+compression, so HTTP readers accept arbitrary frame/block boundaries. `INTEGRATING.md`
+describes the one-block engine entry and how to buffer incomplete bodies.
+
+Server references: `CompressionInfo.h`, `CompressedReadBufferBase.cpp`
+(`readHeaderAndGetCodecAndSize`), `ICompressionCodec.cpp` (size readers),
+`CompressedWriteBuffer.cpp` (`nextImpl`), `CompressionCodecLZ4.cpp`, and
+`CompressionCodecNone.cpp` in `src/Compression/`; `TCPHandler::sendData`,
+`sendTotals`, and `sendExtremes` in `src/Server/TCPHandler.cpp`;
+`Connection::sendData` in `src/Client/Connection.cpp`. HTTP installs the
+compression buffer in `src/Server/HTTPHandler.cpp`;
+`HTTPHandler::Output::pushDelayedResults` copies buffered chunks together into
+that compressor. `executeQuery` in
+`src/Interpreters/executeQuery.cpp` enables `setAutoFlush` for both output
+format branches. `IOutputFormat::work` and `flushImpl` in
+`src/Processors/Formats/IOutputFormat.cpp`, and
+`ParallelFormattingOutputFormat::collectorThreadFunction` in
+`src/Processors/Formats/Impl/ParallelFormattingOutputFormat.cpp`, flush output
+after each chunk or formatted unit.
+
 ## How to read a type section
 
 Every type section uses the same fields, in the same order:

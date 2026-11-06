@@ -366,8 +366,9 @@ Two things differ from decode by nature:
   byte-for-byte, though byte-identity is not guaranteed for non-canonical input.
 
 Encode is at full type parity with decode (every type the crate decodes it also
-encodes) and targets the HTTP `INSERT` path at `protocol_revision = 0`; there is
-no TCP engine or compression framing yet. The per-type encode contract is the
+encodes). HTTP `INSERT` uses `protocol_revision = 0`; TCP block bodies use the
+connection's effective revision. The separate `compression` module wraps those
+bytes in LZ4 frames. There is no TCP packet engine yet. The per-type encode contract is the
 "Encoding" section of `CODEC_CONTRACT.md`.
 
 ### Error handling
@@ -410,7 +411,8 @@ over the supported inner types. The "Supported types" list in `README.md` is the
 current enumeration, and `CODEC_CONTRACT.md` is the per-type contract. Decode and
 encode are at type parity across all of this: whole-buffer and streaming decode,
 Arrow C Data export, and encode back to Native block bytes for the HTTP `INSERT`
-path. Not yet: compression framing and the native TCP protocol. The growth model
+path. The `compression` module reads LZ4/NONE frames and writes LZ4 frames;
+the native TCP packet protocol remains future work. The growth model
 is fixed: implement a type once here, following the documented
 confirm-against-server-source workflow in `AGENTS.md`, and every binding gets it
 for free. The roadmap lives in `README.md`.
