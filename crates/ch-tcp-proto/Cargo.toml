@@ -1,0 +1,16 @@
+[package]
+name = "ch-tcp-proto"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+description = "Sans-I/O ClickHouse TCP native protocol engine"
+license = "Apache-2.0"
+repository = "https://github.com/ClickHouse/ch-core-rs"
+readme = "README.md"
+publish = false
+
+[dependencies]
+# Intentionally ahead of use. The handshake does not need core yet, but the
+# plan is that the protocol engine depends on core, and Data packet decoding
+# lands next. This is the only runtime dependency and it is in-repo.
+ch-core-rs = { path = "../.." }

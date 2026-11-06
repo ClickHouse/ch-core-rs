@@ -1,0 +1,6 @@
+# Captured ClickHouse wire bytes. Never normalize line endings or diff as text.
+tests/fixtures/*.native binary
+tests/fixtures/*.packet binary
+tests/fixtures/*.packets binary
+tests/fixtures/*.bytes binary
+tests/fixtures/*.lz4 binary

@@ -56,6 +56,15 @@ These are the reasons the crate exists. Do not erode them.
   packed bitmaps (bit 1 = valid). Keep new types Arrow-shaped so `ffi/mod.rs` can
   export them through the Arrow C Data Interface.
 
+### Workspace
+
+The repo is a Cargo workspace. The root package is `ch-core-rs`. A second
+crate, `crates/ch-tcp-proto`, is the sans-I/O TCP protocol engine. Its only
+runtime dependency is `ch-core-rs` by path. Core's invariants apply to it as
+well: no panics on untrusted input, the same MSRV (`rust-version = "1.81"`),
+and no new runtime dependencies without asking Joe first. Run checks with
+`--workspace` so both crates are covered.
+
 ## Role
 
 Act like an experienced maintainer of a performance-critical, zero-dependency

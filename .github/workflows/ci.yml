@@ -29,10 +29,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (deny warnings)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test
+        run: cargo test --workspace
 
   msrv:
     name: MSRV check (1.81)
@@ -47,4 +47,4 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check against MSRV
-        run: cargo +1.81 check --all-targets
+        run: cargo +1.81 check --workspace --all-targets
