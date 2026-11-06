@@ -75,18 +75,19 @@ default; the user may override it.
   Arrow contract decisions, synthetic tests, captured fixtures, and live-server
   semantic checks. Resume only for a concrete binding or workload requirement,
   not as an open-ended completeness exercise.
-- **Scope:** frame compression and its unwired files also remain untouched and
-  out of scope. Completeness still means uncompressed HTTP `FORMAT Native`.
+- **TCP work, 2026-11-05:** compression framing is now in scope as a separate
+  byte codec. The first packet engine will advertise revision 54460, separately
+  from core's 54485 ceiling. Sparse and replicated serialization remain deferred
+  until the engine pin rises above 54464.
 - **Sequencing:** type completeness remains ahead of encode-API polish. The
   sink-based encode API stays deferred until a binding measures the owned
   `encode_block` allocation as material. Further open-ended
   `AggregateFunction` work also remains paused because each signature needs a
   separately confirmed unframed state-boundary codec.
-- **Recommended next:** implement revision-54492 String size-stream decode and
-  encode so the core can negotiate the pinned server's current revision without
-  misframing direct or nested String values.
-- **After that:** resolve sparse column serialization, whose nonzero marker can
-  reach ordinary queries at negotiated revisions >= 54454.
+- **Recommended next:** phase 1 compression and revision-54460 fixture
+  validation are complete. Get release approval before tagging core and starting
+  the sibling packet engine crate. Revision-54492 String size streams and
+  sparse/replicated serialization remain on the broader codec roadmap.
 - **Key references:** the MultiPoint and Geometry contract is in
   `CODEC_CONTRACT.md`. The logical and column models are in
   `src/schema.rs` and `src/column.rs`; parser, binary descriptor, decode/scan,
@@ -688,16 +689,13 @@ where the across-release churn lives.
 
 ## Wire / protocol features for the decode path
 
-- [~] Native block compression framing - LZ4 + NONE codecs and the CityHash128
-      checksum are implemented and tested in `src/compression/`
-      (`decompress_native_stream`), hand-rolled to keep the crate zero-dependency.
-      They are **not wired into the decode path**: the current scope is HTTP
-      `FORMAT Native`, which does not enable native block-frame compression by
-      default (see "Scope" in the handoff and "Out of scope" at the bottom), so
-      the decoder assumes uncompressed input. ZSTD (0x90) is rejected pending a
-      dependency discussion (raise with the user, do not add silently). Wire this
-      in only when the `compress=1` / TCP path enters scope. Distinct from HTTP
-      transport compression (gzip/zstd), which stays in the bindings.
+- [x] Native block compression framing - `compression` exposes LZ4/NONE decode,
+      CityHash128 verification, a frame-at-a-time reader, and an LZ4 frame writer.
+      Hand-written Rust keeps the crate zero-dependency. Callers unwrap frames
+      before passing plaintext to the Native decoder. HTTP `compress=1` and
+      revision-54460 TCP captures ground the frame/block boundary tests.
+      ZSTD (0x90) remains deferred and returns `UnsupportedCodec`. HTTP transport
+      compression such as gzip stays in the bindings.
 - [ ] Sparse column serialization - the nonzero custom-serialization marker the
       decoder currently rejects. Needed wherever the server emits sparse columns.
       Resolve before opening the binding POC to outside workloads (2026-07-15
@@ -1109,15 +1107,11 @@ outcome in `CODEC_CONTRACT.md`.
 
 ## Out of scope for this tracker
 
-**Current completeness bar (2026-06-29 decision):** "implementation complete"
-means decoding `FORMAT Native` delivered over **HTTP**. Native delivery over the
-**TCP** protocol is deferred and is not part of the completeness bar right now.
-The decode path also **assumes uncompressed Native bytes**: HTTP `FORMAT Native`
-does not enable native block-frame compression by default, so the compressed-block
-path is not exercised. The LZ4/NONE compressed-block framing (with the hand-rolled
-CityHash128 checksum) lives in `src/compression/`, is tested, but is **deliberately
-left unwired** - nothing in the decode path calls it. Keep the files; wire them in
-only when the HTTP `compress=1` (or TCP) path enters scope.
+The original HTTP `FORMAT Native` completeness bar remains the type-coverage
+baseline. TCP phase 1 adds the separate `compression` codec and captured
+revision-54460 block bodies. Native decode APIs still accept plaintext; callers
+use the compression APIs to unwrap ClickHouse frames first. The packet engine
+is a separate sibling crate, not part of this codec's type-completeness bar.
 
 Tracked elsewhere (README roadmap), intentionally not part of this tracker:
 

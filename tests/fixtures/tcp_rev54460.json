@@ -1,0 +1,151 @@
+{
+  "server_version": "26.8.1.2041",
+  "source_tag": "v26.8.1.2041-lts",
+  "protocol_revision": 54460,
+  "small_query": "SELECT number + 13 AS n, concat('user_', toString(number)) AS s FROM numbers(5) SETTINGS max_block_size=2, max_threads=1",
+  "large_query": "SELECT toUInt64(79) AS n, repeat('xx', 550000) AS s",
+  "files": {
+    "http_multi_rev54460.native": {
+      "length": 165
+    },
+    "tcp_multi_rev54460.packets": {
+      "length": 215,
+      "packets": [
+        {
+          "offset": 0,
+          "length": 32,
+          "rows": 0,
+          "columns": 2,
+          "name": "",
+          "frame_plain_sizes": []
+        },
+        {
+          "offset": 32,
+          "length": 62,
+          "rows": 2,
+          "columns": 2,
+          "name": "",
+          "frame_plain_sizes": []
+        },
+        {
+          "offset": 94,
+          "length": 62,
+          "rows": 2,
+          "columns": 2,
+          "name": "",
+          "frame_plain_sizes": []
+        },
+        {
+          "offset": 156,
+          "length": 47,
+          "rows": 1,
+          "columns": 2,
+          "name": "",
+          "frame_plain_sizes": []
+        },
+        {
+          "offset": 203,
+          "length": 12,
+          "rows": 0,
+          "columns": 0,
+          "name": "",
+          "frame_plain_sizes": []
+        }
+      ]
+    },
+    "http_multi_rev54460_lz4.native": {
+      "length": 234
+    },
+    "tcp_multi_rev54460_lz4.packets": {
+      "length": 337,
+      "packets": [
+        {
+          "offset": 0,
+          "length": 59,
+          "rows": 0,
+          "columns": 2,
+          "name": "",
+          "frame_plain_sizes": [
+            30
+          ]
+        },
+        {
+          "offset": 59,
+          "length": 84,
+          "rows": 2,
+          "columns": 2,
+          "name": "",
+          "frame_plain_sizes": [
+            60
+          ]
+        },
+        {
+          "offset": 143,
+          "length": 84,
+          "rows": 2,
+          "columns": 2,
+          "name": "",
+          "frame_plain_sizes": [
+            60
+          ]
+        },
+        {
+          "offset": 227,
+          "length": 72,
+          "rows": 1,
+          "columns": 2,
+          "name": "",
+          "frame_plain_sizes": [
+            45
+          ]
+        },
+        {
+          "offset": 299,
+          "length": 38,
+          "rows": 0,
+          "columns": 0,
+          "name": "",
+          "frame_plain_sizes": [
+            10
+          ]
+        }
+      ]
+    },
+    "tcp_large_rev54460_lz4.packets": {
+      "length": 4522,
+      "packets": [
+        {
+          "offset": 0,
+          "length": 59,
+          "rows": 0,
+          "columns": 2,
+          "name": "",
+          "frame_plain_sizes": [
+            30
+          ]
+        },
+        {
+          "offset": 59,
+          "length": 4425,
+          "rows": 1,
+          "columns": 2,
+          "name": "",
+          "frame_plain_sizes": [
+            1048576,
+            51465
+          ]
+        },
+        {
+          "offset": 4484,
+          "length": 38,
+          "rows": 0,
+          "columns": 0,
+          "name": "",
+          "frame_plain_sizes": [
+            10
+          ]
+        }
+      ]
+    }
+  }
+}

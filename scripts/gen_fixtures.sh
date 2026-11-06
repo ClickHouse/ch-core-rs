@@ -551,6 +551,11 @@ capture() {
 capture "all_types_rev0.native" "${all_types_query}"
 capture "all_types_rev54485.native" "${all_types_query}" \
   --data-urlencode "client_protocol_version=54485"
+capture "all_types_rev54460.native" "${all_types_query}" \
+  --data-urlencode "client_protocol_version=54460"
+capture "all_types_rev54460.lz4" "${all_types_query}" \
+  --data-urlencode "client_protocol_version=54460" \
+  --data-urlencode "compress=1"
 capture "multi_block_rev0.native" "${multi_block_query}"
 
 # Setting-gated JSON wire shapes, captured at the default (rev 0) HTTP protocol

@@ -2,7 +2,11 @@
 
 This is a high-level guide for maintainers of the ClickHouse language clients who want to evaluate or wrap `ch-core-rs`.
 
-In short, this crate decodes ClickHouse `FORMAT Native` result bytes into owned, typed, columnar buffers, and encodes those buffers back into `FORMAT Native` bytes for `INSERT`. It does not own transport, compression, query APIs, or host object materialization.
+This crate decodes ClickHouse `FORMAT Native` result bytes into owned, typed,
+columnar buffers, and encodes those buffers back into `FORMAT Native` bytes for
+`INSERT`. It also reads ClickHouse LZ4/NONE compression frames and writes LZ4
+frames. Transport, TCP packets, query APIs, and host object materialization stay
+outside core.
 
 ## Where It Fits
 
@@ -21,7 +25,8 @@ Client query API
       v
 +-------------------------------+
 | Client-owned byte handling    |
-| decompress, strip framing,    |
+| strip packet framing, use     |
+| core compression codec,       |
 | handle progress/errors/EOF    |
 +-------------------------------+
       |
@@ -49,9 +54,9 @@ Client query API
 Public client result API
 ```
 
-The important boundary is the middle one: the client owns everything needed to
-turn an HTTP response or native TCP packet stream into raw Native block bytes.
-`ch-core-rs` starts at those block bytes and stops at typed columnar buffers.
+The client owns HTTP responses and native TCP packets. It can use core's
+compression codec to obtain raw Native block bytes, then use the Native codec
+to obtain typed columnar buffers.
 
 ## What This Is
 
@@ -101,7 +106,9 @@ The core decodes the `Native` format.
 
 A client can get bytes for this core by requesting `FORMAT Native` over the HTTP transport. The binding must hand the core the raw Native payload after transport concerns have been handled:
 
-- HTTP response compression must be decompressed first.
+- HTTP transport compression such as gzip must be decompressed first. For
+  ClickHouse's separate `compress=1` envelope, use `compression` to recover the
+  Native bytes.
 - Server exceptions, retries, cancellation, and connection lifecycle remain client responsibilities.
 - The default decode APIs expect string-encoded column type headers. If the
   request enables `output_format_native_encode_types_in_binary_format`, use the
@@ -112,7 +119,10 @@ For INSERT, the default encode APIs write textual headers. If a binding uses an
 `encode_*_binary_types` API, it must set
 `input_format_native_decode_types_in_binary_format=1` on the ClickHouse request.
 
-The same model applies over TCP. A TCP client must do the native protocol work first: handshake, revision negotiation, packet framing, compression framing, server packet dispatch, progress and exception handling, cancellation, and end-of-stream handling. Once it has the Native block payload bytes from server `Data` packets, it can feed those bytes to the core.
+The same model applies over TCP. The packet engine owns handshake, revision
+gating, packet framing, server packet dispatch, progress and exception handling,
+cancellation, and end-of-stream handling. It uses core's compression codec for
+compressed Native bodies and the Native decoder for block payloads.
 
 Not all clients have a ready-to-use `FORMAT Native` result path today. Part of the integration task for those clients is to add or reuse a path that can request `FORMAT Native` and expose the resulting decompressed byte stream to the Rust decoder.
 
@@ -142,6 +152,59 @@ with `client_protocol_version=54485` against the pinned
 modern per-column marker while staying below revision 54492's unsupported
 String size-stream layout. That is the concrete shape bindings should reproduce
 when they request protocol-framed Native over HTTP at that revision.
+
+### One Block At A Time For TCP
+
+The engine entry is the existing `native::varint::ByteReader` plus
+`native::decode::decode_next_block`. There is no new one-block wrapper.
+Set `DecodeOptions.protocol_revision` to the connection's effective revision.
+The first engine advertises 54460; core's decode ceiling remains 54485.
+
+For an uncompressed body, call `native::decode::block_end` on the bytes after
+the packet code and block name. `Ok(None)` means no block is present yet;
+`DecodeError::Io` with `UnexpectedEof` means a partial block needs more bytes.
+Once the scanner returns `Ok(Some(end))`, give `ByteReader` the `[..end]` slice
+and call `decode_next_block`. Use `reader.position()` as the consumed Native byte count,
+and leave any suffix for packet dispatch. Preserve schema-bearing zero-row
+blocks, including INSERT schema replies and empty end markers. Recreate the
+cursor when retrying an incomplete decode: a failed `decode_next_block` may
+have advanced it.
+
+For a compressed body, call
+`compression::decompress_frame_into(input, ChecksumMode::Verify, &mut plain)`
+to append one frame directly to the current block buffer. It reuses the
+buffer's capacity and restores its contents on error. Save the buffer length
+before each call. The returned `FrameInfo::consumed()` is the compressed input
+length to advance, and `plaintext_len()` is the number of bytes appended.
+After each frame, run `block_end`.
+Continue loading frames while the block is incomplete. When the block completes,
+call `info.finish_block(end - prior_plaintext_len)` to check that all plaintext
+in the final frame belongs to that block, then decode that exact slice.
+The count passed to `finish_block` is relative to the final frame, not the
+accumulated block. Return to packet dispatch without reading the next frame or
+packet. Core rejects zero-plaintext frames; they are not end-of-input markers. Bound
+the accumulated body and transport buffers according to the engine's resource
+policy as well as honoring core's per-frame size checks.
+
+Confirmed at `v26.8.1.2041-lts`, `TCPHandler::sendData`, `sendTotals`, and
+`sendExtremes` in `src/Server/TCPHandler.cpp`, and `Connection::sendData` in
+`src/Client/Connection.cpp`, flush the compression buffer after writing each
+Native block. A large block can occupy multiple frames; a frame never spans
+two TCP blocks. Requiring zero leftover plaintext at block end is the derived
+reader check for this server behavior. HTTP `compress=1` enables output
+auto-flush after each chunk, so default HTTP output also aligns frames with
+blocks. Confirmed `HTTPHandler::Output::pushDelayedResults` in
+`src/Server/HTTPHandler.cpp` copies buffered chunks together into the compressor
+with `wait_end_of_query=1` or `http_response_buffer_size>0`. HTTP readers must
+therefore accept a continuous compressed stream with frames crossing Native
+block boundaries and must not apply the TCP check.
+
+For inserts, pass each encoded Native block separately to
+`compression::compress_lz4_frames(&native, 1_048_576)`. This bounds each
+frame's plaintext to 1 MiB and flushes at the block boundary. For a caller
+that already splits its input, `write_lz4_frame` appends a single frame to an
+existing output buffer. Empty end markers are encoded Native blocks with
+nonempty bytes; an empty byte slice is not a valid compression frame.
 
 ## Output Model
 
@@ -232,7 +295,13 @@ let body = encode_chunked(&chunked_batch, &options)?;
 
 Send those bytes as the body of an `INSERT INTO t FORMAT Native` request. Notes for a binding:
 
-- Protocol revision: use `0` for the HTTP `INSERT ... FORMAT Native` path. The server parses that body at revision 0, so encode writes no `BlockInfo` preamble and no per-column marker, and the stream ends at EOF. It must match the revision the server reads with, the same rule as decode. There is no TCP insert engine and no compression framing in the core yet, so the binding still owns transport, request framing, and any compression.
+- Protocol revision: use `0` for the HTTP `INSERT ... FORMAT Native` path. The
+  server parses that body at revision 0, so encode writes no `BlockInfo`
+  preamble and no per-column marker, and the stream ends at EOF. For TCP, use
+  the connection's effective revision. Frame each encoded block separately
+  when compression is enabled, including the empty end marker. Packet codes
+  and block names stay outside the compressed envelope. Transport and packet
+  framing remain the client's responsibility.
 - Coverage: encode is at full type parity with decode. Every type the crate decodes it also encodes, so a batch the core produced round-trips back to Native bytes. Only a type the decoder itself does not support returns `EncodeError::UnsupportedType`.
 - Validation: the input is your in-memory buffers, not wire bytes, but encode still validates the whole batch before writing anything and returns `EncodeError::InconsistentBatch` on a malformed column (wrong length, bad offsets, width mismatch, out-of-range `LowCardinality` index, a null in a non-nullable column). A rejected batch produces no partial bytes.
 - Round trip: `decode(encode(x))` reproduces the buffers. The "Encoding" section of `CODEC_CONTRACT.md` has the precise preconditions, encoder choices, and round-trip guarantees.
@@ -241,7 +310,8 @@ Send those bytes as the body of an `INSERT INTO t FORMAT Native` request. Notes 
 
 The core stops at typed buffers plus ClickHouse logical type metadata. The binding will need to own:
 
-- Transport, decompression, streaming, cancellation, retries, and backpressure.
+- Transport, HTTP transport decompression, streaming, cancellation, retries,
+  and backpressure.
 - Public client API shape.
 - Host scalar mapping, for example `UInt64` as Python `int` or JavaScript `BigInt`.
 - Temporal presentation, for example how to apply a `DateTime` timezone or whether `DateTime64` becomes a host datetime object.

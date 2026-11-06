@@ -115,11 +115,12 @@ Implemented:
 - Malformed-input hardening: untrusted wire bytes return errors, never panic.
 - Encode every supported column back to Native block bytes for `INSERT`
   (`native::encode`); accepted by a live server over HTTP.
+- Decode ClickHouse compression frames with LZ4 or NONE and verify CityHash128
+  checksums. Encode LZ4 frames for inserts, with no runtime dependencies.
 
 Not implemented yet:
 
 - TCP/native protocol packet framing.
-- Compression framing.
 - Language-specific materialization policy (bindings own this, by design).
 
 ## Supported types
@@ -156,8 +157,8 @@ Unsupported types raise a decode error rather than guessing.
 
 In rough priority order:
 
-1. Sparse column serialization.
-2. Compression framing: LZ4, then ZSTD.
+1. Sparse and replicated column serialization.
+2. ZSTD compression support, deferred under the zero-dependency policy.
 3. Per-runtime zero-copy adapters: JS `TypedArray` over an external
    `ArrayBuffer`, NumPy export that does not route through Arrow.
 4. Insert-path completion: a streaming/sink encode API. Type parity is kept as
@@ -214,6 +215,7 @@ block bytes for `INSERT` with `native::encode::encode_block` or
 - `src/batch.rs` - `ColBatch` and `ChunkedBatch` result model.
 - `src/bitmap.rs` - validity bitmap conversion and storage.
 - `src/native/` - Native-format varints, block decode, stream decode, and block encode.
+- `src/compression/` - ClickHouse compression frames, CityHash128, and LZ4.
 - `src/ffi/mod.rs` - Arrow C Data Interface export.
 
 ## Testing
@@ -243,7 +245,7 @@ version and first-byte hexdumps.
 
 A working core under active development. The API is not yet stable. Decode and
 encode are at type parity, both verified against a live ClickHouse server. Not
-yet implemented: compression framing and the native TCP protocol; a
+yet implemented: the native TCP packet protocol; a
 streaming/sink encode API is future work. Releases are tagged and semver'd, each
 recorded in `CHANGELOG.md`. `ARCHITECTURE.md` describes how the pieces fit
 together.

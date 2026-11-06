@@ -2,6 +2,7 @@ use ch_core_rs::batch::ChunkedBatch;
 use ch_core_rs::column::{
     Column, DynamicChild, FixedBinaryColumn, JsonBody, JsonColumn, StructuredJson, Utf8Column,
 };
+use ch_core_rs::compression::{decompress_native_stream, ChecksumMode};
 use ch_core_rs::native::decode::{decode_all_bytes, DecodeOptions, DBMS_TCP_PROTOCOL_VERSION};
 use ch_core_rs::schema::{
     ChType, GeoKind, IntervalKind, QBitElementType, JSON_DEFAULT_MAX_DYNAMIC_PATHS,
@@ -61,6 +62,11 @@ fixture_tests! {
         protocol_revision: DBMS_TCP_PROTOCOL_VERSION,
         assert: assert_all_types,
     },
+    all_types_rev54460: {
+        file: "all_types_rev54460.native",
+        protocol_revision: 54460,
+        assert: assert_all_types,
+    },
     multi_block_rev0: {
         file: "multi_block_rev0.native",
         protocol_revision: 0,
@@ -76,6 +82,17 @@ fixture_tests! {
         protocol_revision: 0,
         assert: assert_json_flattened,
     },
+}
+
+#[test]
+fn all_types_rev54460_compressed() {
+    let compressed = include_bytes!("fixtures/all_types_rev54460.lz4");
+    let plain = decompress_native_stream(compressed, ChecksumMode::Verify).unwrap();
+    assert_eq!(plain, include_bytes!("fixtures/all_types_rev54460.native"));
+    let mut options = DecodeOptions::default();
+    options.protocol_revision = 54460;
+    let batch = decode_all_bytes(&plain, &options).unwrap();
+    assert_all_types(&batch);
 }
 
 /// `output_format_native_write_json_as_string=1` (STRING mode): the JSON column
