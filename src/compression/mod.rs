@@ -735,6 +735,32 @@ mod tests {
     }
 
     #[test]
+    fn lz4_frame_appends_amortize_capacity_growth() {
+        const FRAME_COUNT: usize = 64;
+        let raw = vec![0x79; 4096];
+        let frame = compress_lz4_frame(&raw).unwrap();
+        let mut out = Vec::new();
+        let mut capacity_changes = 0;
+
+        for _ in 0..FRAME_COUNT {
+            let capacity = out.capacity();
+            let info = decompress_frame_into(&frame, ChecksumMode::Verify, &mut out).unwrap();
+            assert_eq!(info.consumed(), frame.len());
+            assert_eq!(info.plaintext_len(), raw.len());
+            capacity_changes += usize::from(out.capacity() != capacity);
+        }
+
+        assert_eq!(out.len(), FRAME_COUNT * raw.len());
+        assert!(out.chunks_exact(raw.len()).all(|chunk| chunk == raw));
+        // A performance regression guard for supported toolchains, not a
+        // promise about Vec's exact growth factor or allocator behavior.
+        assert!(
+            capacity_changes <= 8,
+            "64 frame appends grew capacity {capacity_changes} times"
+        );
+    }
+
+    #[test]
     fn one_frame_leaves_following_packet_bytes_untouched() {
         let raw = b"one Native block";
         let frame_bytes = frame_block(METHOD_NONE, raw.len() as u32, raw);

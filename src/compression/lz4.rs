@@ -25,8 +25,8 @@
 //! `Vec`'s length as an initialized frontier a little ahead of the write
 //! position, zero-filling it in small windows. Long literal runs and long
 //! matches are appended at the frontier without any fill. The frontier never
-//! passes the block's declared end, so no byte beyond `uncompressed_size` is
-//! ever allocated, written, or observable.
+//! passes the block's declared end, so no byte beyond that end is initialized,
+//! written, or exposed as output.
 //!
 //! The decoder has two sequence paths, the hot slice loop
 //! (`decode_initialized`) and the cold `Vec`-level step
@@ -68,7 +68,7 @@ const FILL_WINDOW: usize = 4096;
 /// is the exact decompressed length from the block header. On success the
 /// returned `Vec` has exactly `uncompressed_size` bytes.
 ///
-/// The output is allocated with `uncompressed_size` capacity. The server
+/// The output is allocated with at least `uncompressed_size` capacity. The server
 /// reserves an extra `ADDITIONAL_BYTES_AT_END_OF_BUFFER` (64) for its wide
 /// SIMD tail overwrite. This decoder falls back to exact copies within the last
 /// few bytes of the block instead, so it needs no slack.
@@ -110,7 +110,7 @@ fn decompress_block_into_windowed<const W: usize>(
     }
 
     let base = out.len();
-    out.try_reserve_exact(uncompressed_size)
+    out.try_reserve(uncompressed_size)
         .map_err(|_| CompressionError::AllocationFailed {
             requested: uncompressed_size,
         })?;
