@@ -251,12 +251,18 @@ fn seeded_random_chunking_is_split_independent_for_every_fixture_stream() {
 /// what the client wrote. Like a real server, each server segment becomes
 /// readable only after the client wrote the bytes it answers. Every other
 /// read fails with `Interrupted` first, as a signal would.
+///
+/// With `buffered`, writes stay in `unflushed` until `flush`, like a
+/// `BufWriter`, and only flushed bytes count toward a segment's gate.
 struct ReplaySocket {
     /// `(client bytes written before this is readable, server bytes)`.
     segments: Vec<(usize, Vec<u8>)>,
     read_size: usize,
+    /// Bytes the server has received.
     written: Vec<u8>,
     interrupt: bool,
+    buffered: bool,
+    unflushed: Vec<u8>,
 }
 
 impl Read for ReplaySocket {
@@ -269,6 +275,11 @@ impl Read for ReplaySocket {
             return Ok(0);
         };
         if self.written.len() < *gate {
+            // A real server would never answer, so the client would hang.
+            assert!(
+                self.written.len() + self.unflushed.len() < *gate,
+                "client read while its request was buffered but not flushed"
+            );
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "client read before writing the request",
@@ -286,11 +297,16 @@ impl Read for ReplaySocket {
 
 impl Write for ReplaySocket {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.written.extend_from_slice(bytes);
+        if self.buffered {
+            self.unflushed.extend_from_slice(bytes);
+        } else {
+            self.written.extend_from_slice(bytes);
+        }
         Ok(bytes.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        self.written.append(&mut self.unflushed);
         Ok(())
     }
 }
@@ -317,7 +333,19 @@ fn replay_socket(read_size: usize, segments: Vec<(usize, Vec<u8>)>) -> ReplaySoc
         read_size,
         written: Vec::new(),
         interrupt: false,
+        buffered: false,
+        unflushed: Vec::new(),
     }
+}
+
+fn capture_segments() -> Vec<(usize, Vec<u8>)> {
+    vec![
+        (CLIENT_HELLO.len(), SERVER_HELLO.to_vec()),
+        (
+            CLIENT_HELLO.len() + ADDENDUM.len() + PING.len(),
+            PONG.to_vec(),
+        ),
+    ]
 }
 
 const READ_SIZES: [usize; 4] = [1, 3, 7, SERVER_HELLO.len()];
@@ -326,16 +354,7 @@ const READ_SIZES: [usize; 4] = [1, 3, 7, SERVER_HELLO.len()];
 #[test]
 fn readme_connect_replays_the_capture_with_partial_reads() {
     for read_size in READ_SIZES {
-        let mut socket = replay_socket(
-            read_size,
-            vec![
-                (CLIENT_HELLO.len(), SERVER_HELLO.to_vec()),
-                (
-                    CLIENT_HELLO.len() + ADDENDUM.len() + PING.len(),
-                    PONG.to_vec(),
-                ),
-            ],
-        );
+        let mut socket = replay_socket(read_size, capture_segments());
         let connection = connect(&mut socket, config("default"))
             .unwrap_or_else(|error| panic!("read size {read_size}: {error}"));
         assert_eq!(connection.state(), State::Ready, "read size {read_size}");
@@ -396,4 +415,64 @@ fn readme_connect_reports_the_captured_authentication_failure() {
         assert!(message.contains("Authentication failed"), "{message}");
         assert_eq!(socket.written, FAILED_CLIENT_HELLO, "read size {read_size}");
     }
+}
+
+/// Copilot on PR #9: over a buffered stream, a request left unflushed while
+/// `read` waits for the reply would hang the connection. The socket panics
+/// if `connect` reads past a request it buffered but did not flush.
+#[test]
+fn readme_connect_flushes_every_request_on_a_buffered_stream() {
+    for read_size in READ_SIZES {
+        let mut socket = replay_socket(read_size, capture_segments());
+        socket.buffered = true;
+        let connection = connect(&mut socket, config("default"))
+            .unwrap_or_else(|error| panic!("read size {read_size}: {error}"));
+        assert_eq!(connection.state(), State::Ready, "read size {read_size}");
+        assert!(socket.unflushed.is_empty(), "read size {read_size}");
+        assert_eq!(
+            socket.written,
+            [CLIENT_HELLO, ADDENDUM, PING].concat(),
+            "read size {read_size}"
+        );
+    }
+}
+
+/// Copilot on PR #9: a non-conforming peer sends Server Hello and the start
+/// of an Exception together, before the addendum. A conforming server cannot:
+/// at v26.8.1.2041-lts `TCPHandler::runImpl` calls `sendHello` and then
+/// blocks in `receiveAddendum`. `connect` must defer the Ping rather than
+/// fail, still send the addendum, and report the server's error.
+#[test]
+fn readme_connect_defers_the_ping_behind_a_partial_exception() {
+    const HEAD: usize = 5;
+    let first = [SERVER_HELLO, &AUTH_EXCEPTION[..HEAD]].concat();
+    let mut deferred = 0;
+    for read_size in [1, 3, 7, SERVER_HELLO.len(), first.len(), 8192] {
+        let mut socket = replay_socket(
+            read_size,
+            vec![
+                (CLIENT_HELLO.len(), first.clone()),
+                (
+                    CLIENT_HELLO.len() + ADDENDUM.len(),
+                    AUTH_EXCEPTION[HEAD..].to_vec(),
+                ),
+            ],
+        );
+        let error = connect(&mut socket, config("default"))
+            .expect_err("the server Exception must be reported");
+        let message = error.to_string();
+        assert!(message.contains("516"), "read size {read_size}: {message}");
+
+        // The Ping goes out only if the read that completed the Hello held
+        // no Exception bytes, which happens when it ends on the Hello.
+        let pinged = SERVER_HELLO.len() % read_size == 0;
+        deferred += usize::from(!pinged);
+        let expected = if pinged {
+            [CLIENT_HELLO, ADDENDUM, PING].concat()
+        } else {
+            [CLIENT_HELLO, ADDENDUM].concat()
+        };
+        assert_eq!(socket.written, expected, "read size {read_size}");
+    }
+    assert!(deferred > 0, "no read size exercised the deferred Ping");
 }

@@ -4,8 +4,10 @@ fn connect<S: Read + Write>(
     hello: ClientHello,
 ) -> Result<Connection, Box<dyn std::error::Error>> {
     let mut connection = Connection::new(hello)?;
-    // The Client Hello, which holds the password until taken.
+    // The Client Hello, which holds the password until taken. Flush so a
+    // buffered stream does not hold it while `read` waits for the reply.
     socket.write_all(&connection.take_output())?;
+    socket.flush()?;
 
     let mut buffer = [0_u8; 8192];
     let mut pinged = false;
@@ -45,10 +47,18 @@ fn connect<S: Read + Write>(
             return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
         }
         if connection.state() == State::Ready && !pinged {
-            connection.ping()?;
-            pinged = true;
+            // In `Ready`, `InvalidState` means a server packet is partly
+            // received, so retry after the next read. A conforming server
+            // sends nothing after its Hello until it has read the addendum,
+            // so this only guards against non-conforming peers.
+            match connection.ping() {
+                Ok(()) => pinged = true,
+                Err(ProtocolError::InvalidState { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
-        // After the Server Hello: the addendum, then the Ping.
+        // After the Server Hello: the addendum, then the Ping once sent.
         socket.write_all(&connection.take_output())?;
+        socket.flush()?;
     }
 }
