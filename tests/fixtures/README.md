@@ -209,3 +209,42 @@ It passed against the pinned local server on 2026-11-05. The test defaults to
 `CLICKHOUSE_CONNECT_TEST_HOST`, `CLICKHOUSE_CONNECT_TEST_PORT`,
 `CLICKHOUSE_CONNECT_TEST_USER`, and `CLICKHOUSE_CONNECT_TEST_PASSWORD`
 variables as the other live acceptance tests.
+
+## Revision 54460 handshake and ping
+
+These bytes were captured on 2026-11-06 from `127.0.0.1`, with `no_proxy`
+set and HTTP proxies bypassed, against `26.8.1.2041` and source tag
+`v26.8.1.2041-lts`. The `ch-tcp-proto` replay tests use them without sockets.
+
+| File | Bytes | First bytes | Content |
+|------|-------|-------------|---------|
+| `tcp_handshake_client_hello_rev54460.packet` | 42 | `00 19 63 68 2d 63 6f 72` | Client Hello, user `default`, empty password |
+| `tcp_handshake_server_hello_rev54460.packet` | 35 | `00 0a 43 6c 69 63 6b 48` | Server Hello, advertised revision 54492, effective revision 54460 |
+| `tcp_handshake_addendum_rev54460.bytes` | 1 | `00` | Empty quota-key string, no packet tag |
+| `tcp_ping_client_rev54460.packet` | 1 | `04` | Ping after the addendum |
+| `tcp_ping_server_rev54460.packet` | 1 | `04` | Pong |
+| `tcp_handshake_exception_client_rev54460.packet` | 73 | `00 19 63 68 2d 63 6f 72` | Client Hello with a deliberately nonexistent user |
+| `tcp_handshake_exception_server_rev54460.packet` | 1411 | `02 04 02 00 00 0d 44 42` | Authentication Exception, code 516 |
+| `tcp_handshake_rev54460.json` | variable | JSON | Capture metadata, decoded fields, sizes and SHA-256 hashes |
+
+Regenerate using Python's standard library:
+
+```sh
+no_proxy=127.0.0.1 NO_PROXY=127.0.0.1 python3 scripts/gen_tcp_handshake_fixtures.py
+```
+
+The script checks the exact HTTP server version, TCP Hello version and
+`.server-ref` before writing. It uses `default` with an empty password for
+success and `ch_core_handshake_fixture_missing_user` with an empty password
+for the failure. It records the bytes as received, including the server's
+display name and exception stack trace. These can change between captures,
+so the replay tests assert only that the display name is non-empty and that the
+stack trace mentions `receiveHello`. The JSON manifest records the captured
+values for reference.
+
+The matching server source confirms these layouts in
+`src/Server/TCPHandler.cpp`, `TCPHandler::receiveHello`, `sendHello`,
+`receiveAddendum`, and `sendException`; `src/Core/Protocol.h`; and
+`src/IO/WriteHelpers.cpp`, `writeException`. All Hello fields after the raw
+server revision are parsed using effective revision 54460. Fields introduced
+at 54461 and above are absent even though the server advertises 54492.

@@ -1,0 +1,70 @@
+{
+  "captured_on": "2026-11-06",
+  "server_version": "26.8.1.2041",
+  "source_tag": "v26.8.1.2041-lts",
+  "declared_revision": 54460,
+  "client_name": "ch-core-handshake-fixture",
+  "client_version": {
+    "major": 26,
+    "minor": 8
+  },
+  "database": "",
+  "success_user": "default",
+  "password": "",
+  "missing_user": "ch_core_handshake_fixture_missing_user",
+  "quota_key": "",
+  "server_hello": {
+    "name": "ClickHouse",
+    "major": 26,
+    "minor": 8,
+    "patch": 1,
+    "revision": 54492,
+    "effective_revision": 54460,
+    "timezone": "UTC",
+    "display_name": "16defa1b2280"
+  },
+  "exception": {
+    "code": 516,
+    "name": "DB::Exception",
+    "message": "DB::Exception: ch_core_handshake_fixture_missing_user: Authentication failed: password is incorrect, or there is no user with such name",
+    "stack_trace_bytes": 1252,
+    "has_nested": false
+  },
+  "files": {
+    "tcp_handshake_client_hello_rev54460.packet": {
+      "length": 42,
+      "sha256": "c98d9f32f321498a11f28a2d9250130c90bcd09a47974c98830338bd9e825817",
+      "first_bytes": "00 19 63 68 2d 63 6f 72 65 2d 68 61 6e 64 73 68"
+    },
+    "tcp_handshake_server_hello_rev54460.packet": {
+      "length": 35,
+      "sha256": "f812639081062d6e1540041c31762455b25c11630247142ce0e78f3ca5a4e80c",
+      "first_bytes": "00 0a 43 6c 69 63 6b 48 6f 75 73 65 1a 08 dc a9"
+    },
+    "tcp_handshake_addendum_rev54460.bytes": {
+      "length": 1,
+      "sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+      "first_bytes": "00"
+    },
+    "tcp_ping_client_rev54460.packet": {
+      "length": 1,
+      "sha256": "e52d9c508c502347344d8c07ad91cbd6068afc75ff6292f062a09ca381c89e71",
+      "first_bytes": "04"
+    },
+    "tcp_ping_server_rev54460.packet": {
+      "length": 1,
+      "sha256": "e52d9c508c502347344d8c07ad91cbd6068afc75ff6292f062a09ca381c89e71",
+      "first_bytes": "04"
+    },
+    "tcp_handshake_exception_client_rev54460.packet": {
+      "length": 73,
+      "sha256": "92af67dcbfbb76b11f6456b266b473d9ac25618a7ae004bc5bba45ebd5060830",
+      "first_bytes": "00 19 63 68 2d 63 6f 72 65 2d 68 61 6e 64 73 68"
+    },
+    "tcp_handshake_exception_server_rev54460.packet": {
+      "length": 1411,
+      "sha256": "432b2476b93b50d5b6dea3bc20a04340e93084e89497a33f230e96c85b50ff52",
+      "first_bytes": "02 04 02 00 00 0d 44 42 3a 3a 45 78 63 65 70 74"
+    }
+  }
+}

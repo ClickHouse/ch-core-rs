@@ -210,6 +210,11 @@ block bytes for `INSERT` with `native::encode::encode_block` or
 
 ## Repo layout
 
+The root package remains `ch-core-rs`. The workspace also contains
+[`ch-tcp-proto`](crates/ch-tcp-proto/README.md), a sans-I/O TCP protocol engine.
+Its current scope is the revision-54460 handshake and Ping/Pong. The engine
+depends on core; core has no runtime dependencies.
+
 - `src/schema.rs` - ClickHouse logical type model.
 - `src/column.rs` - Arrow-compatible physical column buffers.
 - `src/batch.rs` - `ColBatch` and `ChunkedBatch` result model.
@@ -223,6 +228,8 @@ block bytes for `INSERT` with `native::encode::encode_block` or
 ```sh
 cargo test
 ```
+
+The default workspace members include both crates, so this command tests both.
 
 Decode logic is tested two ways: synthesized wire bytes in unit tests, and
 committed `FORMAT Native` fixture bytes captured from a live ClickHouse server

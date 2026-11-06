@@ -1,3 +1,11 @@
+[workspace]
+members = ["crates/ch-tcp-proto"]
+default-members = [".", "crates/ch-tcp-proto"]
+resolver = "2"
+# Agent worktrees under .claude/worktrees are full checkouts with their own
+# root manifest. Exclude them so Cargo does not treat them as members.
+exclude = [".claude"]
+
 [package]
 name = "ch-core-rs"
 version = "0.2.1"
