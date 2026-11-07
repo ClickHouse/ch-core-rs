@@ -219,7 +219,7 @@ fn server_hello_is_incremental_and_queues_addendum() {
     assert_eq!(engine.take_output(), [0]);
     assert_eq!(
         events(&mut engine),
-        [Event::ServerHello(ServerHello {
+        [Event::ServerHello(Box::new(ServerHello {
             server_name: "ClickHouse".to_owned(),
             version_major: 26,
             version_minor: 8,
@@ -228,7 +228,7 @@ fn server_hello_is_incremental_and_queues_addendum() {
             timezone: "UTC".to_owned(),
             display_name: "server".to_owned(),
             version_patch: 1,
-        })]
+        }))]
     );
 }
 
@@ -269,7 +269,7 @@ fn server_hello_literal_bytes_per_boundary() {
         engine.feed(&[PREFIX, encoded, tail].concat()).unwrap();
         assert_eq!(
             events(&mut engine),
-            [Event::ServerHello(ServerHello {
+            [Event::ServerHello(Box::new(ServerHello {
                 server_name: "ClickHouse".to_owned(),
                 version_major: 26,
                 version_minor: 8,
@@ -278,7 +278,7 @@ fn server_hello_literal_bytes_per_boundary() {
                 timezone: timezone.to_owned(),
                 display_name: display_name.to_owned(),
                 version_patch,
-            })],
+            }))],
             "revision {revision}"
         );
         assert_eq!(engine.take_output(), addendum, "revision {revision}");
@@ -319,10 +319,9 @@ fn rejects_overflowing_varuint() {
         let mut engine = engine();
         assert_eq!(engine.feed(&bytes), Err(ProtocolError::InvalidVarUInt));
         assert_eq!(engine.state(), PROTOCOL_FAILED);
-        assert!(matches!(
-            engine.finish(),
-            Err(ProtocolError::InvalidState { .. })
-        ));
+        // EOF after a protocol failure reports the original cause.
+        assert_eq!(engine.finish(), Err(ProtocolError::InvalidVarUInt));
+        assert_eq!(engine.finish(), Err(ProtocolError::InvalidVarUInt));
     }
 }
 
@@ -366,15 +365,35 @@ fn ping_requires_ready_and_pong_returns_to_ready() {
         Err(ProtocolError::InvalidState { .. })
     ));
     engine.feed(&server_hello(ENGINE_REVISION)).unwrap();
+    assert_eq!(
+        engine.ping(),
+        Err(ProtocolError::InvalidState {
+            operation: "send Ping before draining completed events",
+            state: State::Ready,
+        })
+    );
+    assert!(matches!(
+        events(&mut engine).as_slice(),
+        [Event::ServerHello(_)]
+    ));
     engine.ping().unwrap();
     assert_eq!(engine.state(), State::AwaitingPong);
     assert_eq!(engine.take_output(), [0, CLIENT_PACKET_PING as u8]);
     engine.feed(&[SERVER_PACKET_PONG as u8]).unwrap();
     assert_eq!(engine.state(), State::Ready);
-    assert!(matches!(
-        events(&mut engine).as_slice(),
-        [Event::ServerHello(_), Event::Pong]
-    ));
+    assert_eq!(events(&mut engine), [Event::Pong]);
+}
+
+#[test]
+fn effective_revision_is_known_after_the_server_hello() {
+    let mut engine = engine();
+    assert_eq!(engine.effective_revision(), None);
+    engine.feed(&server_hello(54_492)).unwrap();
+    assert_eq!(engine.effective_revision(), Some(ENGINE_REVISION));
+
+    let mut old = Connection::new(client_hello()).unwrap();
+    old.feed(&server_hello(54_459)).unwrap();
+    assert_eq!(old.effective_revision(), Some(54_459));
 }
 
 /// W1: a Pong whose packet code straddles a `ping` call must not be taken as
@@ -467,14 +486,14 @@ fn exception_is_an_event_and_terminal() {
     assert_eq!(engine.state(), EXCEPTION_FAILED);
     assert_eq!(
         events(&mut engine),
-        [Event::Exception(ServerException {
+        [Event::Exception(Box::new(ServerException {
             code: 516,
             name: "DB::Exception".to_owned(),
             message: "Authentication failed".to_owned(),
             stack_trace: "stack".to_owned(),
             has_nested: true,
             truncated: false,
-        })]
+        }))]
     );
     assert!(matches!(
         engine.ping(),
@@ -495,7 +514,7 @@ fn exception_is_accepted_in_ready_and_while_awaiting_pong() {
         assert_eq!(engine.state(), EXCEPTION_FAILED, "ping {ping}");
         assert!(matches!(
             events(&mut engine).as_slice(),
-            [Event::Exception(ServerException { code: 516, .. })]
+            [Event::Exception(error)] if error.code == 516
         ));
         assert_eq!(engine.finish(), Ok(()));
     }
@@ -544,7 +563,7 @@ fn exception_with_trailing_bytes_is_split_independent() {
             assert_eq!(whole.state_after_finish, EXCEPTION_FAILED);
             assert!(matches!(
                 whole.events.last(),
-                Some(Event::Exception(ServerException { code: 516, .. }))
+                Some(Event::Exception(error)) if error.code == 516
             ));
 
             for split in 0..=stream.len() {
@@ -720,7 +739,7 @@ fn ping_is_rejected_while_an_exception_is_pending() {
     assert_eq!(engine.state(), EXCEPTION_FAILED);
     assert!(matches!(
         events(&mut engine).as_slice(),
-        [Event::Exception(ServerException { code: 516, .. })]
+        [Event::Exception(error)] if error.code == 516
     ));
 }
 
@@ -808,14 +827,7 @@ fn large_chunk_with_complete_packets_is_not_rejected_for_size() {
     assert_eq!(engine.feed(&stream), Ok(()));
     assert!(matches!(
         events(&mut engine).as_slice(),
-        [
-            Event::ServerHello(_),
-            Event::Exception(ServerException {
-                code: 79,
-                truncated: true,
-                ..
-            })
-        ]
+        [Event::ServerHello(_), Event::Exception(error)] if error.code == 79 && error.truncated
     ));
     assert_eq!(
         engine.finish(),
@@ -888,4 +900,855 @@ fn drained_large_input_buffer_is_shrunk() {
     assert!(engine.input.capacity() <= INPUT_SHRINK_THRESHOLD);
     engine.feed(&packet[stack_start + 3..]).unwrap();
     assert_eq!(engine.state(), EXCEPTION_FAILED);
+}
+
+// ---------------------------------------------------------------------------
+// Query
+// ---------------------------------------------------------------------------
+
+fn framed_int64_block(values: &[i64]) -> Vec<u8> {
+    let mut bytes = vec![1, 0, 2];
+    bytes.extend_from_slice(&(-1_i32).to_le_bytes());
+    bytes.push(0);
+    put_varuint(&mut bytes, 1);
+    put_varuint(&mut bytes, values.len() as u64);
+    put_string(&mut bytes, "n");
+    put_string(&mut bytes, "Int64");
+    bytes.push(0); // default custom serialization
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+fn framed_empty_block() -> Vec<u8> {
+    let mut bytes = vec![1, 0, 2];
+    bytes.extend_from_slice(&(-1_i32).to_le_bytes());
+    bytes.extend_from_slice(&[0, 0, 0]);
+    bytes
+}
+
+fn data_packet(block: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![SERVER_PACKET_DATA as u8, 0];
+    bytes.extend_from_slice(block);
+    bytes
+}
+
+fn framed_string_block(length: usize) -> Vec<u8> {
+    let mut bytes = vec![1, 0, 2];
+    bytes.extend_from_slice(&(-1_i32).to_le_bytes());
+    bytes.push(0);
+    put_varuint(&mut bytes, 1);
+    put_varuint(&mut bytes, 1);
+    put_string(&mut bytes, "s");
+    put_string(&mut bytes, "String");
+    bytes.push(0);
+    put_varuint(&mut bytes, length as u64);
+    bytes.resize(bytes.len() + length, b'x');
+    bytes
+}
+
+fn framed_array_string_block(elements: usize, string_length: usize) -> Vec<u8> {
+    let mut bytes = vec![1, 0, 2];
+    bytes.extend_from_slice(&(-1_i32).to_le_bytes());
+    bytes.push(0);
+    put_varuint(&mut bytes, 1);
+    put_varuint(&mut bytes, 1);
+    put_string(&mut bytes, "items");
+    put_string(&mut bytes, "Array(String)");
+    bytes.push(0);
+    bytes.extend_from_slice(&(elements as u64).to_le_bytes());
+    for _ in 0..elements {
+        put_varuint(&mut bytes, string_length as u64);
+        bytes.resize(bytes.len() + string_length, b'x');
+    }
+    bytes
+}
+
+#[test]
+fn query_parameter_is_one_quoting_layer_over_http_param_text() {
+    // The value is HTTP `param_` text. The engine adds exactly one String
+    // Field quoting layer, which `readQueryParameters` undoes at
+    // v26.8.1.2041-lts. Containers and `\N` must reach the server verbatim.
+    let cases: [(&str, &[u8]); 5] = [
+        ("a\\tb", b"'a\\\\tb'"),
+        ("it's \\\\", b"'it\\'s \\\\\\\\'"),
+        ("\\N", b"'\\\\N'"),
+        ("['user_1','user_2']", b"'[\\'user_1\\',\\'user_2\\']'"),
+        ("{'k1':13}", b"'{\\'k1\\':13}'"),
+    ];
+    for (value, quoted) in cases {
+        let mut engine = ready_engine();
+        engine
+            .query(Query::new("SELECT {p:String}").with_parameter("p", value))
+            .unwrap();
+        let output = engine.take_output();
+        let mut expected = Vec::new();
+        put_string(&mut expected, "p");
+        put_varuint(&mut expected, 2);
+        put_varuint(&mut expected, quoted.len() as u64);
+        expected.extend_from_slice(quoted);
+        put_string(&mut expected, "");
+        assert!(
+            output
+                .windows(expected.len())
+                .any(|window| window == expected.as_slice()),
+            "{value:?}"
+        );
+    }
+}
+
+#[test]
+fn query_queues_request_and_filters_tcp_empty_data_sentinel() {
+    let mut engine = ready_engine();
+    engine
+        .query(
+            Query::new("SELECT {value:String}")
+                .with_query_id("query_13")
+                .with_parameter("value", "user_\\'1\\n"),
+        )
+        .unwrap();
+    assert_eq!(engine.state(), State::Querying);
+    let output = engine.take_output();
+    assert!(output.starts_with(&[CLIENT_PACKET_QUERY as u8]));
+    assert!(output
+        .windows(b"'user_\\\\\\'1\\\\n'".len())
+        .any(|window| window == b"'user_\\\\\\'1\\\\n'"));
+    assert!(output.ends_with(&[
+        CLIENT_PACKET_DATA as u8,
+        0,
+        1,
+        0,
+        2,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0,
+        0,
+        0,
+    ]));
+
+    let block = framed_int64_block(&[13, 79]);
+    let mut response = data_packet(&block);
+    response.extend(data_packet(&framed_empty_block()));
+    response.push(SERVER_PACKET_END_OF_STREAM as u8);
+    for byte in response {
+        engine.feed(&[byte]).unwrap();
+    }
+    assert_eq!(
+        events(&mut engine),
+        [Event::Data(block), Event::EndOfStream]
+    );
+    assert_eq!(engine.state(), State::Ready);
+}
+
+#[test]
+fn query_result_packets_are_split_independent_and_typed() {
+    let mut block = framed_int64_block(&[13]);
+    // Valid non-canonical two-byte encoding of BlockInfo field 1. Splitting
+    // between these bytes must remain "partial block", not "clean boundary".
+    block.splice(0..1, [0x81, 0x00]);
+    let mut response = data_packet(&block);
+    response.extend_from_slice(&[SERVER_PACKET_PROGRESS as u8, 1, 2, 3, 4, 5, 6]);
+    response.extend_from_slice(&[SERVER_PACKET_PROFILE_INFO as u8, 1, 2, 3, 1, 4, 1]);
+    response.push(SERVER_PACKET_END_OF_STREAM as u8);
+
+    let run = |chunks: &[&[u8]]| {
+        let mut engine = ready_engine();
+        engine.query(Query::new("SELECT 13")).unwrap();
+        let _ = engine.take_output();
+        for chunk in chunks {
+            engine.feed(chunk).unwrap();
+        }
+        events(&mut engine)
+    };
+    let expected = run(&[&response]);
+    for split in 0..=response.len() {
+        assert_eq!(run(&[&response[..split], &response[split..]]), expected);
+    }
+    assert_eq!(
+        expected,
+        [
+            Event::Data(block),
+            Event::Progress(Progress {
+                read_rows: 1,
+                read_bytes: 2,
+                total_rows_to_read: 3,
+                written_rows: 4,
+                written_bytes: 5,
+                elapsed_ns: 6,
+            }),
+            Event::ProfileInfo(ProfileInfo {
+                rows: 1,
+                blocks: 2,
+                bytes: 3,
+                applied_limit: true,
+                rows_before_limit: 4,
+                unused_obsolete_field: true,
+            }),
+            Event::EndOfStream,
+        ]
+    );
+}
+
+#[test]
+fn query_exception_returns_to_ready_for_reuse() {
+    let mut engine = ready_engine();
+    engine.query(Query::new("SELECT throwIf(1)")).unwrap();
+    let _ = engine.take_output();
+    engine
+        .feed(&exception(79, b"DB::Exception", b"failed", b"", 0))
+        .unwrap();
+    assert_eq!(engine.state(), State::Ready);
+    assert!(matches!(
+        engine.poll_event(),
+        Some(Event::Exception(error)) if error.code == 79
+    ));
+    engine.query(Query::new("SELECT 13")).unwrap();
+    assert_eq!(engine.state(), State::Querying);
+}
+
+#[test]
+fn query_debug_redacts_parameter_values() {
+    let query = Query::new("SELECT {value:String}").with_parameter("value", "secret_13");
+    let debug = format!("{query:?}");
+    assert!(!debug.contains("secret_13"));
+    assert!(debug.contains("<redacted>"));
+}
+
+#[test]
+fn terminal_query_exceptions_fail_the_connection() {
+    for code in [99, 101, 720, 749] {
+        let mut engine = ready_engine();
+        engine.query(Query::new("SELECT 13")).unwrap();
+        engine
+            .feed(&exception(code, b"DB::Exception", b"terminal", b"", 0))
+            .unwrap();
+        assert_eq!(engine.state(), EXCEPTION_FAILED, "code {code}");
+    }
+}
+
+/// Code 115 is terminal only when it names a setting this query sent with
+/// `with_setting` (rejected by `BaseSettings::read` before the query context
+/// exists). The same code naming a SQL `SETTINGS` clause name is reusable,
+/// even when other settings were sent.
+#[test]
+fn unknown_setting_is_terminal_only_for_a_sent_setting() {
+    let cases: [(&[u8], State); 4] = [
+        (b"Unknown setting 'unknown_setting_13'", EXCEPTION_FAILED),
+        (
+            b"Unknown setting 'unknown_setting_13'. Maybe you meant ['x']",
+            EXCEPTION_FAILED,
+        ),
+        (b"Unknown setting 'from_sql_clause'", State::Ready),
+        (
+            b"Setting from_sql_clause is neither a builtin setting nor started with the prefix",
+            State::Ready,
+        ),
+    ];
+    for (message, state) in cases {
+        let mut engine = ready_engine();
+        engine
+            .query(
+                Query::new("SELECT 13 SETTINGS from_sql_clause = 1")
+                    .with_setting("max_threads", "1")
+                    .with_setting("unknown_setting_13", "1"),
+            )
+            .unwrap();
+        engine
+            .feed(&exception(115, b"DB::Exception", message, b"", 0))
+            .unwrap();
+        assert_eq!(
+            engine.state(),
+            state,
+            "{}",
+            String::from_utf8_lossy(message)
+        );
+    }
+
+    // Without wire settings, no 115 can be terminal.
+    let mut engine = ready_engine();
+    engine.query(Query::new("SELECT 13")).unwrap();
+    engine
+        .feed(&exception(
+            115,
+            b"DB::Exception",
+            b"Unknown setting 'unknown_setting_13'",
+            b"",
+            0,
+        ))
+        .unwrap();
+    assert_eq!(engine.state(), State::Ready);
+
+    // The names belong to one query: the next query's 115 is judged alone.
+    let _ = events(&mut engine);
+    engine.query(Query::new("SELECT 79")).unwrap();
+    engine.feed(&[SERVER_PACKET_END_OF_STREAM as u8]).unwrap();
+    let _ = events(&mut engine);
+    engine
+        .query(Query::new("SELECT 13").with_setting("max_threads", "1"))
+        .unwrap();
+    engine
+        .feed(&exception(
+            115,
+            b"DB::Exception",
+            b"Unknown setting 'unknown_setting_13'",
+            b"",
+            0,
+        ))
+        .unwrap();
+    assert_eq!(engine.state(), State::Ready);
+}
+
+/// Settings and parameters have no 64 KiB per-field limit: the server reads
+/// them with `readStringBinary` at its 1 GiB default. Only the 64 MiB packet
+/// bound applies.
+#[test]
+fn large_setting_and_parameter_values_are_accepted() {
+    let mut items = String::from("[");
+    let mut number = 0_u64;
+    while items.len() < 1024 * 1024 {
+        if number > 0 {
+            items.push(',');
+        }
+        items.push_str(&number.to_string());
+        number += 1;
+    }
+    items.push(']');
+    let long_setting = "x".repeat(CLIENT_HELLO_STRING_LIMIT + 1);
+    let mut engine = ready_engine();
+    engine
+        .query(
+            Query::new("SELECT {items:Array(UInt64)}")
+                .with_setting("log_comment", long_setting.as_str())
+                .with_parameter("items", items.as_str()),
+        )
+        .unwrap();
+    let output = engine.take_output();
+    assert!(output.len() > 1024 * 1024 + CLIENT_HELLO_STRING_LIMIT);
+    assert!(output
+        .windows(items.len())
+        .any(|window| window == items.as_bytes()));
+
+    let mut engine = ready_engine();
+    let huge = "1".repeat(QUERY_OUTPUT_LIMIT);
+    assert!(matches!(
+        engine.query(Query::new("SELECT {v:String}").with_parameter("v", huge)),
+        Err(ProtocolError::QueryOutputTooLarge { .. })
+    ));
+    assert!(engine.take_output().is_empty());
+    assert_eq!(engine.state(), State::Ready);
+}
+
+/// Round 4: setting names stay capped so `Unknown setting '<name>'` always
+/// fits in the 1 MiB of Exception message the engine keeps. Values are not.
+#[test]
+fn setting_names_over_the_cap_are_rejected() {
+    let at_cap = "n".repeat(SETTING_NAME_LIMIT);
+    let mut engine = ready_engine();
+    engine
+        .query(Query::new("SELECT 13").with_setting(at_cap.as_str(), "1"))
+        .unwrap();
+
+    let over = "n".repeat(SETTING_NAME_LIMIT + 1);
+    let mut engine = ready_engine();
+    assert_eq!(
+        engine.query(Query::new("SELECT 13").with_setting(over.as_str(), "1")),
+        Err(ProtocolError::StringTooLong {
+            field: "setting_name",
+            length: Some(SETTING_NAME_LIMIT + 1),
+            limit: SETTING_NAME_LIMIT,
+        })
+    );
+    assert!(engine.take_output().is_empty());
+    assert_eq!(engine.state(), State::Ready);
+
+    // A name at the cap still yields a terminal 115 the engine recognizes.
+    let mut engine = ready_engine();
+    engine
+        .query(Query::new("SELECT 13").with_setting(at_cap.as_str(), "1"))
+        .unwrap();
+    let message = format!("Unknown setting '{at_cap}'");
+    engine
+        .feed(&exception(
+            115,
+            b"DB::Exception",
+            message.as_bytes(),
+            b"",
+            0,
+        ))
+        .unwrap();
+    assert_eq!(engine.state(), EXCEPTION_FAILED);
+}
+
+/// The packet length is exact: a Query of exactly 64 MiB is accepted and one
+/// byte more is rejected with its true length.
+#[test]
+fn query_output_limit_is_exact() {
+    let engine = ready_engine();
+    let base = query_packet_len(&Query::new(""), &engine.identity, &engine.quota_key).unwrap();
+    let mut sql_len = QUERY_OUTPUT_LIMIT - base;
+    let length = |sql_len: usize| {
+        let query = Query::new("x".repeat(sql_len));
+        query_packet_len(&query, &engine.identity, &engine.quota_key).unwrap()
+    };
+    // The SQL length prefix grows by a few bytes; step back to fit exactly.
+    while length(sql_len) > QUERY_OUTPUT_LIMIT {
+        sql_len -= 1;
+    }
+    assert_eq!(length(sql_len), QUERY_OUTPUT_LIMIT);
+
+    let mut exact = ready_engine();
+    exact.query(Query::new("x".repeat(sql_len))).unwrap();
+    assert_eq!(exact.take_output().len(), QUERY_OUTPUT_LIMIT);
+
+    let mut over = ready_engine();
+    assert_eq!(
+        over.query(Query::new("x".repeat(sql_len + 1))),
+        Err(ProtocolError::QueryOutputTooLarge {
+            length: QUERY_OUTPUT_LIMIT + 1,
+            limit: QUERY_OUTPUT_LIMIT,
+        })
+    );
+    assert!(over.take_output().is_empty());
+}
+
+/// `query_packet_len` matches the written bytes for every field shape,
+/// including multi-byte VarUInts, settings, and escaped parameters.
+#[test]
+fn query_packet_len_matches_the_written_packet() {
+    let long = "q".repeat(200);
+    let queries = [
+        Query::new("SELECT 1"),
+        Query::new(long.as_str())
+            .with_query_id(long.as_str())
+            .with_os_user("os")
+            .with_hostname(long.as_str())
+            .with_initial_query_start_time_microseconds(u64::MAX)
+            .with_setting("max_threads", "1")
+            .with_setting(long.as_str(), long.as_str())
+            .with_parameter("p", "it's a\\b")
+            .with_parameter("q", long.as_str()),
+    ];
+    for query in queries {
+        let mut engine = ready_engine();
+        let expected = query_packet_len(&query, &engine.identity, &engine.quota_key).unwrap();
+        engine.query(query).unwrap();
+        assert_eq!(engine.take_output().len(), expected);
+    }
+    let hello = ClientHello::new("c", "u")
+        .with_client_version(u64::MAX, 300)
+        .with_quota_key("quota_13");
+    let mut engine = Connection::new(hello).unwrap();
+    engine.feed(&server_hello(ENGINE_REVISION)).unwrap();
+    let _ = events(&mut engine);
+    let _ = engine.take_output();
+    let query = Query::new("SELECT 1").with_setting("a", "b");
+    let expected = query_packet_len(&query, &engine.identity, &engine.quota_key).unwrap();
+    engine.query(query).unwrap();
+    assert_eq!(engine.take_output().len(), expected);
+}
+
+/// The Query packet is written straight into the output queue, after any
+/// bytes already queued, with no temporary copy.
+#[test]
+fn query_appends_to_queued_output() {
+    let mut engine = ready_engine();
+    engine.ping().unwrap();
+    engine.feed(&[SERVER_PACKET_PONG as u8]).unwrap();
+    let _ = events(&mut engine);
+    engine.query(Query::new("SELECT 13")).unwrap();
+    let output = engine.take_output();
+    assert_eq!(output[0], CLIENT_PACKET_PING as u8);
+    assert_eq!(output[1], CLIENT_PACKET_QUERY as u8);
+}
+
+#[test]
+fn terminal_query_exception_counts_the_bytes_after_it() {
+    let mut engine = ready_engine();
+    engine.query(Query::new("SELECT 13")).unwrap();
+    let mut response = progress_packet().to_vec();
+    response.extend(exception(101, b"DB::Exception", b"terminal", b"", 0));
+    response.push(SERVER_PACKET_END_OF_STREAM as u8);
+    engine.feed(&response).unwrap();
+    assert_eq!(engine.state(), EXCEPTION_FAILED);
+    assert!(matches!(
+        events(&mut engine).as_slice(),
+        [Event::Progress(_), Event::Exception(error)] if error.code == 101
+    ));
+    assert_eq!(
+        engine.finish(),
+        Err(ProtocolError::TrailingInput { length: 1 })
+    );
+}
+
+#[test]
+fn query_rejects_repeated_parameter_names_but_not_settings() {
+    // TCP keeps the last repeated parameter, HTTP the first, so a repeat is
+    // rejected rather than silently diverging. Settings agree on both
+    // transports (last wins) and stay accepted.
+    let mut ready = ready_engine();
+    let error = ready
+        .query(
+            Query::new("SELECT {p:String}")
+                .with_parameter("p", "user_1")
+                .with_parameter("q", "user_2")
+                .with_parameter("p", "user_2"),
+        )
+        .unwrap_err();
+    assert_eq!(
+        error,
+        ProtocolError::DuplicateName {
+            field: "parameter_name",
+            name: "p".to_owned(),
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        "parameter_name \"p\" is given more than once"
+    );
+    assert_eq!(ready.state(), State::Ready);
+    assert!(ready.take_output().is_empty());
+    ready
+        .query(
+            Query::new("SELECT {p:String}")
+                .with_parameter("p", "user_1")
+                .with_setting("max_threads", "1")
+                .with_setting("max_threads", "2"),
+        )
+        .unwrap();
+    assert_eq!(ready.state(), State::Querying);
+}
+
+#[test]
+fn query_rejects_ambiguous_names_and_old_server_revision() {
+    let mut ready = ready_engine();
+    assert_eq!(
+        ready.query(Query::new("SELECT 1").with_setting("", "1")),
+        Err(ProtocolError::EmptyName {
+            field: "setting_name"
+        })
+    );
+    assert_eq!(
+        ready.query(Query::new("SELECT 1").with_parameter("", "1")),
+        Err(ProtocolError::EmptyName {
+            field: "parameter_name"
+        })
+    );
+    assert_eq!(
+        ready.query(
+            Query::new("SELECT 1")
+                .with_setting("output_format_native_encode_types_in_binary_format", "1")
+        ),
+        Err(ProtocolError::BinaryNativeTypeEncodingUnsupported)
+    );
+
+    let mut old = engine();
+    old.feed(&server_hello(54_459)).unwrap();
+    let _ = events(&mut old);
+    assert_eq!(
+        old.query(Query::new("SELECT 1")),
+        Err(ProtocolError::UnsupportedQueryRevision { revision: 54_459 })
+    );
+}
+
+fn progress_packet() -> [u8; 7] {
+    [SERVER_PACKET_PROGRESS as u8, 1, 2, 3, 4, 5, 6]
+}
+
+/// Round 2 High 1, first repro: the natural loop of feed then drain until
+/// `None`, with no extra call, completes a stream of more than 1024 small
+/// events followed by EndOfStream, at every read size.
+#[test]
+fn natural_feed_drain_loop_completes_after_many_small_events() {
+    let mut response = progress_packet().repeat(1100);
+    response.extend(data_packet(&framed_int64_block(&[13])));
+    response.push(SERVER_PACKET_END_OF_STREAM as u8);
+    for read_size in [1, 7, 4096, response.len()] {
+        let mut engine = ready_engine();
+        engine.query(Query::new("SELECT 13")).unwrap();
+        let mut seen = Vec::new();
+        for chunk in response.chunks(read_size) {
+            engine.feed(chunk).unwrap();
+            seen.extend(std::iter::from_fn(|| engine.poll_event()));
+        }
+        assert_eq!(seen.len(), 1102, "read size {read_size}");
+        assert_eq!(seen.last(), Some(&Event::EndOfStream));
+        assert_eq!(engine.state(), State::Ready, "read size {read_size}");
+        assert_eq!(engine.finish(), Ok(()), "read size {read_size}");
+    }
+}
+
+/// Round 2 High 1, second repro: one feed of 1100 Progress packets, a 5 MiB
+/// Data packet, and EndOfStream used to fail with `InputTooLarge`. Any feed
+/// size of a well-formed stream must succeed.
+#[test]
+fn one_feed_of_many_events_and_a_large_block_succeeds() {
+    let block = framed_string_block(5 * 1024 * 1024);
+    let mut response = progress_packet().repeat(1100);
+    response.extend(data_packet(&block));
+    response.push(SERVER_PACKET_END_OF_STREAM as u8);
+    assert!(response.len() > INPUT_LIMIT);
+    let mut engine = ready_engine();
+    engine.query(Query::new("SELECT 13")).unwrap();
+    assert_eq!(engine.feed(&response), Ok(()));
+    assert!(engine.input.is_empty());
+    let seen = events(&mut engine);
+    assert_eq!(seen.len(), 1102);
+    assert_eq!(seen[1100], Event::Data(block));
+    assert_eq!(seen[1101], Event::EndOfStream);
+    assert_eq!(engine.state(), State::Ready);
+}
+
+/// Round 2 High 2: 1023 Progress, EndOfStream, then a pre-query Exception.
+/// Once drained the engine is `Failed`, so `query` can never queue a Query
+/// that the server will not answer. Before draining, `query` is refused.
+#[test]
+fn query_is_never_accepted_ahead_of_a_closing_exception() {
+    let mut response = progress_packet().repeat(1023);
+    response.push(SERVER_PACKET_END_OF_STREAM as u8);
+    response.extend(exception(60, b"DB::Exception", b"closing", b"", 0));
+    for read_size in [1, 7, 1024, response.len()] {
+        let mut engine = ready_engine();
+        engine.query(Query::new("SELECT 13")).unwrap();
+        let _ = engine.take_output();
+        let mut seen = Vec::new();
+        for chunk in response.chunks(read_size) {
+            engine.feed(chunk).unwrap();
+            assert!(
+                matches!(
+                    engine.query(Query::new("SELECT 79")),
+                    Err(ProtocolError::InvalidState { .. })
+                ),
+                "read size {read_size}"
+            );
+            seen.extend(std::iter::from_fn(|| engine.poll_event()));
+            if engine.state() == State::Ready {
+                // Only between EndOfStream and the Exception's packet code.
+                assert_eq!(seen.last(), Some(&Event::EndOfStream));
+            }
+        }
+        assert_eq!(engine.state(), EXCEPTION_FAILED, "read size {read_size}");
+        assert!(matches!(
+            seen.last(),
+            Some(Event::Exception(error)) if error.code == 60
+        ));
+        assert!(matches!(
+            engine.query(Query::new("SELECT 79")),
+            Err(ProtocolError::InvalidState { .. })
+        ));
+        assert!(engine.take_output().is_empty(), "read size {read_size}");
+    }
+}
+
+#[test]
+fn query_is_refused_until_events_are_drained() {
+    let mut engine = ready_engine();
+    engine.query(Query::new("SELECT 13")).unwrap();
+    engine.feed(&[SERVER_PACKET_END_OF_STREAM as u8]).unwrap();
+    assert_eq!(engine.state(), State::Ready);
+    assert_eq!(
+        engine.query(Query::new("SELECT 79")),
+        Err(ProtocolError::InvalidState {
+            operation: "send Query before draining completed events",
+            state: State::Ready,
+        })
+    );
+    assert_eq!(events(&mut engine), [Event::EndOfStream]);
+    engine.query(Query::new("SELECT 79")).unwrap();
+}
+
+#[test]
+fn empty_feed_is_a_no_op() {
+    let mut engine = ready_engine();
+    engine.query(Query::new("SELECT 13")).unwrap();
+    let progress = progress_packet();
+    engine.feed(&progress[..3]).unwrap();
+    engine.feed(&[]).unwrap();
+    assert!(events(&mut engine).is_empty());
+    engine.feed(&progress[3..]).unwrap();
+    assert!(matches!(
+        events(&mut engine).as_slice(),
+        [Event::Progress(_)]
+    ));
+}
+
+#[test]
+fn queued_payload_limit_is_not_a_query_total_limit() {
+    let block = framed_string_block(1024 * 1024);
+    let packet = data_packet(&block);
+    let mut engine = ready_engine();
+    engine
+        .query(Query::new("SELECT repeat('x', 1048576)"))
+        .unwrap();
+    let mut total = 0;
+    for _ in 0..65 {
+        engine.feed(&packet).unwrap();
+        let Some(Event::Data(bytes)) = engine.poll_event() else {
+            panic!("expected Data");
+        };
+        total += bytes.len();
+    }
+    assert!(total > 64 * 1024 * 1024);
+}
+
+#[test]
+fn multiple_large_blocks_in_one_feed_fit_the_undrained_queue() {
+    let block = framed_string_block(8 * 1024 * 1024);
+    let mut response = data_packet(&block);
+    response.extend_from_slice(&data_packet(&block));
+    let mut engine = ready_engine();
+    engine
+        .query(Query::new("SELECT repeat('x', 8388608)"))
+        .unwrap();
+    engine.feed(&response).unwrap();
+    assert_eq!(events(&mut engine).len(), 2);
+}
+
+#[test]
+fn multi_megabyte_nested_block_uses_the_full_second_read() {
+    let block = framed_array_string_block(8192, 1024);
+    let packet = data_packet(&block);
+    assert!(packet.len() > 8 * 1024 * 1024);
+
+    let mut engine = ready_engine();
+    engine
+        .query(Query::new(
+            "SELECT arrayMap(number -> repeat('x', 1024), range(8192))",
+        ))
+        .unwrap();
+    let before = engine.parse_steps;
+    engine.feed(&packet[..4096]).unwrap();
+    engine.feed(&packet[4096..]).unwrap();
+    let steps = engine.parse_steps - before;
+
+    assert_eq!(events(&mut engine), [Event::Data(block)]);
+    assert!(
+        steps < 10,
+        "large second read was artificially resliced into {steps} parse steps"
+    );
+}
+
+#[test]
+fn max_block_bytes_accepts_a_block_at_the_limit_and_rejects_one_byte_more() {
+    let block = framed_string_block(2000);
+    assert!(block.len() > MIN_MAX_BLOCK_BYTES);
+    let packet = data_packet(&block);
+    for (limit, accepted) in [(block.len(), true), (block.len() - 1, false)] {
+        for read_size in [1, 997, packet.len()] {
+            let mut engine = ready_engine().with_max_block_bytes(limit);
+            engine.query(Query::new("SELECT 13")).unwrap();
+            let _ = engine.take_output();
+            let mut result = Ok(());
+            for chunk in packet.chunks(read_size) {
+                result = engine.feed(chunk);
+                if result.is_err() {
+                    break;
+                }
+            }
+            if accepted {
+                assert_eq!(result, Ok(()), "limit {limit} read size {read_size}");
+                assert_eq!(events(&mut engine), [Event::Data(block.clone())]);
+            } else {
+                assert_eq!(
+                    result,
+                    Err(ProtocolError::NativeBlockTooLarge { limit }),
+                    "limit {limit} read size {read_size}"
+                );
+                assert_eq!(engine.state(), PROTOCOL_FAILED);
+                assert!(engine.input.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn max_block_bytes_applies_to_every_block_packet_kind() {
+    let block = framed_string_block(2000);
+    for packet in [
+        SERVER_PACKET_DATA,
+        SERVER_PACKET_TOTALS,
+        SERVER_PACKET_EXTREMES,
+        SERVER_PACKET_LOG,
+        SERVER_PACKET_PROFILE_EVENTS,
+    ] {
+        let mut engine = ready_engine().with_max_block_bytes(MIN_MAX_BLOCK_BYTES);
+        engine.query(Query::new("SELECT 13")).unwrap();
+        let mut bytes = vec![packet as u8, 0];
+        bytes.extend_from_slice(&block);
+        assert_eq!(
+            engine.feed(&bytes),
+            Err(ProtocolError::NativeBlockTooLarge {
+                limit: MIN_MAX_BLOCK_BYTES
+            }),
+            "packet {packet}"
+        );
+    }
+}
+
+/// A tiny cap is raised to the documented minimum, so it can never reject
+/// the end-of-data marker or a small block.
+#[test]
+fn max_block_bytes_below_the_minimum_is_raised_to_it() {
+    for limit in [0, 1, 8, MIN_MAX_BLOCK_BYTES - 1] {
+        let mut engine = ready_engine().with_max_block_bytes(limit);
+        assert_eq!(engine.max_block_bytes, MIN_MAX_BLOCK_BYTES);
+        engine.query(Query::new("SELECT 13")).unwrap();
+        let block = framed_int64_block(&[13]);
+        let mut response = data_packet(&block);
+        response.extend(data_packet(&framed_empty_block()));
+        response.push(SERVER_PACKET_END_OF_STREAM as u8);
+        engine.feed(&response).unwrap();
+        assert_eq!(
+            events(&mut engine),
+            [Event::Data(block), Event::EndOfStream]
+        );
+    }
+}
+
+#[test]
+fn event_stays_small() {
+    // Two words of payload pointer plus tag would be ideal; Progress, six
+    // `u64`s, sets the floor. The const assertion in lib.rs enforces it too.
+    assert!(std::mem::size_of::<Event>() <= 56);
+}
+
+/// The default cap admits a block above the old hard-coded 64 MiB, and block
+/// capacity never exceeds the configured limit.
+#[test]
+fn default_block_cap_admits_blocks_above_64_mib() {
+    let block = framed_string_block(65 * 1024 * 1024);
+    let packet = data_packet(&block);
+    let mut engine = ready_engine();
+    engine.query(Query::new("SELECT 13")).unwrap();
+    for chunk in packet.chunks(1024 * 1024) {
+        engine.feed(chunk).unwrap();
+    }
+    let [Event::Data(bytes)]: [Event; 1] = events(&mut engine).try_into().unwrap() else {
+        panic!("expected Data");
+    };
+    assert_eq!(bytes.len(), block.len());
+    assert!(bytes.capacity() <= DEFAULT_MAX_BLOCK_BYTES);
+
+    let limit = block.len() + 13;
+    let mut capped = ready_engine().with_max_block_bytes(limit);
+    capped.query(Query::new("SELECT 13")).unwrap();
+    for chunk in packet.chunks(1024 * 1024) {
+        capped.feed(chunk).unwrap();
+    }
+    let [Event::Data(bytes)]: [Event; 1] = events(&mut capped).try_into().unwrap() else {
+        panic!("expected Data");
+    };
+    assert!(bytes.capacity() <= limit, "capacity {}", bytes.capacity());
+}
+
+#[test]
+fn extend_bounded_never_reserves_past_the_limit() {
+    let mut buffer = Vec::new();
+    for _ in 0..100 {
+        extend_bounded(&mut buffer, &[7; 10], 1000);
+        assert!(buffer.capacity() <= 1000);
+    }
+    assert_eq!(buffer.len(), 1000);
 }

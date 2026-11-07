@@ -119,10 +119,34 @@ For INSERT, the default encode APIs write textual headers. If a binding uses an
 `encode_*_binary_types` API, it must set
 `input_format_native_decode_types_in_binary_format=1` on the ClickHouse request.
 
-The same model applies over TCP. The packet engine owns handshake, revision
-gating, packet framing, server packet dispatch, progress and exception handling,
-cancellation, and end-of-stream handling. It uses core's compression codec for
-compressed Native bodies and the Native decoder for block payloads.
+The same model applies over TCP. The sans-I/O engine in `crates/ch-tcp-proto`
+owns the handshake, revision gating, packet framing, and server packet
+dispatch. It reports Progress, ProfileInfo, Log, ProfileEvents, Totals,
+Extremes, Exception, and EndOfStream as typed events. It does not own sockets,
+TLS, timeouts, pooling, or cancellation: there is no Cancel packet yet, so a
+driver that abandons a query mid-stream must discard the connection. The first
+engine handles uncompressed SELECT only. See `crates/ch-tcp-proto/README.md`
+for the driver loop and a tested `run_select` example.
+
+Each `Event::Data` payload is exactly one complete Native block at the
+connection's `effective_revision()`, and the payloads concatenate into one
+Native stream. Either feed that stream to `StreamDecoder`, or decode each
+payload as it arrives with `ByteReader` plus `decode_next_block` into a
+`ch_core_rs::batch::ColBatch`. Prefer the per-payload form: `StreamDecoder`
+scans for block boundaries again before decoding, while the engine has already
+found them. The engine README has a tested `decode_payload` snippet.
+
+Every TCP SELECT result starts with a zero-row Data block that carries only
+the schema, which HTTP `FORMAT Native` does not send. Both decode paths return
+it as a zero-row `ColBatch` first, so bindings must tolerate zero-row batches
+on TCP even where their HTTP path never saw one.
+
+Known limitation: the engine frames `Dynamic`, `JSON`, and `AggregateFunction`
+columns (and containers holding them) with a column-level checkpoint only, so
+the cost of framing such a column grows with its size squared divided by the
+read size. Other column types frame in linear time at any read size. Read in
+large chunks, for example 1 MiB, when results carry large `Dynamic` or `JSON`
+columns.
 
 Not all clients have a ready-to-use `FORMAT Native` result path today. Part of the integration task for those clients is to add or reuse a path that can request `FORMAT Native` and expose the resulting decompressed byte stream to the Rust decoder.
 
@@ -155,36 +179,57 @@ when they request protocol-framed Native over HTTP at that revision.
 
 ### One Block At A Time For TCP
 
-The engine entry is the existing `native::varint::ByteReader` plus
-`native::decode::decode_next_block`. There is no new one-block wrapper.
-Set `DecodeOptions.protocol_revision` to the connection's effective revision.
-The first engine advertises 54460; core's decode ceiling remains 54485.
+To decode one complete block, use `native::varint::ByteReader` plus
+`native::decode::decode_next_block`. To find its boundary without decoding,
+use the scanner below. Set `DecodeOptions.protocol_revision` to the
+connection's effective revision. The first engine advertises 54460; core's
+decode ceiling remains 54485.
 
-For an uncompressed body, call `native::decode::block_end` on the bytes after
-the packet code and block name. `Ok(None)` means no block is present yet;
-`DecodeError::Io` with `UnexpectedEof` means a partial block needs more bytes.
-Once the scanner returns `Ok(Some(end))`, give `ByteReader` the `[..end]` slice
-and call `decode_next_block`. Use `reader.position()` as the consumed Native byte count,
-and leave any suffix for packet dispatch. Preserve schema-bearing zero-row
-blocks, including INSERT schema replies and empty end markers. Recreate the
-cursor when retrying an incomplete decode: a failed `decode_next_block` may
-have advanced it.
+For an uncompressed body, construct
+`native::stream_decoder::BlockScanner` with `DecodeOptions.protocol_revision`
+set to the effective connection revision. Append packet bytes to a bounded
+engine-owned buffer and call `scan` with the whole accumulated block prefix.
+`BlockBoundary::NeedMore` means retain that prefix and wait for more bytes.
+`BlockBoundary::Complete` reports the exact `consumed` prefix plus the declared
+`num_columns` and `num_rows`; leave any suffix for packet dispatch. The shape
+identifies the zero-column, zero-row TCP end marker without decoding a
+`ColBatch`. The scanner copies no wire bytes and creates no decoded column
+buffers. It checkpoints complete top-level columns and resumes inside bodies
+composed from String, fixed-width values, Nullable, Array, Map, Tuple,
+LowCardinality, and Variant. Dynamic, JSON, and AggregateFunction bodies (and
+containers holding them) may re-walk their current column across small reads,
+so pass all currently available bytes
+instead of imposing an artificial scan slice. Call `reset` before reusing a
+scanner after abandoning an incomplete block.
 
-For a compressed body, call
-`compression::decompress_frame_into(input, ChecksumMode::Verify, &mut plain)`
-to append one frame directly to the current block buffer. It reuses the
-buffer's capacity and restores its contents on error. Save the buffer length
-before each call. The returned `FrameInfo::consumed()` is the compressed input
-length to advance, and `plaintext_len()` is the number of bytes appended.
-After each frame, run `block_end`.
-Continue loading frames while the block is incomplete. When the block completes,
-call `info.finish_block(end - prior_plaintext_len)` to check that all plaintext
-in the final frame belongs to that block, then decode that exact slice.
-The count passed to `finish_block` is relative to the final frame, not the
-accumulated block. Return to packet dispatch without reading the next frame or
-packet. Core rejects zero-plaintext frames; they are not end-of-input markers. Bound
-the accumulated body and transport buffers according to the engine's resource
-policy as well as honoring core's per-frame size checks.
+For a compressed body, keep one `BlockScanner` and one plaintext buffer
+`plain` that holds only the current block. For each frame:
+
+1. Save `prior = plain.len()`.
+2. Call
+   `compression::decompress_frame_into(input, ChecksumMode::Verify, &mut plain)`
+   to append the frame directly to the block buffer. It reuses the buffer's
+   capacity and restores its contents on error. Advance the compressed input
+   by `FrameInfo::consumed()`; `plaintext_len()` is the number of bytes
+   appended.
+3. Call `scanner.scan(&plain)`. The scanner resumes from its checkpoint, so
+   each frame costs roughly the bytes it added rather than a rescan of the
+   whole block. Do not call `block_end` after each frame: it restarts from the
+   start of the block every time, which is quadratic in the frame count for a
+   large block.
+4. On `BlockBoundary::NeedMore`, load the next frame. On
+   `BlockBoundary::Complete { consumed, .. }`, call
+   `info.finish_block(consumed - prior)` to check that all plaintext in the
+   final frame belongs to that block, then decode `&plain[..consumed]`. The
+   count passed to `finish_block` is relative to the final frame, not the
+   accumulated block. Return to packet dispatch without reading the next frame
+   or packet.
+
+Dynamic, JSON, and AggregateFunction bodies can still re-walk their current
+column on each frame, as on the uncompressed path. Core rejects
+zero-plaintext frames; they are not end-of-input markers. Bound the accumulated
+body and transport buffers according to the engine's resource policy as well
+as honoring core's per-frame size checks.
 
 Confirmed at `v26.8.1.2041-lts`, `TCPHandler::sendData`, `sendTotals`, and
 `sendExtremes` in `src/Server/TCPHandler.cpp`, and `Connection::sendData` in
@@ -272,6 +317,19 @@ for block in decoder.finish()? {
     // Flush final completed blocks, or surface truncated-stream errors.
 }
 ```
+
+For an outer protocol that interleaves Native blocks with packet headers,
+`BlockScanner` finds one exact block boundary without materializing its typed
+columns. Advance the outer input by the `consumed` field from
+`BlockBoundary::Complete`; any suffix belongs to the outer protocol. The caller
+retains incomplete block bytes, supplies the decode options, and imposes its
+own block byte limit.
+
+`ch-tcp-proto` uses this scanner for uncompressed revision-54460 SELECTs.
+Its `Event::Data` payloads concatenate into a framed Native result stream for
+the ordinary streaming API above. The TCP empty end-of-data marker is consumed
+by the engine; schema-only result blocks remain in the byte stream. Other
+packet bodies arrive through separate event variants.
 
 ## Encoding For Insert
 

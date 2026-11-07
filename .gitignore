@@ -1,4 +1,5 @@
 /target
+__pycache__/
 
 # Local Claude settings (keep shared agent definitions tracked)
 .claude/settings.local.json

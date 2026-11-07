@@ -19,11 +19,124 @@ use std::io;
 
 use crate::batch::ColBatch;
 use crate::native::decode::{
-    block_end_binary_types_resume, block_end_resume, decode_scanned_block, DecodeError,
-    DecodeOptions, ScanProgress, DBMS_TCP_PROTOCOL_VERSION,
+    block_end_binary_types_resume, block_end_resume, decode_scanned_block,
+    scan_block_binary_types_resume, scan_block_resume, DecodeError, DecodeOptions, ScanProgress,
+    DBMS_TCP_PROTOCOL_VERSION,
 };
 use crate::native::varint::ByteReader;
 use crate::schema::Schema;
+
+/// Result of scanning the bytes at the front of an outer protocol buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+#[non_exhaustive]
+pub enum BlockBoundary {
+    /// The supplied bytes do not yet contain a complete Native block.
+    NeedMore,
+    /// One complete block occupies exactly `data[..consumed]`.
+    Complete {
+        /// Number of bytes occupied by the block.
+        consumed: usize,
+        /// Number of columns declared in the block header.
+        num_columns: usize,
+        /// Number of rows declared in the block header.
+        num_rows: usize,
+    },
+}
+
+/// Scan-only boundary finder for one Native block embedded in an outer protocol.
+///
+/// The caller retains the bytes. After [`BlockBoundary::NeedMore`], the next
+/// call must pass the same prefix plus any newly received suffix. The scanner
+/// checkpoints verified top-level columns and, inside a column, any body
+/// composed from String, fixed-width values, Nullable, Array, Map, Tuple,
+/// LowCardinality, and Variant, so feeding a block in pieces of any size walks
+/// it in amortized linear time. Dynamic, JSON, and AggregateFunction bodies (and
+/// containers holding them) retain column-boundary checkpointing and may be
+/// re-walked until that column completes. A complete block or decode error
+/// resets the checkpoint for the next block.
+///
+/// The scanner creates no decoded column buffers and copies no wire bytes.
+/// Header and type parsing can allocate metadata values. The supplied
+/// [`DecodeOptions`] apply while validating framing, headers, declared sizes,
+/// and column bodies.
+#[derive(Debug)]
+pub struct BlockScanner {
+    progress: ScanProgress,
+    options: DecodeOptions,
+    binary_types: bool,
+    scanned: usize,
+}
+
+impl BlockScanner {
+    /// Construct a scanner for Native blocks with textual type headers.
+    pub fn new(options: DecodeOptions) -> Self {
+        Self {
+            progress: ScanProgress::default(),
+            options,
+            binary_types: false,
+            scanned: 0,
+        }
+    }
+
+    /// Construct a scanner for Native blocks with binary type descriptors.
+    pub fn new_binary_types(options: DecodeOptions) -> Self {
+        Self {
+            binary_types: true,
+            ..Self::new(options)
+        }
+    }
+
+    /// Scan the first Native block in `data`.
+    ///
+    /// Bytes after a complete block are ignored and remain available to the
+    /// outer protocol. Calling this method again after completion starts a new
+    /// block. If a caller abandons an incomplete block, call [`Self::reset`]
+    /// before scanning unrelated bytes.
+    pub fn scan(&mut self, data: &[u8]) -> Result<BlockBoundary, DecodeError> {
+        if self.scanned != 0 && data.len() <= self.scanned {
+            if data.len() == self.scanned {
+                return Ok(BlockBoundary::NeedMore);
+            }
+            self.reset();
+        }
+
+        let result = if self.binary_types {
+            scan_block_binary_types_resume(data, &self.options, &mut self.progress)
+        } else {
+            scan_block_resume(data, &self.options, &mut self.progress)
+        };
+
+        match result {
+            Ok(Some(block)) => {
+                self.scanned = 0;
+                Ok(BlockBoundary::Complete {
+                    consumed: block.end,
+                    num_columns: block.num_columns,
+                    num_rows: block.num_rows,
+                })
+            }
+            Ok(None) => {
+                self.scanned = data.len();
+                Ok(BlockBoundary::NeedMore)
+            }
+            Err(DecodeError::Io(ref error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                self.scanned = data.len();
+                Ok(BlockBoundary::NeedMore)
+            }
+            Err(error) => {
+                self.scanned = 0;
+                Err(error)
+            }
+        }
+    }
+
+    /// Discard progress for an incomplete block.
+    pub fn reset(&mut self) {
+        self.progress = ScanProgress::default();
+        self.scanned = 0;
+    }
+}
 
 /// Push-based incremental decoder for ClickHouse Native blocks.
 ///
@@ -189,21 +302,11 @@ impl StreamDecoder {
                         decode_scanned_block(&mut reader, &self.options, self.binary_types)?;
                     match decoded {
                         Some(batch) => {
-                            match &self.schema {
-                                None => self.schema = Some(batch.schema.clone()),
-                                Some(first) => {
-                                    if batch.schema != *first {
-                                        return Err(DecodeError::BlockSchemaMismatch {
-                                            block_index: self.blocks_seen,
-                                        });
-                                    }
-                                }
-                            }
-                            self.blocks_seen += 1;
+                            self.accept_block(&batch)?;
                             blocks.push(batch);
                         }
-                        // `block_end` returned `Some`, so a block is present.
-                        None => unreachable!("block_end confirmed a complete block"),
+                        // The scan returned `Some`, so a block is present.
+                        None => unreachable!("the scan confirmed a complete block"),
                     }
                     self.pos += end;
                     self.scanned = 0;
@@ -229,13 +332,31 @@ impl StreamDecoder {
         }
 
         // Compact buffer: remove consumed bytes to prevent unbounded growth.
+        self.compact();
+
+        Ok(blocks)
+    }
+
+    fn accept_block(&mut self, block: &ColBatch) -> Result<(), DecodeError> {
+        match &self.schema {
+            None => self.schema = Some(block.schema.clone()),
+            Some(first) if block.schema != *first => {
+                return Err(DecodeError::BlockSchemaMismatch {
+                    block_index: self.blocks_seen,
+                });
+            }
+            Some(_) => {}
+        }
+        self.blocks_seen += 1;
+        Ok(())
+    }
+
+    fn compact(&mut self) {
         if self.pos > 0 {
             self.buffer.drain(..self.pos);
             self.scanned = self.scanned.saturating_sub(self.pos);
             self.pos = 0;
         }
-
-        Ok(blocks)
     }
 }
 
@@ -243,7 +364,9 @@ impl StreamDecoder {
 mod tests {
     use super::*;
     use crate::column::Column;
-    use crate::native::decode::DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION;
+    use crate::native::decode::{
+        block_end, decode_next_block, DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION,
+    };
     use crate::native::protocol::LC_HAS_ADDITIONAL_KEYS_BIT;
     use crate::native::varint::write_varint;
 
@@ -381,6 +504,86 @@ mod tests {
         buf
     }
 
+    /// Helper: build one Map(String, String) column block (no framing).
+    fn make_map_string_block(name: &str, rows: &[&[(&str, &str)]]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_varint(&mut buf, 1);
+        write_varint(&mut buf, rows.len() as u64);
+        write_varint(&mut buf, name.len() as u64);
+        buf.extend_from_slice(name.as_bytes());
+        let type_name = b"Map(String, String)";
+        write_varint(&mut buf, type_name.len() as u64);
+        buf.extend_from_slice(type_name);
+        let mut end = 0u64;
+        for row in rows {
+            end += row.len() as u64;
+            buf.extend_from_slice(&end.to_le_bytes());
+        }
+        for row in rows {
+            for (key, _) in *row {
+                write_varint(&mut buf, key.len() as u64);
+                buf.extend_from_slice(key.as_bytes());
+            }
+        }
+        for row in rows {
+            for (_, value) in *row {
+                write_varint(&mut buf, value.len() as u64);
+                buf.extend_from_slice(value.as_bytes());
+            }
+        }
+        buf
+    }
+
+    /// Helper: build one Tuple(Int64, String) column block (no framing).
+    fn make_tuple_int_string_block(name: &str, rows: &[(i64, &str)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_varint(&mut buf, 1);
+        write_varint(&mut buf, rows.len() as u64);
+        write_varint(&mut buf, name.len() as u64);
+        buf.extend_from_slice(name.as_bytes());
+        let type_name = b"Tuple(Int64, String)";
+        write_varint(&mut buf, type_name.len() as u64);
+        buf.extend_from_slice(type_name);
+        for (value, _) in rows {
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+        for (_, value) in rows {
+            write_varint(&mut buf, value.len() as u64);
+            buf.extend_from_slice(value.as_bytes());
+        }
+        buf
+    }
+
+    /// Helper: build one Array(Nullable(String)) column block (no framing).
+    fn make_array_nullable_string_block(name: &str, rows: &[&[Option<&str>]]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_varint(&mut buf, 1);
+        write_varint(&mut buf, rows.len() as u64);
+        write_varint(&mut buf, name.len() as u64);
+        buf.extend_from_slice(name.as_bytes());
+        let type_name = b"Array(Nullable(String))";
+        write_varint(&mut buf, type_name.len() as u64);
+        buf.extend_from_slice(type_name);
+        let mut end = 0u64;
+        for row in rows {
+            end += row.len() as u64;
+            buf.extend_from_slice(&end.to_le_bytes());
+        }
+        for row in rows {
+            for value in *row {
+                buf.push(u8::from(value.is_none()));
+            }
+        }
+        for row in rows {
+            for value in *row {
+                let value = value.unwrap_or("");
+                write_varint(&mut buf, value.len() as u64);
+                buf.extend_from_slice(value.as_bytes());
+            }
+        }
+        buf
+    }
+
     /// Helper: build one two-column block, Int64 then String (no framing).
     fn make_mixed_block(ids: &[i64], names: &[&str]) -> Vec<u8> {
         assert_eq!(ids.len(), names.len());
@@ -505,6 +708,27 @@ mod tests {
         assert_chunking_parity_with(data, expected_blocks, || {
             StreamDecoder::new(DecodeOptions::default())
         });
+    }
+
+    /// Assert a single block remains incomplete at every proper byte prefix
+    /// and completes at its exact final byte.
+    fn assert_block_scanner_bytewise(data: &[u8]) {
+        assert_eq!(
+            block_end(data, &DecodeOptions::default()).unwrap(),
+            Some(data.len())
+        );
+        let mut scanner = BlockScanner::new(DecodeOptions::default());
+        for end in 0..data.len() {
+            assert_eq!(
+                scanner.scan(&data[..end]).unwrap(),
+                BlockBoundary::NeedMore,
+                "prefix length {end}"
+            );
+        }
+        assert!(matches!(
+            scanner.scan(data).unwrap(),
+            BlockBoundary::Complete { consumed, .. } if consumed == data.len()
+        ));
     }
 
     #[test]
@@ -970,6 +1194,218 @@ mod tests {
     }
 
     #[test]
+    fn block_scanner_stops_before_outer_protocol_bytes() {
+        let block = make_int64_block("n", &[13, 79]);
+        let mut chunk = block.clone();
+        chunk.extend(std::iter::repeat(0xa5).take(1024 * 1024));
+        let mut scanner = BlockScanner::new(DecodeOptions::default());
+
+        assert_eq!(scanner.scan(&chunk[..3]).unwrap(), BlockBoundary::NeedMore);
+        assert_eq!(
+            scanner.scan(&chunk).unwrap(),
+            BlockBoundary::Complete {
+                consumed: block.len(),
+                num_columns: 1,
+                num_rows: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn block_scanner_handles_adjacent_blocks_without_taking_the_second() {
+        let first = make_string_block("s", &["user_1"]);
+        let second = make_string_block("s", &["user_2", "user_3"]);
+        let joined = [first.as_slice(), second.as_slice()].concat();
+        let mut scanner = BlockScanner::new(DecodeOptions::default());
+
+        assert_eq!(
+            scanner.scan(&joined).unwrap(),
+            BlockBoundary::Complete {
+                consumed: first.len(),
+                num_columns: 1,
+                num_rows: 1,
+            }
+        );
+        assert_eq!(
+            scanner.scan(&joined[first.len()..]).unwrap(),
+            BlockBoundary::Complete {
+                consumed: second.len(),
+                num_columns: 1,
+                num_rows: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn block_scanner_validates_revision_on_empty_input() {
+        let options = DecodeOptions {
+            protocol_revision: DBMS_TCP_PROTOCOL_VERSION + 1,
+            ..DecodeOptions::default()
+        };
+        let mut scanner = BlockScanner::new(options);
+
+        assert!(matches!(
+            scanner.scan(b""),
+            Err(DecodeError::UnsupportedProtocolRevision { .. })
+        ));
+    }
+
+    #[test]
+    fn block_scanner_retains_partial_first_block_info_varint() {
+        let mut block = make_framed_block("n", "Int64", 1, &13_i64.to_le_bytes());
+        // Non-canonical but valid two-byte encoding of BlockInfo field 1.
+        block.splice(0..1, [0x81, 0x00]);
+        let mut scanner = BlockScanner::new(framed_options());
+
+        assert_eq!(scanner.scan(&block[..1]).unwrap(), BlockBoundary::NeedMore);
+        assert_eq!(
+            scanner.scan(&block).unwrap(),
+            BlockBoundary::Complete {
+                consumed: block.len(),
+                num_columns: 1,
+                num_rows: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn block_scanner_rejects_malformed_block_info() {
+        let mut scanner = BlockScanner::new(framed_options());
+
+        assert!(matches!(
+            scanner.scan(&[0x04, 0x00]),
+            Err(DecodeError::InvalidBlockInfo { field_num: 4 })
+        ));
+    }
+
+    #[test]
+    fn block_scanner_retains_partial_revision_zero_column_count() {
+        let block = make_int64_block("n", &[13]);
+        let mut noncanonical = vec![0x81];
+        noncanonical.extend_from_slice(&block[1..]);
+        let mut scanner = BlockScanner::new(DecodeOptions::default());
+
+        assert_eq!(
+            scanner.scan(&noncanonical[..1]).unwrap(),
+            BlockBoundary::NeedMore
+        );
+        noncanonical.insert(1, 0x00);
+        assert_eq!(
+            scanner.scan(&noncanonical).unwrap(),
+            BlockBoundary::Complete {
+                consumed: noncanonical.len(),
+                num_columns: 1,
+                num_rows: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn binary_type_block_scanner_reports_shape_and_boundary() {
+        let block = make_binary_string_block("s", &["user_1", "user_2"]);
+        let mut with_suffix = block.clone();
+        with_suffix.extend_from_slice(&[0xa5; 16]);
+        let mut scanner = BlockScanner::new_binary_types(DecodeOptions::default());
+
+        assert_eq!(
+            scanner.scan(&with_suffix).unwrap(),
+            BlockBoundary::Complete {
+                consumed: block.len(),
+                num_columns: 1,
+                num_rows: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn nested_prefix_free_scanner_matches_block_end_bytewise() {
+        let array = make_array_string_block("a", &[&["user_1", "user_2"], &[], &["13"]]);
+        let map = make_map_string_block(
+            "m",
+            &[
+                &[("user_1", "13"), ("user_2", "79")],
+                &[],
+                &[("user_3", "")],
+            ],
+        );
+        let tuple = make_tuple_int_string_block("t", &[(13, "user_1"), (79, ""), (-7, "user_2")]);
+        let nullable =
+            make_array_nullable_string_block("n", &[&[Some("user_1"), None], &[], &[Some("79")]]);
+
+        for data in [&array, &map, &tuple, &nullable] {
+            assert_block_scanner_bytewise(data);
+        }
+    }
+
+    #[test]
+    fn nested_array_scan_walks_linear_bytes_across_socket_sized_feeds() {
+        let value = "x".repeat(4 * 1024 * 1024);
+        let data = make_array_string_block("a", &[&[value.as_str()]]);
+        let mut scanner = BlockScanner::new(DecodeOptions::default());
+
+        for end in (64 * 1024..data.len()).step_by(64 * 1024) {
+            assert_eq!(scanner.scan(&data[..end]).unwrap(), BlockBoundary::NeedMore);
+        }
+        assert!(matches!(
+            scanner.scan(&data).unwrap(),
+            BlockBoundary::Complete { consumed, .. } if consumed == data.len()
+        ));
+        assert!(
+            scanner.progress.bytes_walked < 3 * data.len() as u64,
+            "scanner walked {} bytes for a {}-byte nested block",
+            scanner.progress.bytes_walked,
+            data.len()
+        );
+    }
+
+    #[test]
+    fn nested_array_scanner_preserves_decreasing_offset_error_across_split() {
+        let mut data = Vec::new();
+        write_varint(&mut data, 1);
+        write_varint(&mut data, 2);
+        write_varint(&mut data, 1);
+        data.push(b'a');
+        write_varint(&mut data, 13);
+        data.extend_from_slice(b"Array(String)");
+        let offset_start = data.len();
+        data.extend_from_slice(&2u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+
+        let expected = block_end(&data, &DecodeOptions::default()).unwrap_err();
+        assert!(matches!(expected, DecodeError::InvalidArray { .. }));
+
+        let mut scanner = BlockScanner::new(DecodeOptions::default());
+        assert_eq!(
+            scanner
+                .scan(&data[..offset_start + std::mem::size_of::<u64>()])
+                .unwrap(),
+            BlockBoundary::NeedMore
+        );
+        assert!(matches!(
+            scanner.scan(&data),
+            Err(DecodeError::InvalidArray { .. })
+        ));
+    }
+
+    #[test]
+    fn impossible_array_offset_run_stays_incomplete_after_more_bytes() {
+        let mut data = Vec::new();
+        write_varint(&mut data, 1);
+        write_varint(&mut data, usize::MAX as u64);
+        write_varint(&mut data, 1);
+        data.push(b'a');
+        write_varint(&mut data, 12);
+        data.extend_from_slice(b"Array(Int64)");
+        let mut scanner = BlockScanner::new(DecodeOptions::default());
+
+        assert_eq!(scanner.scan(&data).unwrap(), BlockBoundary::NeedMore);
+        data.push(0);
+        assert_eq!(scanner.scan(&data).unwrap(), BlockBoundary::NeedMore);
+        data.push(0);
+        assert_eq!(scanner.scan(&data).unwrap(), BlockBoundary::NeedMore);
+    }
+
+    #[test]
     fn test_string_scan_walks_linear_bytes_across_small_feeds() {
         // Linearity guard: a large String block fed in small chunks must be
         // walked a bounded number of times overall, not re-walked from the
@@ -1055,5 +1491,482 @@ mod tests {
                 }) if revision == DBMS_TCP_PROTOCOL_VERSION + 1
             ));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Resumable LowCardinality / Variant scan parity
+    // -----------------------------------------------------------------------
+
+    /// One column of a hand-built block: name, type string, and the column's
+    /// full data bytes (state-prefix words, then body).
+    type TestColumn<'a> = (&'a str, &'a str, Vec<u8>);
+
+    /// Build one block with a BlockInfo preamble when `revision > 0` and the
+    /// custom-serialization marker when `revision >= 54454`.
+    fn make_block_at(revision: u64, num_rows: usize, columns: &[TestColumn]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        if revision > 0 {
+            write_varint(&mut buf, 1);
+            buf.push(0x00);
+            write_varint(&mut buf, 2);
+            buf.extend_from_slice(&(-1i32).to_le_bytes());
+            write_varint(&mut buf, 0);
+        }
+        write_varint(&mut buf, columns.len() as u64);
+        write_varint(&mut buf, num_rows as u64);
+        for (name, type_name, data) in columns {
+            write_varint(&mut buf, name.len() as u64);
+            buf.extend_from_slice(name.as_bytes());
+            write_varint(&mut buf, type_name.len() as u64);
+            buf.extend_from_slice(type_name.as_bytes());
+            if revision >= DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION {
+                buf.push(0x00);
+            }
+            buf.extend_from_slice(data);
+        }
+        buf
+    }
+
+    fn string_values(values: &[&str]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for value in values {
+            write_varint(&mut buf, value.len() as u64);
+            buf.extend_from_slice(value.as_bytes());
+        }
+        buf
+    }
+
+    /// One LowCardinality body (no key-version prefix): index word with width
+    /// tag `tag`, dictionary size, `dictionary` body bytes, row count, indexes.
+    fn lc_body(tag: u64, num_keys: usize, dictionary: &[u8], indexes: &[u64]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(tag | LC_HAS_ADDITIONAL_KEYS_BIT).to_le_bytes());
+        buf.extend_from_slice(&(num_keys as u64).to_le_bytes());
+        buf.extend_from_slice(dictionary);
+        buf.extend_from_slice(&(indexes.len() as u64).to_le_bytes());
+        for index in indexes {
+            buf.extend_from_slice(&index.to_le_bytes()[..1 << tag]);
+        }
+        buf
+    }
+
+    const LC_KEY_VERSION: [u8; 8] = 1u64.to_le_bytes();
+
+    fn offsets(ends: &[u64]) -> Vec<u8> {
+        ends.iter().flat_map(|end| end.to_le_bytes()).collect()
+    }
+
+    fn options_at(revision: u64) -> DecodeOptions {
+        DecodeOptions {
+            protocol_revision: revision,
+            ..DecodeOptions::default()
+        }
+    }
+
+    /// The boundary `decode_next_block` leaves the reader at for the first block
+    /// of `data`, in `BlockBoundary` form.
+    fn decoded_boundary(data: &[u8], revision: u64) -> BlockBoundary {
+        let mut reader = ByteReader::new(data);
+        let batch = decode_next_block(&mut reader, &options_at(revision))
+            .unwrap()
+            .expect("a block");
+        BlockBoundary::Complete {
+            consumed: reader.position(),
+            num_columns: batch.schema.fields.len(),
+            num_rows: batch.num_rows,
+        }
+    }
+
+    /// Scanner parity with `decode_next_block` for the first block of `data`:
+    /// one-shot, fed one byte at a time through one scanner, and at every
+    /// two-way split (strided above 4 KiB) through a fresh scanner. Bytes after the block are offered
+    /// at every step, so a scanner overrunning the boundary would be caught.
+    fn assert_scan_matches_decode(data: &[u8], revision: u64) {
+        let expected = decoded_boundary(data, revision);
+        let BlockBoundary::Complete { consumed: end, .. } = expected else {
+            unreachable!()
+        };
+        assert_eq!(
+            BlockScanner::new(options_at(revision)).scan(data).unwrap(),
+            expected
+        );
+
+        let mut scanner = BlockScanner::new(options_at(revision));
+        for prefix in 0..end {
+            assert_eq!(
+                scanner.scan(&data[..prefix]).unwrap(),
+                BlockBoundary::NeedMore,
+                "bytewise prefix {prefix}/{end}"
+            );
+        }
+        assert_eq!(scanner.scan(data).unwrap(), expected, "bytewise final");
+
+        // Every split for small blocks; a co-prime stride keeps the 10 KB
+        // real-server fixtures fast in debug builds (the release-mode probe
+        // covers every split of those).
+        let stride = if end > 4096 { 13 } else { 1 };
+        for split in (0..end).step_by(stride) {
+            let mut scanner = BlockScanner::new(options_at(revision));
+            assert_eq!(
+                scanner.scan(&data[..split]).unwrap(),
+                BlockBoundary::NeedMore,
+                "split {split}/{end}"
+            );
+            assert_eq!(scanner.scan(data).unwrap(), expected, "split {split}/{end}");
+        }
+    }
+
+    /// Every block of a multi-block stream, in order, through one reused scanner
+    /// fed in `step`-byte increments.
+    fn assert_stream_scan_matches_decode(data: &[u8], revision: u64, step: usize) {
+        let mut scanner = BlockScanner::new(options_at(revision));
+        let mut start = 0;
+        while start < data.len() {
+            let rest = &data[start..];
+            let expected = decoded_boundary(rest, revision);
+            let BlockBoundary::Complete { consumed, .. } = expected else {
+                unreachable!()
+            };
+            let mut available = step.min(rest.len());
+            loop {
+                match scanner.scan(&rest[..available]).unwrap() {
+                    BlockBoundary::NeedMore => {
+                        assert!(available < consumed, "NeedMore with the whole block");
+                        available = (available + step).min(rest.len());
+                    }
+                    complete => {
+                        assert_eq!(complete, expected);
+                        break;
+                    }
+                }
+            }
+            start += consumed;
+        }
+    }
+
+    /// A scan error that decode would also raise on the same complete bytes.
+    fn assert_scan_rejects_like_decode(data: &[u8], split: usize) {
+        let decoded =
+            decode_next_block(&mut ByteReader::new(data), &DecodeOptions::default()).unwrap_err();
+        let mut scanner = BlockScanner::new(DecodeOptions::default());
+        let first = scanner.scan(&data[..split]);
+        let scanned = match first {
+            Ok(BlockBoundary::NeedMore) => scanner.scan(data).unwrap_err(),
+            other => other.unwrap_err(),
+        };
+        assert_eq!(scanned.to_string(), decoded.to_string());
+    }
+
+    fn lc_string_column(dictionary: &[&str], indexes: &[u64]) -> Vec<u8> {
+        let mut data = LC_KEY_VERSION.to_vec();
+        data.extend(lc_body(
+            0,
+            dictionary.len(),
+            &string_values(dictionary),
+            indexes,
+        ));
+        data
+    }
+
+    #[test]
+    fn low_cardinality_scan_matches_decode_at_every_split() {
+        let plain = lc_string_column(&["", "user_1", "user_2"], &[1, 2, 1, 0]);
+        // Nullable dictionary: index 0 is the NULL sentinel, u16 indexes.
+        let mut nullable = LC_KEY_VERSION.to_vec();
+        nullable.extend(lc_body(
+            1,
+            3,
+            &string_values(&["", "user_1", "user_2"]),
+            &[0, 2, 1, 0],
+        ));
+        // Fixed-width dictionary with u32 indexes.
+        let mut uint32 = LC_KEY_VERSION.to_vec();
+        let dictionary: Vec<u8> = [0u32, 13, 79]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        uint32.extend(lc_body(2, 3, &dictionary, &[2, 1, 1, 0]));
+        // u64 indexes.
+        let mut wide = LC_KEY_VERSION.to_vec();
+        wide.extend(lc_body(3, 2, &string_values(&["", "x"]), &[1, 1, 0, 1]));
+
+        for revision in [0, 54460, 54485] {
+            for column in [
+                ("s", "LowCardinality(String)", plain.clone()),
+                ("n", "LowCardinality(Nullable(String))", nullable.clone()),
+                ("u", "LowCardinality(UInt32)", uint32.clone()),
+                ("w", "LowCardinality(String)", wide.clone()),
+            ] {
+                assert_scan_matches_decode(&make_block_at(revision, 4, &[column]), revision);
+            }
+            // All four in one block, with trailing bytes after it.
+            let mut block = make_block_at(
+                revision,
+                4,
+                &[
+                    ("s", "LowCardinality(String)", plain.clone()),
+                    ("n", "LowCardinality(Nullable(String))", nullable.clone()),
+                    ("u", "LowCardinality(UInt32)", uint32.clone()),
+                    ("w", "LowCardinality(String)", wide.clone()),
+                ],
+            );
+            block.extend_from_slice(&[0xa5; 9]);
+            assert_scan_matches_decode(&block, revision);
+        }
+    }
+
+    #[test]
+    fn low_cardinality_in_containers_scan_matches_decode_at_every_split() {
+        // Array(LowCardinality(String)): [["a","b"], [], ["a"]].
+        let mut array = LC_KEY_VERSION.to_vec();
+        array.extend(offsets(&[2, 2, 3]));
+        array.extend(lc_body(0, 3, &string_values(&["", "a", "b"]), &[1, 2, 1]));
+        // Every array empty: the key version is still in the column prefix, but
+        // the zero-length LowCardinality run has no body at all.
+        let mut empty_array = LC_KEY_VERSION.to_vec();
+        empty_array.extend(offsets(&[0, 0, 0]));
+        // Map(LowCardinality(String), String).
+        let mut map = LC_KEY_VERSION.to_vec();
+        map.extend(offsets(&[1, 3, 3]));
+        map.extend(lc_body(0, 3, &string_values(&["", "k1", "k2"]), &[1, 1, 2]));
+        map.extend(string_values(&["v1", "", "v3"]));
+        // Tuple(LowCardinality(String), UInt8, LowCardinality(Nullable(String))):
+        // both key versions lead the column, then the element bodies in order.
+        let mut tuple = LC_KEY_VERSION.to_vec();
+        tuple.extend(LC_KEY_VERSION);
+        tuple.extend(lc_body(0, 2, &string_values(&["", "t"]), &[1, 0, 1]));
+        tuple.extend([7, 8, 9]);
+        tuple.extend(lc_body(0, 2, &string_values(&["", "z"]), &[0, 1, 0]));
+        // Array(Tuple(LowCardinality(String), Array(LowCardinality(String)))).
+        let mut nested = LC_KEY_VERSION.to_vec();
+        nested.extend(LC_KEY_VERSION);
+        nested.extend(offsets(&[1, 1, 3]));
+        nested.extend(lc_body(0, 2, &string_values(&["", "o"]), &[1, 1, 0]));
+        nested.extend(offsets(&[2, 2, 3]));
+        nested.extend(lc_body(1, 2, &string_values(&["", "i"]), &[1, 0, 1]));
+        // Variant(LowCardinality(String), String, UInt64): mode word, then the
+        // LowCardinality key version, discriminators, dense alternative runs.
+        let mut variant = 0u64.to_le_bytes().to_vec();
+        variant.extend(LC_KEY_VERSION);
+        variant.extend([0, 255, 2]);
+        variant.extend(lc_body(0, 2, &string_values(&["", "lc"]), &[1]));
+        variant.extend(13u64.to_le_bytes());
+        // Map(String, Variant(String, UInt64)) with an alternative that never
+        // occurs. The mode word is a prefix word, so it leads the column.
+        let mut map_variant = 0u64.to_le_bytes().to_vec();
+        map_variant.extend(offsets(&[1, 1, 2]));
+        map_variant.extend(string_values(&["k", "l"]));
+        map_variant.extend([1, 255]);
+        map_variant.extend(79u64.to_le_bytes());
+
+        let columns: [TestColumn; 7] = [
+            ("a", "Array(LowCardinality(String))", array),
+            ("e", "Array(LowCardinality(String))", empty_array),
+            ("m", "Map(LowCardinality(String), String)", map),
+            (
+                "t",
+                "Tuple(LowCardinality(String), UInt8, LowCardinality(Nullable(String)))",
+                tuple,
+            ),
+            (
+                "x",
+                "Array(Tuple(LowCardinality(String), Array(LowCardinality(String))))",
+                nested,
+            ),
+            (
+                "v",
+                "Variant(LowCardinality(String), String, UInt64)",
+                variant,
+            ),
+            ("mv", "Map(String, Variant(String, UInt64))", map_variant),
+        ];
+        for revision in [0, 54460] {
+            for column in &columns {
+                assert_scan_matches_decode(
+                    &make_block_at(revision, 3, std::slice::from_ref(column)),
+                    revision,
+                );
+            }
+            assert_scan_matches_decode(&make_block_at(revision, 3, &columns), revision);
+        }
+    }
+
+    #[test]
+    fn low_cardinality_multi_block_stream_scan_matches_decode() {
+        let first = make_block_at(
+            54460,
+            2,
+            &[(
+                "s",
+                "LowCardinality(String)",
+                lc_string_column(&["", "a"], &[1, 0]),
+            )],
+        );
+        let second = make_block_at(
+            54460,
+            3,
+            &[(
+                "s",
+                "LowCardinality(String)",
+                lc_string_column(&["", "b", "c"], &[2, 1, 2]),
+            )],
+        );
+        // A zero-row block carries the header only: no key version, no body.
+        let empty = make_block_at(54460, 0, &[("s", "LowCardinality(String)", Vec::new())]);
+        let stream = [first, second, empty].concat();
+        for step in [1, 3, 8, 17, stream.len()] {
+            assert_stream_scan_matches_decode(&stream, 54460, step);
+        }
+        let zero_rows = make_block_at(0, 0, &[("s", "LowCardinality(String)", Vec::new())]);
+        assert_scan_matches_decode(&zero_rows, 0);
+    }
+
+    #[test]
+    fn low_cardinality_scan_rejects_what_decode_rejects_across_splits() {
+        let block = |data: Vec<u8>| make_block_at(0, 2, &[("s", "LowCardinality(String)", data)]);
+        let mut bad_key_version = 2u64.to_le_bytes().to_vec();
+        bad_key_version.extend(lc_body(0, 2, &string_values(&["", "a"]), &[1, 0]));
+        let mut bad_flags = LC_KEY_VERSION.to_vec();
+        bad_flags.extend(lc_body(0, 2, &string_values(&["", "a"]), &[1, 0]));
+        bad_flags[8 + 1] = 0; // clear HasAdditionalKeysBit
+        let mut bad_tag = LC_KEY_VERSION.to_vec();
+        bad_tag.extend(lc_body(0, 2, &string_values(&["", "a"]), &[1, 0]));
+        bad_tag[8] = 4;
+        let mut bad_rows = LC_KEY_VERSION.to_vec();
+        bad_rows.extend(lc_body(0, 2, &string_values(&["", "a"]), &[1, 0]));
+        let rows_at = bad_rows.len() - 2 - 8;
+        bad_rows[rows_at] = 3;
+        let out_of_range = lc_string_column(&["", "a"], &[1, 2]);
+
+        for data in [
+            block(bad_key_version),
+            block(bad_flags),
+            block(bad_tag),
+            block(bad_rows),
+            block(out_of_range),
+        ] {
+            for split in 0..=data.len() {
+                assert_scan_rejects_like_decode(&data, split);
+            }
+        }
+
+        // A Variant discriminator naming no alternative.
+        let mut variant = 0u64.to_le_bytes().to_vec();
+        variant.extend([0, 2]);
+        variant.extend(string_values(&["s"]));
+        let data = make_block_at(0, 2, &[("v", "Variant(String, UInt64)", variant)]);
+        for split in 0..=data.len() {
+            assert_scan_rejects_like_decode(&data, split);
+        }
+    }
+
+    /// A String length past `i32::MAX` is fatal `InvalidData` in decode before
+    /// any payload is read; the scan must reject it the same way at every
+    /// split rather than wait forever for 2 GiB of payload.
+    #[test]
+    fn oversized_string_length_rejected_like_decode_at_every_split() {
+        let oversized = [0x80, 0x80, 0x80, 0x80, 0x08]; // varint 2^31
+        let string = make_block_at(0, 1, &[("c", "String", oversized.to_vec())]);
+        let mut array = offsets(&[1]);
+        array.extend(oversized);
+        let array = make_block_at(0, 1, &[("a", "Array(String)", array)]);
+        let mut lc = LC_KEY_VERSION.to_vec();
+        lc.extend((LC_HAS_ADDITIONAL_KEYS_BIT).to_le_bytes());
+        lc.extend(1u64.to_le_bytes());
+        lc.extend(oversized);
+        let lc = make_block_at(0, 1, &[("l", "LowCardinality(String)", lc)]);
+        for data in [string, array, lc] {
+            let err = block_end(&data, &DecodeOptions::default()).unwrap_err();
+            assert!(
+                matches!(err, DecodeError::Io(ref e) if e.kind() == io::ErrorKind::InvalidData),
+                "{err:?}"
+            );
+            for split in 0..=data.len() {
+                assert_scan_rejects_like_decode(&data, split);
+            }
+        }
+    }
+
+    #[test]
+    fn low_cardinality_scan_walks_linear_bytes_across_small_feeds() {
+        let keys: Vec<String> = (0..20_000).map(|i| format!("user_{i}")).collect();
+        let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let indexes: Vec<u64> = (0..20_000).collect();
+        let mut lc = LC_KEY_VERSION.to_vec();
+        lc.extend(lc_body(1, keys.len(), &string_values(&key_refs), &indexes));
+
+        let rows = 20_000;
+        let mut map = LC_KEY_VERSION.to_vec();
+        map.extend(offsets(
+            &(1..=rows as u64).map(|i| 2 * i).collect::<Vec<_>>(),
+        ));
+        map.extend(lc_body(
+            0,
+            3,
+            &string_values(&["", "k1", "k2"]),
+            &(0..2 * rows as u64).map(|i| 1 + i % 2).collect::<Vec<_>>(),
+        ));
+        let value = "v".repeat(40);
+        map.extend(string_values(&vec![value.as_str(); 2 * rows]));
+
+        for (num_rows, type_name, column) in [
+            (rows, "LowCardinality(String)", lc),
+            (rows, "Map(LowCardinality(String), String)", map),
+        ] {
+            let data = make_block_at(54460, num_rows, &[("c", type_name, column)]);
+            let mut scanner = BlockScanner::new(options_at(54460));
+            for end in (1024..data.len()).step_by(1024) {
+                assert_eq!(scanner.scan(&data[..end]).unwrap(), BlockBoundary::NeedMore);
+            }
+            assert!(matches!(
+                scanner.scan(&data).unwrap(),
+                BlockBoundary::Complete { consumed, .. } if consumed == data.len()
+            ));
+            assert!(
+                scanner.progress.bytes_walked < 2 * data.len() as u64,
+                "{type_name}: scanner walked {} bytes for a {}-byte block",
+                scanner.progress.bytes_walked,
+                data.len()
+            );
+        }
+    }
+
+    /// Differential check against every real-server Native fixture: each block
+    /// at every two-way split (and bytewise through one scanner) must report
+    /// exactly the boundary and shape `decode_next_block` produces.
+    #[test]
+    fn real_server_fixtures_scan_matches_decode_at_every_split() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            // `_lz4.native` holds compressed frames, not a bare Native stream.
+            if !name.ends_with(".native") || name.ends_with("_lz4.native") {
+                continue;
+            }
+            let revision = if name.contains("rev54485") {
+                54485
+            } else if name.contains("rev54460") {
+                54460
+            } else {
+                assert!(name.contains("rev0"), "fixture {name} names no revision");
+                0
+            };
+            let data = std::fs::read(&path).unwrap();
+            let mut start = 0;
+            while start < data.len() {
+                let rest = &data[start..];
+                assert_scan_matches_decode(rest, revision);
+                let BlockBoundary::Complete { consumed, .. } = decoded_boundary(rest, revision)
+                else {
+                    unreachable!()
+                };
+                start += consumed;
+            }
+            assert_stream_scan_matches_decode(&data, revision, 61);
+            checked += 1;
+        }
+        assert!(checked >= 10, "only {checked} fixtures found");
     }
 }

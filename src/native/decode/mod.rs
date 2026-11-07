@@ -8,7 +8,7 @@ use crate::column::{
     variant_child_counts, variant_layout_from_discriminators, AggregateStateColumn, ArrayColumn,
     BoolColumn, Column, DecimalColumn, DictionaryColumn, DynamicChild, DynamicColumn,
     FixedBinaryColumn, JsonColumn, MapColumn, NothingColumn, PrimitiveColumn, QBitColumn,
-    StructuredJson, TupleColumn, Utf8Column, VariantColumn,
+    StructuredJson, TupleColumn, Utf8Column, VariantColumn, VariantColumnError,
 };
 use crate::native::aggregate_function::{
     decode_aggregate_states, decode_state_codec, scan_aggregate_states,
@@ -202,6 +202,7 @@ fn ensure_supported_protocol_revision(revision: u64) -> Result<(), DecodeError> 
 }
 
 /// Options for Native format decoding.
+#[derive(Debug)]
 #[non_exhaustive]
 pub struct DecodeOptions {
     /// Negotiated server protocol revision the Native stream was produced with.
@@ -481,21 +482,30 @@ fn decode_string_data(reader: &mut ByteReader, num_rows: usize) -> io::Result<(V
         // into `data`. This is a fatal error, not UnexpectedEof, so the
         // streaming decoder does not mistake it for "need more bytes". Blocks
         // stay separate chunks, so the 2 GiB cap is per chunk, not per result.
-        offset = i32::try_from(len)
-            .ok()
-            .and_then(|len_i32| offset.checked_add(len_i32))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "String column chunk exceeds 2 GiB (i32 offset overflow)",
-                )
-            })?;
+        offset = next_string_offset(offset, len)?;
         let bytes = reader.read_slice(len)?;
         data.extend_from_slice(bytes);
         offsets.push(offset);
     }
 
     Ok((offsets, data))
+}
+
+/// Advance one String run's running Arrow i32 offset past a value of `len`
+/// bytes, rejecting a run whose data would exceed `i32::MAX` bytes. Shared by
+/// [`decode_string_data`] and both completeness-scan walkers so all three reject
+/// the same runs with the same error, before any payload byte is read.
+#[inline]
+fn next_string_offset(offset: i32, len: usize) -> io::Result<i32> {
+    i32::try_from(len)
+        .ok()
+        .and_then(|len| offset.checked_add(len))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "String column chunk exceeds 2 GiB (i32 offset overflow)",
+            )
+        })
 }
 
 fn decode_fixed_binary_data(
@@ -3058,11 +3068,14 @@ fn empty_column(ch_type: &ChType) -> Column {
 /// block boundary at end of stream), or `Ok(true)` once a full preamble has been
 /// consumed.
 fn read_block_info(reader: &mut ByteReader) -> Result<bool, DecodeError> {
-    let mut field_num = match reader.read_varint() {
-        Ok(n) => n,
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
-        Err(e) => return Err(e.into()),
-    };
+    if reader.remaining() == 0 {
+        return Ok(false);
+    }
+    // Once any byte of the first field-number VarUInt is present, EOF means
+    // the block is partial rather than a clean boundary. This distinction is
+    // essential for streaming: a non-canonical multi-byte field number may
+    // straddle feeds.
+    let mut field_num = reader.read_varint()?;
 
     while field_num != 0 {
         match field_num {
@@ -3094,9 +3107,11 @@ fn read_block_info(reader: &mut ByteReader) -> Result<bool, DecodeError> {
 /// clean end-of-stream at a block boundary returns `Ok(None)`.
 ///
 /// `decode_all_bytes` and `StreamDecoder` both drive the decode through this
-/// entry point. `StreamDecoder` first runs [`block_end`] to confirm a full
-/// block is buffered, so it never reaches the allocating decode for a partial
-/// block.
+/// entry point. `StreamDecoder` first runs the same resumable completeness
+/// scan that backs [`BlockScanner`](crate::native::stream_decoder::BlockScanner),
+/// keeping its `ScanProgress` checkpoint across feeds, so it reaches the
+/// allocating decode only once a whole block is buffered and walks a block fed
+/// in many pieces once overall rather than once per feed.
 ///
 /// [`max_synthetic_allocation_bytes`](DecodeOptions::max_synthetic_allocation_bytes)
 /// bounds synthesized allocations cumulatively across this block's columns.
@@ -3166,12 +3181,12 @@ fn decode_next_block_with_settings_unchecked(
         )?));
     }
 
-    // No protocol framing. End of stream falls on the column-count varint.
-    let num_cols = match reader.read_varint() {
-        Ok(n) => varint_usize(n, "column count")?,
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
+    // No protocol framing. Only an empty reader is a clean block boundary.
+    // Once the column-count VarUInt starts, EOF means the block is partial.
+    if reader.remaining() == 0 {
+        return Ok(None);
+    }
+    let num_cols = varint_usize(reader.read_varint()?, "column count")?;
     let num_rows = varint_usize(reader.read_varint()?, "row count")?;
     Ok(Some(decode_block_body(
         reader, options, num_cols, num_rows,
@@ -3407,11 +3422,15 @@ fn has_min_one_byte_per_row(ch_type: &ChType) -> bool {
 ///   surfaced even before the whole block is buffered, exactly as the real
 ///   decode would surface it.
 ///
-/// The streaming decoder calls this before [`decode_next_block`] so it never
-/// allocates and discards column buffers for a block that has not fully arrived.
-/// It shares `read_block_info` and `read_column_header` with the real
-/// decode; only `skip_column_data` is scan specific, and it walks the exact
-/// same wire bytes the per-type decoders consume.
+/// This is the one-shot form: it restarts from the block start on every call.
+/// `StreamDecoder` and [`BlockScanner`](crate::native::stream_decoder::BlockScanner)
+/// instead run the resumable form of the same scan, which keeps a
+/// `ScanProgress` checkpoint (completed columns, plus a task stack inside a
+/// resumable column) across "need more bytes", so incremental feeds walk each
+/// byte about once. Calling this after every partial read is quadratic in the
+/// number of reads. The scan shares `read_block_info` and `read_column_header`
+/// with the real decode, and its column walkers consume exactly the wire bytes
+/// the per-type decoders consume and reject what they reject.
 pub fn block_end(data: &[u8], options: &DecodeOptions) -> Result<Option<usize>, DecodeError> {
     block_end_with_settings(data, &DecodeSettings::text(options))
 }
@@ -3457,9 +3476,10 @@ pub(crate) struct ScanProgress {
     /// to the offset just past the block header.
     columns_done: usize,
     columns_end: usize,
-    /// Mid-body checkpoint inside the current column, recorded only for the
-    /// flat-resumable String and Nullable(String) bodies.
-    string_body: Option<StringScanState>,
+    /// Mid-column checkpoint inside a column [`is_resumable`] accepts (fixed
+    /// width values, String, Nullable, Array, Map, Tuple, LowCardinality, and
+    /// Variant), covering its state-prefix words and its body.
+    body: Option<ResumableBodyState>,
     /// Cumulative bytes the scan advanced over, across resumes. Backs the
     /// O(n) linearity guard in the stream decoder tests.
     #[cfg(test)]
@@ -3470,7 +3490,7 @@ impl ScanProgress {
     /// Offset the next scan resumes from, which is also the largest saved
     /// offset (checkpoints only move forward within a block).
     fn resume_offset(&self) -> usize {
-        match &self.string_body {
+        match &self.body {
             Some(body) => body.offset,
             None => self.columns_end,
         }
@@ -3482,20 +3502,137 @@ impl ScanProgress {
         self.header = None;
         self.columns_done = 0;
         self.columns_end = 0;
-        self.string_body = None;
+        self.body = None;
     }
 }
 
-/// Mid-body scan checkpoint for a String or Nullable(String) column.
+/// Resumable scan state for one top-level column whose type passes
+/// [`is_resumable`]: its state-prefix words, then its body, as a task stack.
 #[derive(Debug)]
-struct StringScanState {
-    /// Whether the Nullable null map has been skipped. Starts true for plain
-    /// String, which carries none.
-    null_map_done: bool,
-    /// Rows whose length varint and payload are fully verified.
-    rows_done: usize,
-    /// Offset of the first unverified byte, relative to the block start.
+struct ResumableBodyState {
+    column: String,
+    tasks: Vec<BodyScanTask>,
+    /// Offset of the first unverified byte, relative to the block start. The
+    /// task on top of the stack resumes reading exactly here.
     offset: usize,
+}
+
+impl ResumableBodyState {
+    /// Seed the task stack for one column: every bulk-state-prefix word in the
+    /// preorder [`read_state_prefix`] reads them (first word on top), then the
+    /// column's value run.
+    fn new(column: String, ch_type: ChType, num_rows: usize, offset: usize) -> Self {
+        let mut words = Vec::new();
+        collect_prefix_words(&ch_type, &mut words);
+        let mut tasks = Vec::with_capacity(words.len() + 4);
+        tasks.push(BodyScanTask::Values { ch_type, num_rows });
+        tasks.extend(words.into_iter().rev().map(BodyScanTask::PrefixWord));
+        Self {
+            column,
+            tasks,
+            offset,
+        }
+    }
+}
+
+/// One fixed 8-byte bulk-state-prefix word of a resumable column.
+#[derive(Debug, Clone, Copy)]
+enum PrefixWord {
+    /// `LowCardinality` key version, which must be 1
+    /// ([`read_low_cardinality_state`]).
+    LowCardinalityKeyVersion,
+    /// `Variant` discriminator mode, which must be BASIC mode 0
+    /// ([`read_variant_state`]).
+    VariantMode,
+}
+
+/// A bounded piece of the resumable column traversal. Every task that reads a
+/// fixed 8-byte word ([`BodyScanTask::reads_word`]) is parked whole until the
+/// word is buffered, so a word is never split across resumes.
+#[derive(Debug)]
+enum BodyScanTask {
+    PrefixWord(PrefixWord),
+    Values {
+        ch_type: ChType,
+        num_rows: usize,
+    },
+    Bytes {
+        remaining: usize,
+    },
+    Strings {
+        rows_remaining: usize,
+        length_value: u64,
+        length_shift: u32,
+        length_complete: bool,
+        payload_remaining: usize,
+        /// Running Arrow i32 offset of this run, checked exactly as one
+        /// [`decode_string_data`] call checks it.
+        data_offset: i32,
+    },
+    Offsets {
+        rows_remaining: usize,
+        previous: u64,
+        children: Vec<ChType>,
+    },
+    ValidateOffsetCount {
+        count: u64,
+        children: Vec<ChType>,
+    },
+    /// `LowCardinality` index-serialization word, the first body word
+    /// [`decode_low_cardinality`] reads.
+    LowCardinality {
+        dict_type: ChType,
+        num_rows: usize,
+    },
+    /// `LowCardinality` per-block dictionary size word; the dictionary body
+    /// follows as an ordinary value run of `dict_type`.
+    LowCardinalityDictionary {
+        dict_type: ChType,
+        num_rows: usize,
+        index_width: usize,
+    },
+    /// `LowCardinality` index row-count word, after the dictionary body.
+    LowCardinalityRows {
+        num_rows: usize,
+        index_width: usize,
+        num_keys: usize,
+    },
+    /// `LowCardinality` raw index array, validated against the dictionary.
+    LowCardinalityIndexes {
+        rows_remaining: usize,
+        index_width: usize,
+        num_keys: usize,
+    },
+    /// `Variant` one-byte discriminators, counted per alternative; the dense
+    /// alternative runs follow once every row is counted.
+    VariantDiscriminators {
+        alternatives: Vec<ChType>,
+        counts: Vec<usize>,
+        rows_done: usize,
+        rows_remaining: usize,
+    },
+}
+
+impl BodyScanTask {
+    /// Whether the task begins by reading one fixed 8-byte LE word.
+    fn reads_word(&self) -> bool {
+        matches!(
+            self,
+            BodyScanTask::PrefixWord(_)
+                | BodyScanTask::LowCardinality { .. }
+                | BodyScanTask::LowCardinalityDictionary { .. }
+                | BodyScanTask::LowCardinalityRows { .. }
+        )
+    }
+}
+
+fn is_unexpected_eof(error: &DecodeError) -> bool {
+    matches!(error, DecodeError::Io(error) if error.kind() == io::ErrorKind::UnexpectedEof)
+}
+
+fn need_more_bytes() -> DecodeError {
+    // A bare-kind `io::Error` carries no heap payload.
+    DecodeError::Io(io::Error::from(io::ErrorKind::UnexpectedEof))
 }
 
 /// Resumable [`block_end`]: on "need more bytes" the verified progress is kept
@@ -3524,6 +3661,39 @@ fn block_end_resume_with_settings(
     settings: &DecodeSettings,
     progress: &mut ScanProgress,
 ) -> Result<Option<usize>, DecodeError> {
+    block_scan_resume_with_settings(data, settings, progress)
+        .map(|block| block.map(|block| block.end))
+}
+
+/// Shape and boundary found by the allocation-free block scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScannedBlock {
+    pub(crate) end: usize,
+    pub(crate) num_columns: usize,
+    pub(crate) num_rows: usize,
+}
+
+pub(crate) fn scan_block_resume(
+    data: &[u8],
+    options: &DecodeOptions,
+    progress: &mut ScanProgress,
+) -> Result<Option<ScannedBlock>, DecodeError> {
+    block_scan_resume_with_settings(data, &DecodeSettings::text(options), progress)
+}
+
+pub(crate) fn scan_block_binary_types_resume(
+    data: &[u8],
+    options: &DecodeOptions,
+    progress: &mut ScanProgress,
+) -> Result<Option<ScannedBlock>, DecodeError> {
+    block_scan_resume_with_settings(data, &DecodeSettings::binary(options), progress)
+}
+
+fn block_scan_resume_with_settings(
+    data: &[u8],
+    settings: &DecodeSettings,
+    progress: &mut ScanProgress,
+) -> Result<Option<ScannedBlock>, DecodeError> {
     if !progress.revision_validated {
         if let Err(error) = ensure_supported_protocol_revision(settings.protocol_revision) {
             progress.reset();
@@ -3549,7 +3719,7 @@ fn block_end_resume_with_settings(
     let resume_from = progress.resume_offset();
 
     let mut reader = ByteReader::new(data);
-    let result = scan_block_resume(&mut reader, settings, progress);
+    let result = scan_block_body_resume(&mut reader, settings, progress);
 
     #[cfg(test)]
     {
@@ -3566,18 +3736,18 @@ fn block_end_resume_with_settings(
 
 /// Body of the resumable completeness scan. Jumps to the finest checkpoint in
 /// `progress`, then records new progress after the header, after each fully
-/// scanned column, and per row inside a flat-resumable String body.
-fn scan_block_resume(
+/// scanned column, and inside resumable columns ([`is_resumable`]).
+fn scan_block_body_resume(
     reader: &mut ByteReader,
     settings: &DecodeSettings,
     progress: &mut ScanProgress,
-) -> Result<Option<usize>, DecodeError> {
+) -> Result<Option<ScannedBlock>, DecodeError> {
     let (num_cols, num_rows) = if let Some((num_cols, num_rows)) = progress.header {
-        if let Some(body) = progress.string_body.as_mut() {
+        if let Some(body) = progress.body.as_mut() {
             // The wrapper verified `body.offset` lies within the data.
             reader.skip(body.offset)?;
-            skip_string_body_resumable(reader, num_rows, body)?;
-            progress.string_body = None;
+            scan_resumable_body(reader, body)?;
+            progress.body = None;
             progress.columns_done += 1;
         } else {
             reader.skip(progress.columns_end)?;
@@ -3601,18 +3771,16 @@ fn scan_block_resume(
     while progress.columns_done < num_cols {
         let (name, ch_type) = read_column_header(reader, settings)?;
         if num_rows > 0 {
-            if let Some(nullable) = flat_string_body(&ch_type) {
-                let mut body = StringScanState {
-                    null_map_done: !nullable,
-                    rows_done: 0,
-                    offset: reader.position(),
-                };
-                if let Err(err) = skip_string_body_resumable(reader, num_rows, &mut body) {
-                    if matches!(&err, DecodeError::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof)
-                    {
-                        progress.string_body = Some(body);
+            if needs_resumable_body(&ch_type) {
+                // One pass, complete or partial: the task walker is the only
+                // walker for these types, so a complete buffer is not walked
+                // twice and a partial one keeps its exact checkpoint.
+                let mut body = ResumableBodyState::new(name, ch_type, num_rows, reader.position());
+                if let Err(error) = scan_resumable_body(reader, &mut body) {
+                    if is_unexpected_eof(&error) {
+                        progress.body = Some(body);
                     }
-                    return Err(err);
+                    return Err(error);
                 }
             } else {
                 skip_column_data(reader, &ch_type, num_rows, &name, settings)?;
@@ -3622,44 +3790,842 @@ fn scan_block_resume(
         progress.columns_end = reader.position();
     }
 
-    Ok(Some(reader.position()))
+    Ok(Some(ScannedBlock {
+        end: reader.position(),
+        num_columns: num_cols,
+        num_rows,
+    }))
 }
 
-/// Whether `ch_type` has a flat-resumable body for the streaming scan: no
-/// state prefix or suffix bytes and a flat per-row walk. True only for the
-/// exact `String` and `Nullable(String)` spellings; returns the nullability,
-/// since a `Nullable(String)` body leads with its null map. Every other type,
-/// including aliases that physically delegate to String, keeps the general
-/// column-boundary checkpointing.
-fn flat_string_body(ch_type: &ChType) -> Option<bool> {
+/// Whether a top-level column of `ch_type` can use the resumable task walker
+/// below: every node is a fixed-width leaf, String, Nullable, Array, Map,
+/// Tuple, LowCardinality, Variant, or a name-decoration alias over those.
+///
+/// These types' bulk state prefix is a fixed list of 8-byte words (one per
+/// LowCardinality and Variant node) and they carry no state suffix, so the
+/// whole column is a resumable task sequence. Dynamic, JSON, and
+/// AggregateFunction read runtime-shaped state and stay on the column-boundary
+/// checkpoint. Returning `false` is always safe: the column then goes through
+/// [`skip_column_data`], the reference walker.
+fn is_resumable(ch_type: &ChType) -> bool {
+    if let Some(delegate) = ch_type.physical_delegate_ref() {
+        return is_resumable(delegate.as_ref());
+    }
     match ch_type {
-        ChType::String => Some(false),
-        ChType::Nullable(inner) if matches!(inner.as_ref(), ChType::String) => Some(true),
-        _ => None,
+        ChType::Nothing
+        | ChType::Bool
+        | ChType::Int8
+        | ChType::Int16
+        | ChType::Int32
+        | ChType::Int64
+        | ChType::UInt8
+        | ChType::UInt16
+        | ChType::UInt32
+        | ChType::UInt64
+        | ChType::Float32
+        | ChType::Float64
+        | ChType::BFloat16
+        | ChType::QBit { .. }
+        | ChType::Int128
+        | ChType::UInt128
+        | ChType::Int256
+        | ChType::UInt256
+        | ChType::String
+        | ChType::FixedString(_)
+        | ChType::Date
+        | ChType::Date32
+        | ChType::DateTime { .. }
+        | ChType::DateTime64 { .. }
+        | ChType::Time
+        | ChType::Time64 { .. }
+        | ChType::Interval(_)
+        | ChType::Decimal { .. }
+        | ChType::Uuid
+        | ChType::Ipv4
+        | ChType::Ipv6
+        | ChType::Enum8 { .. }
+        | ChType::Enum16 { .. } => true,
+        ChType::Nullable(inner) => is_resumable_nullable_inner(inner),
+        // The dictionary value type is validated by the task itself, exactly
+        // where `decode_low_cardinality` validates it.
+        ChType::LowCardinality(_) => true,
+        ChType::Array(inner) => is_resumable(inner),
+        ChType::Tuple(elements) => elements.iter().all(|(_, element)| is_resumable(element)),
+        ChType::Map(key, value) => is_resumable(key) && is_resumable(value),
+        ChType::Variant(alternatives) => alternatives.iter().all(is_resumable),
+        ChType::Dynamic { .. } | ChType::Json { .. } | ChType::AggregateFunction { .. } => false,
+        // Resolved by `physical_delegate_ref` above; unreachable, and `false`
+        // is the safe answer if that ever changes.
+        ChType::SimpleAggregateFunction { .. }
+        | ChType::Geo(_)
+        | ChType::Geometry
+        | ChType::Nested(_) => false,
     }
 }
 
-/// Walk a String body row loop, recording verified progress in `state` so an
-/// `UnexpectedEof` resumes at the last row boundary. The walk is byte-for-byte
-/// the `ChType::String` arm of [`skip_column_body`], preceded by the Nullable
-/// null map skip from [`skip_values`] when the column is `Nullable(String)`.
-fn skip_string_body_resumable(
-    reader: &mut ByteReader,
-    num_rows: usize,
-    state: &mut StringScanState,
-) -> Result<(), DecodeError> {
-    if !state.null_map_done {
-        reader.skip(num_rows)?; // null map: 1 byte per row
-        state.null_map_done = true;
-        state.offset = reader.position();
+/// Whether `Nullable(inner)` walks the same bytes in the task walker as in
+/// [`skip_values`]. That walker unwraps the null map, expands at most ONE alias
+/// level, then accepts only a Tuple or a leaf body; anything else (a nested
+/// wrapper or container, a chained alias) is an `UnsupportedType` there, so it
+/// must stay on that path here too rather than be silently accepted.
+fn is_resumable_nullable_inner(inner: &ChType) -> bool {
+    let delegate = inner.physical_delegate_ref();
+    let inner = delegate.as_deref().unwrap_or(inner);
+    match inner {
+        ChType::Tuple(elements) => elements.iter().all(|(_, element)| is_resumable(element)),
+        leaf => is_fixed_width_leaf(leaf) || matches!(leaf, ChType::String),
     }
-    while state.rows_done < num_rows {
-        let len = varint_usize(reader.read_varint()?, "String value length")?;
-        reader.skip(len)?;
-        state.rows_done += 1;
-        state.offset = reader.position();
+}
+
+/// Whether a top-level column benefits from the resumable task walker.
+///
+/// Fixed-width leaves (and the empty `Tuple()`) keep the allocation-free
+/// arithmetic skip in [`skip_column_data`]: re-walking them after a partial
+/// feed is O(1). Every other resumable type uses the task walker for both
+/// partial and complete buffers.
+fn needs_resumable_body(ch_type: &ChType) -> bool {
+    if let Some(delegate) = ch_type.physical_delegate_ref() {
+        return needs_resumable_body(delegate.as_ref());
+    }
+    match ch_type {
+        ChType::Tuple(elements) if elements.is_empty() => false,
+        other => !is_fixed_width_leaf(other) && is_resumable(other),
+    }
+}
+
+/// Collect the 8-byte state-prefix words of a resumable type in the exact
+/// preorder [`read_state_prefix`] reads them: a LowCardinality key version (not
+/// descending into its inner, which carries no prefix), a Variant mode followed
+/// by its alternatives' words, and the children of Nullable, Array, Tuple, and
+/// Map in declaration order. Recursion depth is bounded by the parsed type,
+/// which [`parse_ch_type`] caps at `MAX_TYPE_DEPTH`.
+fn collect_prefix_words(ch_type: &ChType, words: &mut Vec<PrefixWord>) {
+    if let Some(delegate) = ch_type.physical_delegate_ref() {
+        return collect_prefix_words(delegate.as_ref(), words);
+    }
+    match ch_type {
+        ChType::LowCardinality(_) => words.push(PrefixWord::LowCardinalityKeyVersion),
+        ChType::Variant(alternatives) => {
+            words.push(PrefixWord::VariantMode);
+            for alternative in alternatives {
+                collect_prefix_words(alternative, words);
+            }
+        }
+        ChType::Nullable(inner) | ChType::Array(inner) => collect_prefix_words(inner, words),
+        ChType::Tuple(elements) => {
+            for (_, element) in elements {
+                collect_prefix_words(element, words);
+            }
+        }
+        ChType::Map(key, value) => {
+            collect_prefix_words(key, words);
+            collect_prefix_words(value, words);
+        }
+        _ => {}
+    }
+}
+
+/// Resume a resumable column without materializing row or column buffers.
+///
+/// Consumes exactly the bytes [`skip_column_data`] (and so `decode_column`)
+/// consumes and rejects with the same errors; it only differs in being able to
+/// stop at any byte and continue later from `state.offset`. The task stack is
+/// bounded by type metadata, never by row count.
+fn scan_resumable_body(
+    reader: &mut ByteReader,
+    state: &mut ResumableBodyState,
+) -> Result<(), DecodeError> {
+    while let Some(task) = state.tasks.pop() {
+        if task.reads_word() && reader.remaining() < 8 {
+            state.tasks.push(task);
+            return Err(need_more_bytes());
+        }
+        match task {
+            BodyScanTask::PrefixWord(word) => {
+                let value = reader.read_u64_le()?;
+                match word {
+                    PrefixWord::LowCardinalityKeyVersion => {
+                        if value != LOW_CARDINALITY_KEY_VERSION {
+                            return Err(DecodeError::InvalidLowCardinality {
+                                column: state.column.clone(),
+                                reason:
+                                    "key version is not 1 (SharedDictionariesWithAdditionalKeys)",
+                            });
+                        }
+                    }
+                    PrefixWord::VariantMode => {
+                        if value != 0 {
+                            return Err(DecodeError::InvalidVariant {
+                                column: state.column.clone(),
+                                reason: format!(
+                                    "discriminator mode {value} is not BASIC mode 0 emitted by FORMAT Native"
+                                ),
+                            });
+                        }
+                    }
+                }
+                state.offset = reader.position();
+            }
+            BodyScanTask::Values { ch_type, num_rows } => {
+                if let Err(error) =
+                    push_value_tasks(&mut state.tasks, &ch_type, num_rows, &state.column)
+                {
+                    if is_unexpected_eof(&error) {
+                        state.tasks.push(BodyScanTask::Values { ch_type, num_rows });
+                    }
+                    return Err(error);
+                }
+            }
+            BodyScanTask::Bytes { mut remaining } => {
+                let consumed = remaining.min(reader.remaining());
+                reader.skip(consumed)?;
+                remaining -= consumed;
+                state.offset = reader.position();
+                if remaining != 0 {
+                    state.tasks.push(BodyScanTask::Bytes { remaining });
+                    return Err(need_more_bytes());
+                }
+            }
+            BodyScanTask::Strings {
+                mut rows_remaining,
+                mut length_value,
+                mut length_shift,
+                mut length_complete,
+                mut payload_remaining,
+                mut data_offset,
+            } => {
+                while rows_remaining != 0 {
+                    if payload_remaining != 0 {
+                        let consumed = payload_remaining.min(reader.remaining());
+                        reader.skip(consumed)?;
+                        payload_remaining -= consumed;
+                        state.offset = reader.position();
+                        if payload_remaining != 0 {
+                            state.tasks.push(BodyScanTask::Strings {
+                                rows_remaining,
+                                length_value,
+                                length_shift,
+                                length_complete,
+                                payload_remaining,
+                                data_offset,
+                            });
+                            return Err(need_more_bytes());
+                        }
+                        rows_remaining -= 1;
+                        continue;
+                    }
+
+                    if !length_complete {
+                        let byte = match reader.read_u8() {
+                            Ok(byte) => byte,
+                            Err(error) => {
+                                state.tasks.push(BodyScanTask::Strings {
+                                    rows_remaining,
+                                    length_value,
+                                    length_shift,
+                                    length_complete,
+                                    payload_remaining,
+                                    data_offset,
+                                });
+                                return Err(error.into());
+                            }
+                        };
+                        state.offset = reader.position();
+                        length_value |= u64::from(byte & 0x7f) << length_shift;
+                        if byte & 0x80 != 0 {
+                            length_shift += 7;
+                            if length_shift >= 64 {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "varint overflow",
+                                )
+                                .into());
+                            }
+                            continue;
+                        }
+                        length_complete = true;
+                    }
+                    payload_remaining = match varint_usize(length_value, "String value length") {
+                        Ok(length) => length,
+                        Err(error) => {
+                            state.tasks.push(BodyScanTask::Strings {
+                                rows_remaining,
+                                length_value,
+                                length_shift,
+                                length_complete,
+                                payload_remaining,
+                                data_offset,
+                            });
+                            return Err(error.into());
+                        }
+                    };
+                    // Fatal `InvalidData`, so nothing is parked.
+                    data_offset = next_string_offset(data_offset, payload_remaining)?;
+                    length_value = 0;
+                    length_shift = 0;
+                    length_complete = false;
+                    if payload_remaining == 0 {
+                        rows_remaining -= 1;
+                    }
+                }
+            }
+            BodyScanTask::Offsets {
+                mut rows_remaining,
+                mut previous,
+                children,
+            } => {
+                while rows_remaining != 0 {
+                    let current = match reader.read_u64_le() {
+                        Ok(current) => current,
+                        Err(error) => {
+                            state.tasks.push(BodyScanTask::Offsets {
+                                rows_remaining,
+                                previous,
+                                children,
+                            });
+                            return Err(error.into());
+                        }
+                    };
+                    state.offset = reader.position();
+                    if current < previous {
+                        return Err(DecodeError::InvalidArray {
+                            column: state.column.clone(),
+                            reason: "offsets are not monotonically non-decreasing",
+                        });
+                    }
+                    if i64::try_from(current).is_err() {
+                        return Err(DecodeError::InvalidArray {
+                            column: state.column.clone(),
+                            reason: "offset exceeds i64::MAX",
+                        });
+                    }
+                    previous = current;
+                    rows_remaining -= 1;
+                }
+                state.tasks.push(BodyScanTask::ValidateOffsetCount {
+                    count: previous,
+                    children,
+                });
+            }
+            BodyScanTask::ValidateOffsetCount { count, children } => {
+                let wire_count = count;
+                let count = match usize::try_from(wire_count) {
+                    Ok(count) => count,
+                    Err(_) => {
+                        state
+                            .tasks
+                            .push(BodyScanTask::ValidateOffsetCount { count, children });
+                        return Err(DecodeError::Io(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "Array element count overflows usize",
+                        )));
+                    }
+                };
+                if let Err(error) = check_header_count(count, "Array element count", reader) {
+                    state.tasks.push(BodyScanTask::ValidateOffsetCount {
+                        count: wire_count,
+                        children,
+                    });
+                    return Err(error);
+                }
+                for child in children.into_iter().rev() {
+                    state.tasks.push(BodyScanTask::Values {
+                        ch_type: child,
+                        num_rows: count,
+                    });
+                }
+            }
+            // The four LowCardinality tasks mirror `decode_low_cardinality`
+            // step for step, with the same rejections in the same order.
+            BodyScanTask::LowCardinality {
+                dict_type,
+                num_rows,
+            } => {
+                let index_word = reader.read_u64_le()?;
+                let index_width = low_cardinality_index_width(index_word, &state.column)?;
+                state.offset = reader.position();
+                state.tasks.push(BodyScanTask::LowCardinalityDictionary {
+                    dict_type,
+                    num_rows,
+                    index_width,
+                });
+            }
+            BodyScanTask::LowCardinalityDictionary {
+                dict_type,
+                num_rows,
+                index_width,
+            } => {
+                // Validate before committing the word: the size and capacity
+                // checks report `UnexpectedEof`, so on those the task is parked
+                // unchanged and the word is re-read once more bytes arrive.
+                let checked = usize::try_from(reader.read_u64_le()?)
+                    .map_err(|_| {
+                        DecodeError::Io(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "LowCardinality dictionary size overflows usize",
+                        ))
+                    })
+                    .and_then(|num_keys| {
+                        check_header_count(num_keys, "LowCardinality dictionary size", reader)
+                            .map(|()| num_keys)
+                    });
+                let num_keys = match checked {
+                    Ok(num_keys) => num_keys,
+                    Err(error) => {
+                        if is_unexpected_eof(&error) {
+                            state.tasks.push(BodyScanTask::LowCardinalityDictionary {
+                                dict_type,
+                                num_rows,
+                                index_width,
+                            });
+                        }
+                        return Err(error);
+                    }
+                };
+                if !is_low_cardinality_inner(&dict_type) {
+                    return Err(DecodeError::UnsupportedType {
+                        column: state.column.clone(),
+                        type_name: format!("LowCardinality({dict_type})"),
+                    });
+                }
+                state.offset = reader.position();
+                state.tasks.push(BodyScanTask::LowCardinalityRows {
+                    num_rows,
+                    index_width,
+                    num_keys,
+                });
+                state.tasks.push(BodyScanTask::Values {
+                    ch_type: dict_type,
+                    num_rows: num_keys,
+                });
+            }
+            BodyScanTask::LowCardinalityRows {
+                num_rows,
+                index_width,
+                num_keys,
+            } => {
+                let wire_rows = match usize::try_from(reader.read_u64_le()?) {
+                    Ok(wire_rows) => wire_rows,
+                    Err(_) => {
+                        state.tasks.push(BodyScanTask::LowCardinalityRows {
+                            num_rows,
+                            index_width,
+                            num_keys,
+                        });
+                        return Err(DecodeError::Io(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "LowCardinality row count overflows usize",
+                        )));
+                    }
+                };
+                if wire_rows != num_rows {
+                    return Err(DecodeError::InvalidLowCardinality {
+                        column: state.column.clone(),
+                        reason: "indexes row count disagrees with the block row count",
+                    });
+                }
+                if num_rows.checked_mul(index_width).is_none() {
+                    // Same overflow report `decode_low_cardinality_indices`
+                    // gives; the bytes for it can never arrive.
+                    state.tasks.push(BodyScanTask::LowCardinalityRows {
+                        num_rows,
+                        index_width,
+                        num_keys,
+                    });
+                    return Err(DecodeError::Io(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "LowCardinality index byte length overflows usize",
+                    )));
+                }
+                state.offset = reader.position();
+                state.tasks.push(BodyScanTask::LowCardinalityIndexes {
+                    rows_remaining: num_rows,
+                    index_width,
+                    num_keys,
+                });
+            }
+            BodyScanTask::LowCardinalityIndexes {
+                mut rows_remaining,
+                index_width,
+                num_keys,
+            } => {
+                // Whole indexes only, so a partial index is re-read next time.
+                let take = rows_remaining.min(reader.remaining() / index_width);
+                // `take * index_width <= reader.remaining()`, so no overflow.
+                let raw = reader.read_slice(take * index_width)?;
+                check_low_cardinality_indexes(raw, index_width, num_keys, &state.column)?;
+                rows_remaining -= take;
+                state.offset = reader.position();
+                if rows_remaining != 0 {
+                    state.tasks.push(BodyScanTask::LowCardinalityIndexes {
+                        rows_remaining,
+                        index_width,
+                        num_keys,
+                    });
+                    return Err(need_more_bytes());
+                }
+            }
+            BodyScanTask::VariantDiscriminators {
+                alternatives,
+                mut counts,
+                mut rows_done,
+                mut rows_remaining,
+            } => {
+                let take = rows_remaining.min(reader.remaining());
+                let raw = reader.read_slice(take)?;
+                for (row, &discriminator) in raw.iter().enumerate() {
+                    if discriminator == u8::MAX {
+                        continue;
+                    }
+                    let Some(count) = counts.get_mut(discriminator as usize) else {
+                        return Err(DecodeError::InvalidVariant {
+                            column: state.column.clone(),
+                            reason: VariantColumnError::InvalidDiscriminator {
+                                row: rows_done + row,
+                                discriminator,
+                                alternatives: alternatives.len(),
+                            }
+                            .to_string(),
+                        });
+                    };
+                    *count += 1;
+                }
+                rows_done += take;
+                rows_remaining -= take;
+                state.offset = reader.position();
+                if rows_remaining != 0 {
+                    state.tasks.push(BodyScanTask::VariantDiscriminators {
+                        alternatives,
+                        counts,
+                        rows_done,
+                        rows_remaining,
+                    });
+                    return Err(need_more_bytes());
+                }
+                for (alternative, count) in alternatives.into_iter().zip(counts).rev() {
+                    state.tasks.push(BodyScanTask::Values {
+                        ch_type: alternative,
+                        num_rows: count,
+                    });
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Decode and validate a `LowCardinality` index-serialization word, returning
+/// the index width. The same rejections, in the same order, as
+/// [`decode_low_cardinality`].
+fn low_cardinality_index_width(index_word: u64, column: &str) -> Result<usize, DecodeError> {
+    if index_word & LC_NEED_GLOBAL_DICTIONARY_BIT != 0 {
+        return Err(DecodeError::InvalidLowCardinality {
+            column: column.to_string(),
+            reason: "NeedGlobalDictionaryBit is set; Native never uses a global dictionary",
+        });
+    }
+    if index_word & LC_HAS_ADDITIONAL_KEYS_BIT == 0 {
+        return Err(DecodeError::InvalidLowCardinality {
+            column: column.to_string(),
+            reason: "HasAdditionalKeysBit is clear; Native always carries a per-block dictionary",
+        });
+    }
+    match index_word & 0xFF {
+        0 => Ok(1),
+        1 => Ok(2),
+        2 => Ok(4),
+        3 => Ok(8),
+        _ => Err(DecodeError::InvalidLowCardinality {
+            column: column.to_string(),
+            reason: "index width tag is outside 0..=3",
+        }),
+    }
+}
+
+/// Read one raw little-endian `LowCardinality` index of `index_width` bytes.
+/// `chunk` comes from `chunks_exact(index_width)` with a validated width.
+#[inline]
+fn low_cardinality_raw_index(chunk: &[u8]) -> u64 {
+    match *chunk {
+        [a] => u64::from(a),
+        [a, b] => u64::from(u16::from_le_bytes([a, b])),
+        [a, b, c, d] => u64::from(u32::from_le_bytes([a, b, c, d])),
+        [a, b, c, d, e, f, g, h] => u64::from_le_bytes([a, b, c, d, e, f, g, h]),
+        // The width tag admits only 1/2/4/8; anything else cannot index a
+        // dictionary, and reporting it as out of range keeps this panic-free.
+        _ => u64::MAX,
+    }
+}
+
+/// Validate a run of whole `LowCardinality` indexes the way
+/// [`decode_low_cardinality_indices`] does: every index must point inside the
+/// block dictionary and a non-sentinel index must fit i32. The common all-valid
+/// case is one branch-free max reduction; only a run that fails it is re-walked
+/// row by row to report the decode's first error exactly.
+fn check_low_cardinality_indexes(
+    raw: &[u8],
+    index_width: usize,
+    num_keys: usize,
+    column: &str,
+) -> Result<(), DecodeError> {
+    let max = raw
+        .chunks_exact(index_width)
+        .map(low_cardinality_raw_index)
+        .max()
+        .unwrap_or(0);
+    let num_keys = num_keys as u64;
+    if raw.is_empty() || (max < num_keys && max <= i32::MAX as u64) {
+        return Ok(());
+    }
+    for raw_index in raw.chunks_exact(index_width).map(low_cardinality_raw_index) {
+        if raw_index >= num_keys {
+            return Err(DecodeError::InvalidLowCardinality {
+                column: column.to_string(),
+                reason: "index value points outside the block dictionary",
+            });
+        }
+        // A NULL sentinel is index 0, always in range, so no exemption is
+        // needed here.
+        if raw_index > i32::MAX as u64 {
+            return Err(DecodeError::InvalidLowCardinality {
+                column: column.to_string(),
+                reason: "index value exceeds i32::MAX",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Expand one logical value run into bounded scan tasks in wire order. The
+/// dispatch order mirrors [`skip_values`]: alias, LowCardinality, Array, Map,
+/// Variant, then the Nullable unwrap, then Tuple or a leaf body.
+fn push_value_tasks(
+    tasks: &mut Vec<BodyScanTask>,
+    ch_type: &ChType,
+    num_rows: usize,
+    column: &str,
+) -> Result<(), DecodeError> {
+    if let Some(delegate) = ch_type.physical_delegate() {
+        tasks.push(BodyScanTask::Values {
+            ch_type: delegate,
+            num_rows,
+        });
+        return Ok(());
+    }
+    match ch_type {
+        // A zero-length LowCardinality run carries no body bytes at all (the
+        // matching gate in `decode_values`).
+        ChType::LowCardinality(_) if num_rows == 0 => {}
+        ChType::LowCardinality(inner) => {
+            // Nullability only changes how decode reads index 0, not the bytes.
+            let (_, dict_type) = low_cardinality_dict_value_type(inner);
+            tasks.push(BodyScanTask::LowCardinality {
+                dict_type: dict_type.clone(),
+                num_rows,
+            });
+        }
+        ChType::Variant(alternatives) => {
+            // `variant_child_counts` with no rows performs exactly the
+            // alternative-count check `decode_variant` applies and returns the
+            // zeroed per-alternative counters, then the same row guard.
+            // The row guard fires before the discriminators arrive: no
+            // completion of these bytes can decode, and waiting would stall.
+            let (counts, _) = variant_child_counts(&[], alternatives.len())
+                .and_then(|counts| check_variant_row_count(num_rows).map(|()| counts))
+                .map_err(|error| DecodeError::InvalidVariant {
+                    column: column.to_string(),
+                    reason: error.to_string(),
+                })?;
+            tasks.push(BodyScanTask::VariantDiscriminators {
+                alternatives: alternatives.clone(),
+                counts,
+                rows_done: 0,
+                rows_remaining: num_rows,
+            });
+        }
+        ChType::Nullable(inner) => {
+            tasks.push(BodyScanTask::Values {
+                ch_type: inner.as_ref().clone(),
+                num_rows,
+            });
+            tasks.push(BodyScanTask::Bytes {
+                remaining: num_rows,
+            });
+        }
+        ChType::Array(inner) => {
+            checked_array_offset_bytes(num_rows)?;
+            tasks.push(BodyScanTask::Offsets {
+                rows_remaining: num_rows,
+                previous: 0,
+                children: vec![inner.as_ref().clone()],
+            });
+        }
+        ChType::Map(key, value) => {
+            checked_array_offset_bytes(num_rows)?;
+            tasks.push(BodyScanTask::Offsets {
+                rows_remaining: num_rows,
+                previous: 0,
+                children: vec![key.as_ref().clone(), value.as_ref().clone()],
+            });
+        }
+        ChType::Tuple(elements) if elements.is_empty() => {
+            tasks.push(BodyScanTask::Bytes {
+                remaining: num_rows,
+            });
+        }
+        ChType::Tuple(elements) => {
+            for (_, element) in elements.iter().rev() {
+                tasks.push(BodyScanTask::Values {
+                    ch_type: element.clone(),
+                    num_rows,
+                });
+            }
+        }
+        ChType::String => tasks.push(BodyScanTask::Strings {
+            rows_remaining: num_rows,
+            length_value: 0,
+            length_shift: 0,
+            length_complete: false,
+            payload_remaining: 0,
+            data_offset: 0,
+        }),
+        fixed => {
+            let bytes = fixed_width_body_bytes(fixed, num_rows, column)?;
+            tasks.push(BodyScanTask::Bytes { remaining: bytes });
+        }
+    }
+    Ok(())
+}
+
+fn checked_array_offset_bytes(num_rows: usize) -> Result<usize, DecodeError> {
+    num_rows.checked_mul(8).ok_or_else(|| {
+        DecodeError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "Array offset byte length overflows usize",
+        ))
+    })
+}
+
+/// Whether `ch_type` is a leaf whose body is a computable run of bytes
+/// ([`fixed_width_body_bytes`] accepts it). Exhaustive so a new `ChType`
+/// variant must be classified here.
+fn is_fixed_width_leaf(ch_type: &ChType) -> bool {
+    match ch_type {
+        ChType::Nothing
+        | ChType::Bool
+        | ChType::Int8
+        | ChType::Int16
+        | ChType::Int32
+        | ChType::Int64
+        | ChType::UInt8
+        | ChType::UInt16
+        | ChType::UInt32
+        | ChType::UInt64
+        | ChType::Float32
+        | ChType::Float64
+        | ChType::BFloat16
+        | ChType::QBit { .. }
+        | ChType::Int128
+        | ChType::UInt128
+        | ChType::Int256
+        | ChType::UInt256
+        | ChType::FixedString(_)
+        | ChType::Date
+        | ChType::Date32
+        | ChType::DateTime { .. }
+        | ChType::DateTime64 { .. }
+        | ChType::Time
+        | ChType::Time64 { .. }
+        | ChType::Interval(_)
+        | ChType::Decimal { .. }
+        | ChType::Uuid
+        | ChType::Ipv4
+        | ChType::Ipv6
+        | ChType::Enum8 { .. }
+        | ChType::Enum16 { .. } => true,
+        ChType::String
+        | ChType::Nullable(_)
+        | ChType::LowCardinality(_)
+        | ChType::Array(_)
+        | ChType::Tuple(_)
+        | ChType::Map(..)
+        | ChType::Variant(_)
+        | ChType::Dynamic { .. }
+        | ChType::SimpleAggregateFunction { .. }
+        | ChType::AggregateFunction { .. }
+        | ChType::Geo(_)
+        | ChType::Geometry
+        | ChType::Nested(_)
+        | ChType::Json { .. } => false,
+    }
+}
+
+/// Byte length of a fixed-width value run, the same length
+/// [`skip_column_body`] skips (with the overflow reported as `UnexpectedEof`).
+fn fixed_width_body_bytes(
+    ch_type: &ChType,
+    num_rows: usize,
+    column: &str,
+) -> Result<usize, DecodeError> {
+    let width = match ch_type {
+        ChType::Nothing | ChType::Bool | ChType::Int8 | ChType::UInt8 | ChType::Enum8 { .. } => 1,
+        ChType::Int16
+        | ChType::UInt16
+        | ChType::BFloat16
+        | ChType::Date
+        | ChType::Enum16 { .. } => 2,
+        ChType::Int32
+        | ChType::UInt32
+        | ChType::Float32
+        | ChType::Date32
+        | ChType::DateTime { .. }
+        | ChType::Time
+        | ChType::Ipv4 => 4,
+        ChType::Int64
+        | ChType::UInt64
+        | ChType::Float64
+        | ChType::DateTime64 { .. }
+        | ChType::Time64 { .. }
+        | ChType::Interval(_) => 8,
+        ChType::FixedString(width) => *width,
+        ChType::Uuid | ChType::Ipv6 | ChType::Int128 | ChType::UInt128 => 16,
+        ChType::Int256 | ChType::UInt256 => 32,
+        ChType::Decimal { bits, .. } => usize::from(*bits / 8),
+        ChType::QBit {
+            element_type,
+            dimension,
+        } => {
+            let (_, wire_len, _) = qbit_layout(num_rows, *dimension, element_type.bit_width())?;
+            return Ok(wire_len);
+        }
+        // Not fixed-width leaves; `push_value_tasks` dispatches every
+        // resumable one before reaching here, so this is defense in depth.
+        ChType::String
+        | ChType::Nullable(_)
+        | ChType::LowCardinality(_)
+        | ChType::Array(_)
+        | ChType::Tuple(_)
+        | ChType::Map(..)
+        | ChType::Variant(_)
+        | ChType::Dynamic { .. }
+        | ChType::SimpleAggregateFunction { .. }
+        | ChType::AggregateFunction { .. }
+        | ChType::Geo(_)
+        | ChType::Geometry
+        | ChType::Nested(_)
+        | ChType::Json { .. } => {
+            return Err(DecodeError::UnsupportedType {
+                column: column.to_string(),
+                type_name: ch_type.to_string(),
+            })
+        }
+    };
+    num_rows.checked_mul(width).ok_or_else(|| {
+        DecodeError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "fixed-width byte length overflows usize",
+        ))
+    })
 }
 
 /// Advance `reader` past one column's data without materializing it.
@@ -3782,6 +4748,17 @@ fn skip_values(
     skip_column_body(reader, inner, num_rows)
 }
 
+/// The `i32::MAX` row guard [`variant_layout_from_discriminators`] applies to a
+/// Variant run (Arrow Dense Union child offsets are i32).
+fn check_variant_row_count(num_rows: usize) -> Result<(), VariantColumnError> {
+    if num_rows > i32::MAX as usize {
+        return Err(VariantColumnError::ChildOffsetOverflow {
+            row: i32::MAX as usize,
+        });
+    }
+    Ok(())
+}
+
 /// Walk one BASIC Variant body without allocating its Arrow routing buffers.
 fn skip_variant_data(
     reader: &mut ByteReader,
@@ -3792,12 +4769,11 @@ fn skip_variant_data(
     state_cursor: &mut usize,
 ) -> Result<(), DecodeError> {
     let discriminators = reader.read_slice(num_rows)?;
-    let (counts, _null_count) =
-        variant_child_counts(discriminators, alternatives.len()).map_err(|err| {
-            DecodeError::InvalidVariant {
-                column: column.to_string(),
-                reason: err.to_string(),
-            }
+    let (counts, _null_count) = variant_child_counts(discriminators, alternatives.len())
+        .and_then(|counts| check_variant_row_count(num_rows).map(|()| counts))
+        .map_err(|err| DecodeError::InvalidVariant {
+            column: column.to_string(),
+            reason: err.to_string(),
         })?;
     for (alternative, count) in alternatives.iter().zip(counts) {
         skip_values(reader, alternative, count, column, states, state_cursor)?;
@@ -3816,6 +4792,13 @@ fn skip_dynamic_data(
     state_cursor: &mut usize,
 ) -> Result<(), DecodeError> {
     let num_children = state.children.len();
+    // Same guard, at the same point, as `decode_dynamic`.
+    if num_rows > i32::MAX as usize {
+        return Err(invalid_dynamic(
+            column,
+            "row count exceeds Arrow Dense Union's i32 child-offset range",
+        ));
+    }
     let mut counts = vec![0usize; num_children];
     match state.kind {
         DynamicWireKind::Variant => {
@@ -3892,12 +4875,8 @@ fn skip_dynamic_data(
             DynamicStateChild::Typed(ch_type) => {
                 skip_values(reader, ch_type, count, column, states, state_cursor)?
             }
-            DynamicStateChild::Shared => {
-                for _ in 0..count {
-                    let len = varint_usize(reader.read_varint()?, "Dynamic shared value length")?;
-                    reader.skip(len)?;
-                }
-            }
+            // Decoded by `decode_string_data`, so walked as one String run.
+            DynamicStateChild::Shared => skip_column_body(reader, &ChType::String, count)?,
         }
     }
     Ok(())
@@ -4089,8 +5068,10 @@ fn skip_column_body(
         ChType::Int128 | ChType::UInt128 => reader.skip(num_rows.saturating_mul(16))?,
         ChType::Int256 | ChType::UInt256 => reader.skip(num_rows.saturating_mul(32))?,
         ChType::String => {
+            let mut offset = 0i32;
             for _ in 0..num_rows {
                 let len = varint_usize(reader.read_varint()?, "String value length")?;
+                offset = next_string_offset(offset, len)?;
                 reader.skip(len)?;
             }
         }
@@ -4136,8 +5117,11 @@ fn skip_column_body(
 
 /// Walk one `LowCardinality(T)` column block (after its key-version prefix) in
 /// the completeness scan, consuming exactly what [`decode_low_cardinality`]
-/// reads: the index type word, the per-block dictionary, the row count, and the
-/// raw index array. Mirrors the decode path so the two cannot drift.
+/// reads and rejecting what it rejects: the index type word, the per-block
+/// dictionary, the row count, and the raw index array (range-checked against the
+/// dictionary). Shares its validation helpers with the resumable
+/// `BodyScanTask::LowCardinality*` tasks so the walkers cannot drift. Reached
+/// only from the non-resumable walkers (a LowCardinality inside Dynamic or JSON).
 fn skip_low_cardinality_data(
     reader: &mut ByteReader,
     inner: &ChType,
@@ -4147,42 +5131,11 @@ fn skip_low_cardinality_data(
     // Resolve the inner through the shared helper, the scan-side mirror of
     // [`decode_low_cardinality`], so the dictionary body walk matches the decode
     // for `LowCardinality(SAF(anyLast, Nullable(String)))` and chained SAF alike.
-    // The scan does not need the nullability flag: nulls are index-0 sentinels in
-    // the same raw index array it skips regardless.
     let (_, dict_value_type) = low_cardinality_dict_value_type(inner);
 
-    // Index type word. Mirror the decode-side rejections
-    // ([`decode_low_cardinality`]) exactly, not just the index width: a hostile
-    // flags word that sets `NeedGlobalDictionaryBit` or clears
-    // `HasAdditionalKeysBit` would make the scan walk framing the decode refuses,
-    // so the scan would either misreport the block length or stall the
-    // `StreamDecoder` with a misleading truncation error instead of surfacing the
-    // same `InvalidLowCardinality` the decode returns.
-    let index_word = reader.read_u64_le()?;
-    if index_word & LC_NEED_GLOBAL_DICTIONARY_BIT != 0 {
-        return Err(DecodeError::InvalidLowCardinality {
-            column: column.to_string(),
-            reason: "NeedGlobalDictionaryBit is set; Native never uses a global dictionary",
-        });
-    }
-    if index_word & LC_HAS_ADDITIONAL_KEYS_BIT == 0 {
-        return Err(DecodeError::InvalidLowCardinality {
-            column: column.to_string(),
-            reason: "HasAdditionalKeysBit is clear; Native always carries a per-block dictionary",
-        });
-    }
-    let index_width = match index_word & 0xFF {
-        0 => 1usize,
-        1 => 2,
-        2 => 4,
-        3 => 8,
-        _ => {
-            return Err(DecodeError::InvalidLowCardinality {
-                column: column.to_string(),
-                reason: "index width tag is outside 0..=3",
-            })
-        }
-    };
+    // Index type word, with the decode-side flag and width rejections: a hostile
+    // flags word would otherwise make the scan walk framing the decode refuses.
+    let index_width = low_cardinality_index_width(reader.read_u64_le()?, column)?;
 
     // Per-block dictionary: a count then that many inner values. Reject an inner
     // type outside the LowCardinality allowlist exactly as the decode path does,
@@ -4193,6 +5146,7 @@ fn skip_low_cardinality_data(
             "LowCardinality dictionary size overflows usize",
         ))
     })?;
+    check_header_count(num_keys, "LowCardinality dictionary size", reader)?;
     if !is_low_cardinality_inner(dict_value_type) {
         return Err(DecodeError::UnsupportedType {
             column: column.to_string(),
@@ -4201,10 +5155,27 @@ fn skip_low_cardinality_data(
     }
     skip_column_body(reader, dict_value_type, num_keys)?;
 
-    // Row count word, then the raw index array.
-    reader.skip(8)?; // num_rows (re-stated in the indexes stream)
-    reader.skip(num_rows.saturating_mul(index_width))?;
-    Ok(())
+    // Row count word (must restate the run length), then the raw index array.
+    let wire_rows = usize::try_from(reader.read_u64_le()?).map_err(|_| {
+        DecodeError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "LowCardinality row count overflows usize",
+        ))
+    })?;
+    if wire_rows != num_rows {
+        return Err(DecodeError::InvalidLowCardinality {
+            column: column.to_string(),
+            reason: "indexes row count disagrees with the block row count",
+        });
+    }
+    let total = num_rows.checked_mul(index_width).ok_or_else(|| {
+        DecodeError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "LowCardinality index byte length overflows usize",
+        ))
+    })?;
+    let raw = reader.read_slice(total)?;
+    check_low_cardinality_indexes(raw, index_width, num_keys, column)
 }
 
 /// Decode all blocks from a complete byte buffer into a `ChunkedBatch`.

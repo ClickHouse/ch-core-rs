@@ -2,28 +2,38 @@
 
 `ch-tcp-proto` is the sans-I/O ClickHouse TCP native protocol engine for
 `ch-core-rs`. The engine owns packet framing and revision gates. Drivers own
-sockets, TLS, timeouts, and connection pooling. The engine accepts arbitrary
-byte chunks, queues protocol events, and queues ordered bytes to send.
+sockets, TLS, timeouts, cancellation, and connection pooling. The engine
+accepts arbitrary byte chunks, queues protocol events, and queues ordered bytes
+to send.
 
-The initial scope is deliberately small: Client Hello, Server Hello, the client
-addendum, Ping, Pong, and handshake-phase Exception packets at protocol
-revision 54460. Query and Data packets are not implemented yet. Data blocks are
-intended to be decoded through core's `StreamDecoder` rather than by growing
-this engine's input buffer, and a `ProtocolError` variant wrapping core's
-`DecodeError` will be added with them (`ProtocolError` is `non_exhaustive`).
+The initial scope is deliberately small: handshake, Ping/Pong, and uncompressed
+initial SELECT queries at protocol revision 54460. SELECT results emit complete
+Native block bytes plus typed Progress, ProfileInfo, ProfileEvents, Log, Totals,
+Extremes, Exception, and EndOfStream events. INSERT, cancellation, external
+tables, and compressed TCP packets are not implemented yet.
 
 ## Driver loop
+
+The whole contract is: feed any amount, drain `poll_event` until it returns
+`None`, repeat. `feed` parses every byte it is given before returning, so a
+read of any size is fine, from one byte to a whole result, and there is no
+resume call. The event queue has no bound of its own: its memory is
+proportional to the bytes fed since the last drain, which the driver controls
+through its read size. Drain after every feed.
 
 Write queued output before each read, feed whatever the read returned, then
 drain every queued event before looking at the `feed` result. Events completed
 before an error in the same chunk stay queued, so draining first never loses
-them. Reads may return any number of bytes; the engine reassembles packets
-across chunk boundaries. A Pong is success only once `feed` also succeeded: a
-malformed packet after it in the same chunk still fails the connection. Retry
-reads interrupted by a signal; `write_all` already does. Flush after each write
-so a buffered stream never holds a request while `read` waits for its reply.
-Build the `ClientHello` with the driver's own name and version, for example
+them. A Pong is success only once `feed` also succeeded: a malformed packet
+after it in the same chunk still fails the connection. Retry reads interrupted
+by a signal; `write_all` already does. Flush after each write so a buffered
+stream never holds a request while `read` waits for its reply. Build the
+`ClientHello` with the driver's own name and version, for example
 `ClientHello::new("example-client", "default").with_client_version(1, 0)`.
+
+`Event`, `State`, `FailureKind`, and `ProtocolError` are `#[non_exhaustive]`,
+as are the event payload structs, so matches need a wildcard arm and new
+variants are not breaking changes.
 
 `tests/handshake_replay.rs` compiles this exact function from
 `tests/support/readme_connect.rs` and fails if the two differ.
@@ -99,19 +109,283 @@ fn connect<S: Read + Write>(
 }
 ```
 
+A SELECT on that connection follows the same loop. `run_select` returns the
+concatenated `Event::Data` payloads, which form one Native stream, and a typed
+error that tells I/O and protocol failures, after which the connection must be
+discarded, from a server Exception, after which it may be reusable.
+`tests/query_replay.rs` runs this exact function from
+`tests/support/readme_run_select.rs` against the recorded captures with random
+read sizes, including one-byte reads and one read of a whole response, and
+decodes the result.
+
+```rust
+use std::io::{self, Read, Write};
+
+use ch_tcp_proto::{Connection, Event, ProtocolError, Query, ServerException};
+
+/// Why `run_select` failed. After `Server` the connection is reusable if
+/// `connection.state()` is `State::Ready`; after `Io` or `Protocol`, discard
+/// it with its socket.
+#[derive(Debug)]
+enum SelectError {
+    Io(io::Error),
+    Protocol(ProtocolError),
+    Server(Box<ServerException>),
+}
+
+impl std::fmt::Display for SelectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "I/O error: {error}"),
+            Self::Protocol(error) => write!(f, "protocol error: {error}"),
+            Self::Server(error) => write!(f, "server error {}: {}", error.code, error.message),
+        }
+    }
+}
+
+impl std::error::Error for SelectError {}
+
+impl From<io::Error> for SelectError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<ProtocolError> for SelectError {
+    fn from(error: ProtocolError) -> Self {
+        Self::Protocol(error)
+    }
+}
+
+/// Runs one SELECT on a connection from `connect` and returns the result as
+/// one Native byte stream: the Data payloads concatenated in order.
+fn run_select<S: Read + Write>(
+    socket: &mut S,
+    connection: &mut Connection,
+    query: Query,
+) -> Result<Vec<u8>, SelectError> {
+    connection.query(query)?;
+    // Flush so a buffered stream does not hold the Query while `read` waits.
+    socket.write_all(&connection.take_output())?;
+    socket.flush()?;
+
+    let mut native = Vec::new();
+    let mut read_rows = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = match socket.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        // EOF before EndOfStream is truncation, reported by `finish`.
+        let fed = if read == 0 {
+            connection.finish()
+        } else {
+            connection.feed(&buffer[..read])
+        };
+        // Drain every event before acting on `fed`. Queued events hold
+        // memory proportional to the bytes fed since the last drain.
+        let mut done = false;
+        let mut failure = None;
+        while let Some(event) = connection.poll_event() {
+            match event {
+                Event::Data(block) => native.extend_from_slice(&block),
+                // Progress packets carry increments, not running totals.
+                Event::Progress(progress) => read_rows += progress.read_rows,
+                Event::ProfileInfo(info) => println!("{} result rows", info.rows),
+                // The query failed and the exchange is over.
+                Event::Exception(exception) => failure = Some(exception),
+                Event::EndOfStream => done = true,
+                // Totals, Extremes, Log, and ProfileEvents. HTTP FORMAT
+                // Native drops Totals and Extremes, so ignoring them matches
+                // HTTP results. `Event` is non-exhaustive, so a wildcard arm
+                // is required anyway.
+                _ => {}
+            }
+        }
+        // A malformed packet after the Exception in the same chunk failed
+        // the connection, so it is not reusable: report that first.
+        fed?;
+        if let Some(exception) = failure {
+            return Err(SelectError::Server(exception));
+        }
+        if done {
+            println!("read {read_rows} rows");
+            return Ok(native);
+        }
+        if read == 0 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+        }
+    }
+}
+```
+
+### Decoding results
+
+Every TCP SELECT result starts with a zero-row Data block that carries only
+the schema; the rows follow in later blocks. HTTP `FORMAT Native` sends no
+such block. Core's `StreamDecoder` and `decode_next_block` both return it as a
+zero-row `ch_core_rs::batch::ColBatch`, so bindings must accept zero-row
+batches, and can use the first one to learn the schema of an empty result.
+
+Either feed the concatenated payloads to `StreamDecoder`, or decode each
+payload as it arrives. The per-payload form is preferred: `StreamDecoder`
+scans for block boundaries again, while the engine has already found them.
+Set `DecodeOptions::protocol_revision` to `Connection::effective_revision()`
+in both cases. `tests/query_replay.rs` runs this function on every capture.
+
+```rust
+use std::io;
+
+use ch_core_rs::batch::ColBatch;
+use ch_core_rs::native::decode::{decode_next_block, DecodeError, DecodeOptions};
+use ch_core_rs::native::varint::ByteReader;
+use ch_tcp_proto::Connection;
+
+/// Decodes one `Event::Data` payload, which is exactly one Native block, as
+/// soon as it arrives. A zero-row block still carries the result schema.
+fn decode_payload(payload: &[u8], connection: &Connection) -> Result<ColBatch, DecodeError> {
+    let mut options = DecodeOptions::default();
+    // Known once the Server Hello is parsed, which `connect` guarantees.
+    options.protocol_revision = connection.effective_revision().unwrap_or(0);
+    let mut reader = ByteReader::new(payload);
+    match decode_next_block(&mut reader, &options)? {
+        // The engine never emits an empty payload, and the block fills it.
+        Some(batch) if reader.remaining() == 0 => Ok(batch),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "not one Native block").into()),
+    }
+}
+```
+
+### Health check
+
+A pooled connection can be checked with one Ping while it is `Ready` and
+drained. `tests/query_replay.rs` runs this function too.
+
+```rust
+use std::io::{self, Read, Write};
+
+use ch_tcp_proto::{Connection, Event};
+
+/// Sends one Ping on an idle `Ready` connection and waits for its Pong, for
+/// example before reusing a pooled connection.
+fn health_check<S: Read + Write>(
+    socket: &mut S,
+    connection: &mut Connection,
+) -> Result<(), Box<dyn std::error::Error>> {
+    connection.ping()?;
+    socket.write_all(&connection.take_output())?;
+    socket.flush()?;
+    let mut buffer = [0_u8; 1024];
+    loop {
+        let read = match socket.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let fed = if read == 0 {
+            connection.finish()
+        } else {
+            connection.feed(&buffer[..read])
+        };
+        let mut got_pong = false;
+        let mut failure = None;
+        while let Some(event) = connection.poll_event() {
+            match event {
+                Event::Pong => got_pong = true,
+                // Terminal outside a query: the server is closing.
+                Event::Exception(exception) => failure = Some(exception),
+                _ => {}
+            }
+        }
+        fed?;
+        if let Some(exception) = failure {
+            let message = format!("server error {}: {}", exception.code, exception.message);
+            return Err(message.into());
+        }
+        if got_pong {
+            return Ok(());
+        }
+        if read == 0 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+        }
+    }
+}
+```
+
 ## Contract
 
 - `feed` returns only errors. Every completed packet is an `Event` read with
   `poll_event`. A malformed or unexpected packet fails the connection with
-  `State::Failed(FailureKind::Protocol)`.
-- A server Exception is an event. It is terminal during the handshake and
-  pre-query phase, which is all this crate implements:
-  `State::Failed(FailureKind::ServerException)`. At `v26.8.1.2041-lts` the
-  server sends at most one Exception from its handshake and then closes the
-  connection (`TCPHandler::runImpl` handshake catch, `TCPHandler::run`).
-  Query-time exceptions are not terminal at that tag: `runImpl` sends the
-  Exception and keeps the connection for the next query, apart from
-  connection-level errors. They will be modeled when Query support lands.
+  `State::Failed(FailureKind::Protocol)`, and a later `finish` returns that
+  same error.
+- `feed` consumes its whole input. The only bytes it retains between calls are
+  the tail of one incomplete scalar field; Native block bodies go straight to
+  their event buffer. On a live connection `feed(&[])` is a no-op.
+- `query` and `ping` are rejected with `InvalidState` until every queued event
+  is drained, and while any server packet is partly received. So a Query is
+  never queued behind an undelivered Exception that ends the connection.
+- A server Exception is an event and the last of its exchange: no EndOfStream,
+  Log, or ProfileEvents follows it. It is terminal during the handshake and
+  pre-query phase: `State::Failed(FailureKind::ServerException)`. At
+  `v26.8.1.2041-lts` (`TCPHandler::runImpl`):
+  - The handshake catch sends at most one Exception and the connection closes.
+  - Any query-time exception raised before the query context exists is sent
+    and the connection closes. The engine identifies the one such case it can
+    see in the packet: code 115 whose message is `Unknown setting '<name>'` for
+    a name passed to `Query::with_setting`, rejected by `BaseSettings::read`
+    while the Query packet is read. Code 115 for a name in the SQL `SETTINGS`
+    clause comes later, from `AccessControl::checkSettingNameIsAllowed`, and
+    leaves the connection reusable.
+  - Codes 101, 720, and 749 are sent and the connection closes. Code 99 closes
+    without being sent; it is listed defensively.
+  - Every other query-time Exception returns the engine to `Ready`.
+- There is no Cancel packet and no reset. A driver that abandons a query before
+  its EndOfStream or Exception, for example on a timeout, must discard the
+  `Connection` and its socket rather than reuse them.
+- `query` queues a revision-54460 Query packet followed by an empty client Data
+  block. It accepts string settings and parameter values. See
+  `Query::with_parameter` for how parameter values are encoded. Setting names
+  are capped at 64 KiB (`StringTooLong`), so a code 115 message naming one
+  always fits in the retained Exception text. Setting values and parameter
+  names and values have no per-field limit: the server reads them with a 1 GiB
+  string limit, and the engine bounds only the whole packet, at exactly
+  64 MiB (`QueryOutputTooLarge` reports the packet's true length).
+- Every `Query::with_setting` is sent with `IMPORTANT`, so an unknown name is a
+  terminal code 115 Exception instead of being silently ignored. A binding
+  that forwards a user's settings map should forward only names it knows.
+- `Query` reports `initial_address` `0.0.0.0:0` unless
+  `Query::with_initial_address` sets it.
+- At revision 54460 the server never echoes the query ID. A binding that needs
+  one, to correlate logs or `system.query_log`, must generate it and pass it
+  with `Query::with_query_id`.
+- Query support is limited to statements whose complete response uses the
+  initial SELECT result exchange. INSERT, input(), external tables,
+  parallel-replica exchanges, cancellation, and compressed packets are not
+  supported. The engine does not parse SQL to classify statements.
+- The engine frames result blocks with core's scanner, so a result column type
+  core cannot decode fails the whole connection with `ProtocolError::Decode`.
+- `output_format_native_encode_types_in_binary_format` accepts only `"0"` in
+  explicit settings. This guard is best-effort: a SQL `SETTINGS` clause, a user
+  profile, or an earlier `SET` can still enable it, and the engine then fails
+  on the first block with `ProtocolError::Decode`. Keep it disabled
+  server-side.
+- Each server Data packet emits `Event::Data` with exactly one complete Native
+  block. Concatenating Data payloads produces a stream accepted by core's
+  `StreamDecoder` at `effective_revision()`. The zero-column, zero-row TCP end
+  marker is filtered because appending it would violate the result schema. A
+  real zero-row block, including the leading schema block, retains its column
+  headers and is emitted.
+- `Event::Totals` and `Event::Extremes` can be ignored for parity with HTTP. At
+  `v26.8.1.2041-lts` HTTP `FORMAT Native` drops totals and extremes
+  (`IOutputFormat::consumeTotals` is a no-op that `NativeOutputFormat` does not
+  override). This is inferred from source, not live-probed.
+- `Progress` values are increments since the previous Progress packet, not
+  running totals (`TCPHandler::sendProgress`).
+- `ServerHello::timezone` is the server timezone, the TCP counterpart of HTTP's
+  `X-ClickHouse-Timezone` header. Use it for `DateTime` columns that declare
+  no timezone.
 - Bytes after a handshake-phase Exception are counted, never parsed, and `feed`
   keeps returning `Ok`. `finish` then returns `TrailingInput` if any bytes
   followed, otherwise `Ok`. The result does not depend on how the stream was
@@ -142,16 +416,46 @@ each decoded Exception field is at most 3 MiB, 9 MiB for the three text fields.
 Bytes retained across `feed` calls are bounded by the per-field caps, at most
 about 1 MiB while an Exception field straddles a chunk boundary. The 4 MiB
 retained-input limit (`InputTooLarge`) is a backstop that the per-field caps
-keep from firing. An input buffer grown past 64 KiB is shrunk once it drains.
-The Exception bounds are engine policy because the server wire reader has no
-explicit Exception string cap.
+keep from firing; it does not depend on how much is passed to one `feed`. An
+input buffer grown past 64 KiB is shrunk once it drains. The Exception bounds
+are engine policy because the server wire reader has no explicit Exception
+string cap.
+
+Each queued event costs `size_of::<Event>()`, at most 56 bytes on 64-bit
+targets, plus its own payload allocation. `ServerHello` and `ServerException`
+are boxed to keep that small.
+
+One Native packet body is capped at `DEFAULT_MAX_BLOCK_BYTES`, 1 GiB, by
+default. Set another cap with `Connection::with_max_block_bytes`; values below
+`MIN_MAX_BLOCK_BYTES`, 1 KiB, are raised to it. The cap applies to every
+block-carrying packet: Data, including the end-of-data marker, Totals,
+Extremes, Log (`send_logs_level`), and ProfileEvents. HTTP has no per-block
+cap, so a low value can reject results HTTP returns: `SELECT
+randomString(1100) FROM numbers(100000)` produces blocks of about 72 MB. Block
+memory grows only with bytes actually received, never from a declared length,
+and the block buffer's capacity never exceeds the cap. Core's scan-only
+boundary parser finds the block's exact end without allocating decoded
+columns, and malformed bodies surface as `ProtocolError::Decode`.
+
+Known limitation: framing a block is linear in its size for String,
+fixed-width, Nullable, Array, Map, Tuple, LowCardinality, and Variant columns,
+whatever the read size. A `Dynamic`, `JSON`, or `AggregateFunction` column,
+or a container holding one, is re-walked from the start of that column on
+every read until it completes, so framing it costs about the column size
+squared divided by the read size. Use large reads, for example 1 MiB, for
+results with large `Dynamic` or `JSON` columns.
 
 ## Server reference
 
 The wire layout is confirmed against ClickHouse `v26.8.1.2041-lts` in
-`TCPHandler::{receiveHello,sendHello,receiveAddendum,sendException}`,
-`Client::Connection::{sendHello,receiveHello,sendAddendum,receiveException}`,
+`TCPHandler::{receiveHello,sendHello,receiveAddendum,receiveQuery,sendData,sendTotals,sendExtremes}`,
+`Client::Connection::{sendHello,receiveHello,sendAddendum,sendQuery}`,
+`ClientInfo::{write,read}`, `ProgressValues::write`, `ProfileInfo::write`,
+`BaseSettingsHelpers::writeFlags`, `Settings::{writeQueryParameters,readQueryParameters}`,
+`SettingFieldCustom::toString`,
+`ReplaceQueryParameterVisitor::resolveParameterValueAsField`,
+`SerializationString::{serializeTextEscaped,deserializeTextEscaped}`,
 `Core/Protocol.h`, `Core/ProtocolDefines.h`, and the exception helpers in
-`IO/{WriteHelpers,ReadHelpers}`. Applying `min(54460, server revision)` to
-every Server Hello field gate is inferred, not confirmed: the server gates on
-the client-declared revision while stock clients gate on the server revision.
+`IO/{WriteHelpers,ReadHelpers}`. Applying `min(54460, server revision)` to every
+Server Hello field gate is inferred, not confirmed: the server gates on the
+client-declared revision while stock clients gate on the server revision.

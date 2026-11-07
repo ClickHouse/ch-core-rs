@@ -1115,7 +1115,9 @@ is a separate sibling crate, not part of this codec's type-completeness bar.
 
 Tracked elsewhere (README roadmap), intentionally not part of this tracker:
 
-- Native TCP protocol engine (handshake, packet framing, revision negotiation).
+- The native TCP protocol engine, `crates/ch-tcp-proto`: handshake, Ping, and
+  uncompressed SELECT at revision 54460 today; compression, INSERT, and
+  cancellation are tracked in its README and the root README roadmap.
 - Per-runtime zero-copy adapters in the bindings (those live in the client
   repos).
 - Row-major materialization (a binding concern by design).
