@@ -386,10 +386,14 @@ fn pathless_flattened_json_offsets_are_bounded_cumulatively_per_block() {
         .column_header("j2", "JSON")
         .raw_bytes(&prefix)
         .build();
-    assert_eq!(
-        block_end(&two_columns, &options(one_offsets_run)).unwrap(),
-        Some(two_columns.len())
-    );
+    assert!(matches!(
+        block_end(&two_columns, &options(one_offsets_run)),
+        Err(DecodeError::ResourceLimit {
+            limit,
+            requested,
+            what: "FLATTENED JSON shared offsets",
+        }) if limit == one_offsets_run && requested == one_offsets_run * 2
+    ));
     assert!(matches!(
         decode_all_bytes(&two_columns, &options(one_offsets_run)),
         Err(DecodeError::ResourceLimit {

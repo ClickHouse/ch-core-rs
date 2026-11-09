@@ -11,7 +11,7 @@ use crate::column::{
     StructuredJson, TupleColumn, Utf8Column, VariantColumn, VariantColumnError,
 };
 use crate::native::aggregate_function::{
-    decode_aggregate_states, decode_state_codec, scan_aggregate_states,
+    decode_aggregate_states, decode_state_codec, scan_aggregate_states, AggregateStateCodec,
 };
 use crate::native::qbit::{transpose8, QBitWord};
 use crate::native::varint::ByteReader;
@@ -25,7 +25,7 @@ use crate::native::protocol::{
     LC_HAS_ADDITIONAL_KEYS_BIT, LC_NEED_GLOBAL_DICTIONARY_BIT, LOW_CARDINALITY_KEY_VERSION,
     MAX_TYPE_DEPTH,
 };
-use crate::native::type_binary::{read_binary_type, BinaryTypeError};
+use crate::native::type_binary::{read_binary_type, BinaryTypeError, BinaryTypeScanner};
 use crate::native::type_parser::{
     is_low_cardinality_inner, is_valid_variant_alternative, resolves_to_nothing,
     unsupported_header_type_name,
@@ -254,6 +254,7 @@ impl Default for DecodeOptions {
 }
 
 /// Cumulative per-block allowance for allocations not bounded by input.
+#[derive(Debug)]
 struct AllocationBudget {
     limit: usize,
     used: usize,
@@ -285,7 +286,7 @@ impl AllocationBudget {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct DecodeSettings {
     protocol_revision: u64,
     types_in_binary_format: bool,
@@ -3196,7 +3197,7 @@ fn decode_next_block_with_settings_unchecked(
 /// Read one column header: name, type string, and the optional custom
 /// serialization marker. Returns the parsed `ChType` plus the column name.
 ///
-/// Shared by the allocating decode and the allocation-free completeness scan so
+/// Shared by the allocating decode and the scan-only completeness walk so
 /// the two cannot drift on header framing or on which types and serializations
 /// are accepted.
 fn read_column_header(
@@ -3355,8 +3356,8 @@ fn decode_block_body(
             // bottoms out in one, can legitimately write ZERO bytes per row (a
             // pathless FLATTENED object under the flattened JSON serialization),
             // so it is bounded by its own read-before-allocate decode instead
-            // (`decode_json`), keeping decode symmetric with the allocation-free
-            // scan, which never applied a row-count guard.
+            // (`decode_json`), keeping decode symmetric with the scan-only
+            // walk, which never applied a row-count guard.
             if has_min_one_byte_per_row(&ch_type) {
                 check_header_count(num_rows, "row count", reader)?;
             }
@@ -3419,8 +3420,10 @@ fn has_min_one_byte_per_row(ch_type: &ChType) -> bool {
 ///   (the caller should wait for more bytes).
 /// - `Err(_)`: a real decode error (unsupported type/serialization, bad
 ///   BlockInfo field, varint overflow, invalid UTF-8 in a header), which is
-///   surfaced even before the whole block is buffered, exactly as the real
-///   decode would surface it.
+///   which may be surfaced before the whole block is buffered. Scan and decode
+///   agree on acceptance or rejection and complete-block boundaries, not on
+///   error wording or timing. Corrupt partial data can fail with invalid data
+///   while decode still reports truncation.
 ///
 /// This is the one-shot form: it restarts from the block start on every call.
 /// `StreamDecoder` and [`BlockScanner`](crate::native::stream_decoder::BlockScanner)
@@ -3477,9 +3480,10 @@ pub(crate) struct ScanProgress {
     columns_done: usize,
     columns_end: usize,
     /// Mid-column checkpoint inside a column [`is_resumable`] accepts (fixed
-    /// width values, String, Nullable, Array, Map, Tuple, LowCardinality, and
-    /// Variant), covering its state-prefix words and its body.
-    body: Option<ResumableBodyState>,
+    /// width values, String, Nullable, containers, LowCardinality, Variant,
+    /// Dynamic, JSON, and AggregateFunction), covering prefixes and bodies.
+    body: Option<Box<ResumableBodyState>>,
+    synthetic_allocation_used: usize,
     /// Cumulative bytes the scan advanced over, across resumes. Backs the
     /// O(n) linearity guard in the stream decoder tests.
     #[cfg(test)]
@@ -3503,14 +3507,64 @@ impl ScanProgress {
         self.columns_done = 0;
         self.columns_end = 0;
         self.body = None;
+        self.synthetic_allocation_used = 0;
+    }
+
+    #[cfg(test)]
+    /// Fixed task storage, used only after verifying task-owned heaps are empty.
+    pub(crate) fn retained_task_bytes(&self) -> usize {
+        let Some(body) = self.body.as_deref() else {
+            return 0;
+        };
+        let prefix_boxes = body
+            .prefix_tasks
+            .iter()
+            .map(|task| match task {
+                PrefixScanTask::Dynamic(task) => std::mem::size_of_val(task.as_ref()),
+                PrefixScanTask::Json(task) => std::mem::size_of_val(task.as_ref()),
+                _ => 0,
+            })
+            .sum::<usize>();
+        std::mem::size_of::<ResumableBodyState>()
+            + body.prefix_tasks.capacity() * std::mem::size_of::<PrefixScanTask>()
+            + prefix_boxes
+            + body.tasks.capacity() * std::mem::size_of::<BodyScanTask>()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_tasks_have_empty_payloads(&self) -> bool {
+        let Some(body) = self.body.as_deref() else {
+            return true;
+        };
+        body.prefix_tasks.iter().all(|task| match task {
+            PrefixScanTask::Dynamic(task) => {
+                task.typed.capacity() == 0 && task.names.is_empty() && task.binary_scanner.is_none()
+            }
+            PrefixScanTask::DynamicRun { .. } | PrefixScanTask::Word(_) => true,
+            PrefixScanTask::Type { .. } | PrefixScanTask::Json(_) => false,
+        }) && body.tasks.iter().all(|task| match task {
+            BodyScanTask::DynamicValuesRun { .. } | BodyScanTask::ChargeSynthetic { .. } => true,
+            BodyScanTask::DynamicIndexes {
+                children, counts, ..
+            } => children.capacity() == 0 && counts.capacity() == 0,
+            _ => false,
+        })
     }
 }
 
-/// Resumable scan state for one top-level column whose type passes
-/// [`is_resumable`]: its state-prefix words, then its body, as a task stack.
+/// Resumable scan state for one top-level column: its static and runtime-shaped
+/// state prefix, retained self-describing states, then its body task stack.
 #[derive(Debug)]
 struct ResumableBodyState {
     column: String,
+    root_type: ChType,
+    num_rows: usize,
+    settings: DecodeSettings,
+    prefix_tasks: Vec<PrefixScanTask>,
+    states: Vec<StatePrefix>,
+    state_cursor: usize,
+    body_seeded: bool,
+    allocation_budget: AllocationBudget,
     tasks: Vec<BodyScanTask>,
     /// Offset of the first unverified byte, relative to the block start. The
     /// task on top of the stack resumes reading exactly here.
@@ -3518,21 +3572,106 @@ struct ResumableBodyState {
 }
 
 impl ResumableBodyState {
-    /// Seed the task stack for one column: every bulk-state-prefix word in the
-    /// preorder [`read_state_prefix`] reads them (first word on top), then the
-    /// column's value run.
-    fn new(column: String, ch_type: ChType, num_rows: usize, offset: usize) -> Self {
-        let mut words = Vec::new();
-        collect_prefix_words(&ch_type, &mut words);
-        let mut tasks = Vec::with_capacity(words.len() + 4);
-        tasks.push(BodyScanTask::Values { ch_type, num_rows });
-        tasks.extend(words.into_iter().rev().map(BodyScanTask::PrefixWord));
+    /// Seed the prefix traversal for one column. The body is scheduled only
+    /// after every runtime type table and nested prefix is retained.
+    fn new(
+        column: String,
+        ch_type: ChType,
+        num_rows: usize,
+        offset: usize,
+        settings: DecodeSettings,
+    ) -> Self {
         Self {
             column,
-            tasks,
+            root_type: ch_type.clone(),
+            num_rows,
+            settings,
+            prefix_tasks: vec![PrefixScanTask::Type { ch_type, depth: 0 }],
+            states: Vec::new(),
+            state_cursor: 0,
+            body_seeded: false,
+            allocation_budget: AllocationBudget::new(settings.max_synthetic_allocation_bytes),
+            tasks: Vec::new(),
             offset,
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct PartialVarint {
+    value: u64,
+    shift: u32,
+}
+
+#[derive(Debug)]
+enum PrefixScanTask {
+    Type {
+        ch_type: ChType,
+        depth: usize,
+    },
+    Word(PrefixWord),
+    Dynamic(Box<DynamicPrefixTask>),
+    DynamicRun {
+        remaining: usize,
+        max_types: u8,
+        depth: usize,
+    },
+    Json(Box<JsonPrefixTask>),
+}
+
+#[derive(Debug)]
+struct DynamicPrefixTask {
+    max_types: u8,
+    depth: usize,
+    version: Option<u64>,
+    legacy: Option<PartialVarint>,
+    count: Option<usize>,
+    count_varint: PartialVarint,
+    typed: Vec<(String, ChType)>,
+    names: std::collections::BTreeSet<String>,
+    entry_length: PartialVarint,
+    entry_len: Option<usize>,
+    binary_start: Option<usize>,
+    binary_scanner: Option<BinaryTypeScanner>,
+}
+
+impl DynamicPrefixTask {
+    fn new(max_types: u8, depth: usize) -> Self {
+        Self {
+            max_types,
+            depth,
+            version: None,
+            legacy: None,
+            count: None,
+            count_varint: PartialVarint::default(),
+            typed: Vec::new(),
+            names: std::collections::BTreeSet::new(),
+            entry_length: PartialVarint::default(),
+            entry_len: None,
+            binary_start: None,
+            binary_scanner: None,
+        }
+    }
+}
+
+fn dynamic_prefix_task(max_types: u8, depth: usize) -> PrefixScanTask {
+    PrefixScanTask::Dynamic(Box::new(DynamicPrefixTask::new(max_types, depth)))
+}
+
+#[derive(Debug)]
+struct JsonPrefixTask {
+    max_dynamic_paths: u32,
+    max_dynamic_types: u8,
+    typed_paths: Vec<(String, ChType)>,
+    depth: usize,
+    version: Option<u64>,
+    kind: Option<JsonWireKind>,
+    legacy: Option<PartialVarint>,
+    count: Option<usize>,
+    count_varint: PartialVarint,
+    paths: Vec<String>,
+    path_length: PartialVarint,
+    path_len: Option<usize>,
 }
 
 /// One fixed 8-byte bulk-state-prefix word of a resumable column.
@@ -3551,9 +3690,12 @@ enum PrefixWord {
 /// word is buffered, so a word is never split across resumes.
 #[derive(Debug)]
 enum BodyScanTask {
-    PrefixWord(PrefixWord),
     Values {
         ch_type: ChType,
+        num_rows: usize,
+    },
+    DynamicValuesRun {
+        remaining: usize,
         num_rows: usize,
     },
     Bytes {
@@ -3611,6 +3753,28 @@ enum BodyScanTask {
         rows_done: usize,
         rows_remaining: usize,
     },
+    DynamicIndexes {
+        children: Vec<DynamicStateChild>,
+        counts: Vec<usize>,
+        rows_remaining: usize,
+        width: usize,
+        kind: DynamicWireKind,
+    },
+    AggregateCount {
+        rows_remaining: usize,
+        shift: u32,
+    },
+    AggregateZeroBytes {
+        rows_remaining: usize,
+    },
+    AggregateNullableSum {
+        rows_remaining: usize,
+        state_width: usize,
+    },
+    ChargeSynthetic {
+        bytes: usize,
+        what: &'static str,
+    },
 }
 
 impl BodyScanTask {
@@ -3618,8 +3782,7 @@ impl BodyScanTask {
     fn reads_word(&self) -> bool {
         matches!(
             self,
-            BodyScanTask::PrefixWord(_)
-                | BodyScanTask::LowCardinality { .. }
+            BodyScanTask::LowCardinality { .. }
                 | BodyScanTask::LowCardinalityDictionary { .. }
                 | BodyScanTask::LowCardinalityRows { .. }
         )
@@ -3665,7 +3828,7 @@ fn block_end_resume_with_settings(
         .map(|block| block.map(|block| block.end))
 }
 
-/// Shape and boundary found by the allocation-free block scan.
+/// Shape and boundary found by the scan-only block walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ScannedBlock {
     pub(crate) end: usize,
@@ -3747,6 +3910,7 @@ fn scan_block_body_resume(
             // The wrapper verified `body.offset` lies within the data.
             reader.skip(body.offset)?;
             scan_resumable_body(reader, body)?;
+            progress.synthetic_allocation_used = body.allocation_budget.used;
             progress.body = None;
             progress.columns_done += 1;
         } else {
@@ -3775,13 +3939,17 @@ fn scan_block_body_resume(
                 // One pass, complete or partial: the task walker is the only
                 // walker for these types, so a complete buffer is not walked
                 // twice and a partial one keeps its exact checkpoint.
-                let mut body = ResumableBodyState::new(name, ch_type, num_rows, reader.position());
+                let mut body =
+                    ResumableBodyState::new(name, ch_type, num_rows, reader.position(), *settings);
+                body.allocation_budget.used = progress.synthetic_allocation_used;
                 if let Err(error) = scan_resumable_body(reader, &mut body) {
+                    progress.synthetic_allocation_used = body.allocation_budget.used;
                     if is_unexpected_eof(&error) {
-                        progress.body = Some(body);
+                        progress.body = Some(Box::new(body));
                     }
                     return Err(error);
                 }
+                progress.synthetic_allocation_used = body.allocation_budget.used;
             } else {
                 skip_column_data(reader, &ch_type, num_rows, &name, settings)?;
             }
@@ -3797,16 +3965,10 @@ fn scan_block_body_resume(
     }))
 }
 
-/// Whether a top-level column of `ch_type` can use the resumable task walker
-/// below: every node is a fixed-width leaf, String, Nullable, Array, Map,
-/// Tuple, LowCardinality, Variant, or a name-decoration alias over those.
-///
-/// These types' bulk state prefix is a fixed list of 8-byte words (one per
-/// LowCardinality and Variant node) and they carry no state suffix, so the
-/// whole column is a resumable task sequence. Dynamic, JSON, and
-/// AggregateFunction read runtime-shaped state and stay on the column-boundary
-/// checkpoint. Returning `false` is always safe: the column then goes through
-/// [`skip_column_data`], the reference walker.
+/// Whether a top-level column of `ch_type` can use the resumable task walker.
+/// This includes self-describing Dynamic and JSON prefixes and the registered
+/// AggregateFunction state codecs. Returning `false` remains safe: the column
+/// then goes through [`skip_column_data`], the reference walker.
 fn is_resumable(ch_type: &ChType) -> bool {
     if let Some(delegate) = ch_type.physical_delegate_ref() {
         return is_resumable(delegate.as_ref());
@@ -3853,7 +4015,7 @@ fn is_resumable(ch_type: &ChType) -> bool {
         ChType::Tuple(elements) => elements.iter().all(|(_, element)| is_resumable(element)),
         ChType::Map(key, value) => is_resumable(key) && is_resumable(value),
         ChType::Variant(alternatives) => alternatives.iter().all(is_resumable),
-        ChType::Dynamic { .. } | ChType::Json { .. } | ChType::AggregateFunction { .. } => false,
+        ChType::Dynamic { .. } | ChType::Json { .. } | ChType::AggregateFunction { .. } => true,
         // Resolved by `physical_delegate_ref` above; unreachable, and `false`
         // is the safe answer if that ever changes.
         ChType::SimpleAggregateFunction { .. }
@@ -3873,6 +4035,7 @@ fn is_resumable_nullable_inner(inner: &ChType) -> bool {
     let inner = delegate.as_deref().unwrap_or(inner);
     match inner {
         ChType::Tuple(elements) => elements.iter().all(|(_, element)| is_resumable(element)),
+        ChType::Json { .. } => true,
         leaf => is_fixed_width_leaf(leaf) || matches!(leaf, ChType::String),
     }
 }
@@ -3893,87 +4056,518 @@ fn needs_resumable_body(ch_type: &ChType) -> bool {
     }
 }
 
-/// Collect the 8-byte state-prefix words of a resumable type in the exact
-/// preorder [`read_state_prefix`] reads them: a LowCardinality key version (not
-/// descending into its inner, which carries no prefix), a Variant mode followed
-/// by its alternatives' words, and the children of Nullable, Array, Tuple, and
-/// Map in declaration order. Recursion depth is bounded by the parsed type,
-/// which [`parse_ch_type`] caps at `MAX_TYPE_DEPTH`.
-fn collect_prefix_words(ch_type: &ChType, words: &mut Vec<PrefixWord>) {
-    if let Some(delegate) = ch_type.physical_delegate_ref() {
-        return collect_prefix_words(delegate.as_ref(), words);
+fn read_partial_varint(
+    reader: &mut ByteReader,
+    partial: &mut PartialVarint,
+) -> Result<Option<u64>, DecodeError> {
+    while reader.remaining() != 0 {
+        let byte = reader.read_u8()?;
+        partial.value |= u64::from(byte & 0x7f) << partial.shift;
+        if byte & 0x80 == 0 {
+            return Ok(Some(partial.value));
+        }
+        partial.shift += 7;
+        if partial.shift >= 64 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "varint overflow").into());
+        }
     }
-    match ch_type {
-        ChType::LowCardinality(_) => words.push(PrefixWord::LowCardinalityKeyVersion),
-        ChType::Variant(alternatives) => {
-            words.push(PrefixWord::VariantMode);
-            for alternative in alternatives {
-                collect_prefix_words(alternative, words);
+    Ok(None)
+}
+
+fn push_prefix_type(tasks: &mut Vec<PrefixScanTask>, ch_type: ChType, depth: usize) {
+    tasks.push(PrefixScanTask::Type { ch_type, depth });
+}
+
+fn parse_complete_binary_dynamic_type(bytes: &[u8], column: &str) -> Result<ChType, DecodeError> {
+    let mut descriptor = ByteReader::new(bytes);
+    let parsed = read_binary_type(&mut descriptor).map_err(|error| {
+        DecodeError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("binary type boundary scanner/parser mismatch: {error}"),
+        ))
+    })?;
+    if descriptor.position() != bytes.len() {
+        return Err(DecodeError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "binary type boundary scanner/parser mismatch for column '{column}': parser consumed {} of {} bytes",
+                descriptor.position(),
+                bytes.len()
+            ),
+        )));
+    }
+    Ok(parsed)
+}
+
+fn scan_prefix_task(
+    reader: &mut ByteReader,
+    state: &mut ResumableBodyState,
+    task: PrefixScanTask,
+) -> Result<(), DecodeError> {
+    match task {
+        PrefixScanTask::Word(word) => {
+            if reader.remaining() < 8 {
+                state.prefix_tasks.push(PrefixScanTask::Word(word));
+                return Err(need_more_bytes());
+            }
+            let value = reader.read_u64_le()?;
+            match word {
+                PrefixWord::LowCardinalityKeyVersion if value != LOW_CARDINALITY_KEY_VERSION => {
+                    return Err(DecodeError::InvalidLowCardinality {
+                        column: state.column.clone(),
+                        reason: "key version is not 1 (SharedDictionariesWithAdditionalKeys)",
+                    });
+                }
+                PrefixWord::VariantMode if value != 0 => {
+                    return Err(DecodeError::InvalidVariant {
+                        column: state.column.clone(),
+                        reason: format!(
+                            "discriminator mode {value} is not BASIC mode 0 emitted by FORMAT Native"
+                        ),
+                    });
+                }
+                _ => {}
             }
         }
-        ChType::Nullable(inner) | ChType::Array(inner) => collect_prefix_words(inner, words),
-        ChType::Tuple(elements) => {
-            for (_, element) in elements {
-                collect_prefix_words(element, words);
+        PrefixScanTask::Type { ch_type, depth } => {
+            if let Some(delegate) = ch_type.physical_delegate() {
+                push_prefix_type(&mut state.prefix_tasks, delegate, depth + 1);
+            } else {
+                match ch_type {
+                    ChType::LowCardinality(_) => state
+                        .prefix_tasks
+                        .push(PrefixScanTask::Word(PrefixWord::LowCardinalityKeyVersion)),
+                    ChType::Variant(alternatives) => {
+                        for alternative in alternatives.into_iter().rev() {
+                            push_prefix_type(&mut state.prefix_tasks, alternative, depth + 1);
+                        }
+                        state
+                            .prefix_tasks
+                            .push(PrefixScanTask::Word(PrefixWord::VariantMode));
+                    }
+                    ChType::Array(inner) | ChType::Nullable(inner) => {
+                        push_prefix_type(&mut state.prefix_tasks, *inner, depth + 1)
+                    }
+                    ChType::Tuple(elements) => {
+                        for (_, element) in elements.into_iter().rev() {
+                            push_prefix_type(&mut state.prefix_tasks, element, depth + 1);
+                        }
+                    }
+                    ChType::Map(key, value) => {
+                        push_prefix_type(&mut state.prefix_tasks, *value, depth + 1);
+                        push_prefix_type(&mut state.prefix_tasks, *key, depth + 1);
+                    }
+                    ChType::Dynamic { max_types } => state
+                        .prefix_tasks
+                        .push(dynamic_prefix_task(max_types, depth)),
+                    ChType::Json {
+                        max_dynamic_paths,
+                        max_dynamic_types,
+                        typed_paths,
+                        ..
+                    } => state
+                        .prefix_tasks
+                        .push(PrefixScanTask::Json(Box::new(JsonPrefixTask {
+                            max_dynamic_paths,
+                            max_dynamic_types,
+                            typed_paths,
+                            depth,
+                            version: None,
+                            kind: None,
+                            legacy: None,
+                            count: None,
+                            count_varint: PartialVarint::default(),
+                            paths: Vec::new(),
+                            path_length: PartialVarint::default(),
+                            path_len: None,
+                        }))),
+                    _ => {}
+                }
             }
         }
-        ChType::Map(key, value) => {
-            collect_prefix_words(key, words);
-            collect_prefix_words(value, words);
+        PrefixScanTask::Dynamic(mut dynamic) => {
+            if dynamic.depth >= MAX_TYPE_DEPTH {
+                return Err(invalid_dynamic(
+                    &state.column,
+                    format!("Dynamic nesting exceeds the maximum type depth {MAX_TYPE_DEPTH}"),
+                ));
+            }
+            if dynamic.version.is_none() {
+                if reader.remaining() < 8 {
+                    state.prefix_tasks.push(PrefixScanTask::Dynamic(dynamic));
+                    return Err(need_more_bytes());
+                }
+                let version = reader.read_u64_le()?;
+                match version {
+                    1 => dynamic.legacy = Some(PartialVarint::default()),
+                    2 | 3 => {}
+                    4 => {
+                        return Err(invalid_dynamic(
+                            &state.column,
+                            "structure word 4 (V3) is not emitted by NativeWriter",
+                        ))
+                    }
+                    other => {
+                        return Err(invalid_dynamic(
+                            &state.column,
+                            format!("unknown structure word {other}"),
+                        ))
+                    }
+                }
+                dynamic.version = Some(version);
+            }
+            if let Some(partial) = dynamic.legacy.as_mut() {
+                if read_partial_varint(reader, partial)?.is_none() {
+                    state.prefix_tasks.push(PrefixScanTask::Dynamic(dynamic));
+                    return Err(need_more_bytes());
+                }
+                dynamic.legacy = None;
+            }
+            if dynamic.count.is_none() {
+                let Some(count) = read_partial_varint(reader, &mut dynamic.count_varint)? else {
+                    state.prefix_tasks.push(PrefixScanTask::Dynamic(dynamic));
+                    return Err(need_more_bytes());
+                };
+                let count = varint_usize(count, "Dynamic runtime type count")?;
+                let variant = dynamic.version != Some(3);
+                if variant && count > 254 {
+                    return Err(invalid_dynamic(
+                        &state.column,
+                        format!("direct runtime type count {count} exceeds 254"),
+                    ));
+                }
+                if variant && count > dynamic.max_types as usize {
+                    return Err(invalid_dynamic(
+                        &state.column,
+                        format!(
+                            "direct runtime type count {count} exceeds max_types={}",
+                            dynamic.max_types
+                        ),
+                    ));
+                }
+                if count >= u32::MAX as usize {
+                    return Err(invalid_dynamic(
+                        &state.column,
+                        "runtime type count exceeds the u32 block-local routing model",
+                    ));
+                }
+                dynamic.typed.reserve(reader.capacity_for(count, 1));
+                dynamic.count = Some(count);
+            }
+            let count = dynamic.count.unwrap_or(0);
+            while dynamic.typed.len() < count {
+                let ch_type = if state.settings.types_in_binary_format {
+                    let start = *dynamic.binary_start.get_or_insert(reader.position());
+                    let scanner = dynamic
+                        .binary_scanner
+                        .get_or_insert_with(BinaryTypeScanner::new);
+                    if let Err(error) = scanner.scan(reader) {
+                        match error {
+                            BinaryTypeError::Io(error)
+                                if error.kind() == io::ErrorKind::UnexpectedEof =>
+                            {
+                                state.prefix_tasks.push(PrefixScanTask::Dynamic(dynamic));
+                                return Err(error.into());
+                            }
+                            BinaryTypeError::Io(error) => return Err(error.into()),
+                            BinaryTypeError::Invalid(reason)
+                            | BinaryTypeError::Unsupported(reason) => {
+                                return Err(invalid_dynamic(&state.column, reason))
+                            }
+                        }
+                    }
+                    let bytes = reader.consumed_slice(start)?;
+                    let parsed = parse_complete_binary_dynamic_type(bytes, &state.column)?;
+                    dynamic.binary_start = None;
+                    dynamic.binary_scanner = None;
+                    parsed
+                } else {
+                    if dynamic.entry_len.is_none() {
+                        let Some(len) = read_partial_varint(reader, &mut dynamic.entry_length)?
+                        else {
+                            state.prefix_tasks.push(PrefixScanTask::Dynamic(dynamic));
+                            return Err(need_more_bytes());
+                        };
+                        dynamic.entry_len = Some(varint_usize(len, "String length")?);
+                    }
+                    let len = dynamic.entry_len.unwrap_or(0);
+                    if reader.remaining() < len {
+                        state.prefix_tasks.push(PrefixScanTask::Dynamic(dynamic));
+                        return Err(need_more_bytes());
+                    }
+                    let bytes = reader.read_slice(len)?;
+                    let type_name = std::str::from_utf8(bytes)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    let parsed =
+                        parse_ch_type(type_name).ok_or_else(|| DecodeError::UnsupportedType {
+                            column: state.column.clone(),
+                            type_name: type_name.to_string(),
+                        })?;
+                    dynamic.entry_len = None;
+                    dynamic.entry_length = PartialVarint::default();
+                    parsed
+                };
+                let canonical = ch_type.to_string();
+                if resolves_to_nothing(&ch_type) || !is_valid_variant_alternative(&ch_type) {
+                    return Err(invalid_dynamic(
+                        &state.column,
+                        format!("runtime type {canonical} is not legal in Dynamic"),
+                    ));
+                }
+                if let Some(unsupported) = unsupported_header_type_name(&ch_type) {
+                    return Err(DecodeError::UnsupportedType {
+                        column: state.column.clone(),
+                        type_name: unsupported,
+                    });
+                }
+                if !dynamic.names.insert(canonical.clone()) {
+                    return Err(invalid_dynamic(
+                        &state.column,
+                        format!("duplicate canonical runtime type {canonical}"),
+                    ));
+                }
+                dynamic.typed.push((canonical, ch_type));
+            }
+            let kind = if dynamic.version == Some(3) {
+                DynamicWireKind::Flattened
+            } else {
+                DynamicWireKind::Variant
+            };
+            let children = if kind == DynamicWireKind::Variant {
+                if reader.remaining() < 8 {
+                    state.prefix_tasks.push(PrefixScanTask::Dynamic(dynamic));
+                    return Err(need_more_bytes());
+                }
+                let mode = reader.read_u64_le()?;
+                if mode != 0 {
+                    return Err(invalid_dynamic(
+                        &state.column,
+                        format!("Variant discriminator mode {mode} is not BASIC mode 0"),
+                    ));
+                }
+                let mut global: Vec<_> = dynamic
+                    .typed
+                    .into_iter()
+                    .map(|(name, ty)| (name, DynamicStateChild::Typed(ty)))
+                    .collect();
+                global.push(("SharedVariant".to_string(), DynamicStateChild::Shared));
+                global.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                global
+                    .into_iter()
+                    .map(|(_, child)| child)
+                    .collect::<Vec<_>>()
+            } else {
+                dynamic
+                    .typed
+                    .into_iter()
+                    .map(|(_, ty)| DynamicStateChild::Typed(ty))
+                    .collect()
+            };
+            for child in children.iter().rev() {
+                if let DynamicStateChild::Typed(ch_type) = child {
+                    push_prefix_type(&mut state.prefix_tasks, ch_type.clone(), dynamic.depth + 1);
+                }
+            }
+            state
+                .states
+                .push(StatePrefix::Dynamic(DynamicState { kind, children }));
         }
-        _ => {}
+        PrefixScanTask::DynamicRun {
+            remaining,
+            max_types,
+            depth,
+        } => {
+            if remaining != 0 {
+                state.prefix_tasks.push(PrefixScanTask::DynamicRun {
+                    remaining: remaining - 1,
+                    max_types,
+                    depth,
+                });
+                state
+                    .prefix_tasks
+                    .push(dynamic_prefix_task(max_types, depth));
+            }
+        }
+        PrefixScanTask::Json(mut json) => {
+            if json.depth >= MAX_TYPE_DEPTH {
+                return Err(invalid_json(
+                    &state.column,
+                    format!("JSON nesting exceeds the maximum type depth {MAX_TYPE_DEPTH}"),
+                ));
+            }
+            if json.version.is_none() {
+                if reader.remaining() < 8 {
+                    state.prefix_tasks.push(PrefixScanTask::Json(json));
+                    return Err(need_more_bytes());
+                }
+                let version = reader.read_u64_le()?;
+                let kind = match version {
+                    0 | 2 => JsonWireKind::Structured,
+                    1 => JsonWireKind::Text,
+                    3 => JsonWireKind::Flattened,
+                    4 => {
+                        return Err(invalid_json(
+                            &state.column,
+                            "structure word 4 (V3) is not emitted by NativeWriter",
+                        ))
+                    }
+                    other => {
+                        return Err(invalid_json(
+                            &state.column,
+                            format!("unknown JSON structure word {other}"),
+                        ))
+                    }
+                };
+                json.version = Some(version);
+                json.kind = Some(kind);
+                if version == 0 {
+                    json.legacy = Some(PartialVarint::default());
+                }
+                if kind == JsonWireKind::Text {
+                    state.states.push(StatePrefix::Json(JsonState {
+                        kind,
+                        dynamic_paths: Vec::new(),
+                    }));
+                    state.offset = reader.position();
+                    return Ok(());
+                }
+            }
+            if let Some(partial) = json.legacy.as_mut() {
+                if read_partial_varint(reader, partial)?.is_none() {
+                    state.prefix_tasks.push(PrefixScanTask::Json(json));
+                    return Err(need_more_bytes());
+                }
+                json.legacy = None;
+            }
+            if json.count.is_none() {
+                let Some(count) = read_partial_varint(reader, &mut json.count_varint)? else {
+                    state.prefix_tasks.push(PrefixScanTask::Json(json));
+                    return Err(need_more_bytes());
+                };
+                let count = varint_usize(count, "JSON dynamic path count")?;
+                if json.kind == Some(JsonWireKind::Structured)
+                    && count > json.max_dynamic_paths as usize
+                {
+                    return Err(invalid_json(
+                        &state.column,
+                        format!(
+                            "dynamic path count {count} exceeds max_dynamic_paths={}",
+                            json.max_dynamic_paths
+                        ),
+                    ));
+                }
+                json.paths.reserve(reader.capacity_for(count, 1));
+                json.count = Some(count);
+            }
+            let count = json.count.unwrap_or(0);
+            while json.paths.len() < count {
+                if json.path_len.is_none() {
+                    let Some(len) = read_partial_varint(reader, &mut json.path_length)? else {
+                        state.prefix_tasks.push(PrefixScanTask::Json(json));
+                        return Err(need_more_bytes());
+                    };
+                    json.path_len = Some(varint_usize(len, "String length")?);
+                }
+                let len = json.path_len.unwrap_or(0);
+                if reader.remaining() < len {
+                    state.prefix_tasks.push(PrefixScanTask::Json(json));
+                    return Err(need_more_bytes());
+                }
+                let path = std::str::from_utf8(reader.read_slice(len)?)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                    .to_string();
+                if json.paths.last().is_some_and(|last| path <= *last) {
+                    return Err(invalid_json(
+                        &state.column,
+                        "dynamic paths are not strictly increasing (sorted, unique)",
+                    ));
+                }
+                json.paths.push(path);
+                json.path_len = None;
+                json.path_length = PartialVarint::default();
+            }
+            let kind = json.kind.unwrap_or(JsonWireKind::Text);
+            let num_dynamic = json.paths.len();
+            state.states.push(StatePrefix::Json(JsonState {
+                kind,
+                dynamic_paths: json.paths,
+            }));
+            if num_dynamic != 0 {
+                state.prefix_tasks.push(PrefixScanTask::DynamicRun {
+                    remaining: num_dynamic,
+                    max_types: json.max_dynamic_types,
+                    depth: json.depth + 1,
+                });
+            }
+            for (_, ch_type) in json.typed_paths.into_iter().rev() {
+                push_prefix_type(&mut state.prefix_tasks, ch_type, json.depth + 1);
+            }
+        }
     }
+    state.offset = reader.position();
+    Ok(())
 }
 
 /// Resume a resumable column without materializing row or column buffers.
 ///
 /// Consumes exactly the bytes [`skip_column_data`] (and so `decode_column`)
-/// consumes and rejects with the same errors; it only differs in being able to
-/// stop at any byte and continue later from `state.offset`. The task stack is
-/// bounded by type metadata, never by row count.
+/// consumes, with the same acceptance or rejection of complete blocks. Error
+/// wording and timing can differ for corrupt partial input. It can stop at any
+/// byte and continue later from `state.offset`. The task stack is bounded by
+/// type metadata, never by row count.
 fn scan_resumable_body(
     reader: &mut ByteReader,
     state: &mut ResumableBodyState,
 ) -> Result<(), DecodeError> {
+    while let Some(task) = state.prefix_tasks.pop() {
+        if let Err(error) = scan_prefix_task(reader, state, task) {
+            if is_unexpected_eof(&error) {
+                state.offset = reader.position();
+            }
+            return Err(error);
+        }
+    }
+    if !state.body_seeded {
+        state.tasks.push(BodyScanTask::Values {
+            ch_type: state.root_type.clone(),
+            num_rows: state.num_rows,
+        });
+        state.body_seeded = true;
+    }
     while let Some(task) = state.tasks.pop() {
         if task.reads_word() && reader.remaining() < 8 {
             state.tasks.push(task);
             return Err(need_more_bytes());
         }
         match task {
-            BodyScanTask::PrefixWord(word) => {
-                let value = reader.read_u64_le()?;
-                match word {
-                    PrefixWord::LowCardinalityKeyVersion => {
-                        if value != LOW_CARDINALITY_KEY_VERSION {
-                            return Err(DecodeError::InvalidLowCardinality {
-                                column: state.column.clone(),
-                                reason:
-                                    "key version is not 1 (SharedDictionariesWithAdditionalKeys)",
-                            });
-                        }
-                    }
-                    PrefixWord::VariantMode => {
-                        if value != 0 {
-                            return Err(DecodeError::InvalidVariant {
-                                column: state.column.clone(),
-                                reason: format!(
-                                    "discriminator mode {value} is not BASIC mode 0 emitted by FORMAT Native"
-                                ),
-                            });
-                        }
-                    }
-                }
-                state.offset = reader.position();
-            }
             BodyScanTask::Values { ch_type, num_rows } => {
-                if let Err(error) =
-                    push_value_tasks(&mut state.tasks, &ch_type, num_rows, &state.column)
-                {
+                if let Err(error) = push_value_tasks(
+                    &mut state.tasks,
+                    &ch_type,
+                    num_rows,
+                    &state.column,
+                    &state.states,
+                    &mut state.state_cursor,
+                ) {
                     if is_unexpected_eof(&error) {
                         state.tasks.push(BodyScanTask::Values { ch_type, num_rows });
                     }
                     return Err(error);
+                }
+            }
+            BodyScanTask::DynamicValuesRun {
+                remaining,
+                num_rows,
+            } => {
+                if remaining != 0 {
+                    state.tasks.push(BodyScanTask::DynamicValuesRun {
+                        remaining: remaining - 1,
+                        num_rows,
+                    });
+                    state.tasks.push(BodyScanTask::Values {
+                        ch_type: ChType::Dynamic { max_types: 0 },
+                        num_rows,
+                    });
                 }
             }
             BodyScanTask::Bytes { mut remaining } => {
@@ -4309,7 +4903,177 @@ fn scan_resumable_body(
                     });
                 }
             }
+            BodyScanTask::DynamicIndexes {
+                children,
+                mut counts,
+                mut rows_remaining,
+                width,
+                kind,
+            } => {
+                let take = rows_remaining.min(reader.remaining() / width);
+                let raw = reader.read_slice(take * width)?;
+                let null_index = if kind == DynamicWireKind::Variant {
+                    u64::from(u8::MAX)
+                } else {
+                    children.len() as u64
+                };
+                for bytes in raw.chunks_exact(width) {
+                    let index = match width {
+                        1 => u64::from(bytes[0]),
+                        2 => u64::from(u16::from_le_bytes([bytes[0], bytes[1]])),
+                        4 => {
+                            u64::from(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                        }
+                        8 => u64::from_le_bytes([
+                            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                            bytes[7],
+                        ]),
+                        _ => unreachable!("Dynamic index width is selected from 1/2/4/8"),
+                    };
+                    if index == null_index {
+                        continue;
+                    }
+                    let Some(count) = usize::try_from(index)
+                        .ok()
+                        .and_then(|index| counts.get_mut(index))
+                    else {
+                        let reason = if kind == DynamicWireKind::Variant {
+                            format!(
+                                "discriminator {index} does not name one of {} children",
+                                children.len()
+                            )
+                        } else {
+                            format!(
+                                "flattened index {index} is greater than NULL index {}",
+                                children.len()
+                            )
+                        };
+                        return Err(invalid_dynamic(&state.column, reason));
+                    };
+                    *count += 1;
+                }
+                rows_remaining -= take;
+                state.offset = reader.position();
+                if rows_remaining != 0 {
+                    state.tasks.push(BodyScanTask::DynamicIndexes {
+                        children,
+                        counts,
+                        rows_remaining,
+                        width,
+                        kind,
+                    });
+                    return Err(need_more_bytes());
+                }
+                for (child, count) in children.into_iter().zip(counts).rev() {
+                    state.tasks.push(BodyScanTask::Values {
+                        ch_type: match child {
+                            DynamicStateChild::Typed(ch_type) => ch_type,
+                            DynamicStateChild::Shared => ChType::String,
+                        },
+                        num_rows: count,
+                    });
+                }
+            }
+            BodyScanTask::AggregateCount {
+                mut rows_remaining,
+                mut shift,
+            } => {
+                let bytes = reader.remaining_slice();
+                let mut consumed = 0;
+                while rows_remaining != 0 && consumed < bytes.len() {
+                    let byte = bytes[consumed];
+                    consumed += 1;
+                    if byte & 0x80 != 0 {
+                        shift += 7;
+                        if shift >= 64 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "varint overflow",
+                            )
+                            .into());
+                        }
+                    } else {
+                        rows_remaining -= 1;
+                        shift = 0;
+                    }
+                }
+                reader.skip(consumed)?;
+                state.offset = reader.position();
+                if rows_remaining != 0 {
+                    state.tasks.push(BodyScanTask::AggregateCount {
+                        rows_remaining,
+                        shift,
+                    });
+                    return Err(need_more_bytes());
+                }
+            }
+            BodyScanTask::AggregateZeroBytes { mut rows_remaining } => {
+                let take = rows_remaining.min(reader.remaining());
+                if reader.read_slice(take)?.iter().any(|&byte| byte != 0) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "registered AggregateFunction(nothing*) state byte must be zero",
+                    )
+                    .into());
+                }
+                rows_remaining -= take;
+                state.offset = reader.position();
+                if rows_remaining != 0 {
+                    state
+                        .tasks
+                        .push(BodyScanTask::AggregateZeroBytes { rows_remaining });
+                    return Err(need_more_bytes());
+                }
+            }
+            BodyScanTask::AggregateNullableSum {
+                mut rows_remaining,
+                state_width,
+            } => {
+                let bytes = reader.remaining_slice();
+                let mut consumed = 0;
+                while rows_remaining != 0 {
+                    let Some(&flag) = bytes.get(consumed) else {
+                        break;
+                    };
+                    let after_flag = consumed + 1;
+                    if flag == 0 {
+                        consumed = after_flag;
+                        rows_remaining -= 1;
+                        continue;
+                    }
+                    let end = after_flag.checked_add(state_width).ok_or_else(|| {
+                        DecodeError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "aggregate nullable sum state byte length overflow",
+                        ))
+                    })?;
+                    if bytes.get(after_flag..end).is_none() {
+                        break;
+                    }
+                    consumed = end;
+                    rows_remaining -= 1;
+                }
+                reader.skip(consumed)?;
+                state.offset = reader.position();
+                if rows_remaining != 0 {
+                    state.tasks.push(BodyScanTask::AggregateNullableSum {
+                        rows_remaining,
+                        state_width,
+                    });
+                    return Err(need_more_bytes());
+                }
+            }
+            BodyScanTask::ChargeSynthetic { bytes, what } => {
+                state.allocation_budget.charge(bytes, what)?;
+            }
         }
+    }
+    if state.state_cursor != state.states.len() {
+        let reason = "body traversal did not consume every prefix state";
+        return Err(match state.states.get(state.state_cursor) {
+            Some(StatePrefix::Json(_)) => invalid_json(&state.column, reason),
+            _ => invalid_dynamic(&state.column, reason),
+        });
     }
     Ok(())
 }
@@ -4404,6 +5168,8 @@ fn push_value_tasks(
     ch_type: &ChType,
     num_rows: usize,
     column: &str,
+    states: &[StatePrefix],
+    state_cursor: &mut usize,
 ) -> Result<(), DecodeError> {
     if let Some(delegate) = ch_type.physical_delegate() {
         tasks.push(BodyScanTask::Values {
@@ -4443,6 +5209,127 @@ fn push_value_tasks(
                 rows_remaining: num_rows,
             });
         }
+        ChType::Dynamic { .. } => {
+            let state = next_dynamic_state(states, state_cursor, column)?.clone();
+            if num_rows > i32::MAX as usize {
+                return Err(invalid_dynamic(
+                    column,
+                    "row count exceeds Arrow Dense Union's i32 child-offset range",
+                ));
+            }
+            let num_children = state.children.len();
+            let width = match state.kind {
+                DynamicWireKind::Variant => 1,
+                DynamicWireKind::Flattened => {
+                    let values = num_children.checked_add(1).ok_or_else(|| {
+                        invalid_dynamic(column, "flattened child count overflows usize")
+                    })?;
+                    if values <= u8::MAX as usize + 1 {
+                        1
+                    } else if values <= u16::MAX as usize + 1 {
+                        2
+                    } else if values <= u32::MAX as usize {
+                        4
+                    } else {
+                        8
+                    }
+                }
+            };
+            if num_rows.checked_mul(width).is_none() {
+                return Err(DecodeError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Dynamic flattened index byte length overflows usize",
+                )));
+            }
+            tasks.push(BodyScanTask::DynamicIndexes {
+                counts: vec![0; num_children],
+                children: state.children,
+                rows_remaining: num_rows,
+                width,
+                kind: state.kind,
+            });
+        }
+        ChType::Json { typed_paths, .. } => {
+            let json = next_json_state(states, state_cursor, column)?;
+            let kind = json.kind;
+            let num_dynamic = json.dynamic_paths.len();
+            if num_rows > i32::MAX as usize {
+                return Err(invalid_json(
+                    column,
+                    "row count exceeds Arrow's i32 offset range",
+                ));
+            }
+            if kind == JsonWireKind::Text {
+                tasks.push(BodyScanTask::Strings {
+                    rows_remaining: num_rows,
+                    length_value: 0,
+                    length_shift: 0,
+                    length_complete: false,
+                    payload_remaining: 0,
+                    data_offset: 0,
+                });
+            } else {
+                if kind == JsonWireKind::Flattened
+                    && typed_paths.is_empty()
+                    && num_dynamic == 0
+                    && num_rows > MAX_PATHLESS_JSON_ROWS
+                {
+                    return Err(invalid_json(column, format!("row count {num_rows} exceeds the pathless FLATTENED block limit {MAX_PATHLESS_JSON_ROWS}")));
+                }
+                if kind == JsonWireKind::Flattened {
+                    let offset_bytes = num_rows
+                        .checked_add(1)
+                        .and_then(|rows| rows.checked_mul(std::mem::size_of::<i64>()))
+                        .unwrap_or(usize::MAX);
+                    tasks.push(BodyScanTask::ChargeSynthetic {
+                        bytes: offset_bytes,
+                        what: "FLATTENED JSON shared offsets",
+                    });
+                }
+                if kind == JsonWireKind::Structured {
+                    tasks.push(BodyScanTask::Offsets {
+                        rows_remaining: num_rows,
+                        previous: 0,
+                        children: vec![ChType::String, ChType::String],
+                    });
+                }
+                if num_dynamic != 0 {
+                    tasks.push(BodyScanTask::DynamicValuesRun {
+                        remaining: num_dynamic,
+                        num_rows,
+                    });
+                }
+                for (_, ch_type) in typed_paths.iter().rev() {
+                    tasks.push(BodyScanTask::Values {
+                        ch_type: ch_type.clone(),
+                        num_rows,
+                    });
+                }
+            }
+        }
+        ChType::AggregateFunction { .. } => match decode_state_codec(ch_type)? {
+            AggregateStateCodec::Count => tasks.push(BodyScanTask::AggregateCount {
+                rows_remaining: num_rows,
+                shift: 0,
+            }),
+            AggregateStateCodec::FixedZeroByte => tasks.push(BodyScanTask::AggregateZeroBytes {
+                rows_remaining: num_rows,
+            }),
+            AggregateStateCodec::Sum { state_width } => tasks.push(BodyScanTask::Bytes {
+                remaining: num_rows.checked_mul(state_width).ok_or_else(|| {
+                    DecodeError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "aggregate sum state byte length overflow",
+                    ))
+                })?,
+            }),
+            AggregateStateCodec::NullableSum { state_width } => {
+                tasks.push(BodyScanTask::AggregateNullableSum {
+                    rows_remaining: num_rows,
+                    state_width,
+                })
+            }
+        },
         ChType::Nullable(inner) => {
             tasks.push(BodyScanTask::Values {
                 ch_type: inner.as_ref().clone(),

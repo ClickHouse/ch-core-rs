@@ -281,7 +281,7 @@ let tail = d.finish()?;   // errors if a truncated block remains
 The interesting machinery is how it avoids wasted work on partial data:
 
 - **Completeness scan first.** Before running the allocating decode, it runs
-  `block_end_resume`, the allocation-free walk of the block framing that also
+  `block_end_resume`, the scan-only walk of the block framing that also
   backs the public `BlockScanner`. It shares the exact header-reading code with
   the real decoder (so the two cannot drift) and skips past column data by
   computed length (fixed-width types) or by walking the varint length prefixes
@@ -290,10 +290,11 @@ The interesting machinery is how it avoids wasted work on partial data:
   column buffers exactly once, when the last byte lands.
 - **Resumable checkpoint.** The scan keeps a `ScanProgress` checkpoint across
   feeds: verified top-level columns and, inside a column, bodies built from
-  String, fixed-width values, Nullable, Array, Map, Tuple, LowCardinality, and
-  Variant. A block fed in many pieces is therefore walked once overall.
-  Dynamic, JSON, and AggregateFunction bodies keep only the column-boundary
-  checkpoint and may be re-walked until their column completes.
+  String, fixed-width values, Nullable, Array, Map, Tuple, LowCardinality,
+  Variant, Dynamic, JSON, and AggregateFunction. Runtime type-table prefixes
+  and nested bodies also retain progress. A block fed in many pieces is
+  therefore walked once overall. The scanner allocates metadata and task
+  state, but no decoded column buffers.
 - **High-water mark.** If a scan found the next block incomplete after
   consuming all N buffered bytes, no block can complete until the buffer grows
   past N, so redundant re-scans are skipped.
@@ -301,7 +302,10 @@ The interesting machinery is how it avoids wasted work on partial data:
   internal buffer does not grow without bound.
 - The `UnexpectedEof`-vs-fatal-error distinction from the decode layer is what
   makes this work: EOF means wait for more bytes, anything else aborts the
-  stream.
+  stream. Scan and decode agree on acceptance or rejection and complete-block
+  boundaries, but error wording and timing can differ. An invalid Dynamic
+  index or AggregateFunction zero-state byte in a truncated stream can cause
+  an invalid-data error before decode reports truncation.
 
 Transport-level backpressure stays a binding/client responsibility; the core
 just decodes what it is given.

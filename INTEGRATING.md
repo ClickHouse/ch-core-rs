@@ -141,13 +141,6 @@ the schema, which HTTP `FORMAT Native` does not send. Both decode paths return
 it as a zero-row `ColBatch` first, so bindings must tolerate zero-row batches
 on TCP even where their HTTP path never saw one.
 
-Known limitation: the engine frames `Dynamic`, `JSON`, and `AggregateFunction`
-columns (and containers holding them) with a column-level checkpoint only, so
-the cost of framing such a column grows with its size squared divided by the
-read size. Other column types frame in linear time at any read size. Read in
-large chunks, for example 1 MiB, when results carry large `Dynamic` or `JSON`
-columns.
-
 Not all clients have a ready-to-use `FORMAT Native` result path today. Part of the integration task for those clients is to add or reuse a path that can request `FORMAT Native` and expose the resulting decompressed byte stream to the Rust decoder.
 
 ### Protocol Revision
@@ -196,11 +189,15 @@ identifies the zero-column, zero-row TCP end marker without decoding a
 `ColBatch`. The scanner copies no wire bytes and creates no decoded column
 buffers. It checkpoints complete top-level columns and resumes inside bodies
 composed from String, fixed-width values, Nullable, Array, Map, Tuple,
-LowCardinality, and Variant. Dynamic, JSON, and AggregateFunction bodies (and
-containers holding them) may re-walk their current column across small reads,
-so pass all currently available bytes
-instead of imposing an artificial scan slice. Call `reset` before reusing a
-scanner after abandoning an incomplete block.
+LowCardinality, Variant, Dynamic, JSON, and AggregateFunction, including
+runtime type-table prefixes and nested containers. Progress survives each
+feed, so scanning remains linear across transport read sizes. Call `reset`
+before reusing a scanner after abandoning an incomplete block.
+
+Scan and decode agree on acceptance or rejection and complete-block boundaries.
+Error wording and the point at which corruption is reported can differ. On a
+truncated stream, an invalid Dynamic index or AggregateFunction zero-state byte
+can produce invalid data instead of a truncation error.
 
 For a compressed body, keep one `BlockScanner` and one plaintext buffer
 `plain` that holds only the current block. For each frame:
@@ -225,11 +222,9 @@ For a compressed body, keep one `BlockScanner` and one plaintext buffer
    accumulated block. Return to packet dispatch without reading the next frame
    or packet.
 
-Dynamic, JSON, and AggregateFunction bodies can still re-walk their current
-column on each frame, as on the uncompressed path. Core rejects
-zero-plaintext frames; they are not end-of-input markers. Bound the accumulated
-body and transport buffers according to the engine's resource policy as well
-as honoring core's per-frame size checks.
+Core rejects zero-plaintext frames; they are not end-of-input markers. Bound
+the accumulated body and transport buffers according to the engine's resource
+policy, and honor core's per-frame size checks.
 
 Confirmed at `v26.8.1.2041-lts`, `TCPHandler::sendData`, `sendTotals`, and
 `sendExtremes` in `src/Server/TCPHandler.cpp`, and `Connection::sendData` in

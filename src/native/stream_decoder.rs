@@ -50,16 +50,20 @@ pub enum BlockBoundary {
 /// call must pass the same prefix plus any newly received suffix. The scanner
 /// checkpoints verified top-level columns and, inside a column, any body
 /// composed from String, fixed-width values, Nullable, Array, Map, Tuple,
-/// LowCardinality, and Variant, so feeding a block in pieces of any size walks
-/// it in amortized linear time. Dynamic, JSON, and AggregateFunction bodies (and
-/// containers holding them) retain column-boundary checkpointing and may be
-/// re-walked until that column completes. A complete block or decode error
-/// resets the checkpoint for the next block.
+/// LowCardinality, Variant, Dynamic, JSON, and AggregateFunction. Runtime
+/// type-table prefixes and nested bodies retain progress, so feeding a block
+/// in pieces walks it in amortized linear time. A complete block or decode
+/// error resets the checkpoint for the next block.
 ///
 /// The scanner creates no decoded column buffers and copies no wire bytes.
 /// Header and type parsing can allocate metadata values. The supplied
 /// [`DecodeOptions`] apply while validating framing, headers, declared sizes,
 /// and column bodies.
+///
+/// Scan and decode agree on acceptance or rejection and complete-block
+/// boundaries, not on error wording or when corruption is reported. On a
+/// truncated stream, an invalid Dynamic index or AggregateFunction zero-state
+/// byte can be rejected as invalid data before decode reports truncation.
 #[derive(Debug)]
 pub struct BlockScanner {
     progress: ScanProgress,
@@ -259,7 +263,7 @@ impl StreamDecoder {
 
     /// Try to decode as many complete blocks as possible from the buffer.
     ///
-    /// Each iteration first runs the allocation-free [`block_end_resume`]
+    /// Each iteration first runs the scan-only [`block_end_resume`]
     /// completeness scan over the unconsumed bytes. Only when it confirms a
     /// whole block is buffered do we run the allocating [`decode_next_block`].
     /// A block that arrives over several feeds therefore allocates its column
@@ -365,7 +369,8 @@ mod tests {
     use super::*;
     use crate::column::Column;
     use crate::native::decode::{
-        block_end, decode_next_block, DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION,
+        block_end, decode_next_block, decode_next_block_binary_types,
+        DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION,
     };
     use crate::native::protocol::LC_HAS_ADDITIONAL_KEYS_BIT;
     use crate::native::varint::write_varint;
@@ -943,7 +948,7 @@ mod tests {
     #[test]
     fn test_nullable_sum_block_byte_by_byte() {
         // Split through both true flags and their conditional accumulators. The
-        // allocation-free boundary scan must wait for the complete final state,
+        // scan-only boundary walk must wait for the complete final state,
         // then materialize the variable LargeBinary offsets exactly once.
         let mut states = vec![0x00, 0x01];
         states.extend_from_slice(&13u64.to_le_bytes());
@@ -1318,6 +1323,41 @@ mod tests {
     }
 
     #[test]
+    fn binary_dynamic_runtime_descriptor_scan_matches_decode_at_every_split() {
+        let mut block = Vec::new();
+        write_varint(&mut block, 1);
+        write_varint(&mut block, 3);
+        write_varint(&mut block, 1);
+        block.push(b'd');
+        block.extend([0x2b, 32]); // Dynamic(max_types=32)
+        block.extend(2u64.to_le_bytes());
+        write_varint(&mut block, 1);
+        block.push(0x15); // String runtime descriptor
+        block.extend(0u64.to_le_bytes());
+        block.extend([1, u8::MAX, 1]);
+        block.extend(string_values(&["user_1", "user_2"]));
+
+        let mut reader = ByteReader::new(&block);
+        let decoded = decode_next_block_binary_types(&mut reader, &DecodeOptions::default())
+            .unwrap()
+            .unwrap();
+        let expected = BlockBoundary::Complete {
+            consumed: reader.position(),
+            num_columns: decoded.schema.fields.len(),
+            num_rows: decoded.num_rows,
+        };
+        for split in 0..block.len() {
+            let mut scanner = BlockScanner::new_binary_types(DecodeOptions::default());
+            assert_eq!(
+                scanner.scan(&block[..split]).unwrap(),
+                BlockBoundary::NeedMore,
+                "split {split}"
+            );
+            assert_eq!(scanner.scan(&block).unwrap(), expected, "split {split}");
+        }
+    }
+
+    #[test]
     fn nested_prefix_free_scanner_matches_block_end_bytewise() {
         let array = make_array_string_block("a", &[&["user_1", "user_2"], &[], &["13"]]);
         let map = make_map_string_block(
@@ -1666,6 +1706,247 @@ mod tests {
             indexes,
         ));
         data
+    }
+
+    fn dynamic_prefix(version: u64, types: &[&str]) -> Vec<u8> {
+        let mut data = version.to_le_bytes().to_vec();
+        write_varint(&mut data, types.len() as u64);
+        for ch_type in types {
+            write_varint(&mut data, ch_type.len() as u64);
+            data.extend_from_slice(ch_type.as_bytes());
+        }
+        if version != 3 {
+            data.extend_from_slice(&0u64.to_le_bytes());
+        }
+        data
+    }
+
+    #[test]
+    fn runtime_shaped_columns_scan_match_decode_at_every_split() {
+        let mut dynamic = dynamic_prefix(2, &["String"]);
+        dynamic.extend([1, u8::MAX, 1]);
+        dynamic.extend(string_values(&["user_1", "user_2"]));
+
+        let mut json = 3u64.to_le_bytes().to_vec();
+        write_varint(&mut json, 0);
+
+        let mut json_text = 1u64.to_le_bytes().to_vec();
+        json_text.extend(string_values(&["{}", "13", "null"]));
+
+        let mut json_in_dynamic = dynamic_prefix(3, &["JSON"]);
+        json_in_dynamic.extend(3u64.to_le_bytes());
+        write_varint(&mut json_in_dynamic, 0);
+        json_in_dynamic.push(0);
+
+        let mut array_dynamic = dynamic_prefix(2, &["UInt64"]);
+        array_dynamic.extend(offsets(&[1, 1, 3]));
+        array_dynamic.extend([0, u8::MAX, 0]);
+        array_dynamic.extend(13u64.to_le_bytes());
+        array_dynamic.extend(79u64.to_le_bytes());
+
+        let mut tuple_dynamic = dynamic_prefix(2, &["String"]);
+        tuple_dynamic.extend([1, u8::MAX, 1]);
+        tuple_dynamic.extend(string_values(&["x", "z"]));
+        tuple_dynamic.extend([7, 8, 9]);
+
+        let mut nullable_json = 3u64.to_le_bytes().to_vec();
+        write_varint(&mut nullable_json, 0);
+        nullable_json.extend([0, 1, 0]);
+
+        for (rows, name, ch_type, body) in [
+            (3, "d", "Dynamic(max_types=2)", dynamic),
+            (3, "j", "JSON", json),
+            (3, "jt", "JSON", json_text),
+            (1, "dj", "Dynamic", json_in_dynamic),
+            (3, "a", "Array(Dynamic(max_types=1))", array_dynamic),
+            (3, "t", "Tuple(Dynamic(max_types=1), UInt8)", tuple_dynamic),
+            (3, "n", "Nullable(JSON)", nullable_json),
+            (3, "g", "AggregateFunction(count)", vec![0, 13, 79]),
+            (
+                3,
+                "s",
+                "AggregateFunction(sum, Nullable(UInt8))",
+                vec![0, 1, 13, 0, 0, 0, 0, 0, 0, 0, 0],
+            ),
+        ] {
+            assert_scan_matches_decode(&make_block_at(0, rows, &[(name, ch_type, body)]), 0);
+        }
+    }
+
+    #[test]
+    fn runtime_prefix_and_aggregate_malformed_parity_at_every_split() {
+        let duplicate = dynamic_prefix(2, &["String", "String"]);
+        let mut unsorted_json = 3u64.to_le_bytes().to_vec();
+        write_varint(&mut unsorted_json, 2);
+        for path in ["z", "a"] {
+            write_varint(&mut unsorted_json, path.len() as u64);
+            unsorted_json.extend_from_slice(path.as_bytes());
+        }
+        let cases = [
+            make_block_at(0, 1, &[("d", "Dynamic", duplicate)]),
+            make_block_at(0, 1, &[("j", "JSON", unsorted_json)]),
+            make_block_at(
+                0,
+                1,
+                &[(
+                    "g",
+                    "AggregateFunction(nothingNull, Nullable(Nothing))",
+                    vec![1],
+                )],
+            ),
+        ];
+        for data in cases {
+            for split in 0..=data.len() {
+                assert_scan_rejects_like_decode(&data, split);
+            }
+        }
+    }
+
+    #[test]
+    fn flattened_json_scan_preserves_cumulative_allocation_budget() {
+        let options = || DecodeOptions {
+            max_synthetic_allocation_bytes: 32,
+            ..DecodeOptions::default()
+        };
+        let mut nested = 3u64.to_le_bytes().to_vec();
+        write_varint(&mut nested, 0);
+        nested.extend(3u64.to_le_bytes());
+        write_varint(&mut nested, 0);
+        let nested = make_block_at(0, 3, &[("j", "JSON(a JSON)", nested)]);
+        let decoded = decode_next_block(&mut ByteReader::new(&nested), &options()).unwrap_err();
+        for split in 0..=nested.len() {
+            let mut scanner = BlockScanner::new(options());
+            if split != nested.len() {
+                assert_eq!(
+                    scanner.scan(&nested[..split]).unwrap(),
+                    BlockBoundary::NeedMore
+                );
+            }
+            let scanned = scanner.scan(&nested).unwrap_err();
+            assert_eq!(scanned.to_string(), decoded.to_string(), "split {split}");
+        }
+
+        let mut pathless = 3u64.to_le_bytes().to_vec();
+        write_varint(&mut pathless, 0);
+        let pathless = make_block_at(0, 3, &[("j", "JSON", pathless)]);
+        let mut scanner = BlockScanner::new(options());
+        assert!(matches!(
+            scanner.scan(&pathless).unwrap(),
+            BlockBoundary::Complete { consumed, .. } if consumed == pathless.len()
+        ));
+    }
+
+    #[test]
+    fn runtime_tables_and_json_bodies_scan_linearly_across_small_feeds() {
+        let type_names: Vec<String> = (1..=1_000)
+            .map(|width| format!("FixedString({width})"))
+            .collect();
+        let type_refs: Vec<&str> = type_names.iter().map(String::as_str).collect();
+        let rows = 10_000;
+        let mut dynamic = dynamic_prefix(3, &type_refs);
+        for _ in 0..rows {
+            dynamic.extend_from_slice(&1_000u16.to_le_bytes());
+        }
+        let dynamic = make_block_at(0, rows, &[("d", "Dynamic", dynamic)]);
+
+        let values = vec!["x".repeat(40); 30_000];
+        let value_refs: Vec<&str> = values.iter().map(String::as_str).collect();
+        let mut json = 3u64.to_le_bytes().to_vec();
+        write_varint(&mut json, 0);
+        json.extend(string_values(&value_refs));
+        let json = make_block_at(0, value_refs.len(), &[("j", "JSON(s String)", json)]);
+
+        for (type_name, data) in [("Dynamic", dynamic), ("JSON", json)] {
+            let mut scanner = BlockScanner::new(DecodeOptions::default());
+            for end in (128..data.len()).step_by(128) {
+                assert_eq!(scanner.scan(&data[..end]).unwrap(), BlockBoundary::NeedMore);
+            }
+            assert!(matches!(
+                scanner.scan(&data).unwrap(),
+                BlockBoundary::Complete { consumed, .. } if consumed == data.len()
+            ));
+            assert!(
+                scanner.progress.bytes_walked < 2 * data.len() as u64,
+                "{type_name}: scanner walked {} bytes for {} input bytes",
+                scanner.progress.bytes_walked,
+                data.len()
+            );
+        }
+    }
+
+    #[test]
+    fn many_json_paths_keep_retained_task_memory_bounded() {
+        const PATHS: usize = 80_000;
+        let mut json = 3u64.to_le_bytes().to_vec();
+        write_varint(&mut json, PATHS as u64);
+        for path in 0..PATHS {
+            let path = format!("path_{path:05}");
+            write_varint(&mut json, path.len() as u64);
+            json.extend_from_slice(path.as_bytes());
+        }
+        let names_len = json.len();
+        for _ in 0..PATHS {
+            json.extend_from_slice(&3u64.to_le_bytes());
+            write_varint(&mut json, 0);
+        }
+        let prefixes_len = json.len();
+        json.extend(std::iter::repeat(0u8).take(PATHS));
+        let header_len = make_block_at(0, 1, &[("j", "JSON", Vec::new())]).len();
+        let data = make_block_at(0, 1, &[("j", "JSON", json)]);
+        assert!(data.len() > 1_400_000);
+
+        let mut scanner = BlockScanner::new(DecodeOptions::default());
+        let names_end = header_len + names_len;
+        for end in (4096..names_end).step_by(4096) {
+            assert_eq!(scanner.scan(&data[..end]).unwrap(), BlockBoundary::NeedMore);
+        }
+        let prefixes_end = header_len + prefixes_len;
+        let body_mid = prefixes_end + PATHS / 2;
+        let mut retained = Vec::new();
+        for end in [names_end, prefixes_end, body_mid] {
+            assert_eq!(scanner.scan(&data[..end]).unwrap(), BlockBoundary::NeedMore);
+            assert!(scanner.progress.retained_tasks_have_empty_payloads());
+            retained.push(scanner.progress.retained_task_bytes());
+        }
+        assert!(matches!(
+            scanner.scan(&data).unwrap(),
+            BlockBoundary::Complete { consumed, .. } if consumed == data.len()
+        ));
+        assert!(
+            retained.iter().all(|&bytes| bytes <= 4 * 1024),
+            "retained task stacks used {retained:?} bytes"
+        );
+    }
+
+    #[test]
+    fn runtime_shaped_zero_rows_and_adjacent_blocks_reset_scan_state() {
+        for ch_type in [
+            "Dynamic",
+            "JSON",
+            "Array(Dynamic)",
+            "Tuple(Dynamic, UInt8)",
+            "Nullable(JSON)",
+            "AggregateFunction(count)",
+        ] {
+            assert_scan_matches_decode(&make_block_at(0, 0, &[("c", ch_type, Vec::new())]), 0);
+        }
+
+        let mut dynamic = dynamic_prefix(2, &["String"]);
+        dynamic.push(1);
+        dynamic.extend(string_values(&["user_1"]));
+        let dynamic = make_block_at(0, 1, &[("c", "Dynamic", dynamic)]);
+
+        let mut json = 1u64.to_le_bytes().to_vec();
+        json.extend(string_values(&["{}"]));
+        let json = make_block_at(0, 1, &[("c", "JSON", json)]);
+
+        let aggregate = make_block_at(0, 1, &[("c", "AggregateFunction(count)", vec![13])]);
+        for block in [dynamic, json, aggregate] {
+            let stream = [block.clone(), block].concat();
+            for step in [1, 7, 19] {
+                assert_stream_scan_matches_decode(&stream, 0, step);
+            }
+        }
     }
 
     #[test]

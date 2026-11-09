@@ -37,6 +37,47 @@ fn test_protocol_revision_above_supported_ceiling_is_rejected() {
 }
 
 #[test]
+fn complete_binary_dynamic_type_reparse_rejects_trailing_and_incomplete_bytes() {
+    assert_eq!(
+        parse_complete_binary_dynamic_type(&[0x15], "d").unwrap(),
+        ChType::String
+    );
+    for bytes in [&[0x15, 0x00][..], &[0x16, 0x80][..]] {
+        let err = parse_complete_binary_dynamic_type(bytes, "d").unwrap_err();
+        assert!(
+            matches!(err, DecodeError::Io(ref error) if error.kind() == io::ErrorKind::InvalidData),
+            "{err:?}"
+        );
+    }
+}
+
+#[test]
+fn resumable_body_rejects_unconsumed_prefix_state() {
+    let mut state = ResumableBodyState {
+        column: "d".to_string(),
+        root_type: ChType::Nothing,
+        num_rows: 1,
+        settings: DecodeSettings::text(&DecodeOptions::default()),
+        prefix_tasks: Vec::new(),
+        states: vec![StatePrefix::Dynamic(DynamicState {
+            kind: DynamicWireKind::Flattened,
+            children: Vec::new(),
+        })],
+        state_cursor: 0,
+        body_seeded: true,
+        allocation_budget: AllocationBudget::new(
+            DecodeOptions::default().max_synthetic_allocation_bytes,
+        ),
+        tasks: Vec::new(),
+        offset: 0,
+    };
+    assert!(matches!(
+        scan_resumable_body(&mut ByteReader::new(&[]), &mut state),
+        Err(DecodeError::InvalidDynamic { .. })
+    ));
+}
+
+#[test]
 fn test_block_end_scans_string_column() {
     // The completeness scan must return the exact end offset of a block whose
     // String column it walks via the per-value length prefixes, and report a
@@ -1231,6 +1272,16 @@ fn test_string_offset_helper_rejects_runs_past_i32_max() {
 fn test_resumable_string_walk_rejects_cumulative_i32_overflow_across_park() {
     let mut state = ResumableBodyState {
         column: "s".to_string(),
+        root_type: ChType::String,
+        num_rows: 3,
+        settings: DecodeSettings::text(&DecodeOptions::default()),
+        prefix_tasks: Vec::new(),
+        states: Vec::new(),
+        state_cursor: 0,
+        body_seeded: true,
+        allocation_budget: AllocationBudget::new(
+            DecodeOptions::default().max_synthetic_allocation_bytes,
+        ),
         tasks: vec![BodyScanTask::Strings {
             rows_remaining: 3,
             length_value: 0,
@@ -1276,11 +1327,14 @@ fn test_resumable_string_walk_rejects_cumulative_i32_overflow_across_park() {
 #[test]
 fn test_resumable_variant_rejects_rows_past_i32_max() {
     let mut tasks = Vec::new();
+    let mut state_cursor = 0;
     let err = push_value_tasks(
         &mut tasks,
         &ChType::Variant(vec![ChType::String]),
         i32::MAX as usize + 1,
         "v",
+        &[],
+        &mut state_cursor,
     )
     .unwrap_err();
     match err {

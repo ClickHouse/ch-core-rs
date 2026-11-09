@@ -10,12 +10,17 @@ version; patch releases remain backward compatible.
 - Add a resumable `BlockScanner` for outer protocols to find one exact Native
   block boundary and inspect its declared row and column counts without
   materializing decoded column buffers or copying wire bytes. Partial String,
-  Nullable, Array, Map, Tuple, LowCardinality, and Variant bodies resume within
+  Nullable, Array, Map, Tuple, LowCardinality, Variant, Dynamic, JSON, and
+  AggregateFunction bodies and their runtime type-table prefixes resume within
   the current column instead of re-walking it after each transport read, so
   incremental feeds scan in linear time. The LowCardinality scan rejects the
   same malformed dictionaries and indexes that decode rejects, and the scan
   applies decode's 2 GiB String chunk limit and the Variant and Dynamic i32
-  row guards.
+  row guards. Flattened JSON scanning also enforces decode's cumulative
+  synthetic-allocation budget across nested paths and columns. JSON paths use
+  a counted prefix task rather than retaining one large task per path. Binary
+  runtime descriptor parsing must match the scanned boundary exactly; parser
+  errors after a complete descriptor are fatal rather than resumable EOF.
 - Treat a partial first VarUInt in either `BlockInfo` or the unframed
   revision-zero column count as `UnexpectedEof`. An entirely empty input
   remains a clean block boundary.

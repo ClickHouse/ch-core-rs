@@ -437,13 +437,9 @@ and the block buffer's capacity never exceeds the cap. Core's scan-only
 boundary parser finds the block's exact end without allocating decoded
 columns, and malformed bodies surface as `ProtocolError::Decode`.
 
-Known limitation: framing a block is linear in its size for String,
-fixed-width, Nullable, Array, Map, Tuple, LowCardinality, and Variant columns,
-whatever the read size. A `Dynamic`, `JSON`, or `AggregateFunction` column,
-or a container holding one, is re-walked from the start of that column on
-every read until it completes, so framing it costs about the column size
-squared divided by the read size. Use large reads, for example 1 MiB, for
-results with large `Dynamic` or `JSON` columns.
+Framing retains progress through column bodies and runtime type-table
+prefixes, including Dynamic, JSON, AggregateFunction, and nested containers.
+Scanning stays linear across transport read sizes.
 
 ## Server reference
 
