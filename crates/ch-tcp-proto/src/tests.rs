@@ -463,8 +463,9 @@ fn malformed_tail_keeps_completed_event() {
         events(&mut engine).as_slice(),
         [Event::ServerHello(_)]
     ));
-    // The addendum queued before the failure is still in order.
-    assert_eq!(engine.take_output(), [0]);
+    // Completed events remain observable, but queued writes are unsafe after
+    // a fatal protocol error and are discarded.
+    assert!(engine.take_output().is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -934,6 +935,19 @@ fn data_packet(block: &[u8]) -> Vec<u8> {
     bytes
 }
 
+fn table_columns_packet(table_name: &str, description: &str) -> Vec<u8> {
+    table_columns_bytes_packet(table_name.as_bytes(), description.as_bytes())
+}
+
+fn table_columns_bytes_packet(table_name: &[u8], description: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![SERVER_PACKET_TABLE_COLUMNS as u8];
+    put_varuint(&mut bytes, table_name.len() as u64);
+    bytes.extend_from_slice(table_name);
+    put_varuint(&mut bytes, description.len() as u64);
+    bytes.extend_from_slice(description);
+    bytes
+}
+
 fn framed_string_block(length: usize) -> Vec<u8> {
     let mut bytes = vec![1, 0, 2];
     bytes.extend_from_slice(&(-1_i32).to_le_bytes());
@@ -1041,6 +1055,916 @@ fn query_queues_request_and_filters_tcp_empty_data_sentinel() {
         [Event::Data(block), Event::EndOfStream]
     );
     assert_eq!(engine.state(), State::Ready);
+}
+
+// ---------------------------------------------------------------------------
+// INSERT
+// ---------------------------------------------------------------------------
+
+fn inserting_engine() -> Connection {
+    let mut engine = ready_engine();
+    engine
+        .insert(Query::new("INSERT INTO items VALUES"))
+        .unwrap();
+    let _ = engine.take_output();
+    engine.feed(&data_packet(&framed_int64_block(&[]))).unwrap();
+    assert!(matches!(
+        events(&mut engine).as_slice(),
+        [Event::InsertSchema(_)]
+    ));
+    assert_eq!(engine.state(), State::Inserting);
+    engine
+}
+
+#[test]
+fn insert_queues_query_and_external_table_terminator() {
+    let mut engine = ready_engine();
+    engine
+        .insert(Query::new("INSERT INTO items VALUES").with_query_id("insert_13"))
+        .unwrap();
+    assert_eq!(engine.state(), State::AwaitingInsertSchema);
+    let output = engine.take_output();
+    assert_eq!(output.first(), Some(&(CLIENT_PACKET_QUERY as u8)));
+    let mut terminator = Vec::new();
+    put_empty_data_packet(&mut terminator);
+    assert!(output.ends_with(&terminator));
+}
+
+#[test]
+fn insert_table_columns_and_schema_are_split_independent() {
+    let description = "columns format version: 1\n1 columns:\n`n` Int64\n";
+    let schema = framed_int64_block(&[]);
+    let mut response = table_columns_packet("", description);
+    response.extend(data_packet(&schema));
+
+    let run = |chunks: &[&[u8]]| {
+        let mut engine = ready_engine();
+        engine
+            .insert(Query::new("INSERT INTO items VALUES"))
+            .unwrap();
+        let _ = engine.take_output();
+        for chunk in chunks {
+            engine.feed(chunk).unwrap();
+        }
+        (engine.state(), events(&mut engine))
+    };
+    let expected = run(&[&response]);
+    for split in 0..=response.len() {
+        assert_eq!(
+            run(&[&response[..split], &response[split..]]),
+            expected,
+            "split {split}"
+        );
+    }
+    assert_eq!(
+        expected,
+        (
+            State::Inserting,
+            vec![
+                Event::TableColumns {
+                    table_name: Vec::new(),
+                    description: description.as_bytes().to_vec(),
+                    truncated: false,
+                },
+                Event::InsertSchema(schema),
+            ],
+        )
+    );
+}
+
+#[test]
+fn insert_table_columns_are_raw_bounded_and_stream_above_input_limit() {
+    let large_len = INPUT_LIMIT + 79;
+    let mut description = vec![b'x'; large_len];
+    description[13] = 0xff;
+    let response = table_columns_bytes_packet(b"\xfe", &description);
+    assert!(response.len() > INPUT_LIMIT);
+
+    for read_size in [64, response.len()] {
+        // The budget covers both fields: one table-name byte plus the
+        // description fit exactly.
+        let mut engine = ready_engine().with_max_block_bytes(large_len + 1);
+        engine
+            .insert(Query::new("INSERT INTO items VALUES"))
+            .unwrap();
+        let _ = engine.take_output();
+        for chunk in response.chunks(read_size) {
+            engine.feed(chunk).unwrap();
+        }
+        let [Event::TableColumns {
+            table_name,
+            description: actual,
+            truncated,
+        }]: [Event; 1] = events(&mut engine).try_into().unwrap()
+        else {
+            panic!("expected TableColumns")
+        };
+        assert_eq!(table_name, b"\xfe");
+        assert_eq!(actual, description);
+        assert!(!truncated);
+        assert!(table_name.capacity() + actual.capacity() <= large_len + 1);
+        assert_eq!(engine.state(), State::AwaitingInsertSchema);
+        assert!(engine.input.is_empty());
+    }
+
+    let limit = MIN_MAX_BLOCK_BYTES;
+    let table_name = vec![b'n'; limit + 13];
+    let description = vec![b'd'; limit + 79];
+    let schema = framed_int64_block(&[]);
+    let mut response = table_columns_bytes_packet(&table_name, &description);
+    response.extend(data_packet(&schema));
+    let mut engine = ready_engine().with_max_block_bytes(limit);
+    engine
+        .insert(Query::new("INSERT INTO items VALUES"))
+        .unwrap();
+    let _ = engine.take_output();
+    for chunk in response.chunks(79) {
+        engine.feed(chunk).unwrap();
+    }
+    // The retained table name used the whole shared budget.
+    assert_eq!(
+        events(&mut engine),
+        [
+            Event::TableColumns {
+                table_name: table_name[..limit].to_vec(),
+                description: Vec::new(),
+                truncated: true,
+            },
+            Event::InsertSchema(schema),
+        ]
+    );
+    assert_eq!(engine.state(), State::Inserting);
+    engine.insert_data(&framed_int64_block(&[13])).unwrap();
+    engine.finish_insert().unwrap();
+    let _ = engine.take_output();
+    engine.feed(&[SERVER_PACKET_END_OF_STREAM as u8]).unwrap();
+    assert_eq!(events(&mut engine), [Event::EndOfStream]);
+    assert_eq!(engine.state(), State::Ready);
+}
+
+fn awaiting_insert_schema_engine(limit: usize) -> Connection {
+    let mut engine = ready_engine().with_max_block_bytes(limit);
+    engine
+        .insert(Query::new("INSERT INTO items VALUES"))
+        .unwrap();
+    let _ = engine.take_output();
+    engine
+}
+
+#[test]
+fn insert_table_columns_fields_share_one_retention_budget() {
+    let limit = MIN_MAX_BLOCK_BYTES;
+    let table_name = vec![b'n'; 13];
+    let description = vec![b'd'; limit + 79];
+    let response = table_columns_bytes_packet(&table_name, &description);
+    for read_size in [1, 79, response.len()] {
+        let mut engine = awaiting_insert_schema_engine(limit);
+        for chunk in response.chunks(read_size) {
+            engine.feed(chunk).unwrap();
+        }
+        let [Event::TableColumns {
+            table_name: actual_name,
+            description: actual_description,
+            truncated,
+        }]: [Event; 1] = events(&mut engine).try_into().unwrap()
+        else {
+            panic!("expected TableColumns")
+        };
+        assert_eq!(actual_name, table_name, "read size {read_size}");
+        assert_eq!(actual_description, description[..limit - 13]);
+        assert!(truncated);
+        assert!(actual_name.capacity() + actual_description.capacity() <= limit);
+    }
+}
+
+/// A declared field length above 64 x `max_block_bytes` is corruption and
+/// fails as soon as its VarUInt completes, in either field and at any split.
+#[test]
+fn insert_table_columns_declared_length_bound_fails_fast() {
+    // Pinned: the docs, README, and CHANGELOG promise "64 times".
+    assert_eq!(TABLE_COLUMNS_DECLARED_FACTOR, 64);
+    let limit = MIN_MAX_BLOCK_BYTES;
+    let bound = limit * 64;
+    for length in [bound as u64 + 1, u64::MAX] {
+        let mut table_name_prefix = vec![SERVER_PACKET_TABLE_COLUMNS as u8];
+        put_varuint(&mut table_name_prefix, length);
+        let mut description_prefix = table_columns_bytes_packet(b"t", b"");
+        description_prefix.pop(); // the empty description's zero length
+        put_varuint(&mut description_prefix, length);
+        for (bytes, field) in [
+            (table_name_prefix, "table_columns_table_name"),
+            (description_prefix, "table_columns_description"),
+        ] {
+            for read_size in [1, 2, bytes.len()] {
+                let mut engine = awaiting_insert_schema_engine(limit);
+                let mut result = Ok(());
+                let mut fed = 0;
+                for chunk in bytes.chunks(read_size) {
+                    fed += chunk.len();
+                    result = engine.feed(chunk);
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                assert_eq!(fed, bytes.len(), "{field} {length} read size {read_size}");
+                assert_eq!(
+                    result,
+                    Err(ProtocolError::StringTooLong {
+                        field,
+                        length: Some(usize::try_from(length).unwrap_or(usize::MAX)),
+                        limit: bound,
+                    }),
+                    "{field} {length} read size {read_size}"
+                );
+                assert_eq!(engine.state(), PROTOCOL_FAILED);
+                assert!(engine.output.is_empty());
+                assert!(events(&mut engine).is_empty());
+            }
+        }
+    }
+
+    // Exactly at the bound the field is accepted, retained up to the budget,
+    // and skipped to its end, in both fields.
+    let schema = framed_int64_block(&[]);
+    let at_bound = vec![b'x'; bound];
+    for (table_name, description) in [(&at_bound[..], &b"d"[..]), (&b"t"[..], &at_bound[..])] {
+        let mut response = table_columns_bytes_packet(table_name, description);
+        response.extend(data_packet(&schema));
+        for read_size in [997, response.len()] {
+            let mut engine = awaiting_insert_schema_engine(limit);
+            for chunk in response.chunks(read_size) {
+                engine.feed(chunk).unwrap();
+            }
+            let kept_name = &table_name[..table_name.len().min(limit)];
+            let kept_description = &description[..description.len().min(limit - kept_name.len())];
+            assert_eq!(
+                events(&mut engine),
+                [
+                    Event::TableColumns {
+                        table_name: kept_name.to_vec(),
+                        description: kept_description.to_vec(),
+                        truncated: true,
+                    },
+                    Event::InsertSchema(schema.clone()),
+                ],
+                "read size {read_size}"
+            );
+            assert_eq!(engine.state(), State::Inserting);
+        }
+    }
+}
+
+/// The declared bound saturates instead of overflowing for a huge cap.
+#[test]
+fn insert_table_columns_declared_bound_saturates() {
+    let progress = TableColumnsProgress::new(usize::MAX);
+    assert_eq!(progress.declared_limit, usize::MAX);
+    let progress = TableColumnsProgress::new(DEFAULT_MAX_BLOCK_BYTES);
+    assert_eq!(
+        progress.declared_limit,
+        DEFAULT_MAX_BLOCK_BYTES.saturating_mul(TABLE_COLUMNS_DECLARED_FACTOR)
+    );
+}
+
+#[test]
+fn insert_data_validates_one_nonempty_block_atomically() {
+    let mut engine = inserting_engine();
+    let valid = framed_int64_block(&[13, 79]);
+    engine.insert_data(&valid).unwrap();
+    let queued = engine.output.clone();
+    assert_eq!(queued[..2], [CLIENT_PACKET_DATA as u8, 0]);
+    assert_eq!(&queued[2..], valid.as_slice());
+
+    let mut concatenated = valid.clone();
+    concatenated.extend(framed_int64_block(&[179]));
+    let empty = framed_empty_block();
+    let mut zero_columns_with_rows = framed_empty_block();
+    *zero_columns_with_rows.last_mut().unwrap() = 1;
+    let cases = [
+        (
+            &valid[..valid.len() - 1],
+            ProtocolError::InvalidInsertBlock(InsertBlockError::Truncated),
+        ),
+        (
+            concatenated.as_slice(),
+            ProtocolError::InvalidInsertBlock(InsertBlockError::TrailingBytes {
+                consumed: valid.len(),
+                len: concatenated.len(),
+            }),
+        ),
+        (
+            empty.as_slice(),
+            ProtocolError::InvalidInsertBlock(InsertBlockError::NoColumns),
+        ),
+        (
+            zero_columns_with_rows.as_slice(),
+            ProtocolError::InvalidInsertBlock(InsertBlockError::NoColumns),
+        ),
+    ];
+    for (payload, expected) in cases {
+        assert_eq!(engine.insert_data(payload), Err(expected));
+        assert_eq!(engine.output, queued);
+        assert_eq!(engine.state(), State::Inserting);
+    }
+}
+
+#[test]
+fn outbound_insert_cap_rejection_is_atomic_and_recoverable() {
+    let mut engine = inserting_engine().with_max_block_bytes(MIN_MAX_BLOCK_BYTES);
+    let before = engine.output.clone();
+    let oversized = framed_string_block(MIN_MAX_BLOCK_BYTES + 13);
+    assert_eq!(
+        engine.insert_data(&oversized),
+        Err(ProtocolError::InvalidInsertBlock(
+            InsertBlockError::TooLarge {
+                len: oversized.len(),
+                limit: MIN_MAX_BLOCK_BYTES,
+            }
+        ))
+    );
+    assert_eq!(engine.output, before);
+    assert_eq!(engine.state(), State::Inserting);
+
+    let valid = framed_int64_block(&[13]);
+    engine.insert_data(&valid).unwrap();
+    let mut expected = vec![CLIENT_PACKET_DATA as u8, 0];
+    expected.extend_from_slice(&valid);
+    assert_eq!(engine.take_output(), expected);
+}
+
+/// A block exactly at the cap is accepted; one byte over is rejected.
+#[test]
+fn outbound_insert_cap_accepts_a_block_at_the_limit() {
+    let block = framed_string_block(MIN_MAX_BLOCK_BYTES);
+    let mut engine = inserting_engine().with_max_block_bytes(block.len());
+    let _ = engine.take_output();
+    engine.insert_data(&block).unwrap();
+    let mut expected = vec![CLIENT_PACKET_DATA as u8, 0];
+    expected.extend_from_slice(&block);
+    assert_eq!(engine.take_output(), expected);
+
+    let mut engine = inserting_engine().with_max_block_bytes(block.len() - 1);
+    assert_eq!(
+        engine.insert_data(&block),
+        Err(ProtocolError::InvalidInsertBlock(
+            InsertBlockError::TooLarge {
+                len: block.len(),
+                limit: block.len() - 1,
+            }
+        ))
+    );
+}
+
+/// An empty output queue is reserved exactly; a non-empty one grows
+/// amortized, and repeated untaken writes stay in order.
+#[test]
+fn insert_data_reserves_exactly_into_an_empty_output() {
+    let mut engine = inserting_engine();
+    let _ = engine.take_output();
+    assert_eq!(engine.output.capacity(), 0);
+    let block = framed_int64_block(&[13, 79]);
+    engine.insert_data(&block).unwrap();
+    assert_eq!(engine.output.len(), block.len() + 2);
+    assert_eq!(engine.output.capacity(), engine.output.len());
+
+    // A smaller second write into the non-empty queue grows amortized (at
+    // least doubling); an exact reservation would grow by only its length.
+    let first = engine.output.len();
+    let small = framed_int64_block(&[13]);
+    assert!(small.len() + 2 < first);
+    engine.insert_data(&small).unwrap();
+    assert!(engine.output.capacity() >= 2 * first);
+    let packet = |block: &[u8]| [&[CLIENT_PACKET_DATA as u8, 0][..], block].concat();
+    assert_eq!(
+        engine.take_output(),
+        [packet(&block), packet(&small)].concat()
+    );
+}
+
+#[test]
+fn queued_insert_schema_is_a_write_barrier_until_consumed() {
+    let mut engine = ready_engine();
+    engine
+        .insert(Query::new("INSERT INTO items VALUES"))
+        .unwrap();
+    let _ = engine.take_output();
+    engine.feed(&data_packet(&framed_int64_block(&[]))).unwrap();
+    assert_eq!(engine.state(), State::Inserting);
+    assert_eq!(engine.barrier_events, 1);
+    assert!(matches!(
+        engine.insert_data(&framed_int64_block(&[13])),
+        Err(ProtocolError::InvalidState { .. })
+    ));
+    assert!(matches!(
+        engine.finish_insert(),
+        Err(ProtocolError::InvalidState { .. })
+    ));
+    assert!(matches!(engine.poll_event(), Some(Event::InsertSchema(_))));
+    assert_eq!(engine.barrier_events, 0);
+    engine.insert_data(&framed_int64_block(&[13])).unwrap();
+}
+
+#[test]
+fn insert_finish_is_single_use_and_waits_for_end_of_stream() {
+    let mut engine = inserting_engine();
+    engine.insert_data(&framed_int64_block(&[13])).unwrap();
+    let _ = engine.take_output();
+    engine.finish_insert().unwrap();
+    assert_eq!(engine.state(), State::FinishingInsert);
+    let mut terminator = Vec::new();
+    put_empty_data_packet(&mut terminator);
+    assert_eq!(engine.take_output(), terminator);
+    assert!(matches!(
+        engine.finish_insert(),
+        Err(ProtocolError::InvalidState { .. })
+    ));
+    assert!(matches!(
+        engine.insert_data(&framed_int64_block(&[79])),
+        Err(ProtocolError::InvalidState { .. })
+    ));
+    engine.feed(&[SERVER_PACKET_END_OF_STREAM as u8]).unwrap();
+    assert_eq!(events(&mut engine), [Event::EndOfStream]);
+    assert_eq!(engine.state(), State::Ready);
+}
+
+#[test]
+fn insert_rejects_end_of_stream_table_columns_and_data_during_upload() {
+    let cases = [
+        (
+            vec![SERVER_PACKET_END_OF_STREAM as u8],
+            SERVER_PACKET_END_OF_STREAM,
+        ),
+        (
+            table_columns_packet("", "n Int64"),
+            SERVER_PACKET_TABLE_COLUMNS,
+        ),
+        (data_packet(&framed_int64_block(&[13])), SERVER_PACKET_DATA),
+    ];
+    for (packet, code) in cases {
+        let mut engine = inserting_engine();
+        assert_eq!(
+            engine.feed(&packet),
+            Err(ProtocolError::UnexpectedPacket {
+                packet: code,
+                state: State::Inserting,
+            })
+        );
+        assert_eq!(engine.state(), PROTOCOL_FAILED);
+    }
+}
+
+#[test]
+fn insert_exception_in_every_phase_fails_and_discards_output() {
+    let failure = exception(241, b"DB::Exception", b"insert failed", b"", 0);
+
+    let mut awaiting = ready_engine();
+    awaiting
+        .insert(Query::new("INSERT INTO missing VALUES"))
+        .unwrap();
+    assert!(!awaiting.output.is_empty());
+    awaiting.feed(&failure).unwrap();
+    assert_eq!(awaiting.state(), EXCEPTION_FAILED);
+    assert!(awaiting.take_output().is_empty());
+
+    let mut inserting = inserting_engine();
+    inserting.insert_data(&framed_int64_block(&[179])).unwrap();
+    assert!(!inserting.output.is_empty());
+    inserting.feed(&failure).unwrap();
+    assert_eq!(inserting.state(), EXCEPTION_FAILED);
+    assert!(inserting.take_output().is_empty());
+
+    let mut finishing = inserting_engine();
+    finishing.finish_insert().unwrap();
+    assert!(!finishing.output.is_empty());
+    finishing.feed(&failure).unwrap();
+    assert_eq!(finishing.state(), EXCEPTION_FAILED);
+    assert!(finishing.take_output().is_empty());
+
+    for engine in [&mut awaiting, &mut inserting, &mut finishing] {
+        assert!(matches!(
+            events(engine).as_slice(),
+            [Event::Exception(error)] if error.code == 241
+        ));
+    }
+}
+
+#[test]
+fn insert_rejects_phase_errors_and_truncated_schema() {
+    let mut ready = ready_engine();
+    assert!(matches!(
+        ready.insert_data(&framed_int64_block(&[13])),
+        Err(ProtocolError::InvalidState { .. })
+    ));
+    assert!(matches!(
+        ready.finish_insert(),
+        Err(ProtocolError::InvalidState { .. })
+    ));
+
+    ready
+        .insert(Query::new("INSERT INTO items VALUES"))
+        .unwrap();
+    let _ = ready.take_output();
+    let schema = data_packet(&framed_int64_block(&[]));
+    ready.feed(&schema[..schema.len() - 1]).unwrap();
+    assert_eq!(ready.finish(), Err(ProtocolError::UnexpectedEof));
+    assert_eq!(ready.state(), PROTOCOL_FAILED);
+}
+
+#[test]
+fn insert_rejects_empty_or_nonzero_row_schema() {
+    for schema in [framed_empty_block(), framed_int64_block(&[13])] {
+        let mut engine = ready_engine();
+        engine
+            .insert(Query::new("INSERT INTO items VALUES"))
+            .unwrap();
+        let _ = engine.take_output();
+        assert_eq!(
+            engine.feed(&data_packet(&schema)),
+            Err(ProtocolError::InvalidInsertSchema)
+        );
+        assert_eq!(engine.state(), PROTOCOL_FAILED);
+        assert!(events(&mut engine).is_empty());
+    }
+}
+
+#[test]
+fn insert_accepts_logs_and_profile_events_in_confirmed_phases() {
+    let log = framed_int64_block(&[13]);
+    let profile = framed_int64_block(&[79]);
+    let schema = framed_int64_block(&[]);
+    let mut response = vec![SERVER_PACKET_LOG as u8, 0];
+    response.extend_from_slice(&log);
+    response.extend(data_packet(&schema));
+
+    let mut engine = ready_engine();
+    engine
+        .insert(Query::new("INSERT INTO items VALUES"))
+        .unwrap();
+    let _ = engine.take_output();
+    engine.feed(&response).unwrap();
+    assert_eq!(
+        events(&mut engine),
+        [Event::Log(log), Event::InsertSchema(schema)]
+    );
+    engine.finish_insert().unwrap();
+    let _ = engine.take_output();
+
+    let mut completion = vec![SERVER_PACKET_PROFILE_EVENTS as u8, 0];
+    completion.extend_from_slice(&profile);
+    completion.push(SERVER_PACKET_END_OF_STREAM as u8);
+    engine.feed(&completion).unwrap();
+    assert_eq!(
+        events(&mut engine),
+        [Event::ProfileEvents(profile), Event::EndOfStream]
+    );
+    assert_eq!(engine.state(), State::Ready);
+}
+
+#[test]
+fn inline_insert_completion_without_schema_is_split_independent() {
+    let profile = framed_int64_block(&[13]);
+    let log = framed_int64_block(&[79]);
+    let mut response = progress_packet().to_vec();
+    response.extend_from_slice(&[SERVER_PACKET_PROFILE_EVENTS as u8, 0]);
+    response.extend_from_slice(&profile);
+    response.extend_from_slice(&[SERVER_PACKET_LOG as u8, 0]);
+    response.extend_from_slice(&log);
+    response.push(SERVER_PACKET_END_OF_STREAM as u8);
+
+    let run = |chunks: &[&[u8]]| {
+        let mut engine = ready_engine();
+        engine
+            .insert(Query::new("INSERT INTO items VALUES (13)"))
+            .unwrap();
+        let request = engine.take_output();
+        for chunk in chunks {
+            engine.feed(chunk).unwrap();
+        }
+        assert!(engine.take_output().is_empty());
+        (request, engine.state(), events(&mut engine))
+    };
+    let expected = run(&[&response]);
+    for split in 0..=response.len() {
+        assert_eq!(
+            run(&[&response[..split], &response[split..]]),
+            expected,
+            "split {split}"
+        );
+    }
+    assert_eq!(expected.1, State::Ready);
+    assert_eq!(
+        expected.2,
+        [
+            Event::Progress(Progress {
+                read_rows: 1,
+                read_bytes: 2,
+                total_rows_to_read: 3,
+                written_rows: 4,
+                written_bytes: 5,
+                elapsed_ns: 6,
+            }),
+            Event::ProfileEvents(profile),
+            Event::Log(log),
+            Event::EndOfStream,
+        ]
+    );
+}
+
+#[test]
+fn inline_insert_via_query_uses_identical_request_and_returns_ready() {
+    let request = Query::new("INSERT INTO items VALUES (13)")
+        .with_query_id("inline_13")
+        .with_setting("log_queries", "1");
+    let mut via_query = ready_engine();
+    via_query.query(request.clone()).unwrap();
+    let query_bytes = via_query.take_output();
+
+    let mut via_insert = ready_engine();
+    via_insert.insert(request).unwrap();
+    assert_eq!(via_insert.take_output(), query_bytes);
+
+    via_query
+        .feed(&[SERVER_PACKET_END_OF_STREAM as u8])
+        .unwrap();
+    assert_eq!(events(&mut via_query), [Event::EndOfStream]);
+    assert_eq!(via_query.state(), State::Ready);
+}
+
+#[test]
+fn client_fed_insert_started_with_query_fails_fast_on_default_table_columns() {
+    let mut engine = ready_engine();
+    engine
+        .query(Query::new("INSERT INTO items VALUES"))
+        .unwrap();
+    let _ = engine.take_output();
+    assert_eq!(
+        engine.feed(&table_columns_packet("", "n Int64")),
+        Err(ProtocolError::UnexpectedPacket {
+            packet: SERVER_PACKET_TABLE_COLUMNS,
+            state: State::Querying,
+        })
+    );
+    assert_eq!(engine.state(), PROTOCOL_FAILED);
+}
+
+#[test]
+fn query_with_table_columns_disabled_treats_insert_schema_as_result_data() {
+    let schema = framed_int64_block(&[]);
+    let mut engine = ready_engine();
+    engine
+        .query(
+            Query::new("INSERT INTO items VALUES")
+                .with_setting("input_format_defaults_for_omitted_fields", "0"),
+        )
+        .unwrap();
+    let _ = engine.take_output();
+    engine.feed(&data_packet(&schema)).unwrap();
+    assert_eq!(events(&mut engine), [Event::Data(schema)]);
+    assert_eq!(engine.state(), State::Querying);
+    assert_eq!(engine.finish(), Err(ProtocolError::UnexpectedEof));
+}
+
+#[test]
+fn insert_can_be_followed_by_select_and_another_insert() {
+    let schema = data_packet(&framed_int64_block(&[]));
+    let mut engine = ready_engine();
+
+    engine
+        .insert(Query::new("INSERT INTO items VALUES"))
+        .unwrap();
+    let _ = engine.take_output();
+    engine.feed(&schema).unwrap();
+    let _ = events(&mut engine);
+    engine.insert_data(&framed_int64_block(&[13])).unwrap();
+    engine.finish_insert().unwrap();
+    let _ = engine.take_output();
+    engine.feed(&[SERVER_PACKET_END_OF_STREAM as u8]).unwrap();
+    assert_eq!(events(&mut engine), [Event::EndOfStream]);
+    assert_eq!(engine.state(), State::Ready);
+
+    engine.query(Query::new("SELECT 79")).unwrap();
+    let _ = engine.take_output();
+    engine.feed(&[SERVER_PACKET_END_OF_STREAM as u8]).unwrap();
+    assert_eq!(events(&mut engine), [Event::EndOfStream]);
+
+    engine
+        .insert(Query::new("INSERT INTO items VALUES"))
+        .unwrap();
+    let _ = engine.take_output();
+    engine.feed(&schema).unwrap();
+    let _ = events(&mut engine);
+    engine.insert_data(&framed_int64_block(&[79])).unwrap();
+    engine.finish_insert().unwrap();
+    let output = engine.take_output();
+    assert!(output.starts_with(&[CLIENT_PACKET_DATA as u8, 0]));
+    engine.feed(&[SERVER_PACKET_END_OF_STREAM as u8]).unwrap();
+    assert_eq!(events(&mut engine), [Event::EndOfStream]);
+    assert_eq!(engine.state(), State::Ready);
+}
+
+#[test]
+fn consecutive_client_fed_inserts_reuse_the_connection() {
+    let schema = data_packet(&framed_int64_block(&[]));
+    let mut engine = ready_engine();
+    for value in [13, 79] {
+        engine
+            .insert(Query::new("INSERT INTO items VALUES"))
+            .unwrap();
+        let request = engine.take_output();
+        assert_eq!(request.first(), Some(&(CLIENT_PACKET_QUERY as u8)));
+        engine.feed(&schema).unwrap();
+        assert!(matches!(engine.poll_event(), Some(Event::InsertSchema(_))));
+        engine.insert_data(&framed_int64_block(&[value])).unwrap();
+        engine.finish_insert().unwrap();
+        let upload = engine.take_output();
+        assert!(upload.starts_with(&[CLIENT_PACKET_DATA as u8, 0]));
+        engine.feed(&[SERVER_PACKET_END_OF_STREAM as u8]).unwrap();
+        assert_eq!(events(&mut engine), [Event::EndOfStream]);
+        assert_eq!(engine.state(), State::Ready);
+    }
+}
+
+#[test]
+fn insert_writes_may_interleave_with_partial_or_queued_telemetry() {
+    let block = framed_int64_block(&[13]);
+    for packet_code in [SERVER_PACKET_LOG, SERVER_PACKET_PROFILE_EVENTS] {
+        let telemetry_block = framed_int64_block(&[79]);
+        let mut telemetry = vec![packet_code as u8, 0];
+        telemetry.extend_from_slice(&telemetry_block);
+        for split in 0..=telemetry.len() {
+            let (head, tail) = telemetry.split_at(split);
+
+            let mut upload = inserting_engine();
+            upload.feed(head).unwrap();
+            upload.insert_data(&block).unwrap();
+            upload.feed(tail).unwrap();
+            assert!(!upload.take_output().is_empty(), "upload split {split}");
+
+            let mut finish = inserting_engine();
+            finish.feed(head).unwrap();
+            finish.finish_insert().unwrap();
+            let mut completion = tail.to_vec();
+            completion.push(SERVER_PACKET_END_OF_STREAM as u8);
+            finish.feed(&completion).unwrap();
+            assert_eq!(finish.state(), State::Ready, "finish split {split}");
+            assert!(matches!(
+                events(&mut finish).last(),
+                Some(Event::EndOfStream)
+            ));
+        }
+    }
+}
+
+#[test]
+fn insert_writes_do_not_overtake_partial_exception_or_packet_code() {
+    let failure = exception(241, b"DB::Exception", b"insert failed", b"", 0);
+    for split in 1..failure.len() {
+        let mut engine = inserting_engine();
+        engine.feed(&failure[..split]).unwrap();
+        assert!(matches!(
+            engine.insert_data(&framed_int64_block(&[13])),
+            Err(ProtocolError::InvalidState { .. })
+        ));
+        assert!(matches!(
+            engine.finish_insert(),
+            Err(ProtocolError::InvalidState { .. })
+        ));
+        assert!(engine.take_output().is_empty(), "split {split}");
+    }
+
+    // An incomplete multi-byte packet code is not known to be telemetry.
+    let mut engine = inserting_engine();
+    engine.feed(&[0x80]).unwrap();
+    assert!(matches!(
+        engine.insert_data(&framed_int64_block(&[13])),
+        Err(ProtocolError::InvalidState { .. })
+    ));
+    assert!(matches!(
+        engine.finish_insert(),
+        Err(ProtocolError::InvalidState { .. })
+    ));
+}
+
+#[test]
+fn malformed_outbound_block_is_recoverable_and_keeps_cause() {
+    let mut engine = inserting_engine();
+    let before = engine.output.clone();
+    let error = engine.insert_data(&[0xff; 16]).unwrap_err();
+    let ProtocolError::InvalidInsertBlock(reason) = error else {
+        panic!("expected invalid INSERT block")
+    };
+    assert!(matches!(reason, InsertBlockError::Decode(_)));
+    assert_eq!(engine.output, before);
+    assert_eq!(engine.state(), State::Inserting);
+    let valid = framed_int64_block(&[13]);
+    engine.insert_data(&valid).unwrap();
+    let mut expected = vec![CLIENT_PACKET_DATA as u8, 0];
+    expected.extend_from_slice(&valid);
+    assert_eq!(engine.take_output(), expected);
+}
+
+/// Each level of the error chain prints only its own text, so a reporter
+/// that walks `source()` shows every cause exactly once.
+#[test]
+fn invalid_insert_block_error_chain_prints_each_cause_once() {
+    let mut engine = inserting_engine();
+    let error = engine.insert_data(&[0xff; 16]).unwrap_err();
+    let mut levels = Vec::new();
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    while let Some(level) = current {
+        levels.push(level.to_string());
+        current = level.source();
+    }
+    assert_eq!(levels.len(), 3, "{levels:?}");
+    assert_eq!(levels[0], "invalid INSERT Native block");
+    assert_eq!(levels[1], "Native block scan failed");
+    let report = levels.join(": ");
+    for level in &levels {
+        assert!(!level.is_empty());
+        assert_eq!(report.matches(level.as_str()).count(), 1, "{report}");
+    }
+
+    let mut engine = inserting_engine().with_max_block_bytes(MIN_MAX_BLOCK_BYTES);
+    let oversized = framed_string_block(MIN_MAX_BLOCK_BYTES + 13);
+    let error = engine.insert_data(&oversized).unwrap_err();
+    let reason = std::error::Error::source(&error).expect("InsertBlockError source");
+    assert_eq!(
+        reason.to_string(),
+        format!(
+            "block length {} exceeds the {MIN_MAX_BLOCK_BYTES} byte limit",
+            oversized.len()
+        )
+    );
+    assert!(reason.source().is_none());
+}
+
+#[test]
+fn invalid_insert_block_preserves_the_typed_error_chain() {
+    let mut engine = inserting_engine();
+    let error = engine.insert_data(&[0xff; 16]).unwrap_err();
+    let insert = std::error::Error::source(&error)
+        .and_then(|source| source.downcast_ref::<InsertBlockError>())
+        .expect("InsertBlockError source");
+    assert!(matches!(insert, InsertBlockError::Decode(_)));
+    assert!(std::error::Error::source(insert)
+        .and_then(|source| source.downcast_ref::<DecodeError>())
+        .is_some());
+}
+
+#[test]
+fn insert_barrier_counter_tracks_mixed_event_queue() {
+    let schema = framed_int64_block(&[]);
+    let log = framed_int64_block(&[79]);
+    let mut response = table_columns_packet("", "n Int64");
+    response.extend_from_slice(&[SERVER_PACKET_LOG as u8, 0]);
+    response.extend_from_slice(&log);
+    response.extend(data_packet(&schema));
+
+    let mut engine = ready_engine();
+    engine
+        .insert(Query::new("INSERT INTO items VALUES"))
+        .unwrap();
+    let _ = engine.take_output();
+    engine.feed(&response).unwrap();
+    assert_eq!(engine.barrier_events, 2);
+    assert!(matches!(
+        engine.insert_data(&framed_int64_block(&[13])),
+        Err(ProtocolError::InvalidState { .. })
+    ));
+    assert!(matches!(
+        engine.poll_event(),
+        Some(Event::TableColumns { .. })
+    ));
+    assert_eq!(engine.barrier_events, 1);
+    assert!(matches!(engine.poll_event(), Some(Event::Log(_))));
+    assert_eq!(engine.barrier_events, 1);
+    assert!(matches!(engine.poll_event(), Some(Event::InsertSchema(_))));
+    assert_eq!(engine.barrier_events, 0);
+    assert!(engine.poll_event().is_none());
+    engine.insert_data(&framed_int64_block(&[13])).unwrap();
+}
+
+#[test]
+fn protocol_failure_discards_all_queued_output() {
+    let mut insert = inserting_engine();
+    insert.insert_data(&framed_int64_block(&[13])).unwrap();
+    assert!(!insert.output.is_empty());
+    assert!(matches!(
+        insert.feed(&[SERVER_PACKET_PONG as u8]),
+        Err(ProtocolError::UnexpectedPacket { .. })
+    ));
+    assert!(insert.take_output().is_empty());
+    assert_eq!(insert.state(), PROTOCOL_FAILED);
+
+    let mut query = ready_engine();
+    query.query(Query::new("SELECT 13")).unwrap();
+    assert!(!query.output.is_empty());
+    assert!(matches!(
+        query.feed(&[SERVER_PACKET_PONG as u8]),
+        Err(ProtocolError::UnexpectedPacket { .. })
+    ));
+    assert!(query.take_output().is_empty());
+    assert_eq!(query.state(), PROTOCOL_FAILED);
 }
 
 #[test]

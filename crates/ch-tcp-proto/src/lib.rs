@@ -21,6 +21,13 @@ const _: () = assert!(
     ENGINE_REVISION < 54_461,
     "raising ENGINE_REVISION requires parsing the Server Hello fields gated at 54461 and above"
 );
+// At v26.8.1.2041-lts `TCPHandler::processInsertQuery` can send Progress
+// during an async INSERT upload starting at revision 54484. If the engine
+// ceiling reaches that revision, Inserting and FinishingInsert must accept it.
+const _: () = assert!(
+    ENGINE_REVISION < 54_484,
+    "raising ENGINE_REVISION requires accepting Progress during INSERT upload"
+);
 
 const CLIENT_HELLO_STRING_LIMIT: usize = 64 * 1024;
 const SERVER_HELLO_STRING_LIMIT: usize = 4096;
@@ -33,6 +40,16 @@ const EXCEPTION_STRING_LIMIT: usize = 1024 * 1024;
 /// failing. 64 MiB is 64 times the retained cap and far above any real
 /// message plus stack trace, and it bounds the bytes skipped per field.
 const EXCEPTION_DECLARED_LIMIT: usize = 64 * 1024 * 1024;
+/// Largest declared TableColumns field length accepted, as a multiple of the
+/// connection's `max_block_bytes` (saturating). Engine policy, the same
+/// corruption-only bound as `EXCEPTION_DECLARED_LIMIT`: at v26.8.1.2041-lts
+/// `TCPHandler::sendTableColumns` writes two unbounded `writeStringBinary`
+/// fields, so without this a corrupt length such as `u64::MAX` would discard
+/// every later byte until EOF instead of failing. Lengths within the bound
+/// keep at most `max_block_bytes` across both fields and skip the rest; a
+/// length above it fails the connection with
+/// [`ProtocolError::StringTooLong`].
+const TABLE_COLUMNS_DECLARED_FACTOR: usize = 64;
 /// Backstop on retained input. `feed` parses everything it is given, so the
 /// only input it retains is the tail of one incomplete scalar parse step: at
 /// most one Exception text field (1 MiB kept plus its length prefix), one
@@ -69,6 +86,7 @@ const SERVER_PACKET_PROFILE_INFO: u64 = 6;
 const SERVER_PACKET_TOTALS: u64 = 7;
 const SERVER_PACKET_EXTREMES: u64 = 8;
 const SERVER_PACKET_LOG: u64 = 10;
+const SERVER_PACKET_TABLE_COLUMNS: u64 = 11;
 const SERVER_PACKET_PROFILE_EVENTS: u64 = 14;
 
 // Thresholds from `src/Core/ProtocolDefines.h` at v26.8.1.2041-lts.
@@ -160,7 +178,7 @@ impl fmt::Debug for ClientHello {
     }
 }
 
-/// An uncompressed initial SELECT query.
+/// An uncompressed initial query for SELECT or client-fed INSERT.
 ///
 /// Settings use the server's string representation. Parameter values are
 /// quoted as ClickHouse string literals on the wire.
@@ -177,8 +195,8 @@ pub struct Query {
 }
 
 impl Query {
-    /// Creates a query request for a statement whose complete response uses
-    /// the supported SELECT result packet exchange.
+    /// Creates a query request. Use [`Connection::query`] for a SELECT result
+    /// exchange or [`Connection::insert`] for a client-fed INSERT.
     pub fn new(sql: impl Into<String>) -> Self {
         Self {
             sql: sql.into(),
@@ -399,6 +417,26 @@ pub enum Event {
     /// One complete Native block from a server Data packet. Concatenating
     /// these payloads in event order produces the query's Native stream.
     Data(Vec<u8>),
+    /// The zero-row Native header block the server requests for an INSERT.
+    ///
+    /// This is separate from [`Event::Data`] so a driver cannot accidentally
+    /// treat the INSERT sample block as SELECT result data. After this event,
+    /// [`Connection::insert_data`] accepts client blocks.
+    InsertSchema(Vec<u8>),
+    /// Textual INSERT column metadata sent before [`Event::InsertSchema`]
+    /// when omitted-field defaults are enabled.
+    #[non_exhaustive]
+    TableColumns {
+        /// External-table name. Empty for the main INSERT table.
+        table_name: Vec<u8>,
+        /// Raw `ColumnsDescription::toString(false)` bytes from the server.
+        description: Vec<u8>,
+        /// The two fields together exceeded
+        /// [`Connection::with_max_block_bytes`] and were cut to share that
+        /// many bytes: `table_name` keeps up to the limit and `description`
+        /// keeps the rest of the budget.
+        truncated: bool,
+    },
     /// Incremental query progress counters.
     Progress(Progress),
     /// Final query profile counters.
@@ -417,6 +455,9 @@ pub enum Event {
     /// for the connection-level query cases below, where the connection
     /// becomes [`State::Failed`] with [`FailureKind::ServerException`]. Other
     /// query errors return to [`State::Ready`] after this event is queued.
+    /// Every exchange started with [`Connection::insert`] conservatively
+    /// fails on Exception and discards queued upload bytes, because the server
+    /// may be waiting for the rest of an upload in its skip-data path.
     /// Either way it is the last event of its exchange: no EndOfStream, Log,
     /// or ProfileEvents follows it.
     ///
@@ -464,9 +505,11 @@ const _: () = assert!(
 #[non_exhaustive]
 pub enum FailureKind {
     /// The server sent a complete Exception packet in the handshake or
-    /// pre-query phase, or a connection-level query Exception, after which
-    /// the server closes the connection. Bytes after it are not parsed. See
-    /// [`Event::Exception`] for query-time details.
+    /// pre-query phase, a connection-level query Exception, or any INSERT
+    /// Exception. The server closes in the first cases. INSERT is treated as
+    /// terminal because safe reuse would require finishing or draining its
+    /// skip-data exchange. Bytes after the Exception are not parsed. See
+    /// [`Event::Exception`] for details.
     ServerException,
     /// Malformed, unexpected, oversized, or truncated input.
     Protocol,
@@ -479,6 +522,14 @@ pub enum State {
     Handshaking,
     Ready,
     Querying,
+    /// An INSERT Query was sent and the engine is waiting for the server's
+    /// sample block.
+    AwaitingInsertSchema,
+    /// The server's INSERT sample block was received and data may be sent.
+    Inserting,
+    /// The client end-of-data marker was queued and the engine is waiting for
+    /// EndOfStream.
+    FinishingInsert,
     AwaitingPong,
     Failed(FailureKind),
     Closed,
@@ -559,6 +610,14 @@ pub enum ProtocolError {
         /// Maximum Query packet length.
         limit: usize,
     },
+    /// Bytes passed to [`Connection::insert_data`] were rejected: too large,
+    /// or not exactly one complete Native block with at least one column.
+    /// The connection is unchanged. The reason is the inner error, also
+    /// returned by [`Error::source`].
+    InvalidInsertBlock(InsertBlockError),
+    /// The server's INSERT sample block was not a zero-row schema with at
+    /// least one column.
+    InvalidInsertSchema,
     /// The setting switches Native type names to binary framing, which this
     /// engine cannot delimit.
     ///
@@ -569,13 +628,24 @@ pub enum ProtocolError {
     /// then fails with [`ProtocolError::Decode`] on the first block. Keep the
     /// setting disabled server-side.
     BinaryNativeTypeEncodingUnsupported,
-    /// A Native block exceeded the per-packet limit.
+    /// An inbound Native block exceeded the per-packet limit. Always fatal:
+    /// the connection fails with [`FailureKind::Protocol`].
+    ///
+    /// An oversized outbound [`Connection::insert_data`] block is reported
+    /// as [`InsertBlockError::TooLarge`] instead, so this variant never
+    /// describes a recoverable rejection.
     NativeBlockTooLarge {
         /// Maximum Native block length.
         limit: usize,
     },
+    /// Reserving the complete outbound INSERT Data packet failed.
+    #[non_exhaustive]
+    InsertOutputAllocationFailed {
+        /// Bytes the packet would append to the output queue.
+        additional: usize,
+    },
     /// Core rejected malformed Native block bytes, or a column type it cannot
-    /// decode.
+    /// decode. The [`DecodeError`] is returned by [`Error::source`].
     Decode(Arc<DecodeError>),
     /// Core's scanner reported a block end inside bytes it had already
     /// reported as an incomplete block. An internal invariant; not expected.
@@ -634,10 +704,15 @@ impl fmt::Display for ProtocolError {
             Self::UnexpectedEof => formatter.write_str("unexpected end of protocol input"),
             Self::UnsupportedQueryRevision { revision } => write!(
                 formatter,
-                "SELECT requires protocol revision {ENGINE_REVISION}, effective revision is {revision}"
+                "Query requires protocol revision {ENGINE_REVISION}, effective revision is {revision}"
             ),
             Self::QueryOutputTooLarge { length, limit } => {
                 write!(formatter, "query packet length {length} exceeds the {limit} byte limit")
+            }
+            // The cause is reported through `source`, not repeated here.
+            Self::InvalidInsertBlock(_) => formatter.write_str("invalid INSERT Native block"),
+            Self::InvalidInsertSchema => {
+                formatter.write_str("invalid INSERT schema block")
             }
             Self::BinaryNativeTypeEncodingUnsupported => formatter.write_str(
                 "output_format_native_encode_types_in_binary_format accepts only \"0\"",
@@ -645,7 +720,12 @@ impl fmt::Display for ProtocolError {
             Self::NativeBlockTooLarge { limit } => {
                 write!(formatter, "Native block exceeds the {limit} byte limit")
             }
-            Self::Decode(error) => write!(formatter, "Native decode error: {error}"),
+            Self::InsertOutputAllocationFailed { additional } => write!(
+                formatter,
+                "cannot reserve {additional} bytes for the INSERT Data packet"
+            ),
+            // The DecodeError is reported through `source`, not repeated here.
+            Self::Decode(_) => formatter.write_str("Native block decode failed"),
             Self::InconsistentBlockBoundary { consumed, buffered } => write!(
                 formatter,
                 "Native block boundary {consumed} is inside the {buffered} bytes already scanned"
@@ -734,10 +814,16 @@ impl PartialEq for ProtocolError {
                 UnsupportedQueryRevision { revision: left },
                 UnsupportedQueryRevision { revision: right },
             ) => left == right,
+            (InvalidInsertBlock(left), InvalidInsertBlock(right)) => left == right,
+            (InvalidInsertSchema, InvalidInsertSchema) => true,
             (BinaryNativeTypeEncodingUnsupported, BinaryNativeTypeEncodingUnsupported) => true,
             (NativeBlockTooLarge { limit: left }, NativeBlockTooLarge { limit: right }) => {
                 left == right
             }
+            (
+                InsertOutputAllocationFailed { additional: left },
+                InsertOutputAllocationFailed { additional: right },
+            ) => left == right,
             (Decode(left), Decode(right)) => left.to_string() == right.to_string(),
             (
                 InconsistentBlockBoundary {
@@ -761,6 +847,7 @@ impl Error for ProtocolError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Decode(error) => Some(error.as_ref()),
+            Self::InvalidInsertBlock(error) => Some(error),
             _ => None,
         }
     }
@@ -769,6 +856,96 @@ impl Error for ProtocolError {
 impl From<DecodeError> for ProtocolError {
     fn from(error: DecodeError) -> Self {
         Self::Decode(Arc::new(error))
+    }
+}
+
+/// Why an outbound Native block was rejected before any bytes were queued.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum InsertBlockError {
+    /// The Native block scanner rejected malformed bytes.
+    Decode(Arc<DecodeError>),
+    /// The payload ended before one complete block.
+    Truncated,
+    /// Bytes followed the first complete block.
+    #[non_exhaustive]
+    TrailingBytes {
+        /// Bytes occupied by the first complete block.
+        consumed: usize,
+        /// Total payload length.
+        len: usize,
+    },
+    /// A zero-column block is the upload terminator, not INSERT data.
+    NoColumns,
+    /// The payload exceeded [`Connection::with_max_block_bytes`]. Checked
+    /// before the block is scanned.
+    #[non_exhaustive]
+    TooLarge {
+        /// Payload length.
+        len: usize,
+        /// Maximum outbound Native block length.
+        limit: usize,
+    },
+}
+
+impl fmt::Display for InsertBlockError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // The DecodeError is reported through `source`, not repeated here.
+            Self::Decode(_) => formatter.write_str("Native block scan failed"),
+            Self::Truncated => formatter.write_str("payload is truncated"),
+            Self::TrailingBytes { consumed, len } => write!(
+                formatter,
+                "{} bytes follow the first block",
+                len.saturating_sub(*consumed)
+            ),
+            Self::NoColumns => formatter.write_str("data blocks must contain at least one column"),
+            Self::TooLarge { len, limit } => write!(
+                formatter,
+                "block length {len} exceeds the {limit} byte limit"
+            ),
+        }
+    }
+}
+
+impl PartialEq for InsertBlockError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Decode(left), Self::Decode(right)) => left.to_string() == right.to_string(),
+            (Self::Truncated, Self::Truncated) | (Self::NoColumns, Self::NoColumns) => true,
+            (
+                Self::TrailingBytes {
+                    consumed: left_consumed,
+                    len: left_len,
+                },
+                Self::TrailingBytes {
+                    consumed: right_consumed,
+                    len: right_len,
+                },
+            ) => left_consumed == right_consumed && left_len == right_len,
+            (
+                Self::TooLarge {
+                    len: left_len,
+                    limit: left_limit,
+                },
+                Self::TooLarge {
+                    len: right_len,
+                    limit: right_limit,
+                },
+            ) => left_len == right_len && left_limit == right_limit,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for InsertBlockError {}
+
+impl Error for InsertBlockError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Decode(error) => Some(error.as_ref()),
+            _ => None,
+        }
     }
 }
 
@@ -783,7 +960,7 @@ struct ClientIdentity {
     version_minor: u64,
 }
 
-/// Incremental handshake, Ping/Pong, and uncompressed SELECT engine.
+/// Incremental handshake, Ping/Pong, and uncompressed Query engine.
 ///
 /// Events have exactly one channel: [`Self::feed`] reports only errors, and
 /// every completed packet is queued for [`Self::poll_event`]. A `Vec` return
@@ -816,6 +993,8 @@ pub struct Connection {
     trailing: usize,
     output: Vec<u8>,
     events: VecDeque<Event>,
+    /// Queued events that must be drained before the next INSERT write.
+    barrier_events: usize,
     max_block_bytes: usize,
     quota_key: String,
     identity: ClientIdentity,
@@ -916,6 +1095,7 @@ impl Connection {
             trailing: 0,
             output,
             events: VecDeque::new(),
+            barrier_events: 0,
             max_block_bytes: DEFAULT_MAX_BLOCK_BYTES,
             quota_key: hello.quota_key,
             identity: ClientIdentity {
@@ -939,9 +1119,10 @@ impl Connection {
     /// bytes. The default is [`DEFAULT_MAX_BLOCK_BYTES`], 1 GiB. A value below
     /// [`MIN_MAX_BLOCK_BYTES`], 1 KiB, is raised to it.
     ///
-    /// The limit applies to every block-carrying packet, from the next block
-    /// that starts: Data, including the zero-column end-of-data marker,
-    /// Totals, Extremes, Log, and ProfileEvents. Log blocks from
+    /// The limit applies to every inbound block-carrying packet from the next
+    /// block that starts, and to each later [`Self::insert_data`] call: Data,
+    /// including the zero-column end-of-data marker, Totals, Extremes, Log,
+    /// and ProfileEvents. Log blocks from
     /// `send_logs_level` and ProfileEvents blocks count against the same cap
     /// as result blocks. A larger block fails the connection with
     /// [`ProtocolError::NativeBlockTooLarge`] once that many bytes have
@@ -949,10 +1130,19 @@ impl Connection {
     /// a low value can reject results that HTTP returns:
     /// `SELECT randomString(1100) FROM numbers(100000)` produces blocks of
     /// about 72 MB with default server settings.
+    /// An oversized outbound INSERT block is rejected with
+    /// [`InsertBlockError::TooLarge`] before output or state changes; it does
+    /// not fail the connection.
     ///
     /// Block memory is only ever allocated from bytes actually received,
     /// never from a declared length, and the block buffer's capacity never
-    /// exceeds this limit.
+    /// exceeds this limit. The same value is the retention budget shared by
+    /// both fields of a later [`Event::TableColumns`]: bytes past it are
+    /// skipped and the event has `truncated: true`, so metadata size alone
+    /// does not fail the INSERT. A declared TableColumns field length above
+    /// 64 times this limit (saturating) is treated as corruption and fails
+    /// the connection with [`ProtocolError::StringTooLong`]. Both are
+    /// snapshotted when the TableColumns packet begins.
     pub fn with_max_block_bytes(mut self, limit: usize) -> Self {
         self.max_block_bytes = limit.max(MIN_MAX_BLOCK_BYTES);
         self
@@ -967,7 +1157,8 @@ impl Connection {
     /// is parsed, otherwise `None`.
     ///
     /// Pass this as `DecodeOptions::protocol_revision` when decoding the
-    /// payloads of [`Event::Data`] and the other block events.
+    /// payloads of [`Event::Data`] and the other block events, and as
+    /// `EncodeOptions::protocol_revision` when encoding INSERT blocks.
     pub fn effective_revision(&self) -> Option<u64> {
         self.effective_revision
     }
@@ -978,6 +1169,12 @@ impl Connection {
     /// appends its packet, so a driver may take both in one ordered write.
     /// Until this is called after [`Self::new`], the engine holds the
     /// plaintext password in the queued Client Hello.
+    ///
+    /// A protocol failure, from [`Self::feed`] or an EOF reported by
+    /// [`Self::finish`], discards any output not yet taken, in every state
+    /// including the handshake: none of it is safe to write after the
+    /// server stream went wrong. Take output before feeding if it must be
+    /// written regardless.
     pub fn take_output(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.output)
     }
@@ -988,14 +1185,20 @@ impl Connection {
     /// [`Self::finish`]. Queued events hold memory proportional to the bytes
     /// fed since the last drain.
     pub fn poll_event(&mut self) -> Option<Event> {
-        self.events.pop_front()
+        let event = self.events.pop_front()?;
+        if !matches!(event, Event::Log(_) | Event::ProfileEvents(_)) {
+            debug_assert!(self.barrier_events > 0);
+            self.barrier_events = self.barrier_events.saturating_sub(1);
+        }
+        Some(event)
     }
 
-    /// Queues an uncompressed initial SELECT and its empty external-data block.
+    /// Queues an uncompressed query and its empty external-data block.
     ///
-    /// This milestone supports the SELECT result exchange only. The caller
-    /// must supply a statement whose response uses that exchange. INSERT,
-    /// input(), external tables, parallel-replica exchanges, cancellation,
+    /// Use this for exchanges that need no later client Data, including SELECT,
+    /// inline `INSERT ... VALUES`, and `INSERT ... SELECT`. Use
+    /// [`Self::insert`] when the client will upload encoded Native blocks.
+    /// `input()`, external tables, parallel-replica exchanges, cancellation,
     /// and compressed packets are unsupported.
     ///
     /// Rejected with [`ProtocolError::InvalidState`] unless the connection is
@@ -1021,21 +1224,62 @@ impl Connection {
     /// packet must fit in 64 MiB ([`ProtocolError::QueryOutputTooLarge`],
     /// which reports its exact length).
     pub fn query(&mut self, query: Query) -> Result<(), ProtocolError> {
+        self.start_query(
+            query,
+            State::Querying,
+            "send Query",
+            "send Query while a server packet is partly received",
+            "send Query before draining completed events",
+        )
+    }
+
+    /// Starts an uncompressed INSERT that may request client Native blocks.
+    ///
+    /// The queued bytes are the Query packet followed by the empty Data block
+    /// that terminates external tables. Drain the resulting
+    /// [`Event::InsertSchema`] before calling [`Self::insert_data`] or
+    /// [`Self::finish_insert`]. An inline VALUES, INSERT SELECT, or async
+    /// INSERT can instead complete with Progress, ProfileEvents, Log, and
+    /// EndOfStream without a schema. In that case no second client Data marker
+    /// is sent.
+    ///
+    /// The same Query validation and 64 MiB request limit as [`Self::query`]
+    /// apply. A server Exception may end any INSERT phase. If one arrives,
+    /// queued upload bytes are discarded so they cannot leak into a later
+    /// exchange.
+    pub fn insert(&mut self, query: Query) -> Result<(), ProtocolError> {
+        self.start_query(
+            query,
+            State::AwaitingInsertSchema,
+            "start INSERT",
+            "start INSERT while a server packet is partly received",
+            "start INSERT before draining completed events",
+        )
+    }
+
+    fn start_query(
+        &mut self,
+        query: Query,
+        next_state: State,
+        operation: &'static str,
+        partial_operation: &'static str,
+        undrained_operation: &'static str,
+    ) -> Result<(), ProtocolError> {
         if self.pending.is_some() || !self.input.is_empty() {
             return Err(ProtocolError::InvalidState {
-                operation: "send Query while a server packet is partly received",
+                operation: partial_operation,
                 state: self.state,
             });
         }
         if self.state != State::Ready {
             return Err(ProtocolError::InvalidState {
-                operation: "send Query",
+                operation,
                 state: self.state,
             });
         }
         if !self.events.is_empty() {
             return Err(ProtocolError::InvalidState {
-                operation: "send Query before draining completed events",
+                operation: undrained_operation,
                 state: self.state,
             });
         }
@@ -1141,16 +1385,142 @@ impl Connection {
             }
         }
         put_string(packet, "");
-        put_varuint(packet, CLIENT_PACKET_DATA);
-        put_string(packet, "");
-        // Standard BlockInfo followed by zero columns and zero rows.
-        packet.extend_from_slice(&[1, 0, 2]);
-        packet.extend_from_slice(&(-1_i32).to_le_bytes());
-        packet.extend_from_slice(&[0, 0, 0]);
+        put_empty_data_packet(packet);
         debug_assert_eq!(packet.len() - start, packet_size);
         self.active_query_sent_settings = !query.settings.is_empty();
         self.active_query_has_server_packet = false;
-        self.state = State::Querying;
+        self.state = next_state;
+        Ok(())
+    }
+
+    /// Queues one client Data packet for an INSERT.
+    ///
+    /// `native_block` must be exactly one complete Native block encoded for
+    /// this connection's effective revision, with at least one column. The
+    /// block is scanned for its boundary and framing but is not decoded or
+    /// copied until validation succeeds. A complete or partial
+    /// Log/ProfileEvents packet does not block the write; its event may
+    /// remain queued. The InsertSchema event itself must have been consumed,
+    /// and a partial Exception or unknown packet remains a barrier.
+    ///
+    /// # Errors
+    ///
+    /// Every error is atomic: output and state are unchanged and the
+    /// connection stays usable.
+    ///
+    /// - [`ProtocolError::InvalidState`] if the state is not
+    ///   [`State::Inserting`], or a non-telemetry server packet is queued or
+    ///   partly received (the write barrier).
+    /// - [`ProtocolError::InvalidInsertBlock`] if the payload is oversized,
+    ///   malformed, truncated, concatenated, or has no columns; the
+    ///   [`InsertBlockError`] says which.
+    /// - [`ProtocolError::InsertOutputAllocationFailed`] if the Data packet
+    ///   cannot be reserved in the output queue.
+    pub fn insert_data(&mut self, native_block: &[u8]) -> Result<(), ProtocolError> {
+        if self.state != State::Inserting {
+            return Err(ProtocolError::InvalidState {
+                operation: "send INSERT data",
+                state: self.state,
+            });
+        }
+        if self.insert_write_is_blocked() {
+            return Err(ProtocolError::InvalidState {
+                operation:
+                    "send INSERT data while a non-telemetry server packet is queued or partly received",
+                state: self.state,
+            });
+        }
+        if native_block.len() > self.max_block_bytes {
+            return Err(ProtocolError::InvalidInsertBlock(
+                InsertBlockError::TooLarge {
+                    len: native_block.len(),
+                    limit: self.max_block_bytes,
+                },
+            ));
+        }
+
+        let revision = self.effective_revision.unwrap_or(ENGINE_REVISION);
+        let boundary = native_scanner(revision)
+            .scan(native_block)
+            .map_err(|error| {
+                ProtocolError::InvalidInsertBlock(InsertBlockError::Decode(Arc::new(error)))
+            })?;
+        let (consumed, num_columns) = match boundary {
+            BlockBoundary::NeedMore => {
+                return Err(ProtocolError::InvalidInsertBlock(
+                    InsertBlockError::Truncated,
+                ))
+            }
+            BlockBoundary::Complete {
+                consumed,
+                num_columns,
+                ..
+            } => (consumed, num_columns),
+            _ => {
+                return Err(ProtocolError::InvalidInsertBlock(
+                    InsertBlockError::Truncated,
+                ))
+            }
+        };
+        if consumed != native_block.len() {
+            return Err(ProtocolError::InvalidInsertBlock(
+                InsertBlockError::TrailingBytes {
+                    consumed,
+                    len: native_block.len(),
+                },
+            ));
+        }
+        // The server treats any zero-column block as end-of-data, regardless
+        // of its declared row count. Only finish_insert may send one.
+        if num_columns == 0 {
+            return Err(ProtocolError::InvalidInsertBlock(
+                InsertBlockError::NoColumns,
+            ));
+        }
+
+        let additional = native_block.len().checked_add(2).ok_or(
+            ProtocolError::InsertOutputAllocationFailed {
+                additional: usize::MAX,
+            },
+        )?;
+        // Reserve the whole packet before writing any of it, so a failure
+        // leaves `output` untouched and the header and body are written
+        // without a reallocation between them. Exact sizing for an empty
+        // queue avoids slack in the common take-after-every-write driver;
+        // amortized growth otherwise keeps repeated untaken writes linear.
+        let reserved = if self.output.is_empty() {
+            self.output.try_reserve_exact(additional)
+        } else {
+            self.output.try_reserve(additional)
+        };
+        reserved.map_err(|_| ProtocolError::InsertOutputAllocationFailed { additional })?;
+        put_varuint(&mut self.output, CLIENT_PACKET_DATA);
+        put_string(&mut self.output, "");
+        self.output.extend_from_slice(native_block);
+        Ok(())
+    }
+
+    /// Queues the zero-column Data block that ends an INSERT upload.
+    ///
+    /// The state changes immediately, so the marker can be queued only once
+    /// and no later data block can follow it. Success is reported only by a
+    /// server [`Event::EndOfStream`].
+    pub fn finish_insert(&mut self) -> Result<(), ProtocolError> {
+        if self.state != State::Inserting {
+            return Err(ProtocolError::InvalidState {
+                operation: "finish INSERT",
+                state: self.state,
+            });
+        }
+        if self.insert_write_is_blocked() {
+            return Err(ProtocolError::InvalidState {
+                operation:
+                    "finish INSERT while a non-telemetry server packet is queued or partly received",
+                state: self.state,
+            });
+        }
+        put_empty_data_packet(&mut self.output);
+        self.state = State::FinishingInsert;
         Ok(())
     }
 
@@ -1159,7 +1529,9 @@ impl Connection {
     /// Completed packets are queued for [`Self::poll_event`], including the
     /// ones completed before an error in the same chunk. A malformed packet
     /// returns the error and moves the engine to
-    /// `State::Failed(FailureKind::Protocol)`.
+    /// `State::Failed(FailureKind::Protocol)`. The failure also discards any
+    /// queued output not yet returned by [`Self::take_output`], such as
+    /// INSERT Data packets, so no client bytes follow malformed server input.
     ///
     /// Parsing stops at any terminal server Exception (see
     /// [`Event::Exception`]). Later bytes, in this chunk or in later calls,
@@ -1202,14 +1574,17 @@ impl Connection {
 
     /// Marks transport EOF.
     ///
-    /// EOF closes a `Ready` engine successfully. It is truncation while
-    /// waiting for Server Hello or Pong, or whenever a packet is incomplete.
+    /// EOF closes a `Ready` engine successfully. It is truncation during
+    /// handshake, SELECT, INSERT, or Ping, or whenever a packet is incomplete.
     /// After a terminal server Exception it succeeds unless bytes followed
-    /// the Exception. Reusable query-time exceptions leave the engine Ready
-    /// instead (see [`Event::Exception`]). After a protocol failure it returns the error
-    /// that failed the connection. Events queued before EOF stay queued;
-    /// drain them afterwards as usual. The first EOF outcome is stored and
-    /// every later call returns it again.
+    /// the Exception. Every INSERT Exception is treated as terminal even when
+    /// the server may instead be waiting in its skip-data path. Reusable
+    /// query-time exceptions leave the engine Ready instead (see
+    /// [`Event::Exception`]). After a protocol failure it returns the error
+    /// that failed the connection. EOF that fails the connection discards
+    /// untaken output, as in [`Self::feed`]. Events queued before EOF stay
+    /// queued; drain them afterwards as usual. The first EOF outcome is
+    /// stored and every later call returns it again.
     pub fn finish(&mut self) -> Result<(), ProtocolError> {
         if let Some(result) = &self.finish_result {
             return result.clone();
@@ -1234,7 +1609,13 @@ impl Connection {
                 self.state = State::Closed;
                 Ok(())
             }
-            State::Handshaking | State::Ready | State::Querying | State::AwaitingPong => {
+            State::Handshaking
+            | State::Ready
+            | State::Querying
+            | State::AwaitingInsertSchema
+            | State::Inserting
+            | State::FinishingInsert
+            | State::AwaitingPong => {
                 self.fail_protocol();
                 self.protocol_error = Some(ProtocolError::UnexpectedEof);
                 Err(ProtocolError::UnexpectedEof)
@@ -1290,11 +1671,38 @@ impl Connection {
         self.input = Vec::new();
         self.need = 0;
         self.pending = None;
+        // No bytes queued before a fatal protocol error are safe to write.
+        // In particular, an INSERT upload must not continue after malformed
+        // or unexpected server input.
+        self.output.clear();
         // Queued events stay queued, so an input error never discards a
         // packet completed earlier in the same stream.
     }
 
+    /// Whether an INSERT write could overtake a server packet that may end or
+    /// redirect the exchange. Complete or partial Log/ProfileEvents packets
+    /// are harmless full-duplex telemetry. A partial packet code, Exception,
+    /// schema, or any other event remains a barrier.
+    fn insert_write_is_blocked(&self) -> bool {
+        let pending_is_telemetry = matches!(
+            self.pending,
+            Some(PendingPacket::Block(BlockProgress {
+                kind: BlockKind::Log | BlockKind::ProfileEvents,
+                ..
+            }))
+        );
+        let partial_is_blocked = if self.pending.is_some() {
+            !pending_is_telemetry
+        } else {
+            !self.input.is_empty()
+        };
+        partial_is_blocked || self.barrier_events > 0
+    }
+
     fn queue_event(&mut self, event: Event, next_state: Option<State>) {
+        if !matches!(event, Event::Log(_) | Event::ProfileEvents(_)) {
+            self.barrier_events += 1;
+        }
         self.events.push_back(event);
         if let Some(state) = next_state {
             self.state = state;
@@ -1412,6 +1820,10 @@ impl Connection {
                             has_nested,
                             truncated: progress.truncated,
                         };
+                        let insert_exception = matches!(
+                            self.state,
+                            State::AwaitingInsertSchema | State::Inserting | State::FinishingInsert
+                        );
                         let query_exception = self.state == State::Querying;
                         let terminal = !query_exception
                             || is_terminal_query_exception(
@@ -1419,6 +1831,12 @@ impl Connection {
                                 self.active_query_sent_settings,
                                 progress.first_query_packet,
                             );
+                        if insert_exception {
+                            // Upload bytes not yet taken by the driver must
+                            // never be sent after the server has rejected the
+                            // INSERT, or as part of a later exchange.
+                            self.output.clear();
+                        }
                         self.active_query_sent_settings = false;
                         self.active_query_has_server_packet = false;
                         let next_state = if terminal {
@@ -1441,9 +1859,36 @@ impl Connection {
                         }
                     };
                     if let Some(completed) = completed {
-                        if !(completed.kind == BlockKind::Data && completed.is_empty_sentinel) {
+                        if completed.kind == BlockKind::InsertSchema {
+                            if completed.num_columns == 0 || completed.num_rows != 0 {
+                                return Err(ParseError::Protocol(
+                                    ProtocolError::InvalidInsertSchema,
+                                ));
+                            }
+                            self.queue_event(
+                                Event::InsertSchema(completed.native),
+                                Some(State::Inserting),
+                            );
+                        } else if !(completed.kind == BlockKind::Data
+                            && completed.is_empty_sentinel)
+                        {
                             self.queue_event(completed.kind.event(completed.native), None);
                         }
+                    } else {
+                        self.pending = Some(pending);
+                    }
+                    return Ok(consumed);
+                }
+                PendingPacket::TableColumns(progress) => {
+                    let (consumed, completed) = match progress.step(bytes) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            self.pending = Some(pending);
+                            return Err(error);
+                        }
+                    };
+                    if let Some(event) = completed {
+                        self.queue_event(event, None);
                     } else {
                         self.pending = Some(pending);
                     }
@@ -1481,7 +1926,13 @@ impl Connection {
             // and closes the connection. `checkSettingsConstraints` rejecting
             // a non-empty default database fails the same way.
             (
-                State::Handshaking | State::Ready | State::Querying | State::AwaitingPong,
+                State::Handshaking
+                | State::Ready
+                | State::Querying
+                | State::AwaitingInsertSchema
+                | State::Inserting
+                | State::FinishingInsert
+                | State::AwaitingPong,
                 SERVER_PACKET_EXCEPTION,
             ) => {
                 self.pending = Some(PendingPacket::Exception(ExceptionProgress::new(
@@ -1515,6 +1966,40 @@ impl Connection {
                 self.queue_event(Event::ProfileInfo(profile), None);
             }
             (State::Querying, SERVER_PACKET_END_OF_STREAM) => {
+                self.active_query_sent_settings = false;
+                self.active_query_has_server_packet = false;
+                self.queue_event(Event::EndOfStream, Some(State::Ready));
+            }
+            (State::AwaitingInsertSchema, SERVER_PACKET_TABLE_COLUMNS) => {
+                self.pending = Some(PendingPacket::TableColumns(TableColumnsProgress::new(
+                    self.max_block_bytes,
+                )));
+            }
+            (State::AwaitingInsertSchema, SERVER_PACKET_DATA) => {
+                self.start_block(BlockKind::InsertSchema);
+            }
+            (State::AwaitingInsertSchema, SERVER_PACKET_PROGRESS) => {
+                let progress = parse_progress(&mut cursor)?;
+                self.queue_event(Event::Progress(progress), None);
+            }
+            (
+                State::AwaitingInsertSchema | State::Inserting | State::FinishingInsert,
+                SERVER_PACKET_LOG,
+            ) => {
+                self.start_block(BlockKind::Log);
+            }
+            (
+                State::AwaitingInsertSchema | State::Inserting | State::FinishingInsert,
+                SERVER_PACKET_PROFILE_EVENTS,
+            ) => {
+                self.start_block(BlockKind::ProfileEvents);
+            }
+            (State::FinishingInsert, SERVER_PACKET_END_OF_STREAM) => {
+                self.active_query_sent_settings = false;
+                self.active_query_has_server_packet = false;
+                self.queue_event(Event::EndOfStream, Some(State::Ready));
+            }
+            (State::AwaitingInsertSchema, SERVER_PACKET_END_OF_STREAM) => {
                 self.active_query_sent_settings = false;
                 self.active_query_has_server_packet = false;
                 self.queue_event(Event::EndOfStream, Some(State::Ready));
@@ -1609,11 +2094,13 @@ fn parse_server_hello(cursor: &mut Cursor<'_>) -> ParseResult<ServerHello> {
 enum PendingPacket {
     Exception(ExceptionProgress),
     Block(BlockProgress),
+    TableColumns(TableColumnsProgress),
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum BlockKind {
     Data,
+    InsertSchema,
     ProfileEvents,
     Log,
     Totals,
@@ -1624,6 +2111,7 @@ impl BlockKind {
     fn event(self, bytes: Vec<u8>) -> Event {
         match self {
             Self::Data => Event::Data(bytes),
+            Self::InsertSchema => Event::InsertSchema(bytes),
             Self::ProfileEvents => Event::ProfileEvents(bytes),
             Self::Log => Event::Log(bytes),
             Self::Totals => Event::Totals(bytes),
@@ -1643,6 +2131,8 @@ struct BlockProgress {
 struct CompletedBlock {
     kind: BlockKind,
     native: Vec<u8>,
+    num_columns: usize,
+    num_rows: usize,
     is_empty_sentinel: bool,
 }
 
@@ -1694,6 +2184,8 @@ impl BlockProgress {
                     Some(CompletedBlock {
                         kind: self.kind,
                         native: std::mem::take(&mut self.native),
+                        num_columns,
+                        num_rows,
                         is_empty_sentinel: num_rows == 0 && num_columns == 0,
                     }),
                 ));
@@ -1739,6 +2231,8 @@ impl BlockProgress {
                 Some(CompletedBlock {
                     kind: self.kind,
                     native: std::mem::take(&mut self.native),
+                    num_columns,
+                    num_rows,
                     is_empty_sentinel: num_rows == 0 && num_columns == 0,
                 }),
             ));
@@ -1749,6 +2243,126 @@ impl BlockProgress {
             }));
         }
         Ok((offered, None))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TableColumns packet
+// ---------------------------------------------------------------------------
+
+/// Incrementally reads the two raw strings in a TableColumns packet.
+///
+/// The two fields share one retention budget of `limit` bytes: the table
+/// name keeps up to `limit`, and the description keeps up to whatever the
+/// retained table name left. Any remainder is consumed and discarded as it
+/// arrives, so a very wide table cannot trip the general retained-input
+/// backstop or fail an INSERT only because its metadata is large. Capacity
+/// grows geometrically from bytes actually received and never from an
+/// untrusted declared length. The two buffers' capacities together stay
+/// within `limit`, up to any slack the allocator leaves after the finished
+/// name's `shrink_to_fit` (std does not guarantee `capacity == len`).
+///
+/// A declared field length above `declared_limit`
+/// (`TABLE_COLUMNS_DECLARED_FACTOR` times `limit`) is a protocol error, so a
+/// corrupt length fails as soon as its VarUInt is complete instead of
+/// skipping input until EOF. This mirrors `EXCEPTION_DECLARED_LIMIT`.
+struct TableColumnsProgress {
+    next: TableColumnsField,
+    remaining: Option<u64>,
+    table_name: Vec<u8>,
+    description: Vec<u8>,
+    truncated: bool,
+    /// Retention budget shared by both fields.
+    limit: usize,
+    /// Largest declared field length accepted.
+    declared_limit: usize,
+}
+
+#[derive(Clone, Copy)]
+enum TableColumnsField {
+    TableName,
+    Description,
+}
+
+impl TableColumnsProgress {
+    /// `limit` is the connection's block cap, snapshotted at packet start.
+    fn new(limit: usize) -> Self {
+        Self {
+            next: TableColumnsField::TableName,
+            remaining: None,
+            table_name: Vec::new(),
+            description: Vec::new(),
+            truncated: false,
+            limit,
+            declared_limit: limit.saturating_mul(TABLE_COLUMNS_DECLARED_FACTOR),
+        }
+    }
+
+    fn step(&mut self, bytes: &[u8]) -> ParseResult<(usize, Option<Event>)> {
+        if let Some(remaining) = self.remaining {
+            // Zero-length fields and the final byte of non-empty fields call
+            // `finish_field` in the step that consumes their prefix or body.
+            debug_assert!(remaining > 0);
+            if bytes.is_empty() {
+                return Err(ParseError::NeedMore(1));
+            }
+            let consumed =
+                usize::try_from(remaining).map_or(bytes.len(), |len| len.min(bytes.len()));
+            let (value, field_limit) = match self.next {
+                TableColumnsField::TableName => (&mut self.table_name, self.limit),
+                // `table_name.len() <= limit`, so the budget cannot underflow;
+                // saturate anyway rather than rely on it.
+                TableColumnsField::Description => (
+                    &mut self.description,
+                    self.limit.saturating_sub(self.table_name.len()),
+                ),
+            };
+            let retained = consumed.min(field_limit.saturating_sub(value.len()));
+            extend_bounded(value, &bytes[..retained], field_limit);
+            self.truncated |= retained < consumed;
+            self.remaining = Some(remaining - consumed as u64);
+            let completed = (self.remaining == Some(0))
+                .then(|| self.finish_field())
+                .flatten();
+            return Ok((consumed, completed));
+        }
+
+        let mut cursor = Cursor::new(bytes);
+        let length = cursor.varuint()?;
+        // Checked before any byte of the field is taken, so an oversized
+        // declaration fails as soon as its VarUInt is complete.
+        if length > self.declared_limit as u64 {
+            return Err(ParseError::Protocol(ProtocolError::StringTooLong {
+                field: match self.next {
+                    TableColumnsField::TableName => "table_columns_table_name",
+                    TableColumnsField::Description => "table_columns_description",
+                },
+                length: Some(usize::try_from(length).unwrap_or(usize::MAX)),
+                limit: self.declared_limit,
+            }));
+        }
+        self.remaining = Some(length);
+        let completed = (length == 0).then(|| self.finish_field()).flatten();
+        Ok((cursor.position(), completed))
+    }
+
+    fn finish_field(&mut self) -> Option<Event> {
+        self.remaining = None;
+        match self.next {
+            TableColumnsField::TableName => {
+                // Drop growth slack so both buffers together stay within the
+                // shared budget. The main table's name is empty, so this
+                // is normally a no-op.
+                self.table_name.shrink_to_fit();
+                self.next = TableColumnsField::Description;
+                None
+            }
+            TableColumnsField::Description => Some(Event::TableColumns {
+                table_name: std::mem::take(&mut self.table_name),
+                description: std::mem::take(&mut self.description),
+                truncated: self.truncated,
+            }),
+        }
     }
 }
 
@@ -1982,6 +2596,19 @@ fn put_varuint(output: &mut Vec<u8>, mut value: u64) {
 fn put_string(output: &mut Vec<u8>, value: &str) {
     put_varuint(output, value.len() as u64);
     output.extend_from_slice(value.as_bytes());
+}
+
+/// Writes a client Data packet carrying `Block::empty()` at revision 54460.
+/// Confirmed at `v26.8.1.2041-lts`, `src/Server/TCPHandler.cpp`,
+/// `TCPHandler::processData` treats any zero-column block as end-of-upload.
+fn put_empty_data_packet(output: &mut Vec<u8>) {
+    put_varuint(output, CLIENT_PACKET_DATA);
+    put_string(output, "");
+    // BlockInfo field 1 = overflow false, field 2 = bucket -1, terminator 0,
+    // then zero columns and zero rows.
+    output.extend_from_slice(&[1, 0, 2]);
+    output.extend_from_slice(&(-1_i32).to_le_bytes());
+    output.extend_from_slice(&[0, 0, 0]);
 }
 
 fn escaped_content_len(value: &[u8]) -> Option<usize> {

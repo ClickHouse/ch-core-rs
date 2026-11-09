@@ -7,10 +7,11 @@ accepts arbitrary byte chunks, queues protocol events, and queues ordered bytes
 to send.
 
 The initial scope is deliberately small: handshake, Ping/Pong, and uncompressed
-initial SELECT queries at protocol revision 54460. SELECT results emit complete
+initial SELECT and INSERT queries at protocol revision 54460. SELECT results emit complete
 Native block bytes plus typed Progress, ProfileInfo, ProfileEvents, Log, Totals,
-Extremes, Exception, and EndOfStream events. INSERT, cancellation, external
-tables, and compressed TCP packets are not implemented yet.
+Extremes, Exception, and EndOfStream events. INSERT emits its schema separately
+before accepting client blocks. Cancellation, external tables, and compressed
+TCP packets are not implemented yet.
 
 ## Driver loop
 
@@ -31,9 +32,9 @@ stream never holds a request while `read` waits for its reply. Build the
 `ClientHello` with the driver's own name and version, for example
 `ClientHello::new("example-client", "default").with_client_version(1, 0)`.
 
-`Event`, `State`, `FailureKind`, and `ProtocolError` are `#[non_exhaustive]`,
-as are the event payload structs, so matches need a wildcard arm and new
-variants are not breaking changes.
+`Event`, `State`, `FailureKind`, `ProtocolError`, and `InsertBlockError` are
+`#[non_exhaustive]`, as are the event payload structs, so matches need a
+wildcard arm and new variants are not breaking changes.
 
 `tests/handshake_replay.rs` compiles this exact function from
 `tests/support/readme_connect.rs` and fails if the two differ.
@@ -316,15 +317,87 @@ fn health_check<S: Read + Write>(
 }
 ```
 
+## INSERT exchange
+
+Choose the entry point by where the row data comes from. The engine does not
+parse SQL to classify statements.
+
+| Statement | Entry point | Response |
+|-----------|-------------|----------|
+| `INSERT INTO t (n) VALUES` with Native blocks supplied later | `insert` | `InsertSchema`, then upload, then EndOfStream |
+| `INSERT INTO t VALUES (13), (79)` | `query` or `insert` | Completion without an upload schema |
+| `INSERT INTO t SELECT ...` | `query` or `insert` | Completion without an upload schema |
+| Inline data with `async_insert=1` | `query` or `insert` | Completion without an upload schema |
+
+Use `insert` for a client-fed INSERT. With default server settings, calling
+`query` for it fails on the leading TableColumns packet with
+`UnexpectedPacket { packet: 11, state: Querying }`. If
+`input_format_defaults_for_omitted_fields=0` suppresses that packet, `query`
+emits the schema as Data but provides no upload API, so the server and driver
+can wait indefinitely. Choose `insert` before sending the statement. If
+`insert` is used for a fully specified inline INSERT, accept EndOfStream as
+success without waiting for `InsertSchema` or calling `finish_insert`.
+
+Call `insert(Query::new("INSERT INTO t VALUES"))` on a drained, `Ready`
+connection. This queues the Query and the empty Data block that ends external
+input. Take and flush the output, then feed server bytes and drain events until
+`Event::InsertSchema`, EndOfStream, or Exception arrives. The schema payload is
+one zero-row Native block with column headers, decoded at `effective_revision()`
+just like a Data payload. The connection moves from `AwaitingInsertSchema` to
+`Inserting`. An optional `Event::TableColumns` carries default-expression
+metadata as raw bytes before the schema. Drivers may ignore it when supplying
+every requested column. The bytes can contain non-UTF-8 literals and must be
+preserved if parsed. Check `truncated` before parsing the description.
+
+Encode each client batch with core's `native::encode::encode_block`, setting
+`EncodeOptions::protocol_revision` to the connection's `effective_revision()`.
+Pass exactly one complete block to `insert_data(&native)`, then take and flush
+output. The engine scans its boundary without decoding column values and frames
+accepted bytes as a client Data packet. Oversized, malformed, truncated,
+concatenated, and zero-column payloads return `InvalidInsertBlock` without
+changing the connection state or queued output. `InsertBlockError`
+distinguishes oversize (`TooLarge`), decode errors, truncation, trailing bytes,
+and no-column blocks. Each error level prints only its own message and exposes
+its cause through `source()`, ending at the core `DecodeError`. The caller must
+match names and types to the server's insert schema. The server can reorder
+columns, fill omitted columns, drop unknown columns, and coerce mismatched
+types. A zero-row block with columns is valid upload data and does not end the
+upload.
+
+Call `finish_insert()` once to queue the empty Data end marker and enter
+`FinishingInsert`. Flush it, then keep feeding and draining through
+`Event::EndOfStream`. Log and ProfileEvents may arrive during the exchange. An
+Exception at any phase is an `Event::Exception`; stop uploading and report it.
+Exceptions in an exchange started with `insert` fail the connection and discard
+queued upload bytes. Protocol failures, including a failed `finish()`, also
+discard queued output not yet taken, in every state including the handshake.
+Discard the socket after either failure. After the external-table marker has
+been consumed, an upload-phase Exception can leave the server draining client
+data. Errors before the schema or after the upload terminator do not require
+that upload drain. The engine conservatively retires the connection in all
+`insert` error phases. There is no successful EndOfStream after an Exception.
+Drain all events even when `feed` reports a protocol error. `finish()` still
+means transport EOF, not end of INSERT input.
+
+Outbound blocks use one scan and one copy into the output queue. The engine
+does not materialize rows or re-encode values. Take output between blocks to
+bound queued upload memory. After consuming `InsertSchema`, upload and finish
+calls can proceed while Log or ProfileEvents packets are partially received or
+queued. Drivers should still feed and drain incoming events regularly. A
+partly received Exception or unidentified packet blocks upload until it is
+parsed, so a known pending failure cannot be bypassed by another upload call.
+
 ## Contract
 
 - `feed` returns only errors. Every completed packet is an `Event` read with
   `poll_event`. A malformed or unexpected packet fails the connection with
   `State::Failed(FailureKind::Protocol)`, and a later `finish` returns that
-  same error.
-- `feed` consumes its whole input. The only bytes it retains between calls are
-  the tail of one incomplete scalar field; Native block bodies go straight to
-  their event buffer. On a live connection `feed(&[])` is a no-op.
+  same error. Protocol failures and Exceptions in an `insert` exchange discard
+  queued output.
+- `feed` consumes its whole input. Its scalar input buffer retains only the
+  tail of one incomplete field; Native block bodies and TableColumns payloads
+  go straight to their event buffers. On a live connection `feed(&[])` is a
+  no-op.
 - `query` and `ping` are rejected with `InvalidState` until every queued event
   is drained, and while any server packet is partly received. So a Query is
   never queued behind an undelivered Exception that ends the connection.
@@ -352,6 +425,9 @@ fn health_check<S: Read + Write>(
   - Once a query context exists, other query errors normally leave the
     connection reusable. The wire does not identify every server throw site,
     so a driver must still honor transport EOF and I/O failures.
+  - Exchanges started with `insert()` always fail the connection on Exception,
+    because upload drain completion cannot be established from the Exception
+    packet alone. Queued upload bytes are discarded.
 - There is no Cancel packet and no reset. A driver that abandons a query before
   its EndOfStream or Exception, for example on a timeout, must discard the
   `Connection` and its socket rather than reuse them.
@@ -374,7 +450,9 @@ fn health_check<S: Read + Write>(
   one, to correlate logs or `system.query_log`, must generate it and pass it
   with `Query::with_query_id`.
 - Query support is limited to statements whose complete response uses the
-  initial SELECT result exchange. INSERT, input(), external tables,
+  initial SELECT result exchange, including fully specified inline INSERTs
+  and INSERT SELECT. Use `insert` for a client-fed INSERT.
+  input(), external tables,
   parallel-replica exchanges, cancellation, and compressed packets are not
   supported. The engine does not parse SQL to classify statements.
 - The engine frames result blocks with core's scanner, so a result column type
@@ -425,6 +503,16 @@ bytes, the rest is skipped without buffering, and `ServerException::truncated`
 is set. A declared Exception string length above 64 MiB is a protocol error
 (`StringTooLong`), so a corrupt length cannot make the engine skip forever.
 
+TableColumns fields preserve their wire bytes. The two fields share one
+retention budget of `max_block_bytes`: the table name keeps up to the budget
+and the description keeps the rest, with the remainder skipped and the event
+marked truncated. Exceeding this retention budget does not fail the INSERT.
+A declared field length above 64 times `max_block_bytes` (saturating) is
+treated as corruption, like the 64 MiB Exception bound, and fails the
+connection with `StringTooLong` as soon as the length is read, instead of
+skipping input until EOF. TableColumns payloads stream into their own
+buffers, so the 4 MiB retained-input backstop does not limit wide schemas.
+
 Lossy UTF-8 decoding turns each invalid byte into U+FFFD, which is 3 bytes, so
 each decoded Exception field is at most 3 MiB, 9 MiB for the three text fields.
 Bytes retained across `feed` calls are bounded by the per-field caps, at most
@@ -443,19 +531,37 @@ One Native packet body is capped at `DEFAULT_MAX_BLOCK_BYTES`, 1 GiB, by
 default. Set another cap with `Connection::with_max_block_bytes`; values below
 `MIN_MAX_BLOCK_BYTES`, 1 KiB, are raised to it. The cap applies to every
 block-carrying packet: Data, including the end-of-data marker, Totals,
-Extremes, Log (`send_logs_level`), and ProfileEvents. HTTP has no per-block
+Extremes, Log (`send_logs_level`), and ProfileEvents. The same cap limits each
+outbound `insert_data` block. An inbound block over the cap fails the
+connection with `NativeBlockTooLarge`, which is always fatal. An outbound
+block over the cap returns `InvalidInsertBlock(InsertBlockError::TooLarge)`
+and leaves state and output unchanged. HTTP has no per-block
 cap, so a low value can reject results HTTP returns: `SELECT
 randomString(1100) FROM numbers(100000)` produces blocks of about 72 MB. Block
 memory grows only with bytes actually received, never from a declared length,
 and the block buffer's capacity never exceeds the cap. Core's scan-only
 boundary parser finds the block's exact end without allocating decoded
-columns, and malformed bodies surface as `ProtocolError::Decode`.
+columns. Malformed inbound bodies surface as `ProtocolError::Decode` and fail
+the connection; malformed outbound INSERT bodies return `InvalidInsertBlock`
+and leave the connection usable. Failure to reserve the outbound copy returns
+`InsertOutputAllocationFailed` before changing state or output.
 
 Framing retains progress through column bodies and runtime type-table
 prefixes, including Dynamic, JSON, AggregateFunction, and nested containers.
 Scanning stays linear across transport read sizes.
 
 ## Server reference
+
+The INSERT sequence is confirmed at `v26.8.1.2041-lts` in
+`src/Server/TCPHandler.cpp`, `TCPHandler::{readTemporaryTables,startInsertQuery,processInsertQuery,receivePacketsExpectData,processData,sendTableColumns,sendEndOfStream}`.
+`NativeWriter::write` and `NativeReader::read` in `src/Formats/` define the
+block body. The handler sends an upload Exception before `skipData` drains
+remaining input during upload. The engine conservatively retires connections
+started with `insert` on errors. Inline completion without a schema is confirmed in
+`src/Interpreters/InterpreterInsertQuery.cpp`,
+`InterpreterInsertQuery::{buildInsertPipeline,buildInsertSelectPipeline}`,
+and the completed-pipeline dispatch in `TCPHandler.cpp`.
+`src/Interpreters/executeQuery.cpp` handles inline async INSERTs.
 
 The wire layout is confirmed against ClickHouse `v26.8.1.2041-lts` in
 `TCPHandler::{receiveHello,sendHello,receiveAddendum,receiveQuery,sendData,sendTotals,sendExtremes}`,

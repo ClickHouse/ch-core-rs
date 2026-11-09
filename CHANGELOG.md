@@ -75,6 +75,26 @@ version; patch releases remain backward compatible.
 - `ch-tcp-proto`: the crate README documents and tests `run_select` (with a
   typed error), a per-payload `decode_payload`, and a Ping `health_check`,
   each run against the recorded captures over a fake stream.
+- `ch-tcp-proto`: add uncompressed revision-54460 INSERT upload.
+  `Connection::insert` queues the Query and moves to `AwaitingInsertSchema`;
+  the server's zero-row sample block arrives as `Event::InsertSchema`,
+  optionally preceded by raw-byte `Event::TableColumns` metadata. Then
+  `insert_data` queues one validated client Native block per call and
+  `finish_insert` queues the end-of-data marker before `Event::EndOfStream`.
+  New states `AwaitingInsertSchema`, `Inserting`, and `FinishingInsert`.
+  Rejected blocks return `ProtocolError::InvalidInsertBlock` with an
+  `InsertBlockError` reason (`TooLarge`, `Decode`, `Truncated`,
+  `TrailingBytes`, `NoColumns`) and leave state and output unchanged;
+  `InsertOutputAllocationFailed` reports a failed output reservation.
+  `NativeBlockTooLarge` now means only an inbound block and is always fatal.
+  Every Exception in an `insert` exchange is terminal. TableColumns fields
+  share one `max_block_bytes` retention budget, and a declared field length
+  above 64 times `max_block_bytes` fails as corruption with `StringTooLong`.
+  Replay fixtures are captured from ClickHouse 26.8.
+- `ch-tcp-proto`: a protocol failure, from `feed` or a failing `finish`, now
+  discards queued output not yet returned by `take_output` in every state,
+  including the handshake. Take output before feeding if it must be written
+  regardless.
 
 ## v0.2.1
 

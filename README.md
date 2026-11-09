@@ -120,8 +120,7 @@ Implemented:
 
 Not implemented yet:
 
-- Compressed TCP query exchanges, TCP INSERT exchanges, and query
-  cancellation over TCP.
+- Compressed TCP query exchanges and query cancellation over TCP.
 - Language-specific materialization policy (bindings own this, by design).
 
 ## Supported types
@@ -164,8 +163,8 @@ In rough priority order:
    `ArrayBuffer`, NumPy export that does not route through Arrow.
 4. Insert-path completion: a streaming/sink encode API. Type parity is kept as
    each decoder type lands.
-5. Native TCP protocol engine, the rest of it: compressed query exchanges,
-   INSERT, and cancellation. The handshake, Ping, and uncompressed SELECT at
+5. Native TCP protocol engine, the rest of it: compressed query exchanges
+   and cancellation. The handshake, Ping, uncompressed SELECT, and INSERT at
    revision 54460 ship in `ch-tcp-proto`.
 
 ## Consuming
@@ -215,8 +214,8 @@ block bytes for `INSERT` with `native::encode::encode_block` or
 The root package remains `ch-core-rs`. The workspace also contains
 [`ch-tcp-proto`](crates/ch-tcp-proto/README.md), a sans-I/O TCP protocol engine.
 Its current scope is the revision-54460 handshake, Ping/Pong, and uncompressed
-SELECT exchanges with Native byte output and query metadata events. The engine
-depends on core; core has no runtime dependencies.
+SELECT and INSERT exchanges with Native byte output and query metadata events.
+The engine depends on core; core has no runtime dependencies.
 
 - `src/schema.rs` - ClickHouse logical type model.
 - `src/column.rs` - Arrow-compatible physical column buffers.
@@ -255,7 +254,7 @@ version and first-byte hexdumps.
 
 A working core under active development. The API is not yet stable. Decode and
 encode are at type parity, both verified against a live ClickHouse server. Not
-yet implemented: compressed TCP queries and TCP INSERT exchanges; a
+yet implemented: compressed TCP queries and cancellation; a
 streaming/sink encode API is future work. Releases are tagged and semver'd, each
 recorded in `CHANGELOG.md`. `ARCHITECTURE.md` describes how the pieces fit
 together.

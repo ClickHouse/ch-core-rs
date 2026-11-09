@@ -1,0 +1,2220 @@
+{
+  "captured_on": "2026-11-10",
+  "server_version": "26.8.1.2041",
+  "source_tag": "v26.8.1.2041-lts",
+  "declared_revision": 54460,
+  "host": "127.0.0.1",
+  "queries": {
+    "multi": {
+      "sql": "INSERT INTO ch_core_tcp_insert_fixture (n, s) VALUES",
+      "query_id": "ch-core-insert-fixture-multi",
+      "schema_packets": [
+        {
+          "code": 10,
+          "offset": 0,
+          "name": "",
+          "rows": 1,
+          "columns": 8,
+          "schema": [
+            [
+              "event_time",
+              "DateTime"
+            ],
+            [
+              "event_time_microseconds",
+              "UInt32"
+            ],
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "query_id",
+              "String"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "priority",
+              "Int8"
+            ],
+            [
+              "source",
+              "String"
+            ],
+            [
+              "text",
+              "String"
+            ]
+          ],
+          "block_offset": 2,
+          "block_length": 329,
+          "length": 331
+        },
+        {
+          "code": 11,
+          "offset": 331,
+          "external_table": "",
+          "external_table_hex": "",
+          "columns_description": "columns format version: 1\n2 columns:\n`n` UInt64\n`s` String\n",
+          "columns_description_hex": "636f6c756d6e7320666f726d61742076657273696f6e3a20310a3220636f6c756d6e733a0a606e602055496e7436340a60736020537472696e670a",
+          "length": 62
+        },
+        {
+          "code": 1,
+          "offset": 393,
+          "name": "",
+          "rows": 0,
+          "columns": 2,
+          "schema": [
+            [
+              "n",
+              "UInt64"
+            ],
+            [
+              "s",
+              "String"
+            ]
+          ],
+          "block_offset": 395,
+          "block_length": 30,
+          "length": 32
+        }
+      ],
+      "midupload_packets": [],
+      "completion_packets": [
+        {
+          "code": 10,
+          "offset": 0,
+          "name": "",
+          "rows": 3,
+          "columns": 8,
+          "schema": [
+            [
+              "event_time",
+              "DateTime"
+            ],
+            [
+              "event_time_microseconds",
+              "UInt32"
+            ],
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "query_id",
+              "String"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "priority",
+              "Int8"
+            ],
+            [
+              "source",
+              "String"
+            ],
+            [
+              "text",
+              "String"
+            ]
+          ],
+          "block_offset": 2,
+          "block_length": 535,
+          "length": 537
+        },
+        {
+          "code": 14,
+          "offset": 537,
+          "name": "",
+          "rows": 19,
+          "columns": 6,
+          "schema": [
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "current_time",
+              "DateTime"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "type",
+              "Enum8('increment' = 1, 'gauge' = 2)"
+            ],
+            [
+              "name",
+              "String"
+            ],
+            [
+              "value",
+              "Int64"
+            ]
+          ],
+          "block_offset": 539,
+          "block_length": 1190,
+          "length": 1192
+        },
+        {
+          "code": 14,
+          "offset": 1729,
+          "name": "",
+          "rows": 7,
+          "columns": 6,
+          "schema": [
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "current_time",
+              "DateTime"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "type",
+              "Enum8('increment' = 1, 'gauge' = 2)"
+            ],
+            [
+              "name",
+              "String"
+            ],
+            [
+              "value",
+              "Int64"
+            ]
+          ],
+          "block_offset": 1731,
+          "block_length": 527,
+          "length": 529
+        },
+        {
+          "code": 14,
+          "offset": 2258,
+          "name": "",
+          "rows": 12,
+          "columns": 6,
+          "schema": [
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "current_time",
+              "DateTime"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "type",
+              "Enum8('increment' = 1, 'gauge' = 2)"
+            ],
+            [
+              "name",
+              "String"
+            ],
+            [
+              "value",
+              "Int64"
+            ]
+          ],
+          "block_offset": 2260,
+          "block_length": 785,
+          "length": 787
+        },
+        {
+          "code": 10,
+          "offset": 3045,
+          "name": "",
+          "rows": 3,
+          "columns": 8,
+          "schema": [
+            [
+              "event_time",
+              "DateTime"
+            ],
+            [
+              "event_time_microseconds",
+              "UInt32"
+            ],
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "query_id",
+              "String"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "priority",
+              "Int8"
+            ],
+            [
+              "source",
+              "String"
+            ],
+            [
+              "text",
+              "String"
+            ]
+          ],
+          "block_offset": 3047,
+          "block_length": 566,
+          "length": 568
+        },
+        {
+          "code": 5,
+          "offset": 3613,
+          "length": 1
+        }
+      ],
+      "exchange_order": [
+        "request",
+        "schema",
+        "upload",
+        "finish",
+        "completion"
+      ],
+      "upload_blocks": [
+        {
+          "offset": 0,
+          "length": 62,
+          "rows": [
+            [
+              13,
+              "user_1"
+            ],
+            [
+              79,
+              "user_2"
+            ]
+          ]
+        },
+        {
+          "offset": 62,
+          "length": 41,
+          "rows": [
+            [
+              17,
+              ""
+            ]
+          ]
+        }
+      ],
+      "verified_http_rows": "{\"n\":13,\"s\":\"user_1\"}\n{\"n\":17,\"s\":\"\"}\n{\"n\":79,\"s\":\"user_2\"}",
+      "http_verification": {
+        "status": "verified",
+        "rows": "{\"n\":13,\"s\":\"user_1\"}\n{\"n\":17,\"s\":\"\"}\n{\"n\":79,\"s\":\"user_2\"}"
+      },
+      "exception_phase": null,
+      "completion_probe": null
+    },
+    "empty": {
+      "sql": "INSERT INTO ch_core_tcp_insert_fixture (n, s) VALUES",
+      "query_id": "ch-core-insert-fixture-empty",
+      "schema_packets": [
+        {
+          "code": 10,
+          "offset": 0,
+          "name": "",
+          "rows": 1,
+          "columns": 8,
+          "schema": [
+            [
+              "event_time",
+              "DateTime"
+            ],
+            [
+              "event_time_microseconds",
+              "UInt32"
+            ],
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "query_id",
+              "String"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "priority",
+              "Int8"
+            ],
+            [
+              "source",
+              "String"
+            ],
+            [
+              "text",
+              "String"
+            ]
+          ],
+          "block_offset": 2,
+          "block_length": 329,
+          "length": 331
+        },
+        {
+          "code": 11,
+          "offset": 331,
+          "external_table": "",
+          "external_table_hex": "",
+          "columns_description": "columns format version: 1\n2 columns:\n`n` UInt64\n`s` String\n",
+          "columns_description_hex": "636f6c756d6e7320666f726d61742076657273696f6e3a20310a3220636f6c756d6e733a0a606e602055496e7436340a60736020537472696e670a",
+          "length": 62
+        },
+        {
+          "code": 1,
+          "offset": 393,
+          "name": "",
+          "rows": 0,
+          "columns": 2,
+          "schema": [
+            [
+              "n",
+              "UInt64"
+            ],
+            [
+              "s",
+              "String"
+            ]
+          ],
+          "block_offset": 395,
+          "block_length": 30,
+          "length": 32
+        }
+      ],
+      "midupload_packets": [],
+      "completion_packets": [
+        {
+          "code": 10,
+          "offset": 0,
+          "name": "",
+          "rows": 3,
+          "columns": 8,
+          "schema": [
+            [
+              "event_time",
+              "DateTime"
+            ],
+            [
+              "event_time_microseconds",
+              "UInt32"
+            ],
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "query_id",
+              "String"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "priority",
+              "Int8"
+            ],
+            [
+              "source",
+              "String"
+            ],
+            [
+              "text",
+              "String"
+            ]
+          ],
+          "block_offset": 2,
+          "block_length": 535,
+          "length": 537
+        },
+        {
+          "code": 14,
+          "offset": 537,
+          "name": "",
+          "rows": 20,
+          "columns": 6,
+          "schema": [
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "current_time",
+              "DateTime"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "type",
+              "Enum8('increment' = 1, 'gauge' = 2)"
+            ],
+            [
+              "name",
+              "String"
+            ],
+            [
+              "value",
+              "Int64"
+            ]
+          ],
+          "block_offset": 539,
+          "block_length": 1241,
+          "length": 1243
+        },
+        {
+          "code": 10,
+          "offset": 1780,
+          "name": "",
+          "rows": 2,
+          "columns": 8,
+          "schema": [
+            [
+              "event_time",
+              "DateTime"
+            ],
+            [
+              "event_time_microseconds",
+              "UInt32"
+            ],
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "query_id",
+              "String"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "priority",
+              "Int8"
+            ],
+            [
+              "source",
+              "String"
+            ],
+            [
+              "text",
+              "String"
+            ]
+          ],
+          "block_offset": 1782,
+          "block_length": 424,
+          "length": 426
+        },
+        {
+          "code": 5,
+          "offset": 2206,
+          "length": 1
+        }
+      ],
+      "exchange_order": [
+        "request",
+        "schema",
+        "finish",
+        "completion"
+      ],
+      "upload_blocks": [],
+      "verified_http_rows": "",
+      "http_verification": {
+        "status": "verified",
+        "rows": ""
+      },
+      "exception_phase": null,
+      "completion_probe": null
+    },
+    "zero_rows": {
+      "sql": "INSERT INTO ch_core_tcp_insert_fixture (n, s) VALUES",
+      "query_id": "ch-core-insert-fixture-zero_rows",
+      "schema_packets": [
+        {
+          "code": 10,
+          "offset": 0,
+          "name": "",
+          "rows": 1,
+          "columns": 8,
+          "schema": [
+            [
+              "event_time",
+              "DateTime"
+            ],
+            [
+              "event_time_microseconds",
+              "UInt32"
+            ],
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "query_id",
+              "String"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "priority",
+              "Int8"
+            ],
+            [
+              "source",
+              "String"
+            ],
+            [
+              "text",
+              "String"
+            ]
+          ],
+          "block_offset": 2,
+          "block_length": 333,
+          "length": 335
+        },
+        {
+          "code": 11,
+          "offset": 335,
+          "external_table": "",
+          "external_table_hex": "",
+          "columns_description": "columns format version: 1\n2 columns:\n`n` UInt64\n`s` String\n",
+          "columns_description_hex": "636f6c756d6e7320666f726d61742076657273696f6e3a20310a3220636f6c756d6e733a0a606e602055496e7436340a60736020537472696e670a",
+          "length": 62
+        },
+        {
+          "code": 1,
+          "offset": 397,
+          "name": "",
+          "rows": 0,
+          "columns": 2,
+          "schema": [
+            [
+              "n",
+              "UInt64"
+            ],
+            [
+              "s",
+              "String"
+            ]
+          ],
+          "block_offset": 399,
+          "block_length": 30,
+          "length": 32
+        }
+      ],
+      "midupload_packets": [],
+      "completion_packets": [
+        {
+          "code": 10,
+          "offset": 0,
+          "name": "",
+          "rows": 3,
+          "columns": 8,
+          "schema": [
+            [
+              "event_time",
+              "DateTime"
+            ],
+            [
+              "event_time_microseconds",
+              "UInt32"
+            ],
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "query_id",
+              "String"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "priority",
+              "Int8"
+            ],
+            [
+              "source",
+              "String"
+            ],
+            [
+              "text",
+              "String"
+            ]
+          ],
+          "block_offset": 2,
+          "block_length": 547,
+          "length": 549
+        },
+        {
+          "code": 14,
+          "offset": 549,
+          "name": "",
+          "rows": 19,
+          "columns": 6,
+          "schema": [
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "current_time",
+              "DateTime"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "type",
+              "Enum8('increment' = 1, 'gauge' = 2)"
+            ],
+            [
+              "name",
+              "String"
+            ],
+            [
+              "value",
+              "Int64"
+            ]
+          ],
+          "block_offset": 551,
+          "block_length": 1190,
+          "length": 1192
+        },
+        {
+          "code": 14,
+          "offset": 1741,
+          "name": "",
+          "rows": 10,
+          "columns": 6,
+          "schema": [
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "current_time",
+              "DateTime"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "type",
+              "Enum8('increment' = 1, 'gauge' = 2)"
+            ],
+            [
+              "name",
+              "String"
+            ],
+            [
+              "value",
+              "Int64"
+            ]
+          ],
+          "block_offset": 1743,
+          "block_length": 680,
+          "length": 682
+        },
+        {
+          "code": 10,
+          "offset": 2423,
+          "name": "",
+          "rows": 2,
+          "columns": 8,
+          "schema": [
+            [
+              "event_time",
+              "DateTime"
+            ],
+            [
+              "event_time_microseconds",
+              "UInt32"
+            ],
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "query_id",
+              "String"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "priority",
+              "Int8"
+            ],
+            [
+              "source",
+              "String"
+            ],
+            [
+              "text",
+              "String"
+            ]
+          ],
+          "block_offset": 2425,
+          "block_length": 432,
+          "length": 434
+        },
+        {
+          "code": 5,
+          "offset": 2857,
+          "length": 1
+        }
+      ],
+      "exchange_order": [
+        "request",
+        "schema",
+        "upload",
+        "finish",
+        "completion"
+      ],
+      "upload_blocks": [
+        {
+          "offset": 0,
+          "length": 32,
+          "rows": []
+        }
+      ],
+      "verified_http_rows": "",
+      "http_verification": {
+        "status": "verified",
+        "rows": ""
+      },
+      "exception_phase": null,
+      "completion_probe": null
+    },
+    "before_schema": {
+      "sql": "INSERT INTO ch_core_tcp_insert_fixture_missing (n, s) VALUES",
+      "query_id": "ch-core-insert-fixture-before_schema",
+      "schema_packets": [
+        {
+          "code": 10,
+          "offset": 0,
+          "name": "",
+          "rows": 1,
+          "columns": 8,
+          "schema": [
+            [
+              "event_time",
+              "DateTime"
+            ],
+            [
+              "event_time_microseconds",
+              "UInt32"
+            ],
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "query_id",
+              "String"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "priority",
+              "Int8"
+            ],
+            [
+              "source",
+              "String"
+            ],
+            [
+              "text",
+              "String"
+            ]
+          ],
+          "block_offset": 2,
+          "block_length": 345,
+          "length": 347
+        },
+        {
+          "code": 10,
+          "offset": 347,
+          "name": "",
+          "rows": 4,
+          "columns": 8,
+          "schema": [
+            [
+              "event_time",
+              "DateTime"
+            ],
+            [
+              "event_time_microseconds",
+              "UInt32"
+            ],
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "query_id",
+              "String"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "priority",
+              "Int8"
+            ],
+            [
+              "source",
+              "String"
+            ],
+            [
+              "text",
+              "String"
+            ]
+          ],
+          "block_offset": 349,
+          "block_length": 3154,
+          "length": 3156
+        },
+        {
+          "code": 2,
+          "offset": 3503,
+          "exception_code": 60,
+          "exception_name": "DB::Exception",
+          "message": "DB::Exception: Table default.ch_core_tcp_insert_fixture_missing does not exist. Maybe you meant default.ch_core_tcp_insert_fixture?",
+          "stack_trace": "0. DB::Exception::Exception(DB::Exception::MessageMasked&&, int, bool) @ 0x0000000014335694\n1. DB::Exception::Exception(String&&, int, String, bool) @ 0x000000000ef10e58\n2. DB::Exception::Exception(PreformattedMessage&&, int) @ 0x000000000ef106cc\n3. DB::Exception::Exception<String, String, String, String>(int, FormatStringHelperImpl<std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type>, String&&, String&&, String&&, String&&) @ 0x000000000f014b64\n4. DB::IDatabase::getTable(String const&, std::shared_ptr<DB::Context const>) const @ 0x0000000017e473ec\n5. DB::DatabaseCatalog::getTableImpl(DB::StorageID const&, std::shared_ptr<DB::Context const>, std::optional<DB::Exception>*) const @ 0x0000000018da9420\n6. DB::Context::getOrCacheStorage(DB::StorageID const&, std::function<std::pair<std::shared_ptr<DB::IDatabase>, std::shared_ptr<DB::IStorage>> ()>) const @ 0x0000000018c51e70\n7. DB::DatabaseCatalog::getTable(DB::StorageID const&, std::shared_ptr<DB::Context const>) const @ 0x0000000018db4cb8\n8. DB::InterpreterInsertQuery::getTable(DB::ASTInsertQuery&) @ 0x0000000018f5ced0\n9. DB::InterpreterInsertQuery::execute() @ 0x0000000018f64494\n10. DB::executeQueryImpl(char const*, char const*, std::shared_ptr<DB::Context>, DB::QueryFlags, DB::QueryProcessingStage::Enum, std::unique_ptr<DB::ReadBuffer, std::default_delete<DB::ReadBuffer>>&, boost::intrusive_ptr<DB::IAST>&, std::shared_ptr<DB::ImplicitTransactionControlExecutor>, std::function<void ()>, DB::QueryResultDetails&) @ 0x000000001947b908\n11. DB::executeQuery(std::basic_string_view<char, std::char_traits<char>>, std::shared_ptr<DB::Context>, DB::QueryFlags, DB::QueryProcessingStage::Enum) @ 0x00000000194754ec\n12. DB::TCPHandler::runImpl() @ 0x000000001aa3bbd8\n13. DB::TCPHandler::run() @ 0x000000001aa5b348\n14. Poco::Net::TCPServerConnection::start() @ 0x000000001fde8f18\n15. Poco::Net::TCPServerDispatcher::run() @ 0x000000001fde9520\n16. Poco::PooledThread::run() @ 0x000000001fdaad78\n17. Poco::ThreadImpl::runnableEntry(void*) @ 0x000000001fda8ff0\n18. ? @ 0x00000000000803c8\n19. ? @ 0x00000000000e9edc\n",
+          "has_nested": false,
+          "length": 2312
+        }
+      ],
+      "midupload_packets": [],
+      "completion_packets": [],
+      "exchange_order": [
+        "request",
+        "schema"
+      ],
+      "upload_blocks": [],
+      "verified_http_rows": null,
+      "http_verification": {
+        "status": "not_applicable",
+        "reason": "query targets a missing table"
+      },
+      "exception_phase": "before_schema",
+      "completion_probe": null
+    },
+    "completion_exception": {
+      "sql": "INSERT INTO ch_core_tcp_insert_fixture (n, s) VALUES",
+      "query_id": "ch-core-insert-fixture-completion_exception",
+      "schema_packets": [
+        {
+          "code": 10,
+          "offset": 0,
+          "name": "",
+          "rows": 1,
+          "columns": 8,
+          "schema": [
+            [
+              "event_time",
+              "DateTime"
+            ],
+            [
+              "event_time_microseconds",
+              "UInt32"
+            ],
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "query_id",
+              "String"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "priority",
+              "Int8"
+            ],
+            [
+              "source",
+              "String"
+            ],
+            [
+              "text",
+              "String"
+            ]
+          ],
+          "block_offset": 2,
+          "block_length": 344,
+          "length": 346
+        },
+        {
+          "code": 11,
+          "offset": 346,
+          "external_table": "",
+          "external_table_hex": "",
+          "columns_description": "columns format version: 1\n2 columns:\n`n` UInt64\n`s` String\n",
+          "columns_description_hex": "636f6c756d6e7320666f726d61742076657273696f6e3a20310a3220636f6c756d6e733a0a606e602055496e7436340a60736020537472696e670a",
+          "length": 62
+        },
+        {
+          "code": 1,
+          "offset": 408,
+          "name": "",
+          "rows": 0,
+          "columns": 2,
+          "schema": [
+            [
+              "n",
+              "UInt64"
+            ],
+            [
+              "s",
+              "String"
+            ]
+          ],
+          "block_offset": 410,
+          "block_length": 30,
+          "length": 32
+        }
+      ],
+      "midupload_packets": [
+        {
+          "code": 10,
+          "offset": 0,
+          "name": "",
+          "rows": 3,
+          "columns": 8,
+          "schema": [
+            [
+              "event_time",
+              "DateTime"
+            ],
+            [
+              "event_time_microseconds",
+              "UInt32"
+            ],
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "query_id",
+              "String"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "priority",
+              "Int8"
+            ],
+            [
+              "source",
+              "String"
+            ],
+            [
+              "text",
+              "String"
+            ]
+          ],
+          "block_offset": 2,
+          "block_length": 580,
+          "length": 582
+        },
+        {
+          "code": 14,
+          "offset": 582,
+          "name": "",
+          "rows": 19,
+          "columns": 6,
+          "schema": [
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "current_time",
+              "DateTime"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "type",
+              "Enum8('increment' = 1, 'gauge' = 2)"
+            ],
+            [
+              "name",
+              "String"
+            ],
+            [
+              "value",
+              "Int64"
+            ]
+          ],
+          "block_offset": 584,
+          "block_length": 1190,
+          "length": 1192
+        }
+      ],
+      "completion_packets": [
+        {
+          "code": 10,
+          "offset": 0,
+          "name": "",
+          "rows": 4,
+          "columns": 8,
+          "schema": [
+            [
+              "event_time",
+              "DateTime"
+            ],
+            [
+              "event_time_microseconds",
+              "UInt32"
+            ],
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "query_id",
+              "String"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "priority",
+              "Int8"
+            ],
+            [
+              "source",
+              "String"
+            ],
+            [
+              "text",
+              "String"
+            ]
+          ],
+          "block_offset": 2,
+          "block_length": 3320,
+          "length": 3322
+        },
+        {
+          "code": 2,
+          "offset": 3322,
+          "exception_code": 469,
+          "exception_name": "DB::Exception",
+          "message": "DB::Exception: Constraint `small` for table default.ch_core_tcp_insert_fixture (d93a916f-e877-4632-96a9-2615e07bbb3c) is violated at row 1. Expression: (n < 100). Column values: n = 179",
+          "stack_trace": "0. DB::Exception::Exception(DB::Exception::MessageMasked&&, int, bool) @ 0x0000000014335694\n1. DB::Exception::Exception(String&&, int, String, bool) @ 0x000000000ef10e58\n2. DB::Exception::Exception(PreformattedMessage&&, int) @ 0x000000000ef106cc\n3. DB::Exception::Exception<String, String, unsigned long, String, String&>(int, FormatStringHelperImpl<std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<unsigned long>::type, std::type_identity<String>::type, std::type_identity<String&>::type>, String&&, String&&, unsigned long&&, String&&, String&) @ 0x0000000017cc62a8\n4. DB::CheckConstraintsTransform::onConsume(DB::Chunk) @ 0x000000001aeca4d0\n5. void std::__function::__policy_func<void ()>::__call_func[abi:fqe220101]<DB::ExceptionKeepingTransform::work()::$_1>(std::__function::__policy_storage const*) @ 0x000000001aedf044\n6. DB::runStep(std::function<void ()>, std::shared_ptr<DB::ThreadGroup>&) @ 0x000000001aedee90\n7. DB::ExceptionKeepingTransform::work() @ 0x000000001aede348\n8. DB::ExecutionThreadContext::executeTask() @ 0x000000001abea5ec\n9. DB::PipelineExecutor::executeStepImpl(unsigned long, DB::WorkloadResources&&, std::atomic<bool>*) @ 0x000000001abdc028\n10. void std::__function::__policy_func<void ()>::__call_func[abi:fqe220101]<DB::PipelineExecutor::spawnThreads(std::shared_ptr<DB::IAcquiredSlot>)::$_0>(std::__function::__policy_storage const*) @ 0x000000001abdd3e8\n11. ThreadPoolImpl<ThreadFromGlobalPoolImpl<false, true>>::ThreadFromThreadPool::worker() @ 0x000000001455d0d0\n12. void std::__function::__policy_func<void ()>::__call_func[abi:fqe220101]<startThreadFromGlobalPool(std::shared_ptr<ThreadFromGlobalPoolState>, std::function<void ()>, unsigned long, unsigned long, bool, bool)::$_0>(std::__function::__policy_storage const*) @ 0x000000001456613c\n13. ThreadPoolImpl<std::thread>::ThreadFromThreadPool::worker() @ 0x000000001455aeec\n14. void* std::__thread_proxy[abi:fqe220101]<std::tuple<std::unique_ptr<std::__thread_struct, std::default_delete<std::__thread_struct>>, void (ThreadPoolImpl<std::thread>::ThreadFromThreadPool::*)(), ThreadPoolImpl<std::thread>::ThreadFromThreadPool*>>(void*) @ 0x00000000145635dc\n15. ? @ 0x00000000000803c8\n16. ? @ 0x00000000000e9edc\n",
+          "has_nested": false,
+          "length": 2451
+        }
+      ],
+      "exchange_order": [
+        "request",
+        "schema",
+        "upload",
+        "midupload",
+        "finish",
+        "completion"
+      ],
+      "upload_blocks": [
+        {
+          "offset": 0,
+          "length": 49,
+          "rows": [
+            [
+              179,
+              "rejected"
+            ]
+          ]
+        }
+      ],
+      "verified_http_rows": "",
+      "http_verification": {
+        "status": "verified",
+        "rows": ""
+      },
+      "exception_phase": "after_upload_terminator",
+      "completion_probe": {
+        "result": "telemetry_then_timeout",
+        "timeout_seconds": 0.25,
+        "packet_codes": [
+          10,
+          14
+        ]
+      }
+    },
+    "midupload": {
+      "sql": "INSERT INTO ch_core_tcp_insert_fixture (n, s) SETTINGS interactive_delay=1000 VALUES",
+      "query_id": "ch-core-insert-fixture-midupload",
+      "schema_packets": [
+        {
+          "code": 10,
+          "offset": 0,
+          "name": "",
+          "rows": 1,
+          "columns": 8,
+          "schema": [
+            [
+              "event_time",
+              "DateTime"
+            ],
+            [
+              "event_time_microseconds",
+              "UInt32"
+            ],
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "query_id",
+              "String"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "priority",
+              "Int8"
+            ],
+            [
+              "source",
+              "String"
+            ],
+            [
+              "text",
+              "String"
+            ]
+          ],
+          "block_offset": 2,
+          "block_length": 366,
+          "length": 368
+        },
+        {
+          "code": 11,
+          "offset": 368,
+          "external_table": "",
+          "external_table_hex": "",
+          "columns_description": "columns format version: 1\n2 columns:\n`n` UInt64\n`s` String\n",
+          "columns_description_hex": "636f6c756d6e7320666f726d61742076657273696f6e3a20310a3220636f6c756d6e733a0a606e602055496e7436340a60736020537472696e670a",
+          "length": 62
+        },
+        {
+          "code": 1,
+          "offset": 430,
+          "name": "",
+          "rows": 0,
+          "columns": 2,
+          "schema": [
+            [
+              "n",
+              "UInt64"
+            ],
+            [
+              "s",
+              "String"
+            ]
+          ],
+          "block_offset": 432,
+          "block_length": 30,
+          "length": 32
+        }
+      ],
+      "midupload_packets": [
+        {
+          "code": 10,
+          "offset": 0,
+          "name": "",
+          "rows": 3,
+          "columns": 8,
+          "schema": [
+            [
+              "event_time",
+              "DateTime"
+            ],
+            [
+              "event_time_microseconds",
+              "UInt32"
+            ],
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "query_id",
+              "String"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "priority",
+              "Int8"
+            ],
+            [
+              "source",
+              "String"
+            ],
+            [
+              "text",
+              "String"
+            ]
+          ],
+          "block_offset": 2,
+          "block_length": 547,
+          "length": 549
+        },
+        {
+          "code": 14,
+          "offset": 549,
+          "name": "",
+          "rows": 19,
+          "columns": 6,
+          "schema": [
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "current_time",
+              "DateTime"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "type",
+              "Enum8('increment' = 1, 'gauge' = 2)"
+            ],
+            [
+              "name",
+              "String"
+            ],
+            [
+              "value",
+              "Int64"
+            ]
+          ],
+          "block_offset": 551,
+          "block_length": 1190,
+          "length": 1192
+        }
+      ],
+      "completion_packets": [
+        {
+          "code": 14,
+          "offset": 0,
+          "name": "",
+          "rows": 10,
+          "columns": 6,
+          "schema": [
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "current_time",
+              "DateTime"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "type",
+              "Enum8('increment' = 1, 'gauge' = 2)"
+            ],
+            [
+              "name",
+              "String"
+            ],
+            [
+              "value",
+              "Int64"
+            ]
+          ],
+          "block_offset": 2,
+          "block_length": 711,
+          "length": 713
+        },
+        {
+          "code": 14,
+          "offset": 713,
+          "name": "",
+          "rows": 12,
+          "columns": 6,
+          "schema": [
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "current_time",
+              "DateTime"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "type",
+              "Enum8('increment' = 1, 'gauge' = 2)"
+            ],
+            [
+              "name",
+              "String"
+            ],
+            [
+              "value",
+              "Int64"
+            ]
+          ],
+          "block_offset": 715,
+          "block_length": 785,
+          "length": 787
+        },
+        {
+          "code": 10,
+          "offset": 1500,
+          "name": "",
+          "rows": 3,
+          "columns": 8,
+          "schema": [
+            [
+              "event_time",
+              "DateTime"
+            ],
+            [
+              "event_time_microseconds",
+              "UInt32"
+            ],
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "query_id",
+              "String"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "priority",
+              "Int8"
+            ],
+            [
+              "source",
+              "String"
+            ],
+            [
+              "text",
+              "String"
+            ]
+          ],
+          "block_offset": 1502,
+          "block_length": 577,
+          "length": 579
+        },
+        {
+          "code": 5,
+          "offset": 2079,
+          "length": 1
+        }
+      ],
+      "exchange_order": [
+        "request",
+        "schema",
+        "upload[0]",
+        "midupload",
+        "upload[1]",
+        "finish",
+        "completion"
+      ],
+      "upload_blocks": [
+        {
+          "offset": 0,
+          "length": 47,
+          "rows": [
+            [
+              13,
+              "user_1"
+            ]
+          ]
+        },
+        {
+          "offset": 47,
+          "length": 47,
+          "rows": [
+            [
+              79,
+              "user_2"
+            ]
+          ]
+        }
+      ],
+      "verified_http_rows": "{\"n\":13,\"s\":\"user_1\"}\n{\"n\":79,\"s\":\"user_2\"}",
+      "http_verification": {
+        "status": "verified",
+        "rows": "{\"n\":13,\"s\":\"user_1\"}\n{\"n\":79,\"s\":\"user_2\"}"
+      },
+      "exception_phase": null,
+      "completion_probe": null
+    },
+    "inline_values": {
+      "sql": "INSERT INTO ch_core_tcp_insert_fixture (n, s) VALUES (13, 'user_1'), (79, 'user_2')",
+      "query_id": "ch-core-insert-fixture-inline_values",
+      "schema_packets": [
+        {
+          "code": 10,
+          "offset": 0,
+          "name": "",
+          "rows": 1,
+          "columns": 8,
+          "schema": [
+            [
+              "event_time",
+              "DateTime"
+            ],
+            [
+              "event_time_microseconds",
+              "UInt32"
+            ],
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "query_id",
+              "String"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "priority",
+              "Int8"
+            ],
+            [
+              "source",
+              "String"
+            ],
+            [
+              "text",
+              "String"
+            ]
+          ],
+          "block_offset": 2,
+          "block_length": 338,
+          "length": 340
+        },
+        {
+          "code": 3,
+          "offset": 340,
+          "progress": [
+            2,
+            30,
+            0,
+            2,
+            30,
+            1921667
+          ],
+          "length": 9
+        },
+        {
+          "code": 14,
+          "offset": 349,
+          "name": "",
+          "rows": 27,
+          "columns": 6,
+          "schema": [
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "current_time",
+              "DateTime"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "type",
+              "Enum8('increment' = 1, 'gauge' = 2)"
+            ],
+            [
+              "name",
+              "String"
+            ],
+            [
+              "value",
+              "Int64"
+            ]
+          ],
+          "block_offset": 351,
+          "block_length": 1618,
+          "length": 1620
+        },
+        {
+          "code": 10,
+          "offset": 1969,
+          "name": "",
+          "rows": 3,
+          "columns": 8,
+          "schema": [
+            [
+              "event_time",
+              "DateTime"
+            ],
+            [
+              "event_time_microseconds",
+              "UInt32"
+            ],
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "query_id",
+              "String"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "priority",
+              "Int8"
+            ],
+            [
+              "source",
+              "String"
+            ],
+            [
+              "text",
+              "String"
+            ]
+          ],
+          "block_offset": 1971,
+          "block_length": 591,
+          "length": 593
+        },
+        {
+          "code": 5,
+          "offset": 2562,
+          "length": 1
+        }
+      ],
+      "midupload_packets": [],
+      "completion_packets": [],
+      "exchange_order": [
+        "request",
+        "schema"
+      ],
+      "upload_blocks": [],
+      "verified_http_rows": "{\"n\":13,\"s\":\"user_1\"}\n{\"n\":79,\"s\":\"user_2\"}",
+      "http_verification": {
+        "status": "verified",
+        "rows": "{\"n\":13,\"s\":\"user_1\"}\n{\"n\":79,\"s\":\"user_2\"}"
+      },
+      "exception_phase": null,
+      "completion_probe": null
+    },
+    "insert_select": {
+      "sql": "INSERT INTO ch_core_tcp_insert_fixture (n, s) SELECT toUInt64(13), 'user_1'",
+      "query_id": "ch-core-insert-fixture-insert_select",
+      "schema_packets": [
+        {
+          "code": 10,
+          "offset": 0,
+          "name": "",
+          "rows": 1,
+          "columns": 8,
+          "schema": [
+            [
+              "event_time",
+              "DateTime"
+            ],
+            [
+              "event_time_microseconds",
+              "UInt32"
+            ],
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "query_id",
+              "String"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "priority",
+              "Int8"
+            ],
+            [
+              "source",
+              "String"
+            ],
+            [
+              "text",
+              "String"
+            ]
+          ],
+          "block_offset": 2,
+          "block_length": 360,
+          "length": 362
+        },
+        {
+          "code": 3,
+          "offset": 362,
+          "progress": [
+            1,
+            1,
+            1,
+            1,
+            22,
+            1787666
+          ],
+          "length": 9
+        },
+        {
+          "code": 14,
+          "offset": 371,
+          "name": "",
+          "rows": 48,
+          "columns": 6,
+          "schema": [
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "current_time",
+              "DateTime"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "type",
+              "Enum8('increment' = 1, 'gauge' = 2)"
+            ],
+            [
+              "name",
+              "String"
+            ],
+            [
+              "value",
+              "Int64"
+            ]
+          ],
+          "block_offset": 373,
+          "block_length": 2808,
+          "length": 2810
+        },
+        {
+          "code": 10,
+          "offset": 3181,
+          "name": "",
+          "rows": 9,
+          "columns": 8,
+          "schema": [
+            [
+              "event_time",
+              "DateTime"
+            ],
+            [
+              "event_time_microseconds",
+              "UInt32"
+            ],
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "query_id",
+              "String"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "priority",
+              "Int8"
+            ],
+            [
+              "source",
+              "String"
+            ],
+            [
+              "text",
+              "String"
+            ]
+          ],
+          "block_offset": 3183,
+          "block_length": 1453,
+          "length": 1455
+        },
+        {
+          "code": 5,
+          "offset": 4636,
+          "length": 1
+        }
+      ],
+      "midupload_packets": [],
+      "completion_packets": [],
+      "exchange_order": [
+        "request",
+        "schema"
+      ],
+      "upload_blocks": [],
+      "verified_http_rows": "{\"n\":13,\"s\":\"user_1\"}",
+      "http_verification": {
+        "status": "verified",
+        "rows": "{\"n\":13,\"s\":\"user_1\"}"
+      },
+      "exception_phase": null,
+      "completion_probe": null
+    },
+    "inline_async": {
+      "sql": "INSERT INTO ch_core_tcp_insert_fixture (n, s) SETTINGS async_insert=1, wait_for_async_insert=1 VALUES (79, 'user_2')",
+      "query_id": "ch-core-insert-fixture-inline_async",
+      "schema_packets": [
+        {
+          "code": 10,
+          "offset": 0,
+          "name": "",
+          "rows": 1,
+          "columns": 8,
+          "schema": [
+            [
+              "event_time",
+              "DateTime"
+            ],
+            [
+              "event_time_microseconds",
+              "UInt32"
+            ],
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "query_id",
+              "String"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "priority",
+              "Int8"
+            ],
+            [
+              "source",
+              "String"
+            ],
+            [
+              "text",
+              "String"
+            ]
+          ],
+          "block_offset": 2,
+          "block_length": 387,
+          "length": 389
+        },
+        {
+          "code": 3,
+          "offset": 389,
+          "progress": [
+            1,
+            14,
+            0,
+            1,
+            14,
+            727541
+          ],
+          "length": 9
+        },
+        {
+          "code": 14,
+          "offset": 398,
+          "name": "",
+          "rows": 26,
+          "columns": 6,
+          "schema": [
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "current_time",
+              "DateTime"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "type",
+              "Enum8('increment' = 1, 'gauge' = 2)"
+            ],
+            [
+              "name",
+              "String"
+            ],
+            [
+              "value",
+              "Int64"
+            ]
+          ],
+          "block_offset": 400,
+          "block_length": 1569,
+          "length": 1571
+        },
+        {
+          "code": 10,
+          "offset": 1969,
+          "name": "",
+          "rows": 3,
+          "columns": 8,
+          "schema": [
+            [
+              "event_time",
+              "DateTime"
+            ],
+            [
+              "event_time_microseconds",
+              "UInt32"
+            ],
+            [
+              "host_name",
+              "String"
+            ],
+            [
+              "query_id",
+              "String"
+            ],
+            [
+              "thread_id",
+              "UInt64"
+            ],
+            [
+              "priority",
+              "Int8"
+            ],
+            [
+              "source",
+              "String"
+            ],
+            [
+              "text",
+              "String"
+            ]
+          ],
+          "block_offset": 1971,
+          "block_length": 588,
+          "length": 590
+        },
+        {
+          "code": 5,
+          "offset": 2559,
+          "length": 1
+        }
+      ],
+      "midupload_packets": [],
+      "completion_packets": [],
+      "exchange_order": [
+        "request",
+        "schema"
+      ],
+      "upload_blocks": [],
+      "verified_http_rows": "{\"n\":79,\"s\":\"user_2\"}",
+      "http_verification": {
+        "status": "verified",
+        "rows": "{\"n\":79,\"s\":\"user_2\"}"
+      },
+      "exception_phase": null,
+      "completion_probe": null
+    }
+  },
+  "files": {
+    "tcp_insert_multi_request_rev54460.bytes": {
+      "length": 242,
+      "sha256": "cc52c8230982ef1ed09f042e8a771ff0252dc5857de77010f3ca792ff5be16fd"
+    },
+    "tcp_insert_multi_schema_rev54460.bytes": {
+      "length": 425,
+      "sha256": "9200098ddb6bf64bcca0bcb75758b66a195561ec36cea02f06d1ac7d31d4ccac"
+    },
+    "tcp_insert_multi_upload_rev54460.bytes": {
+      "length": 103,
+      "sha256": "502bb5bb38912cd21444d2180a2f1199a0b08877ad0e277325be8d66c3ce2388"
+    },
+    "tcp_insert_multi_finish_rev54460.bytes": {
+      "length": 12,
+      "sha256": "fa4a938017a5aad5705253983a9dd6128b47c78573fa3bb2c7f1668c86ed76fe"
+    },
+    "tcp_insert_multi_midupload_rev54460.bytes": {
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tcp_insert_multi_completion_rev54460.bytes": {
+      "length": 3614,
+      "sha256": "671fe4fe0ec8dcda625c95757b7f80b8867f63b891ea9a7045dd361368ff131e"
+    },
+    "tcp_insert_empty_request_rev54460.bytes": {
+      "length": 242,
+      "sha256": "e10b65a617d758d78654c25d6f23a7f9148138a9581e38ad0e3ae181b96b1383"
+    },
+    "tcp_insert_empty_schema_rev54460.bytes": {
+      "length": 425,
+      "sha256": "705e5256dc9cc6ee3b1540dad7d12acc63ce1aea7d91f7644ede5676c6ccd1cc"
+    },
+    "tcp_insert_empty_upload_rev54460.bytes": {
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tcp_insert_empty_finish_rev54460.bytes": {
+      "length": 12,
+      "sha256": "fa4a938017a5aad5705253983a9dd6128b47c78573fa3bb2c7f1668c86ed76fe"
+    },
+    "tcp_insert_empty_midupload_rev54460.bytes": {
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tcp_insert_empty_completion_rev54460.bytes": {
+      "length": 2207,
+      "sha256": "df427a9b08019f88a391382a4907f298390e7bf4511d71c66f08ba0399e4c848"
+    },
+    "tcp_insert_zero_rows_request_rev54460.bytes": {
+      "length": 250,
+      "sha256": "b242d15b75e8658341ac5cfbf46ec150610742023227c38d2ff8ca00bd1bc6ec"
+    },
+    "tcp_insert_zero_rows_schema_rev54460.bytes": {
+      "length": 429,
+      "sha256": "a5910663fbf9ff4e0d530dec13b73dc8f9cf71fb6029a675c956600bfe4caa3e"
+    },
+    "tcp_insert_zero_rows_upload_rev54460.bytes": {
+      "length": 32,
+      "sha256": "6a9e8f5dd934351139b0ff26cd4e2fb0ac22220900afa4e4d872e114370089fc"
+    },
+    "tcp_insert_zero_rows_finish_rev54460.bytes": {
+      "length": 12,
+      "sha256": "fa4a938017a5aad5705253983a9dd6128b47c78573fa3bb2c7f1668c86ed76fe"
+    },
+    "tcp_insert_zero_rows_midupload_rev54460.bytes": {
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tcp_insert_zero_rows_completion_rev54460.bytes": {
+      "length": 2858,
+      "sha256": "d613f591046167e233dfc4ded97ee4736d03aac401ecf547f6e96fcaf7e5b82f"
+    },
+    "tcp_insert_before_schema_request_rev54460.bytes": {
+      "length": 266,
+      "sha256": "6e635110d44b0f18fc451e32d6bcabb215be96c53d98a52ef3b974c808e5172f"
+    },
+    "tcp_insert_before_schema_schema_rev54460.bytes": {
+      "length": 5815,
+      "sha256": "2ccdd16137f150b794318a1ec5e61202690d71ef43aec6f4902ddc264cc4420e"
+    },
+    "tcp_insert_before_schema_upload_rev54460.bytes": {
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tcp_insert_before_schema_finish_rev54460.bytes": {
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tcp_insert_before_schema_midupload_rev54460.bytes": {
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tcp_insert_before_schema_completion_rev54460.bytes": {
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tcp_insert_completion_exception_request_rev54460.bytes": {
+      "length": 272,
+      "sha256": "67dea7bc30a48b931aeafc8d2f69d857276352ee1d3c1efce43696caf8db9f10"
+    },
+    "tcp_insert_completion_exception_schema_rev54460.bytes": {
+      "length": 440,
+      "sha256": "b065daa0b4946b534f38643c5ccaf3360f337086a5e304d7c805c5f8144715b2"
+    },
+    "tcp_insert_completion_exception_upload_rev54460.bytes": {
+      "length": 49,
+      "sha256": "6d37ba719fa90a2ccc81743e5c26c48eec235c6f63dcca4abc470928db2314bf"
+    },
+    "tcp_insert_completion_exception_finish_rev54460.bytes": {
+      "length": 12,
+      "sha256": "fa4a938017a5aad5705253983a9dd6128b47c78573fa3bb2c7f1668c86ed76fe"
+    },
+    "tcp_insert_completion_exception_midupload_rev54460.bytes": {
+      "length": 1774,
+      "sha256": "f1d51c8cc0db0b802db47c3d335c041c5e7f20445fe5b6e1b4cbba2f94db8263"
+    },
+    "tcp_insert_completion_exception_completion_rev54460.bytes": {
+      "length": 5773,
+      "sha256": "8059f50535b58e402fdc8e000b2893f9084df40e717fcd377947fc542a586aee"
+    },
+    "tcp_insert_midupload_request_rev54460.bytes": {
+      "length": 282,
+      "sha256": "5812fcd8028d6b9bc249285b19104767bcf474350c4b9c0b6d91fa8f531d768e"
+    },
+    "tcp_insert_midupload_schema_rev54460.bytes": {
+      "length": 462,
+      "sha256": "d1434930521f73fc7ea79ae219e0c2b53864b0859e1d8cb901898e0a71627fc6"
+    },
+    "tcp_insert_midupload_upload_rev54460.bytes": {
+      "length": 94,
+      "sha256": "e64bc1545c0a3c9dace33e7cb09a4de8436534dbc270d4eec5d6f57614411531"
+    },
+    "tcp_insert_midupload_finish_rev54460.bytes": {
+      "length": 12,
+      "sha256": "fa4a938017a5aad5705253983a9dd6128b47c78573fa3bb2c7f1668c86ed76fe"
+    },
+    "tcp_insert_midupload_midupload_rev54460.bytes": {
+      "length": 1741,
+      "sha256": "ad10b77e779aca44bcacd65be20cce744224785531c19a9602c2ef7c0a86dcde"
+    },
+    "tcp_insert_midupload_completion_rev54460.bytes": {
+      "length": 2080,
+      "sha256": "d230084c07e9355ff90d491071c736a5315d4797554a9d087a510e20f1777a1f"
+    },
+    "tcp_insert_inline_values_request_rev54460.bytes": {
+      "length": 289,
+      "sha256": "c2e348da7108f578b046fed1330171c84546629661b1b118b818567bf8753337"
+    },
+    "tcp_insert_inline_values_schema_rev54460.bytes": {
+      "length": 2563,
+      "sha256": "5cd325e8aede564b3b3da1f44608e4623aa4ee7bb5e8bc920140d615ba117b60"
+    },
+    "tcp_insert_inline_values_upload_rev54460.bytes": {
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tcp_insert_inline_values_finish_rev54460.bytes": {
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tcp_insert_inline_values_midupload_rev54460.bytes": {
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tcp_insert_inline_values_completion_rev54460.bytes": {
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tcp_insert_insert_select_request_rev54460.bytes": {
+      "length": 281,
+      "sha256": "c77e638f0e26fa3b3bc9ef8e4f73f2f661d04443645737bcc6a695297880f2a2"
+    },
+    "tcp_insert_insert_select_schema_rev54460.bytes": {
+      "length": 4637,
+      "sha256": "a4fa6bf6cff2baf9e51539fbe99342641974e5193af867f60e16f7886a095df4"
+    },
+    "tcp_insert_insert_select_upload_rev54460.bytes": {
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tcp_insert_insert_select_finish_rev54460.bytes": {
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tcp_insert_insert_select_midupload_rev54460.bytes": {
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tcp_insert_insert_select_completion_rev54460.bytes": {
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tcp_insert_inline_async_request_rev54460.bytes": {
+      "length": 320,
+      "sha256": "2a6e202985a2eddfa66712a0925bec30e0b86d50f3e9e38ee5082ef061387a9e"
+    },
+    "tcp_insert_inline_async_schema_rev54460.bytes": {
+      "length": 2560,
+      "sha256": "ae027d5f3381a477925afc84271f4430c2b0d90be6d2a6d886a6befe434a274e"
+    },
+    "tcp_insert_inline_async_upload_rev54460.bytes": {
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tcp_insert_inline_async_finish_rev54460.bytes": {
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tcp_insert_inline_async_midupload_rev54460.bytes": {
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tcp_insert_inline_async_completion_rev54460.bytes": {
+      "length": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  }
+}
