@@ -1119,7 +1119,7 @@ fn query_debug_redacts_parameter_values() {
 
 #[test]
 fn terminal_query_exceptions_fail_the_connection() {
-    for code in [99, 101, 720, 749] {
+    for code in [99, 101, 702, 720, 749] {
         let mut engine = ready_engine();
         engine.query(Query::new("SELECT 13")).unwrap();
         engine
@@ -1129,76 +1129,162 @@ fn terminal_query_exceptions_fail_the_connection() {
     }
 }
 
-/// Code 115 is terminal only when it names a setting this query sent with
-/// `with_setting` (rejected by `BaseSettings::read` before the query context
-/// exists). The same code naming a SQL `SETTINGS` clause name is reusable,
-/// even when other settings were sent.
+/// Invalid known values and unknown names can both fail while Settings are
+/// read before the query context exists. The Exception is the first query
+/// response, and the server closes the connection after sending it.
 #[test]
-fn unknown_setting_is_terminal_only_for_a_sent_setting() {
-    let cases: [(&[u8], State); 4] = [
-        (b"Unknown setting 'unknown_setting_13'", EXCEPTION_FAILED),
-        (
-            b"Unknown setting 'unknown_setting_13'. Maybe you meant ['x']",
-            EXCEPTION_FAILED,
-        ),
-        (b"Unknown setting 'from_sql_clause'", State::Ready),
-        (
-            b"Setting from_sql_clause is neither a builtin setting nor started with the prefix",
-            State::Ready,
-        ),
-    ];
-    for (message, state) in cases {
+fn first_exception_after_wire_settings_is_terminal_at_every_split() {
+    for (code, message) in [
+        (27, b"Cannot parse max_threads".as_slice()),
+        (115, b"Unknown setting 'unknown_setting_13'".as_slice()),
+        (212, b"Setting value is too large".as_slice()),
+        (467, b"Setting value is invalid".as_slice()),
+    ] {
+        let response = exception(code, b"DB::Exception", message, b"", 0);
+        for split in 0..=response.len() {
+            let mut engine = ready_engine();
+            engine
+                .query(Query::new("SELECT 13").with_setting("max_threads", "invalid"))
+                .unwrap();
+            engine.feed(&[]).unwrap();
+            engine.feed(&response[..split]).unwrap();
+            engine.feed(&[]).unwrap();
+            engine.feed(&response[split..]).unwrap();
+            engine.feed(&[]).unwrap();
+            assert_eq!(
+                engine.state(),
+                EXCEPTION_FAILED,
+                "code {code} split {split}"
+            );
+            assert!(matches!(
+                events(&mut engine).as_slice(),
+                [Event::Exception(error)] if error.code == code
+            ));
+            assert_eq!(engine.finish(), Ok(()));
+        }
+    }
+}
+
+/// A first-packet SQL syntax error has a query context and is reusable when
+/// the query sent no wire settings. Empty feeds and transport splits do not
+/// affect that classification.
+#[test]
+fn first_syntax_exception_without_wire_settings_is_reusable_at_every_split() {
+    let response = exception(62, b"DB::Exception", b"Syntax error", b"", 0);
+    for split in 0..=response.len() {
+        let mut engine = ready_engine();
+        engine.query(Query::new("SELEC 13")).unwrap();
+        engine.feed(&[]).unwrap();
+        engine.feed(&response[..split]).unwrap();
+        engine.feed(&[]).unwrap();
+        engine.feed(&response[split..]).unwrap();
+        engine.feed(&[]).unwrap();
+        assert_eq!(engine.state(), State::Ready, "split {split}");
+        assert!(matches!(
+            events(&mut engine).as_slice(),
+            [Event::Exception(error)] if error.code == 62
+        ));
+    }
+}
+
+/// Once any query packet has arrived, an ordinary Exception remains reusable
+/// even if the query sent settings. Code 702 remains terminal at any position.
+#[test]
+fn prior_query_packet_distinguishes_reusable_and_always_terminal_exceptions() {
+    for (code, state) in [(62, State::Ready), (702, EXCEPTION_FAILED)] {
+        let mut response = progress_packet().to_vec();
+        response.extend(exception(code, b"DB::Exception", b"failed", b"", 0));
+        for split in 0..=response.len() {
+            let mut engine = ready_engine();
+            engine
+                .query(Query::new("SELECT 13").with_setting("max_threads", "1"))
+                .unwrap();
+            engine.feed(&response[..split]).unwrap();
+            engine.feed(&[]).unwrap();
+            engine.feed(&response[split..]).unwrap();
+            assert_eq!(engine.state(), state, "code {code} split {split}");
+            assert!(matches!(
+                events(&mut engine).as_slice(),
+                [Event::Progress(_), Event::Exception(error)] if error.code == code
+            ));
+        }
+    }
+}
+
+/// Query-local settings and first-packet state are reset between exchanges.
+/// The first query has an earlier response packet and is reusable; the second
+/// uses a different setting and fails closed on its first response packet.
+#[test]
+fn consecutive_queries_reset_settings_and_first_packet_state() {
+    let mut first_response = progress_packet().to_vec();
+    first_response.extend(exception(
+        62,
+        b"DB::Exception",
+        b"first syntax error",
+        b"",
+        0,
+    ));
+    let second_response = exception(62, b"DB::Exception", b"second syntax error", b"", 0);
+
+    for first_split in 0..=first_response.len() {
+        for second_split in 0..=second_response.len() {
+            let mut engine = ready_engine();
+            engine
+                .query(Query::new("SELEC 13").with_setting("max_threads", "1"))
+                .unwrap();
+            engine.feed(&first_response[..first_split]).unwrap();
+            engine.feed(&first_response[first_split..]).unwrap();
+            assert_eq!(engine.state(), State::Ready);
+            assert!(matches!(
+                events(&mut engine).as_slice(),
+                [Event::Progress(_), Event::Exception(error)] if error.code == 62
+            ));
+
+            engine
+                .query(Query::new("SELEC 79").with_setting("max_block_size", "13"))
+                .unwrap();
+            engine.feed(&second_response[..second_split]).unwrap();
+            engine.feed(&second_response[second_split..]).unwrap();
+            assert_eq!(
+                engine.state(),
+                EXCEPTION_FAILED,
+                "first split {first_split}, second split {second_split}"
+            );
+            assert!(matches!(
+                events(&mut engine).as_slice(),
+                [Event::Exception(error)] if error.code == 62
+            ));
+        }
+    }
+}
+
+/// A completed query that sent settings must not make the next query look as
+/// though it also sent settings. A first-packet syntax error without settings
+/// remains reusable on the second exchange.
+#[test]
+fn consecutive_queries_reset_sent_settings_state() {
+    let response = exception(62, b"DB::Exception", b"syntax error", b"", 0);
+    for split in 0..=response.len() {
         let mut engine = ready_engine();
         engine
-            .query(
-                Query::new("SELECT 13 SETTINGS from_sql_clause = 1")
-                    .with_setting("max_threads", "1")
-                    .with_setting("unknown_setting_13", "1"),
-            )
+            .query(Query::new("SELECT 13").with_setting("max_threads", "1"))
             .unwrap();
-        engine
-            .feed(&exception(115, b"DB::Exception", message, b"", 0))
-            .unwrap();
-        assert_eq!(
-            engine.state(),
-            state,
-            "{}",
-            String::from_utf8_lossy(message)
-        );
+        engine.feed(&[SERVER_PACKET_END_OF_STREAM as u8]).unwrap();
+        assert_eq!(engine.state(), State::Ready);
+        assert!(matches!(
+            events(&mut engine).as_slice(),
+            [Event::EndOfStream]
+        ));
+
+        engine.query(Query::new("SELEC 79")).unwrap();
+        engine.feed(&response[..split]).unwrap();
+        engine.feed(&response[split..]).unwrap();
+        assert_eq!(engine.state(), State::Ready, "split {split}");
+        assert!(matches!(
+            events(&mut engine).as_slice(),
+            [Event::Exception(error)] if error.code == 62
+        ));
     }
-
-    // Without wire settings, no 115 can be terminal.
-    let mut engine = ready_engine();
-    engine.query(Query::new("SELECT 13")).unwrap();
-    engine
-        .feed(&exception(
-            115,
-            b"DB::Exception",
-            b"Unknown setting 'unknown_setting_13'",
-            b"",
-            0,
-        ))
-        .unwrap();
-    assert_eq!(engine.state(), State::Ready);
-
-    // The names belong to one query: the next query's 115 is judged alone.
-    let _ = events(&mut engine);
-    engine.query(Query::new("SELECT 79")).unwrap();
-    engine.feed(&[SERVER_PACKET_END_OF_STREAM as u8]).unwrap();
-    let _ = events(&mut engine);
-    engine
-        .query(Query::new("SELECT 13").with_setting("max_threads", "1"))
-        .unwrap();
-    engine
-        .feed(&exception(
-            115,
-            b"DB::Exception",
-            b"Unknown setting 'unknown_setting_13'",
-            b"",
-            0,
-        ))
-        .unwrap();
-    assert_eq!(engine.state(), State::Ready);
 }
 
 /// Settings and parameters have no 64 KiB per-field limit: the server reads
@@ -1241,8 +1327,8 @@ fn large_setting_and_parameter_values_are_accepted() {
     assert_eq!(engine.state(), State::Ready);
 }
 
-/// Round 4: setting names stay capped so `Unknown setting '<name>'` always
-/// fits in the 1 MiB of Exception message the engine keeps. Values are not.
+/// Setting names stay capped at 64 KiB. Values are bounded only by the whole
+/// Query packet limit.
 #[test]
 fn setting_names_over_the_cap_are_rejected() {
     let at_cap = "n".repeat(SETTING_NAME_LIMIT);
@@ -1264,7 +1350,7 @@ fn setting_names_over_the_cap_are_rejected() {
     assert!(engine.take_output().is_empty());
     assert_eq!(engine.state(), State::Ready);
 
-    // A name at the cap still yields a terminal 115 the engine recognizes.
+    // A first-packet Exception after a setting at the cap is still terminal.
     let mut engine = ready_engine();
     engine
         .query(Query::new("SELECT 13").with_setting(at_cap.as_str(), "1"))

@@ -13,6 +13,8 @@ const ESCAPED_PARAMETER_TEXT: &str =
 /// The String value the server returns for `ESCAPED_PARAMETER_TEXT`.
 const ESCAPED_PARAMETER: &str =
     "quote' slash\\ nul\0 newline\n carriage\r tab\t backspace\u{8} formfeed\u{c}";
+const QUOTA_KEY: &str = "fixture_quota_13";
+const INITIAL_QUERY_START_TIME_MICROSECONDS: u64 = 1_791_500_000_000_013;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BlockKind {
@@ -95,8 +97,8 @@ const CAPTURES: &[Capture] = &[
     ),
     capture!(
         "exception",
-        "SELECT intDiv(toUInt64(79), number != 4) AS n FROM numbers(8) \
-         SETTINGS max_block_size=2, max_threads=1"
+        "SELECT intDiv(toUInt64(79), number != 1000) AS n FROM numbers(2000) \
+         SETTINGS max_block_size=128, max_threads=1"
     ),
     capture!(
         "totals",
@@ -128,7 +130,9 @@ fn oracle(label: &str) -> &'static CaptureOracle {
 }
 
 fn ready() -> Connection {
-    let hello = ClientHello::new("ch-core-query-fixture", "default").with_client_version(26, 8);
+    let hello = ClientHello::new("ch-core-query-fixture", "default")
+        .with_client_version(13, 79)
+        .with_quota_key(QUOTA_KEY);
     let mut connection = Connection::new(hello).unwrap();
     connection.take_output();
     connection.feed(HELLO).unwrap();
@@ -136,7 +140,13 @@ fn ready() -> Connection {
         connection.poll_event(),
         Some(Event::ServerHello(_))
     ));
-    assert_eq!(connection.take_output(), [0]);
+    assert_eq!(
+        connection.take_output(),
+        [QUOTA_KEY.len() as u8]
+            .into_iter()
+            .chain(QUOTA_KEY.bytes())
+            .collect::<Vec<_>>()
+    );
     connection
 }
 
@@ -144,9 +154,13 @@ fn ready() -> Connection {
 fn base_query(capture: &Capture) -> Query {
     Query::new(capture.sql)
         .with_query_id(format!("ch-core-fixture-{}", capture.label))
-        .with_initial_address("127.0.0.1:0")
+        .with_initial_address("192.0.2.13:79")
+        .with_initial_query_start_time_microseconds(INITIAL_QUERY_START_TIME_MICROSECONDS)
+        .with_os_user("fixture_os_user_13")
+        .with_hostname("fixture_host_79")
         .with_setting("send_profile_events", "1")
         .with_setting("send_logs_level", "debug")
+        .with_setting("log_queries", "1")
 }
 
 fn start(connection: &mut Connection, capture: &Capture) {
@@ -354,7 +368,7 @@ fn real_select_streams_replay_at_every_split_bytewise_and_randomly() {
                 assert_eq!(rows, 1)
             }
             "multi" => assert_eq!(rows, 5),
-            "exception" => assert!(rows > 0 && rows < 8),
+            "exception" => assert!(rows > 0 && rows < 2000),
             "totals" => assert_eq!(rows, 2),
             _ => unreachable!(),
         }
@@ -381,6 +395,7 @@ fn real_select_streams_replay_at_every_split_bytewise_and_randomly() {
             let Column::Utf8(values) = items.values.as_ref() else {
                 panic!("Array(String) elements did not decode as String");
             };
+            assert_eq!(values.offsets, [0, 6, 10]);
             assert_eq!(values.data, b"user_1it's");
             // `\N` for Nullable(String) is NULL, not the string "\N".
             assert_eq!(block.columns[1].null_count(), 1);
@@ -467,7 +482,7 @@ mod readme {
 
     use crate::{
         base_query, capture, oracle, ready, start, BlockKind, Capture, ExpectedEvent, CAPTURES,
-        HELLO,
+        HELLO, QUOTA_KEY,
     };
 
     include!("support/readme_connect.rs");
@@ -478,7 +493,9 @@ mod readme {
     const PONG: &[u8] = &[4];
 
     fn hello() -> ClientHello {
-        ClientHello::new("ch-core-query-fixture", "default").with_client_version(26, 8)
+        ClientHello::new("ch-core-query-fixture", "default")
+            .with_client_version(13, 79)
+            .with_quota_key(QUOTA_KEY)
     }
 
     /// How the fake server sizes each read.
@@ -593,7 +610,9 @@ mod readme {
     fn script(exchanges: &[(&[u8], &'static [u8])]) -> (Vec<(usize, &'static [u8])>, Vec<u8>) {
         let mut client = client_hello_bytes();
         let mut segments = vec![(client.len(), HELLO)];
-        client.extend_from_slice(&[0, 4]); // empty quota-key addendum, Ping
+        client.push(QUOTA_KEY.len() as u8);
+        client.extend_from_slice(QUOTA_KEY.as_bytes());
+        client.push(4); // Ping
         segments.push((client.len(), PONG));
         for (request, response) in exchanges {
             client.extend_from_slice(request);
@@ -760,9 +779,9 @@ mod readme {
         }
     }
 
-    /// Every TCP result starts with a zero-row Data block that carries the
-    /// schema, unlike HTTP. The per-payload decoder yields it as a zero-row
-    /// batch, and row totals match the whole-stream decode.
+    /// Every captured result has a non-empty header and starts with a zero-row
+    /// schema Data block, unlike HTTP. The per-payload decoder yields it as a
+    /// zero-row batch, and row totals match the whole-stream decode.
     #[test]
     fn readme_decode_payload_decodes_each_data_event() {
         for capture in CAPTURES {

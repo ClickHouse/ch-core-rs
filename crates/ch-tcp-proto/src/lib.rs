@@ -50,11 +50,9 @@ pub const DEFAULT_MAX_BLOCK_BYTES: usize = 1024 * 1024 * 1024;
 pub const MIN_MAX_BLOCK_BYTES: usize = 1024;
 const QUERY_OUTPUT_LIMIT: usize = 64 * 1024 * 1024;
 /// Longest setting name `Query::with_setting` accepts. Engine policy, not a
-/// server limit: the server reads names up to 1 GiB. A code 115 Exception is
-/// classified terminal by finding `Unknown setting '<name>'` in its message,
-/// and only the first 1 MiB of the message is kept, so a longer name could
-/// push the match past the cut and leave the engine `Ready` on a closing
-/// socket. Real setting names are far below this.
+/// server limit: the server reads names up to 1 GiB. This independently bounds
+/// user-controlled identifiers without imposing the same per-field cap on
+/// setting values. Real setting names are far below this.
 const SETTING_NAME_LIMIT: usize = 64 * 1024;
 
 const CLIENT_PACKET_HELLO: u64 = 0;
@@ -200,9 +198,11 @@ impl Query {
         self
     }
 
-    /// Sets the initial client address reported in `ClientInfo`. The default
-    /// is `0.0.0.0:0`; the server logs it as `initial_address` in
-    /// `system.query_log`.
+    /// Sets the initial client address serialized in `ClientInfo`.
+    ///
+    /// The default is `0.0.0.0:0`. For this engine's initial queries, the
+    /// server overwrites the field with the connection's peer address before
+    /// logging it as `initial_address` in `system.query_log`.
     pub fn with_initial_address(mut self, address: impl Into<String>) -> Self {
         self.initial_address = address.into();
         self
@@ -228,10 +228,11 @@ impl Query {
 
     /// Adds a query setting using its ClickHouse string representation.
     ///
-    /// Every explicit setting is sent with the `IMPORTANT` flag. An unknown
-    /// name therefore produces a terminal code 115 Exception, which closes
-    /// the connection, rather than being silently ignored. A binding that
-    /// forwards a user's settings map should forward only names it knows.
+    /// Every explicit setting is sent with the `IMPORTANT` flag. An invalid
+    /// setting name or value can therefore produce a first-packet Exception
+    /// before the server creates a query context, after which it closes the
+    /// connection. A binding that forwards a user's settings map should
+    /// validate names and values where practical.
     pub fn with_setting(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.settings.push((name.into(), value.into()));
         self
@@ -412,35 +413,39 @@ pub enum Event {
     Extremes(Vec<u8>),
     /// Successful end of the query response.
     EndOfStream,
-    /// A server Exception. Terminal in the handshake and pre-query phase,
-    /// where the connection becomes [`State::Failed`] with
-    /// [`FailureKind::ServerException`]. During an ordinary query error it
-    /// returns to [`State::Ready`] after this event is queued. Either way it
-    /// is the last event of its exchange: no EndOfStream, Log, or
-    /// ProfileEvents follows it.
+    /// A server Exception. Terminal in the handshake and pre-query phase and
+    /// for the connection-level query cases below, where the connection
+    /// becomes [`State::Failed`] with [`FailureKind::ServerException`]. Other
+    /// query errors return to [`State::Ready`] after this event is queued.
+    /// Either way it is the last event of its exchange: no EndOfStream, Log,
+    /// or ProfileEvents follows it.
     ///
     /// Server behavior at v26.8.1.2041-lts, `TCPHandler::runImpl`:
     ///
     /// - The handshake catch sends at most one Exception and then the
     ///   connection closes (`TCPHandler::run`).
-    /// - Any query-time exception raised before the query context exists is
-    ///   sent and then the connection closes (TCPHandler.cpp:1081-1094). The
-    ///   only such case this engine can identify from the packet is code 115
-    ///   (UNKNOWN_SETTING) for a setting it sent: `BaseSettings::read` throws
-    ///   `Unknown setting '<name>'` (`BaseSettingsHelpers::throwSettingNotFound`)
-    ///   while reading the Query packet. It is terminal exactly when the
-    ///   message names a setting passed to [`Query::with_setting`]. Code 115
-    ///   for a name in the SQL `SETTINGS` clause is raised later by
-    ///   `AccessControl::checkSettingNameIsAllowed`, after the context
-    ///   exists, and the connection stays reusable. A setting sent on the
-    ///   wire that parsed cleanly cannot be that name.
-    /// - Codes 101, 720, and 749 (UNEXPECTED_PACKET_FROM_CLIENT, USER_EXPIRED,
-    ///   TCP_CONNECTION_LIMIT_REACHED) are sent and then the connection
-    ///   closes.
+    /// - `ClientInfo` and wire settings are read before the query context is
+    ///   created. If a query that sent settings receives an Exception as its
+    ///   first server packet, the engine fails closed because invalid known
+    ///   values and unknown names both close the server connection at that
+    ///   point. An Exception after any earlier query packet is reusable unless
+    ///   its code is independently terminal. Without wire settings, ordinary
+    ///   first-packet SQL errors such as code 62 remain reusable.
+    /// - This fail-closed rule deliberately classifies a first-packet syntax
+    ///   error as terminal when the query also sent wire settings, even though
+    ///   the server can keep that socket open. The engine cannot distinguish
+    ///   that case from a settings parse failure. A driver must close its
+    ///   transport when it observes [`State::Failed`]; it must not wait for the
+    ///   server to close first. Safely constructed SQL `SETTINGS` clauses do
+    ///   not set the wire-settings flag and avoid this conservative result.
+    /// - Codes 101, 702, 720, and 749 (UNEXPECTED_PACKET_FROM_CLIENT,
+    ///   CLIENT_INFO_DOES_NOT_MATCH, USER_EXPIRED,
+    ///   TCP_CONNECTION_LIMIT_REACHED) are sent and then the connection closes.
     /// - Code 99 (UNKNOWN_PACKET_FROM_CLIENT) closes without sending at that
     ///   tag; it is listed so a relayed one cannot leave the engine `Ready`.
-    /// - Every other query-time exception is sent and the connection stays
-    ///   reusable.
+    /// - Once the query context exists, other query errors normally leave the
+    ///   connection reusable. The wire does not identify every server throw
+    ///   site, so drivers must still honor transport EOF and I/O failures.
     ///
     /// Boxed to keep [`Event`] small.
     Exception(Box<ServerException>),
@@ -580,8 +585,9 @@ pub enum ProtocolError {
         /// Bytes previously scanned as incomplete.
         buffered: usize,
     },
-    /// Bytes followed a handshake-phase Exception packet, after which the
-    /// server closes the connection. They are counted, not parsed.
+    /// Bytes followed a terminal Exception packet. They are counted, not
+    /// parsed. This applies to handshake, pre-query, and terminal query
+    /// Exceptions.
     TrailingInput {
         /// Bytes received after the terminal Exception.
         length: usize,
@@ -814,9 +820,10 @@ pub struct Connection {
     quota_key: String,
     identity: ClientIdentity,
     effective_revision: Option<u64>,
-    /// Setting names the active query sent with IMPORTANT, to classify a
-    /// code 115 Exception. Empty outside a query.
-    active_setting_names: Vec<String>,
+    /// Whether the active query sent any settings with IMPORTANT.
+    active_query_sent_settings: bool,
+    /// Whether any server packet code has been read for the active query.
+    active_query_has_server_packet: bool,
     /// The error that moved the engine to `Failed(Protocol)`, returned again
     /// by `finish`.
     protocol_error: Option<ProtocolError>,
@@ -918,7 +925,8 @@ impl Connection {
                 version_minor: hello.version_minor,
             },
             effective_revision: None,
-            active_setting_names: Vec::new(),
+            active_query_sent_settings: false,
+            active_query_has_server_packet: false,
             protocol_error: None,
             finish_result: None,
             input_limit: INPUT_LIMIT,
@@ -1007,11 +1015,11 @@ impl Connection {
     /// after it can be parsed. Check the result types a binding allows.
     ///
     /// Setting names are capped at 64 KiB ([`ProtocolError::StringTooLong`])
-    /// so a code 115 message naming one is never truncated. Setting values
-    /// and parameter names and values have no per-field limit beyond the
-    /// server's 1 GiB string limit. The whole packet must fit in 64 MiB
-    /// ([`ProtocolError::QueryOutputTooLarge`], which reports its exact
-    /// length).
+    /// as an engine policy that independently bounds user-controlled
+    /// identifiers. Setting values and parameter names and values have no
+    /// per-field limit beyond the server's 1 GiB string limit. The whole
+    /// packet must fit in 64 MiB ([`ProtocolError::QueryOutputTooLarge`],
+    /// which reports its exact length).
     pub fn query(&mut self, query: Query) -> Result<(), ProtocolError> {
         if self.pending.is_some() || !self.input.is_empty() {
             return Err(ProtocolError::InvalidState {
@@ -1140,7 +1148,8 @@ impl Connection {
         packet.extend_from_slice(&(-1_i32).to_le_bytes());
         packet.extend_from_slice(&[0, 0, 0]);
         debug_assert_eq!(packet.len() - start, packet_size);
-        self.active_setting_names = query.settings.into_iter().map(|(name, _)| name).collect();
+        self.active_query_sent_settings = !query.settings.is_empty();
+        self.active_query_has_server_packet = false;
         self.state = State::Querying;
         Ok(())
     }
@@ -1152,8 +1161,8 @@ impl Connection {
     /// returns the error and moves the engine to
     /// `State::Failed(FailureKind::Protocol)`.
     ///
-    /// Parsing stops at a handshake or pre-query server Exception, which is
-    /// terminal (see [`Event::Exception`]). Later bytes, in this chunk or in later calls,
+    /// Parsing stops at any terminal server Exception (see
+    /// [`Event::Exception`]). Later bytes, in this chunk or in later calls,
     /// are counted without being parsed and `feed` keeps returning `Ok`, so
     /// the outcome never depends on where the stream was split.
     /// [`Self::finish`] reports them as [`ProtocolError::TrailingInput`].
@@ -1195,10 +1204,9 @@ impl Connection {
     ///
     /// EOF closes a `Ready` engine successfully. It is truncation while
     /// waiting for Server Hello or Pong, or whenever a packet is incomplete.
-    /// After a server Exception it succeeds unless bytes followed the
-    /// Exception. That Exception is terminal because the server closes the
-    /// connection after it; query-time exceptions are not terminal (see
-    /// [`Event::Exception`]). After a protocol failure it returns the error
+    /// After a terminal server Exception it succeeds unless bytes followed
+    /// the Exception. Reusable query-time exceptions leave the engine Ready
+    /// instead (see [`Event::Exception`]). After a protocol failure it returns the error
     /// that failed the connection. Events queued before EOF stay queued;
     /// drain them afterwards as usual. The first EOF outcome is stored and
     /// every later call returns it again.
@@ -1406,8 +1414,13 @@ impl Connection {
                         };
                         let query_exception = self.state == State::Querying;
                         let terminal = !query_exception
-                            || is_terminal_query_exception(&exception, &self.active_setting_names);
-                        self.active_setting_names = Vec::new();
+                            || is_terminal_query_exception(
+                                &exception,
+                                self.active_query_sent_settings,
+                                progress.first_query_packet,
+                            );
+                        self.active_query_sent_settings = false;
+                        self.active_query_has_server_packet = false;
                         let next_state = if terminal {
                             State::Failed(FailureKind::ServerException)
                         } else {
@@ -1441,6 +1454,13 @@ impl Connection {
 
         let mut cursor = Cursor::new(bytes);
         let packet = cursor.varuint()?;
+        let first_query_packet = if self.state == State::Querying {
+            let first = !self.active_query_has_server_packet;
+            self.active_query_has_server_packet = true;
+            first
+        } else {
+            false
+        };
         match (self.state, packet) {
             (State::Handshaking, SERVER_PACKET_HELLO) => {
                 let hello = parse_server_hello(&mut cursor)?;
@@ -1464,7 +1484,9 @@ impl Connection {
                 State::Handshaking | State::Ready | State::Querying | State::AwaitingPong,
                 SERVER_PACKET_EXCEPTION,
             ) => {
-                self.pending = Some(PendingPacket::Exception(ExceptionProgress::default()));
+                self.pending = Some(PendingPacket::Exception(ExceptionProgress::new(
+                    first_query_packet,
+                )));
             }
             (State::AwaitingPong, SERVER_PACKET_PONG) => {
                 self.queue_event(Event::Pong, Some(State::Ready));
@@ -1493,7 +1515,8 @@ impl Connection {
                 self.queue_event(Event::ProfileInfo(profile), None);
             }
             (State::Querying, SERVER_PACKET_END_OF_STREAM) => {
-                self.active_setting_names = Vec::new();
+                self.active_query_sent_settings = false;
+                self.active_query_has_server_packet = false;
                 self.queue_event(Event::EndOfStream, Some(State::Ready));
             }
             (state, packet) => {
@@ -1662,6 +1685,7 @@ impl BlockProgress {
                 consumed,
                 num_columns,
                 num_rows,
+                ..
             } = boundary
             {
                 self.native.extend_from_slice(&bytes[..consumed]);
@@ -1693,6 +1717,7 @@ impl BlockProgress {
             consumed,
             num_columns,
             num_rows,
+            ..
         } = boundary
         {
             // A prefix of `previous` bytes already scanned as incomplete, so
@@ -1776,30 +1801,25 @@ fn parse_profile_info(cursor: &mut Cursor<'_>) -> ParseResult<ProfileInfo> {
 
 /// Whether a query-time Exception means the server is closing the
 /// connection. See [`Event::Exception`] for the server rules.
-fn is_terminal_query_exception(exception: &ServerException, sent_settings: &[String]) -> bool {
+fn is_terminal_query_exception(
+    exception: &ServerException,
+    sent_settings: bool,
+    first_query_packet: bool,
+) -> bool {
     // Confirmed at v26.8.1.2041-lts in `TCPHandler::runImpl`: 101, 720, and
     // 749 return from the connection loop after sending the Exception
     // (TCPHandler.cpp:1166). 99 cancels the output and returns before
     // sending anything (TCPHandler.cpp:1069), so it is listed defensively.
-    if matches!(exception.code, 99 | 101 | 720 | 749) {
+    if matches!(exception.code, 99 | 101 | 702 | 720 | 749) {
         return true;
     }
-    // UNKNOWN_SETTING from the Query packet's own settings is thrown by
-    // `BaseSettings::read` before `query_context` exists, which closes the
-    // connection (TCPHandler.cpp:1081-1094). Its text is exactly
-    // "Unknown setting '<name>'" (`BaseSettingsHelpers::throwSettingNotFound`,
-    // BaseSettings.cpp:61). The same code from the SQL `SETTINGS` clause is
-    // raised after the context exists and is reusable; it can only name a
-    // setting that was not sent on the wire, because every wire setting
-    // parsed cleanly before that point. The server formats the name raw,
-    // `"Unknown setting '{}'", String{name}`, with no quoting or escaping, so
-    // matching the raw name is exact. `SETTING_NAME_LIMIT` keeps the whole
-    // text inside the 1 MiB of message the engine retains.
-    exception.code == 115
-        && sent_settings.iter().any(|name| {
-            let quoted = format!("Unknown setting '{name}'");
-            exception.message.contains(&quoted)
-        })
+    // `TCPHandler::processQuery` reads ClientInfo and Settings before it
+    // creates the query context. Any failure there is sent as the query's
+    // first server packet and then the connection closes. The wire does not
+    // identify the exact throw site, so a first-packet Exception after the
+    // client sent settings fails closed. Once any earlier packet arrived, the
+    // context exists and ordinary query errors leave the connection reusable.
+    sent_settings && first_query_packet
 }
 
 // ---------------------------------------------------------------------------
@@ -1817,8 +1837,9 @@ fn is_terminal_query_exception(exception: &ServerException, sent_settings: &[Str
 /// without buffering, so the code survives an oversized message. A declared
 /// length above `EXCEPTION_DECLARED_LIMIT` is a protocol error, so the skip
 /// always ends.
-#[derive(Default)]
 struct ExceptionProgress {
+    /// Whether this Exception packet was the first server packet of its query.
+    first_query_packet: bool,
     next: ExceptionField,
     code: i32,
     name: String,
@@ -1842,6 +1863,20 @@ enum ExceptionField {
 }
 
 impl ExceptionProgress {
+    fn new(first_query_packet: bool) -> Self {
+        Self {
+            first_query_packet,
+            next: ExceptionField::Code,
+            code: 0,
+            name: String::new(),
+            message: String::new(),
+            stack_trace: String::new(),
+            truncated: false,
+            skip: 0,
+            has_nested: None,
+        }
+    }
+
     fn step(&mut self, bytes: &[u8]) -> ParseResult<usize> {
         if self.skip > 0 {
             if bytes.is_empty() {

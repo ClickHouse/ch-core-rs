@@ -34,6 +34,7 @@ pub enum BlockBoundary {
     /// The supplied bytes do not yet contain a complete Native block.
     NeedMore,
     /// One complete block occupies exactly `data[..consumed]`.
+    #[non_exhaustive]
     Complete {
         /// Number of bytes occupied by the block.
         consumed: usize,
@@ -55,15 +56,19 @@ pub enum BlockBoundary {
 /// in pieces walks it in amortized linear time. A complete block or decode
 /// error resets the checkpoint for the next block.
 ///
-/// The scanner creates no decoded column buffers and copies no wire bytes.
+/// The scanner creates no decoded column buffers and copies no payload bytes.
 /// Header and type parsing can allocate metadata values. The supplied
 /// [`DecodeOptions`] apply while validating framing, headers, declared sizes,
 /// and column bodies.
 ///
 /// Scan and decode agree on acceptance or rejection and complete-block
 /// boundaries, not on error wording or when corruption is reported. On a
-/// truncated stream, an invalid Dynamic index or AggregateFunction zero-state
-/// byte can be rejected as invalid data before decode reports truncation.
+/// truncated stream, header corruption, an invalid Dynamic index, or an
+/// AggregateFunction zero-state byte can be rejected as invalid data before
+/// decode reports truncation.
+/// Conversely, malformed UTF-8 in a binary descriptor split across feeds may
+/// be rejected only after the descriptor is complete, so an earlier stream
+/// end reports truncation instead of invalid data.
 #[derive(Debug)]
 pub struct BlockScanner {
     progress: ScanProgress,
@@ -1283,6 +1288,52 @@ mod tests {
         ));
     }
 
+    fn duplicate_block_info(fields: &[u64]) -> Vec<u8> {
+        let mut block = Vec::new();
+        for &field in fields {
+            write_varint(&mut block, field);
+            match field {
+                1 => block.push(0),
+                2 => block.extend_from_slice(&(-1i32).to_le_bytes()),
+                3 => write_varint(&mut block, 0),
+                _ => unreachable!("test helper only writes known BlockInfo fields"),
+            }
+        }
+        write_varint(&mut block, 0);
+        write_varint(&mut block, 0); // num_cols
+        write_varint(&mut block, 0); // num_rows
+        block
+    }
+
+    #[test]
+    fn decode_and_scan_reject_duplicate_known_block_info_fields() {
+        for fields in [&[1, 2, 1][..], &[2, 1, 2][..], &[1, 2, 3, 3][..]] {
+            let data = duplicate_block_info(fields);
+            let duplicate = *fields.last().unwrap();
+            let mut reader = ByteReader::new(&data);
+            assert!(matches!(
+                decode_next_block(&mut reader, &framed_options()),
+                Err(DecodeError::DuplicateBlockInfo { field_num }) if field_num == duplicate
+            ));
+
+            for split in 0..=data.len() {
+                let mut scanner = BlockScanner::new(framed_options());
+                let first = scanner.scan(&data[..split]);
+                if matches!(
+                    first,
+                    Err(DecodeError::DuplicateBlockInfo { field_num }) if field_num == duplicate
+                ) {
+                    continue;
+                }
+                assert_eq!(first.unwrap(), BlockBoundary::NeedMore, "split {split}");
+                assert!(matches!(
+                    scanner.scan(&data),
+                    Err(DecodeError::DuplicateBlockInfo { field_num }) if field_num == duplicate
+                ));
+            }
+        }
+    }
+
     #[test]
     fn block_scanner_retains_partial_revision_zero_column_count() {
         let block = make_int64_block("n", &[13]);
@@ -1320,6 +1371,193 @@ mod tests {
                 num_rows: 2,
             }
         );
+    }
+
+    #[test]
+    fn fixed_width_text_header_is_not_reparsed_for_each_body_feed() {
+        let name = "n".repeat(256 * 1024);
+        let data = make_int64_block(&name, &[79]);
+        let header_end = data.len() - std::mem::size_of::<i64>();
+        let mut scanner = BlockScanner::new(DecodeOptions::default());
+
+        for end in (4096..header_end).step_by(4096) {
+            assert_eq!(scanner.scan(&data[..end]).unwrap(), BlockBoundary::NeedMore);
+        }
+        assert_eq!(
+            scanner.scan(&data[..header_end]).unwrap(),
+            BlockBoundary::NeedMore
+        );
+        for end in header_end + 1..data.len() {
+            assert_eq!(scanner.scan(&data[..end]).unwrap(), BlockBoundary::NeedMore);
+        }
+        assert!(matches!(
+            scanner.scan(&data).unwrap(),
+            BlockBoundary::Complete { consumed, .. } if consumed == data.len()
+        ));
+        assert!(
+            scanner.progress.bytes_walked < 2 * data.len() as u64,
+            "scanner walked {} bytes for {} input bytes",
+            scanner.progress.bytes_walked,
+            data.len()
+        );
+    }
+
+    #[test]
+    fn partial_text_header_borrows_buffered_name_bytes() {
+        let name = "n".repeat(256 * 1024);
+        let data = make_int64_block(&name, &[79]);
+        let name_mid = 2 + 3 + name.len() / 2;
+        let mut scanner = BlockScanner::new(DecodeOptions::default());
+
+        assert_eq!(
+            scanner.scan(&data[..name_mid]).unwrap(),
+            BlockBoundary::NeedMore
+        );
+        assert_eq!(scanner.progress.retained_header_string_bytes(), 0);
+        assert_eq!(
+            scanner.scan(&data).unwrap(),
+            BlockBoundary::Complete {
+                consumed: data.len(),
+                num_columns: 1,
+                num_rows: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn split_header_then_body_preserves_last_complete_column_boundary() {
+        let type_name =
+            "Nullable(SimpleAggregateFunction(any, SimpleAggregateFunction(any, Int8)))";
+        let body = [0, 1, 7, 8];
+        let data = make_block_at(0, 2, &[("c", type_name, body.to_vec())]);
+        let header_end = data.len() - body.len();
+        let mut scanner = BlockScanner::new(DecodeOptions::default());
+
+        assert_eq!(
+            scanner.scan(&data[..header_end - 3]).unwrap(),
+            BlockBoundary::NeedMore
+        );
+        assert_eq!(
+            scanner.scan(&data[..header_end + 1]).unwrap(),
+            BlockBoundary::NeedMore
+        );
+        let scanned = scanner.scan(&data).unwrap_err();
+        let decoded = block_end(&data, &DecodeOptions::default()).unwrap_err();
+        assert!(matches!(scanned, DecodeError::UnsupportedType { .. }));
+        assert_eq!(scanned.to_string(), decoded.to_string());
+    }
+
+    #[test]
+    fn incomplete_binary_enum_descriptor_scans_linearly_across_small_feeds() {
+        let mut data = Vec::new();
+        write_varint(&mut data, 1);
+        write_varint(&mut data, 1);
+        let name = "e".repeat(64 * 1024);
+        write_varint(&mut data, name.len() as u64);
+        data.extend_from_slice(name.as_bytes());
+        data.push(0x17); // DataTypesBinaryEncoding Enum8
+        write_varint(&mut data, 256);
+        for value in i8::MIN..=i8::MAX {
+            let label = format!("enum_{value:+04}_{}", "x".repeat(200));
+            write_varint(&mut data, label.len() as u64);
+            data.extend_from_slice(label.as_bytes());
+            data.push(value as u8);
+        }
+        data.push(0); // one Enum8 value
+
+        let mut scanner = BlockScanner::new_binary_types(DecodeOptions::default());
+        for end in (64..data.len()).step_by(64) {
+            assert_eq!(scanner.scan(&data[..end]).unwrap(), BlockBoundary::NeedMore);
+        }
+        assert!(matches!(
+            scanner.scan(&data).unwrap(),
+            BlockBoundary::Complete { consumed, .. } if consumed == data.len()
+        ));
+        assert!(
+            scanner.progress.bytes_walked < 3 * data.len() as u64,
+            "scanner walked {} bytes for {} input bytes",
+            scanner.progress.bytes_walked,
+            data.len()
+        );
+    }
+
+    #[test]
+    fn binary_header_retains_type_while_waiting_for_revision_marker() {
+        let mut data = Vec::new();
+        write_varint(&mut data, 1);
+        data.push(0);
+        write_varint(&mut data, 2);
+        data.extend_from_slice(&(-1i32).to_le_bytes());
+        write_varint(&mut data, 0);
+        write_varint(&mut data, 1);
+        write_varint(&mut data, 1);
+        write_varint(&mut data, 1);
+        data.push(b'n');
+        data.push(0x04); // DataTypesBinaryEncoding UInt64
+        let marker_offset = data.len();
+        data.push(0); // default serialization
+        data.extend_from_slice(&79u64.to_le_bytes());
+
+        let mut scanner = BlockScanner::new_binary_types(options_at(54460));
+        assert_eq!(
+            scanner.scan(&data[..marker_offset]).unwrap(),
+            BlockBoundary::NeedMore
+        );
+        assert!(scanner.progress.header_waits_after_complete_type());
+        assert!(matches!(
+            scanner.scan(&data).unwrap(),
+            BlockBoundary::Complete { consumed, .. } if consumed == data.len()
+        ));
+        assert_eq!(scanner.progress.bytes_walked, data.len() as u64);
+    }
+
+    #[test]
+    fn adjacent_fixed_columns_scan_linearly_at_bare_and_framed_revisions() {
+        for revision in [0, 54460] {
+            let data = make_block_at(
+                revision,
+                1,
+                &[
+                    ("first", "Int64", 13i64.to_le_bytes().to_vec()),
+                    ("second", "UInt64", 79u64.to_le_bytes().to_vec()),
+                ],
+            );
+            let mut scanner = BlockScanner::new(options_at(revision));
+            for end in 1..data.len() {
+                assert_eq!(scanner.scan(&data[..end]).unwrap(), BlockBoundary::NeedMore);
+            }
+            assert!(matches!(
+                scanner.scan(&data).unwrap(),
+                BlockBoundary::Complete { consumed, .. } if consumed == data.len()
+            ));
+            assert!(
+                scanner.progress.bytes_walked < 3 * data.len() as u64,
+                "revision {revision}: walked {} bytes for {} input bytes",
+                scanner.progress.bytes_walked,
+                data.len()
+            );
+        }
+    }
+
+    #[test]
+    fn binary_scan_validates_unsupported_zero_row_header() {
+        let mut data = Vec::new();
+        write_varint(&mut data, 1);
+        write_varint(&mut data, 0);
+        write_varint(&mut data, 1);
+        data.push(b'c');
+        data.extend([0x26, 0x1e, 0x15]); // LowCardinality(Array(String))
+
+        let mut scanner = BlockScanner::new_binary_types(DecodeOptions::default());
+        assert!(matches!(
+            scanner.scan(&data),
+            Err(DecodeError::UnsupportedType { .. })
+        ));
+        let mut reader = ByteReader::new(&data);
+        assert!(matches!(
+            decode_next_block_binary_types(&mut reader, &DecodeOptions::default()),
+            Err(DecodeError::UnsupportedType { .. })
+        ));
     }
 
     #[test]
@@ -1897,9 +2135,16 @@ mod tests {
 
         let mut scanner = BlockScanner::new(DecodeOptions::default());
         let names_end = header_len + names_len;
+        let mut max_name_scan_retained = 0;
         for end in (4096..names_end).step_by(4096) {
             assert_eq!(scanner.scan(&data[..end]).unwrap(), BlockBoundary::NeedMore);
+            max_name_scan_retained =
+                max_name_scan_retained.max(scanner.progress.retained_task_bytes());
         }
+        assert!(
+            max_name_scan_retained <= 4 * 1024,
+            "JSON name scanning retained {max_name_scan_retained} bytes"
+        );
         let prefixes_end = header_len + prefixes_len;
         let body_mid = prefixes_end + PATHS / 2;
         let mut retained = Vec::new();

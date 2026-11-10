@@ -39,11 +39,11 @@ fn test_protocol_revision_above_supported_ceiling_is_rejected() {
 #[test]
 fn complete_binary_dynamic_type_reparse_rejects_trailing_and_incomplete_bytes() {
     assert_eq!(
-        parse_complete_binary_dynamic_type(&[0x15], "d").unwrap(),
+        parse_complete_binary_type(&[0x15], "d").unwrap(),
         ChType::String
     );
     for bytes in [&[0x15, 0x00][..], &[0x16, 0x80][..]] {
-        let err = parse_complete_binary_dynamic_type(bytes, "d").unwrap_err();
+        let err = parse_complete_binary_type(bytes, "d").unwrap_err();
         assert!(
             matches!(err, DecodeError::Io(ref error) if error.kind() == io::ErrorKind::InvalidData),
             "{err:?}"

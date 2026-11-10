@@ -128,6 +128,14 @@ driver that abandons a query mid-stream must discard the connection. The first
 engine handles uncompressed SELECT only. See `crates/ch-tcp-proto/README.md`
 for the driver loop and a tested `run_select` example.
 
+The engine conservatively fails a query when its first response is an
+Exception and that query sent wire settings. This safely covers settings parse
+errors raised before the server creates a query context, but can also classify
+a reusable syntax error as terminal. A driver must close its socket whenever
+the engine enters `State::Failed`, even if the server has not closed its side.
+Where a binding can safely construct it, an SQL `SETTINGS` clause avoids the
+wire-settings flag and this conservative false positive.
+
 Each `Event::Data` payload is exactly one complete Native block at the
 connection's `effective_revision()`, and the payloads concatenate into one
 Native stream. Either feed that stream to `StreamDecoder`, or decode each
@@ -136,10 +144,11 @@ payload as it arrives with `ByteReader` plus `decode_next_block` into a
 scans for block boundaries again before decoding, while the engine has already
 found them. The engine README has a tested `decode_payload` snippet.
 
-Every TCP SELECT result starts with a zero-row Data block that carries only
-the schema, which HTTP `FORMAT Native` does not send. Both decode paths return
-it as a zero-row `ColBatch` first, so bindings must tolerate zero-row batches
-on TCP even where their HTTP path never saw one.
+A TCP SELECT result with columns starts with a zero-row Data block that carries
+only the schema, which HTTP `FORMAT Native` does not send. Both decode paths
+return it as a zero-row `ColBatch` first, so bindings must tolerate zero-row
+batches on TCP even where their HTTP path never saw one. A result with no
+columns need not send a schema block.
 
 Not all clients have a ready-to-use `FORMAT Native` result path today. Part of the integration task for those clients is to add or reuse a path that can request `FORMAT Native` and expose the resulting decompressed byte stream to the Rust decoder.
 
@@ -186,18 +195,23 @@ engine-owned buffer and call `scan` with the whole accumulated block prefix.
 `BlockBoundary::Complete` reports the exact `consumed` prefix plus the declared
 `num_columns` and `num_rows`; leave any suffix for packet dispatch. The shape
 identifies the zero-column, zero-row TCP end marker without decoding a
-`ColBatch`. The scanner copies no wire bytes and creates no decoded column
-buffers. It checkpoints complete top-level columns and resumes inside bodies
-composed from String, fixed-width values, Nullable, Array, Map, Tuple,
+`ColBatch`. The scanner copies no payload bytes and creates no decoded column
+buffers. It checkpoints parsed column headers and complete top-level columns,
+and resumes inside bodies composed from String, fixed-width values, Nullable, Array, Map, Tuple,
 LowCardinality, Variant, Dynamic, JSON, and AggregateFunction, including
-runtime type-table prefixes and nested containers. Progress survives each
-feed, so scanning remains linear across transport read sizes. Call `reset`
+top-level binary descriptors, runtime type-table prefixes and nested containers.
+Progress survives each feed, so scanning remains linear across transport read sizes. Call `reset`
 before reusing a scanner after abandoning an incomplete block.
 
 Scan and decode agree on acceptance or rejection and complete-block boundaries.
 Error wording and the point at which corruption is reported can differ. On a
-truncated stream, an invalid Dynamic index or AggregateFunction zero-state byte
-can produce invalid data instead of a truncation error.
+truncated stream, header corruption, an invalid Dynamic index, or an
+AggregateFunction zero-state byte can produce invalid data instead of a
+truncation error.
+
+The decoder and scanner reject repeated known `BlockInfo` fields. The server
+writer emits each field once; rejecting repeats bounds preamble work even
+though the server reader accepts them.
 
 For a compressed body, keep one `BlockScanner` and one plaintext buffer
 `plain` that holds only the current block. For each frame:

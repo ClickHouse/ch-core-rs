@@ -52,6 +52,11 @@ pub enum DecodeError {
     InvalidBlockInfo {
         field_num: u64,
     },
+    /// A `BlockInfo` preamble repeated a known field. The server writer emits
+    /// every field exactly once, so repeats are rejected as non-canonical.
+    DuplicateBlockInfo {
+        field_num: u64,
+    },
     /// A column advertised a custom (non-default) serialization, whose wire
     /// layout this crate does not decode. `serialization_byte` is the raw
     /// custom-serialization marker the server wrote (0 would mean default).
@@ -143,6 +148,9 @@ impl std::fmt::Display for DecodeError {
             DecodeError::InvalidBlockInfo { field_num } => {
                 write!(f, "Unknown BlockInfo field number {field_num}")
             }
+            DecodeError::DuplicateBlockInfo { field_num } => {
+                write!(f, "Duplicate BlockInfo field number {field_num}")
+            }
             DecodeError::UnsupportedSerialization {
                 column,
                 serialization_byte,
@@ -202,7 +210,7 @@ fn ensure_supported_protocol_revision(revision: u64) -> Result<(), DecodeError> 
 }
 
 /// Options for Native format decoding.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct DecodeOptions {
     /// Negotiated server protocol revision the Native stream was produced with.
@@ -352,6 +360,15 @@ enum JsonWireKind {
 struct JsonState {
     kind: JsonWireKind,
     dynamic_paths: Vec<String>,
+    /// Number of dynamic paths represented by this state. Allocating decode
+    /// retains their names, while the scan-only path retains only this count.
+    dynamic_path_count: usize,
+}
+
+impl JsonState {
+    fn dynamic_path_count(&self) -> usize {
+        self.dynamic_path_count
+    }
 }
 
 /// One entry in the per-column preorder state vector shared by the prefix, body,
@@ -776,7 +793,7 @@ fn read_state_prefix(
                     } => {
                         let state = read_json_state(reader, *max_dynamic_paths, column, depth)?;
                         let kind = state.kind;
-                        let num_dynamic = state.dynamic_paths.len();
+                        let num_dynamic = state.dynamic_path_count();
                         states.push(StatePrefix::Json(state));
                         if kind != JsonWireKind::Text {
                             for _ in 0..num_dynamic {
@@ -829,7 +846,7 @@ fn read_state_prefix(
                     } => {
                         let state = read_json_state(reader, max_dynamic_paths, column, depth)?;
                         let kind = state.kind;
-                        let num_dynamic = state.dynamic_paths.len();
+                        let num_dynamic = state.dynamic_path_count();
                         states.push(StatePrefix::Json(state));
                         if kind != JsonWireKind::Text {
                             for _ in 0..num_dynamic {
@@ -928,7 +945,7 @@ fn read_state_suffix(
         // state cursor stays aligned (all suffixes are no-ops today).
         ChType::Json { typed_paths, .. } => {
             let state = next_json_state(states, state_cursor, column)?;
-            let (kind, num_dynamic) = (state.kind, state.dynamic_paths.len());
+            let (kind, num_dynamic) = (state.kind, state.dynamic_path_count());
             if kind == JsonWireKind::Text {
                 return Ok(());
             }
@@ -1260,6 +1277,7 @@ fn read_json_state(
 
     Ok(JsonState {
         kind,
+        dynamic_path_count: dynamic_paths.len(),
         dynamic_paths,
     })
 }
@@ -3048,8 +3066,9 @@ fn empty_column(ch_type: &ChType) -> Column {
 // ---------------------------------------------------------------------------
 
 /// Consume the `BlockInfo` preamble that precedes each block when the producer
-/// used a protocol revision > 0 (server `BlockInfo::read` in
-/// `src/Core/BlockInfo.cpp`, confirmed at v26.6.1.1193-stable).
+/// used a protocol revision > 0 (server `BlockInfo::read` and
+/// `BlockInfo::write` in `src/Core/BlockInfo.cpp`, confirmed at
+/// v26.8.1.2041-lts).
 ///
 /// `BlockInfo` is a self-describing, field-tagged structure: each field is a
 /// varint field number followed by the field value, and a field number of 0
@@ -3064,6 +3083,9 @@ fn empty_column(ch_type: &ChType) -> Column {
 /// Parsing by field number is revision independent: the older 8-byte two-field
 /// preamble and the current 10-byte three-field preamble both decode correctly.
 /// An unknown field number is rejected, matching the server, which throws.
+/// A repeated known field is also rejected. The server reader accepts repeats
+/// with last-value-wins semantics, but `BlockInfo::write` emits every declared
+/// field exactly once in declaration order, so repeats are not server output.
 ///
 /// Returns `Ok(false)` if the stream ends cleanly before any block info byte (a
 /// block boundary at end of stream), or `Ok(true)` once a full preamble has been
@@ -3077,8 +3099,19 @@ fn read_block_info(reader: &mut ByteReader) -> Result<bool, DecodeError> {
     // essential for streaming: a non-canonical multi-byte field number may
     // straddle feeds.
     let mut field_num = reader.read_varint()?;
+    let mut seen = 0u8;
 
     while field_num != 0 {
+        let bit = match field_num {
+            1 => 1 << 0,
+            2 => 1 << 1,
+            3 => 1 << 2,
+            other => return Err(DecodeError::InvalidBlockInfo { field_num: other }),
+        };
+        if seen & bit != 0 {
+            return Err(DecodeError::DuplicateBlockInfo { field_num });
+        }
+        seen |= bit;
         match field_num {
             1 => reader.skip(1)?, // is_overflows
             2 => reader.skip(4)?, // bucket_num (Int32)
@@ -3087,7 +3120,8 @@ fn read_block_info(reader: &mut ByteReader) -> Result<bool, DecodeError> {
                 let count = varint_usize(reader.read_varint()?, "out_of_order_buckets count")?;
                 reader.skip(count.saturating_mul(4))?;
             }
-            other => return Err(DecodeError::InvalidBlockInfo { field_num: other }),
+            // The field number was validated above.
+            _ => unreachable!("known BlockInfo field matched above"),
         }
         field_num = reader.read_varint()?;
     }
@@ -3197,9 +3231,9 @@ fn decode_next_block_with_settings_unchecked(
 /// Read one column header: name, type string, and the optional custom
 /// serialization marker. Returns the parsed `ChType` plus the column name.
 ///
-/// Shared by the allocating decode and the scan-only completeness walk so
-/// the two cannot drift on header framing or on which types and serializations
-/// are accepted.
+/// The resumable completeness walk mirrors this in [`scan_column_header`],
+/// retaining partial strings and binary descriptors across feeds. Both paths
+/// finish with [`validate_header_type`] so acceptance cannot drift.
 fn read_column_header(
     reader: &mut ByteReader,
     options: &DecodeSettings,
@@ -3241,6 +3275,130 @@ fn read_column_header(
     validate_header_type(&col_name, &ch_type)?;
 
     Ok((col_name, ch_type))
+}
+
+/// Resume one top-level column header without reparsing completed strings.
+fn scan_column_header(
+    reader: &mut ByteReader,
+    options: &DecodeSettings,
+    saved: &mut Option<Box<ColumnHeaderScanState>>,
+) -> Result<(String, ChType), DecodeError> {
+    if let Some(state) = saved.as_mut() {
+        reader.skip(state.offset)?;
+        let result = scan_column_header_state(reader, options, state);
+        if !is_unexpected_eof_result(&result) {
+            saved.take();
+        }
+        return result;
+    }
+
+    let mut state = ColumnHeaderScanState {
+        name_scan: PartialStringScan::default(),
+        name: None,
+        text_type_scan: PartialStringScan::default(),
+        descriptor_start: None,
+        descriptor: None,
+        ch_type: None,
+        offset: reader.position(),
+    };
+    let result = scan_column_header_state(reader, options, &mut state);
+    if is_unexpected_eof_result(&result) {
+        *saved = Some(Box::new(state));
+    }
+    result
+}
+
+fn is_unexpected_eof_result<T>(result: &Result<T, DecodeError>) -> bool {
+    matches!(result, Err(DecodeError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof)
+}
+
+fn scan_column_header_state(
+    reader: &mut ByteReader,
+    options: &DecodeSettings,
+    state: &mut ColumnHeaderScanState,
+) -> Result<(String, ChType), DecodeError> {
+    if state.name.is_none() {
+        let Some(name) = state.name_scan.scan(reader)? else {
+            state.offset = reader.position();
+            return Err(need_more_bytes());
+        };
+        state.name = Some(name);
+        state.offset = reader.position();
+    }
+    if state.ch_type.is_none() {
+        let name = state.name.as_deref().unwrap_or("");
+        if options.types_in_binary_format {
+            let descriptor_start = *state.descriptor_start.get_or_insert(reader.position());
+            if state.descriptor.is_none() {
+                let mut probe = ByteReader::new(reader.remaining_slice());
+                match read_binary_type(&mut probe) {
+                    Ok(ch_type) => {
+                        reader.skip(probe.position())?;
+                        state.ch_type = Some(ch_type);
+                    }
+                    Err(BinaryTypeError::Io(error))
+                        if error.kind() == io::ErrorKind::UnexpectedEof =>
+                    {
+                        state.descriptor = Some(BinaryTypeScanner::new());
+                    }
+                    Err(error) => return Err(binary_type_error(error, name)),
+                }
+            }
+            if state.ch_type.is_none() {
+                let Some(descriptor_scanner) = state.descriptor.as_mut() else {
+                    return Err(DecodeError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "binary column header has no descriptor scanner",
+                    )));
+                };
+                if let Err(error) = descriptor_scanner.scan(reader) {
+                    state.offset = reader.position();
+                    return Err(binary_type_error(error, name));
+                }
+                let descriptor = reader.consumed_slice(descriptor_start)?;
+                state.ch_type = Some(parse_complete_binary_type(descriptor, name)?);
+            }
+        } else {
+            let Some(type_name) = state.text_type_scan.scan(reader)? else {
+                state.offset = reader.position();
+                return Err(need_more_bytes());
+            };
+            state.ch_type =
+                Some(
+                    parse_ch_type(&type_name).ok_or_else(|| DecodeError::UnsupportedType {
+                        column: name.to_string(),
+                        type_name,
+                    })?,
+                );
+        }
+        state.offset = reader.position();
+    }
+
+    if options.protocol_revision >= DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION {
+        let marker = reader.read_u8()?;
+        state.offset = reader.position();
+        if marker != 0 {
+            return Err(DecodeError::UnsupportedSerialization {
+                column: state.name.clone().unwrap_or_default(),
+                serialization_byte: marker,
+            });
+        }
+    }
+
+    let Some(ch_type) = state.ch_type.take() else {
+        return Err(DecodeError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "column header scanner returned before its type completed",
+        )));
+    };
+    let name = state.name.take().ok_or_else(|| {
+        DecodeError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "column header scanner returned before its name completed",
+        ))
+    })?;
+    validate_header_type(&name, &ch_type)?;
+    Ok((name, ch_type))
 }
 
 /// Reject a header type this crate parses but cannot decode, at header-read time.
@@ -3419,8 +3577,8 @@ fn has_min_one_byte_per_row(ch_type: &ChType) -> bool {
 /// - `Err(Io(UnexpectedEof))`: a block has started but is not fully buffered yet
 ///   (the caller should wait for more bytes).
 /// - `Err(_)`: a real decode error (unsupported type/serialization, bad
-///   BlockInfo field, varint overflow, invalid UTF-8 in a header), which is
-///   which may be surfaced before the whole block is buffered. Scan and decode
+///   BlockInfo field, varint overflow, invalid UTF-8 in a header), which may be
+///   surfaced before the whole block is buffered. Scan and decode
 ///   agree on acceptance or rejection and complete-block boundaries, not on
 ///   error wording or timing. Corrupt partial data can fail with invalid data
 ///   while decode still reports truncation.
@@ -3431,15 +3589,15 @@ fn has_min_one_byte_per_row(ch_type: &ChType) -> bool {
 /// `ScanProgress` checkpoint (completed columns, plus a task stack inside a
 /// resumable column) across "need more bytes", so incremental feeds walk each
 /// byte about once. Calling this after every partial read is quadratic in the
-/// number of reads. The scan shares `read_block_info` and `read_column_header`
-/// with the real decode, and its column walkers consume exactly the wire bytes
-/// the per-type decoders consume and reject what they reject.
+/// number of reads. The scan shares `read_block_info` with the real decode,
+/// mirrors its column-header validation, and its column walkers consume exactly
+/// the wire bytes the per-type decoders consume and reject what they reject.
 pub fn block_end(data: &[u8], options: &DecodeOptions) -> Result<Option<usize>, DecodeError> {
     block_end_with_settings(data, &DecodeSettings::text(options))
 }
 
-/// Allocation-free completeness scan for a block using binary data-type
-/// descriptors. This is the binary-header counterpart of [`block_end`].
+/// Completeness scan for a block using binary data-type descriptors. This is
+/// the binary-header counterpart of [`block_end`].
 pub fn block_end_binary_types(
     data: &[u8],
     options: &DecodeOptions,
@@ -3479,6 +3637,13 @@ pub(crate) struct ScanProgress {
     /// to the offset just past the block header.
     columns_done: usize,
     columns_end: usize,
+    /// Partially scanned top-level column header, including incremental name
+    /// and text-type strings or a binary descriptor grammar walk.
+    column_header: Option<Box<ColumnHeaderScanState>>,
+    /// A fully parsed fixed-width top-level column whose body is incomplete.
+    /// Retaining only its byte range avoids both header reparsing and task
+    /// storage on the primitive hot path.
+    fixed_body: Option<FixedBodyState>,
     /// Mid-column checkpoint inside a column [`is_resumable`] accepts (fixed
     /// width values, String, Nullable, containers, LowCardinality, Variant,
     /// Dynamic, JSON, and AggregateFunction), covering prefixes and bodies.
@@ -3496,7 +3661,14 @@ impl ScanProgress {
     fn resume_offset(&self) -> usize {
         match &self.body {
             Some(body) => body.offset,
-            None => self.columns_end,
+            None => self.fixed_body.as_ref().map_or_else(
+                || {
+                    self.column_header
+                        .as_ref()
+                        .map_or(self.columns_end, |header| header.offset)
+                },
+                |body| body.start,
+            ),
         }
     }
 
@@ -3506,8 +3678,24 @@ impl ScanProgress {
         self.header = None;
         self.columns_done = 0;
         self.columns_end = 0;
+        self.column_header = None;
+        self.fixed_body = None;
         self.body = None;
         self.synthetic_allocation_used = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_header_string_bytes(&self) -> usize {
+        self.column_header.as_ref().map_or(0, |header| {
+            header.name.as_ref().map_or(0, |name| name.capacity())
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn header_waits_after_complete_type(&self) -> bool {
+        self.column_header
+            .as_ref()
+            .is_some_and(|header| header.ch_type.is_some() && header.descriptor.is_none())
     }
 
     #[cfg(test)]
@@ -3521,7 +3709,13 @@ impl ScanProgress {
             .iter()
             .map(|task| match task {
                 PrefixScanTask::Dynamic(task) => std::mem::size_of_val(task.as_ref()),
-                PrefixScanTask::Json(task) => std::mem::size_of_val(task.as_ref()),
+                PrefixScanTask::Json(task) => {
+                    std::mem::size_of_val(task.as_ref())
+                        + task
+                            .previous_path
+                            .as_ref()
+                            .map_or(0, |path| path.capacity())
+                }
                 _ => 0,
             })
             .sum::<usize>();
@@ -3550,6 +3744,56 @@ impl ScanProgress {
             _ => false,
         })
     }
+}
+
+#[derive(Debug, Default)]
+struct PartialStringScan {
+    length: PartialVarint,
+    len: Option<usize>,
+    payload_start: Option<usize>,
+    bytes_read: usize,
+}
+
+impl PartialStringScan {
+    fn scan(&mut self, reader: &mut ByteReader) -> Result<Option<String>, DecodeError> {
+        if self.len.is_none() {
+            let Some(len) = read_partial_varint(reader, &mut self.length)? else {
+                return Ok(None);
+            };
+            self.len = Some(varint_usize(len, "String length")?);
+        }
+        let len = self.len.unwrap_or(0);
+        let payload_start = *self.payload_start.get_or_insert(reader.position());
+        let remaining = len.saturating_sub(self.bytes_read);
+        let take = remaining.min(reader.remaining());
+        reader.skip(take)?;
+        self.bytes_read += take;
+        if self.bytes_read != len {
+            return Ok(None);
+        }
+        std::str::from_utf8(reader.consumed_slice(payload_start)?)
+            .map(str::to_owned)
+            .map(Some)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error).into())
+    }
+}
+
+/// Resumable framing state for one top-level column header.
+#[derive(Debug)]
+struct ColumnHeaderScanState {
+    name_scan: PartialStringScan,
+    name: Option<String>,
+    text_type_scan: PartialStringScan,
+    descriptor_start: Option<usize>,
+    descriptor: Option<BinaryTypeScanner>,
+    ch_type: Option<ChType>,
+    offset: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FixedBodyState {
+    start: usize,
+    end: usize,
 }
 
 /// Resumable scan state for one top-level column: its static and runtime-shaped
@@ -3669,7 +3913,8 @@ struct JsonPrefixTask {
     legacy: Option<PartialVarint>,
     count: Option<usize>,
     count_varint: PartialVarint,
-    paths: Vec<String>,
+    paths_read: usize,
+    previous_path: Option<String>,
     path_length: PartialVarint,
     path_len: Option<usize>,
 }
@@ -3913,7 +4158,15 @@ fn scan_block_body_resume(
             progress.synthetic_allocation_used = body.allocation_budget.used;
             progress.body = None;
             progress.columns_done += 1;
-        } else {
+        } else if let Some(body) = progress.fixed_body {
+            if reader.remaining() < body.end {
+                reader.skip(body.start)?;
+                return Err(need_more_bytes());
+            }
+            reader.skip(body.end)?;
+            progress.fixed_body = None;
+            progress.columns_done += 1;
+        } else if progress.column_header.is_none() {
             reader.skip(progress.columns_end)?;
         }
         (num_cols, num_rows)
@@ -3930,12 +4183,22 @@ fn scan_block_body_resume(
         progress.header = Some((num_cols, num_rows));
         (num_cols, num_rows)
     };
-    progress.columns_end = reader.position();
+    if progress.column_header.is_none() {
+        progress.columns_end = reader.position();
+    }
 
     while progress.columns_done < num_cols {
-        let (name, ch_type) = read_column_header(reader, settings)?;
+        let (name, ch_type) = scan_column_header(reader, settings, &mut progress.column_header)?;
         if num_rows > 0 {
-            if needs_resumable_body(&ch_type) {
+            if let Some(bytes) = fixed_width_top_level_bytes(&ch_type, num_rows, &name)? {
+                if reader.remaining() < bytes {
+                    let start = reader.position();
+                    let end = start.checked_add(bytes).ok_or_else(need_more_bytes)?;
+                    progress.fixed_body = Some(FixedBodyState { start, end });
+                    return Err(need_more_bytes());
+                }
+                reader.skip(bytes)?;
+            } else if is_resumable(&ch_type) {
                 // One pass, complete or partial: the task walker is the only
                 // walker for these types, so a complete buffer is not walked
                 // twice and a partial one keeps its exact checkpoint.
@@ -3963,6 +4226,25 @@ fn scan_block_body_resume(
         num_columns: num_cols,
         num_rows,
     }))
+}
+
+/// Compute the complete body size for top-level types whose Native payload is
+/// one fixed byte run and has no state prefix or suffix.
+fn fixed_width_top_level_bytes(
+    ch_type: &ChType,
+    num_rows: usize,
+    column: &str,
+) -> Result<Option<usize>, DecodeError> {
+    if let Some(delegate) = ch_type.physical_delegate_ref() {
+        return fixed_width_top_level_bytes(delegate.as_ref(), num_rows, column);
+    }
+    if matches!(ch_type, ChType::Tuple(elements) if elements.is_empty()) {
+        return Ok(Some(num_rows));
+    }
+    if is_fixed_width_leaf(ch_type) {
+        return fixed_width_body_bytes(ch_type, num_rows, column).map(Some);
+    }
+    Ok(None)
 }
 
 /// Whether a top-level column of `ch_type` can use the resumable task walker.
@@ -4040,22 +4322,6 @@ fn is_resumable_nullable_inner(inner: &ChType) -> bool {
     }
 }
 
-/// Whether a top-level column benefits from the resumable task walker.
-///
-/// Fixed-width leaves (and the empty `Tuple()`) keep the allocation-free
-/// arithmetic skip in [`skip_column_data`]: re-walking them after a partial
-/// feed is O(1). Every other resumable type uses the task walker for both
-/// partial and complete buffers.
-fn needs_resumable_body(ch_type: &ChType) -> bool {
-    if let Some(delegate) = ch_type.physical_delegate_ref() {
-        return needs_resumable_body(delegate.as_ref());
-    }
-    match ch_type {
-        ChType::Tuple(elements) if elements.is_empty() => false,
-        other => !is_fixed_width_leaf(other) && is_resumable(other),
-    }
-}
-
 fn read_partial_varint(
     reader: &mut ByteReader,
     partial: &mut PartialVarint,
@@ -4078,13 +4344,14 @@ fn push_prefix_type(tasks: &mut Vec<PrefixScanTask>, ch_type: ChType, depth: usi
     tasks.push(PrefixScanTask::Type { ch_type, depth });
 }
 
-fn parse_complete_binary_dynamic_type(bytes: &[u8], column: &str) -> Result<ChType, DecodeError> {
+fn parse_complete_binary_type(bytes: &[u8], column: &str) -> Result<ChType, DecodeError> {
     let mut descriptor = ByteReader::new(bytes);
-    let parsed = read_binary_type(&mut descriptor).map_err(|error| {
-        DecodeError::Io(io::Error::new(
+    let parsed = read_binary_type(&mut descriptor).map_err(|error| match error {
+        BinaryTypeError::Io(error) => DecodeError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("binary type boundary scanner/parser mismatch: {error}"),
-        ))
+        )),
+        other => binary_type_error(other, column),
     })?;
     if descriptor.position() != bytes.len() {
         return Err(DecodeError::Io(io::Error::new(
@@ -4097,6 +4364,18 @@ fn parse_complete_binary_dynamic_type(bytes: &[u8], column: &str) -> Result<ChTy
         )));
     }
     Ok(parsed)
+}
+
+fn binary_type_error(error: BinaryTypeError, column: &str) -> DecodeError {
+    match error {
+        BinaryTypeError::Io(error) => DecodeError::Io(error),
+        BinaryTypeError::Invalid(reason) | BinaryTypeError::Unsupported(reason) => {
+            DecodeError::UnsupportedType {
+                column: column.to_string(),
+                type_name: reason,
+            }
+        }
+    }
 }
 
 fn scan_prefix_task(
@@ -4177,7 +4456,8 @@ fn scan_prefix_task(
                             legacy: None,
                             count: None,
                             count_varint: PartialVarint::default(),
-                            paths: Vec::new(),
+                            paths_read: 0,
+                            previous_path: None,
                             path_length: PartialVarint::default(),
                             path_len: None,
                         }))),
@@ -4277,7 +4557,7 @@ fn scan_prefix_task(
                         }
                     }
                     let bytes = reader.consumed_slice(start)?;
-                    let parsed = parse_complete_binary_dynamic_type(bytes, &state.column)?;
+                    let parsed = parse_complete_binary_type(bytes, &state.column)?;
                     dynamic.binary_start = None;
                     dynamic.binary_scanner = None;
                     parsed
@@ -4427,6 +4707,7 @@ fn scan_prefix_task(
                     state.states.push(StatePrefix::Json(JsonState {
                         kind,
                         dynamic_paths: Vec::new(),
+                        dynamic_path_count: 0,
                     }));
                     state.offset = reader.position();
                     return Ok(());
@@ -4456,11 +4737,10 @@ fn scan_prefix_task(
                         ),
                     ));
                 }
-                json.paths.reserve(reader.capacity_for(count, 1));
                 json.count = Some(count);
             }
             let count = json.count.unwrap_or(0);
-            while json.paths.len() < count {
+            while json.paths_read < count {
                 if json.path_len.is_none() {
                     let Some(len) = read_partial_varint(reader, &mut json.path_length)? else {
                         state.prefix_tasks.push(PrefixScanTask::Json(json));
@@ -4476,21 +4756,27 @@ fn scan_prefix_task(
                 let path = std::str::from_utf8(reader.read_slice(len)?)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
                     .to_string();
-                if json.paths.last().is_some_and(|last| path <= *last) {
+                if json
+                    .previous_path
+                    .as_ref()
+                    .is_some_and(|last| path <= *last)
+                {
                     return Err(invalid_json(
                         &state.column,
                         "dynamic paths are not strictly increasing (sorted, unique)",
                     ));
                 }
-                json.paths.push(path);
+                json.previous_path = Some(path);
+                json.paths_read += 1;
                 json.path_len = None;
                 json.path_length = PartialVarint::default();
             }
             let kind = json.kind.unwrap_or(JsonWireKind::Text);
-            let num_dynamic = json.paths.len();
+            let num_dynamic = json.paths_read;
             state.states.push(StatePrefix::Json(JsonState {
                 kind,
-                dynamic_paths: json.paths,
+                dynamic_paths: Vec::new(),
+                dynamic_path_count: num_dynamic,
             }));
             if num_dynamic != 0 {
                 state.prefix_tasks.push(PrefixScanTask::DynamicRun {
@@ -5252,7 +5538,7 @@ fn push_value_tasks(
         ChType::Json { typed_paths, .. } => {
             let json = next_json_state(states, state_cursor, column)?;
             let kind = json.kind;
-            let num_dynamic = json.dynamic_paths.len();
+            let num_dynamic = json.dynamic_path_count();
             if num_rows > i32::MAX as usize {
                 return Err(invalid_json(
                     column,
@@ -5786,7 +6072,7 @@ fn skip_json_data(
         return Err(invalid_json(column, "not a JSON type"));
     };
     let state = next_json_state(states, state_cursor, column)?;
-    let (kind, num_dynamic) = (state.kind, state.dynamic_paths.len());
+    let (kind, num_dynamic) = (state.kind, state.dynamic_path_count());
 
     if kind == JsonWireKind::Text {
         return skip_column_body(reader, &ChType::String, num_rows);

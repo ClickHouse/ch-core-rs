@@ -10,14 +10,15 @@ and NativeWriter::write. See tests/fixtures/README.md.
 
 import argparse
 from datetime import date
+import errno
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
 import socket
 import struct
 import sys
-import urllib.parse
 import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -27,6 +28,13 @@ from gen_tcp_handshake_fixtures import read_hello
 REVISION = 54460
 VERSION = "26.8.1.2041"
 CLIENT_NAME = "ch-core-query-fixture"
+CLIENT_VERSION_MAJOR = 13
+CLIENT_VERSION_MINOR = 79
+QUOTA_KEY = "fixture_quota_13"
+INITIAL_ADDRESS = "192.0.2.13:79"
+INITIAL_QUERY_START_TIME_MICROSECONDS = 1791500000000013
+OS_USER = "fixture_os_user_13"
+CLIENT_HOSTNAME = "fixture_host_79"
 EMPTY_BLOCK = bytes.fromhex("010002ffffffff000000")
 QUERIES = {
     "select": "SELECT 1",
@@ -37,8 +45,8 @@ QUERIES = {
     # A blockwise expression prevents the exception from being folded before
     # earlier blocks are sent. The capture asserts positive-row Data precedes it.
     "exception": (
-        "SELECT intDiv(toUInt64(79), number != 4) AS n FROM numbers(8) "
-        "SETTINGS max_block_size=2, max_threads=1"
+        "SELECT intDiv(toUInt64(79), number != 1000) AS n FROM numbers(2000) "
+        "SETTINGS max_block_size=128, max_threads=1"
     ),
     "totals": (
         "SELECT number % 2 AS k, count() AS n FROM numbers(5) "
@@ -60,11 +68,17 @@ PARAMETERS = {
     "escaped_parameter": [("value", ESCAPED_PARAMETER_TEXT)],
     "container_parameter": [("items", "['user_1','it\\'s']"), ("missing", "\\N")],
 }
+CAPTURE_SETTINGS = [
+    ("send_profile_events", "1"),
+    ("send_logs_level", "debug"),
+    ("log_queries", "1"),
+]
 
 
 def client_hello():
     return (
-        varuint(0) + string(CLIENT_NAME) + varuint(26) + varuint(8)
+        varuint(0) + string(CLIENT_NAME) + varuint(CLIENT_VERSION_MAJOR)
+        + varuint(CLIENT_VERSION_MINOR)
         + varuint(REVISION) + string("") + string("default") + string("")
     )
 
@@ -89,24 +103,28 @@ def dump_query_parameter(text):
     return dump_field_string(text)
 
 
-def query_packet(query, query_id, parameters=()):
+def query_packet(query, query_id, parameters=(), settings=CAPTURE_SETTINGS):
     client_info = (
-        b"\x01" + string("default") + string(query_id) + string("127.0.0.1:0")
-        + struct.pack("<Q", 0) + b"\x01" + string("") + string("")
-        + string(CLIENT_NAME) + varuint(26) + varuint(8) + varuint(REVISION)
-        + string("") + varuint(0) + varuint(0) + b"\0"
+        b"\x01" + string("default") + string(query_id) + string(INITIAL_ADDRESS)
+        + struct.pack("<Q", INITIAL_QUERY_START_TIME_MICROSECONDS)
+        + b"\x01" + string(OS_USER) + string(CLIENT_HOSTNAME)
+        + string(CLIENT_NAME) + varuint(CLIENT_VERSION_MAJOR)
+        + varuint(CLIENT_VERSION_MINOR) + varuint(REVISION)
+        + string(QUOTA_KEY) + varuint(0) + varuint(0) + b"\0"
         + varuint(0) + varuint(0) + varuint(0)
     )
-    settings = (
-        string("send_profile_events") + varuint(1) + string("1")
-        + string("send_logs_level") + varuint(1) + string("debug") + string("")
+    encoded_settings = (
+        b"".join(
+            string(name) + varuint(1) + string(value) for name, value in settings
+        )
+        + string("")
     )
     params = b"".join(
         string(name) + varuint(2) + string(dump_query_parameter(value))
         for name, value in parameters
     )
     return (
-        varuint(1) + string(query_id) + client_info + settings + string("")
+        varuint(1) + string(query_id) + client_info + encoded_settings + string("")
         + varuint(2) + varuint(0) + string(query) + params + string("")
         + varuint(2) + string("") + EMPTY_BLOCK
     )
@@ -127,6 +145,7 @@ def native_block(reader):
             raise ValueError(f"unexpected BlockInfo field {field}")
     columns, rows = reader.uint(), reader.uint()
     schema = []
+    bodies = []
     widths = {
         b"UInt8": 1, b"Int8": 1, b"UInt32": 4, b"Int32": 4,
         b"UInt64": 8, b"Int64": 8, b"DateTime": 4,
@@ -136,6 +155,7 @@ def native_block(reader):
         schema.append([name.decode(), kind.decode()])
         if reader.read(1) != b"\0":
             raise ValueError("unexpected custom serialization")
+        body_start = len(reader.record)
         if kind == b"String":
             for _ in range(rows):
                 reader.string()
@@ -153,7 +173,8 @@ def native_block(reader):
             reader.read(rows * widths[kind])
         else:
             raise ValueError(f"unexpected fixture type {kind!r}")
-    return rows, columns, schema, bytes(reader.record[start:])
+        bodies.append(bytes(reader.record[body_start:]))
+    return rows, columns, schema, bodies, bytes(reader.record[start:])
 
 
 def response(reader):
@@ -165,9 +186,10 @@ def response(reader):
         if code in (1, 7, 8, 10, 14):
             entry["name"] = reader.string().decode()
             block_offset = len(reader.record)
-            rows, columns, schema, block = native_block(reader)
+            rows, columns, schema, bodies, block = native_block(reader)
             entry.update(
                 rows=rows, columns=columns, schema=schema,
+                _column_bodies=[body.hex() for body in bodies],
                 block_offset=entry["offset"] + block_offset,
                 block_length=len(block),
             )
@@ -256,6 +278,148 @@ def write_rust_oracle(output, queries):
     (output / "tcp_query_oracle_rev54460.rs").write_text("\n".join(lines))
 
 
+def public_packets(packets):
+    """Drop parser-only fields before writing the fixture manifest."""
+    return [
+        {key: value for key, value in packet.items() if not key.startswith("_")}
+        for packet in packets
+    ]
+
+
+def http_query(opener, host, port, query):
+    request = urllib.request.Request(
+        f"http://{host}:{port}/", data=query.encode(), method="POST"
+    )
+    with opener.open(request, timeout=30) as source:
+        return source.read().decode()
+
+
+def normalized_ip_address(value):
+    """Normalize IPv4-mapped IPv6 addresses to their IPv4 address."""
+    address = ipaddress.ip_address(value)
+    return getattr(address, "ipv4_mapped", None) or address
+
+
+def assert_client_info_query_log(opener, host, port, query_id):
+    """Verify sent ClientInfo fields through the server's independent log."""
+    http_query(opener, host, port, "SYSTEM FLUSH LOGS")
+    fields = [
+        "query_id", "initial_query_id", "initial_user",
+        "toString(initial_address) AS initial_address",
+        "toString(initial_port) AS initial_port", "toString(interface) AS interface",
+        "os_user", "client_hostname", "client_name",
+        "toString(client_revision) AS client_revision",
+        "toString(client_version_major) AS client_version_major",
+        "toString(client_version_minor) AS client_version_minor",
+        "toString(client_version_patch) AS client_version_patch", "quota_key",
+        "toString(distributed_depth) AS distributed_depth",
+        "toString(toUnixTimestamp64Micro(initial_query_start_time_microseconds)) "
+        "AS initial_query_start_time_microseconds",
+    ]
+    sql = (
+        f"SELECT {', '.join(fields)} FROM system.query_log "
+        f"WHERE query_id = '{query_id}' AND type = 'QueryFinish' "
+        "ORDER BY event_time_microseconds DESC LIMIT 1 FORMAT JSONEachRow"
+    )
+    rows = [json.loads(line) for line in http_query(opener, host, port, sql).splitlines()]
+    if len(rows) != 1:
+        raise ValueError(f"expected one query_log row for {query_id}, got {len(rows)}")
+    row = rows[0]
+    expected = {
+        "query_id": query_id,
+        "initial_query_id": query_id,
+        "initial_user": "default",
+        "interface": "1",
+        "os_user": OS_USER,
+        "client_hostname": CLIENT_HOSTNAME,
+        "client_name": CLIENT_NAME,
+        "client_revision": str(REVISION),
+        "client_version_major": str(CLIENT_VERSION_MAJOR),
+        "client_version_minor": str(CLIENT_VERSION_MINOR),
+        "client_version_patch": "0",
+        "quota_key": QUOTA_KEY,
+        "distributed_depth": "0",
+        "initial_query_start_time_microseconds": str(INITIAL_QUERY_START_TIME_MICROSECONDS),
+    }
+    mismatches = {key: (row.get(key), value) for key, value in expected.items()
+                  if row.get(key) != value}
+    # INITIAL_QUERY fields are deliberately not oracle sentinels: the server
+    # replaces the supplied address with the real peer before logging it.
+    sent_address = normalized_ip_address(INITIAL_ADDRESS.rsplit(":", 1)[0])
+    try:
+        logged_address = normalized_ip_address(row.get("initial_address", ""))
+    except ValueError:
+        mismatches["initial_address"] = (row.get("initial_address"), "valid peer address")
+    else:
+        if logged_address == sent_address:
+            mismatches["initial_address"] = (
+                row.get("initial_address"), "real peer address"
+            )
+    if int(row.get("initial_port", "0")) <= 0:
+        mismatches["initial_port"] = (row.get("initial_port"), "positive peer port")
+    if mismatches:
+        raise ValueError(f"ClientInfo query_log mismatch: {mismatches}")
+    return {
+        **expected,
+        "initial_address_overwritten": True,
+        "initial_port_positive": True,
+    }
+
+
+def assert_connection_closed(sock):
+    """Require EOF, treating reset and broken pipe as closed transport."""
+    try:
+        sock.sendall(varuint(4))
+        sock.settimeout(5)
+        closed = not sock.recv(1)
+    except OSError as error:
+        if error.errno not in (errno.ECONNRESET, errno.EPIPE):
+            raise
+        closed = True
+    if not closed:
+        raise ValueError("bad-setting socket remained readable after Exception")
+
+
+def assert_exception_lifecycle(host, port):
+    """Live-probe the terminal settings error and reusable SQL error split."""
+    bad = query_packet(
+        "SELECT 13", "ch-core-fixture-bad-setting",
+        settings=[("max_threads", "abc")],
+    )
+    with socket.create_connection((host, port), timeout=30) as sock:
+        sock.sendall(client_hello())
+        with sock.makefile("rb") as source:
+            reader = Reader(source)
+            read_hello(reader)
+            sock.sendall(string(QUOTA_KEY) + bad)
+            _, _, packets = response(reader)
+            if len(packets) != 1 or packets[0].get("exception_code") != 27:
+                raise ValueError(f"expected only code 27 bad-setting Exception: {packets}")
+            assert_connection_closed(sock)
+
+    syntax = query_packet("SELEC 13", "ch-core-fixture-syntax-error", settings=[])
+    recovery = query_packet("SELECT 13", "ch-core-fixture-syntax-recovery", settings=[])
+    with socket.create_connection((host, port), timeout=30) as sock:
+        sock.sendall(client_hello())
+        with sock.makefile("rb") as source:
+            reader = Reader(source)
+            read_hello(reader)
+            sock.sendall(string(QUOTA_KEY) + syntax)
+            _, _, packets = response(reader)
+            if len(packets) != 1 or packets[0].get("exception_code") != 62:
+                raise ValueError(f"expected only code 62 syntax Exception: {packets}")
+            sock.sendall(recovery)
+            _, _, packets = response(reader)
+            if packets[-1]["code"] != 5:
+                raise ValueError(f"syntax-error socket was not reusable: {packets[-1]}")
+    return {
+        "bad_known_setting_code": 27,
+        "bad_known_setting_connection_closed": True,
+        "syntax_error_code": 62,
+        "syntax_error_connection_reused": True,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", choices=["127.0.0.1"], default="127.0.0.1")
@@ -267,9 +431,7 @@ def main():
     os.environ["no_proxy"] = args.host
     os.environ["NO_PROXY"] = args.host
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    params = urllib.parse.urlencode({"query": "SELECT version()"})
-    with opener.open(f"http://{args.host}:{args.http_port}/?{params}", timeout=30) as source:
-        version = source.read().decode().strip()
+    version = http_query(opener, args.host, args.http_port, "SELECT version()").strip()
     reference = (Path(__file__).resolve().parents[1] / ".server-ref").read_text().strip()
     if version != VERSION or reference != f"v{VERSION}-lts":
         raise ValueError(f"capture server/source pin mismatch: {version}/{reference}")
@@ -278,11 +440,24 @@ def main():
         "captured_on": date.today().isoformat(), "server_version": version,
         "source_tag": reference, "declared_revision": REVISION,
         "client_name": CLIENT_NAME, "user": "default", "password": "",
+        "client_info": {
+            "version_major": CLIENT_VERSION_MAJOR,
+            "version_minor": CLIENT_VERSION_MINOR,
+            "quota_key": QUOTA_KEY,
+            "initial_address": INITIAL_ADDRESS,
+            "initial_query_start_time_microseconds": INITIAL_QUERY_START_TIME_MICROSECONDS,
+            "os_user": OS_USER,
+            "client_hostname": CLIENT_HOSTNAME,
+        },
         "settings": [
             ["send_profile_events", 1, "1"], ["send_logs_level", 1, "debug"],
+            ["log_queries", 1, "1"],
         ],
         "queries": {}, "files": {},
     }
+    manifest["exception_lifecycle_probe"] = assert_exception_lifecycle(
+        args.host, args.tcp_port
+    )
     for label, sql in QUERIES.items():
         query_id = f"ch-core-fixture-{label}"
         parameters = PARAMETERS.get(label, [])
@@ -298,7 +473,9 @@ def main():
                     if boundaries[-1]["code"] != 2:
                         raise ValueError("expected mid-stream exception")
                     if not any(p["code"] == 1 and p["rows"] > 0 for p in boundaries):
-                        raise ValueError("exception arrived before positive-row Data")
+                        raise ValueError(
+                            f"exception arrived before positive-row Data: {boundaries}"
+                        )
                     # Confirm a query-time Exception does not require EOS and the
                     # same transport accepts another query immediately.
                     recovery = query_packet("SELECT 1", "ch-core-fixture-recovery")
@@ -311,31 +488,45 @@ def main():
                     captures["tcp_query_recovery_rev54460.native"] = body
                     manifest["queries"]["recovery"] = {
                         "sql": "SELECT 1", "query_id": "ch-core-fixture-recovery",
-                        "packets": recovered,
+                        "packets": public_packets(recovered),
                     }
                 elif boundaries[-1]["code"] != 5:
                     raise ValueError(f"query {label} failed: {boundaries[-1]}")
-                # Spot-check the parameter contract on the decoded payload.
-                expected = {
-                    "escaped_parameter": [ESCAPED_PARAMETER.encode()],
-                    # One Array row of two strings, then a 1 null-mask byte.
-                    "container_parameter": [
-                        struct.pack("<Q", 2) + string("user_1") + string("it's")
-                        + b"\x01",
-                    ],
-                }.get(label, [])
-                if any(part not in native for part in expected):
-                    raise ValueError(f"query {label} parameter value mismatch")
+                # Check exact parsed column bodies. This cannot accidentally
+                # match a value substring or the next column's length byte.
+                result_blocks = [
+                    p for p in boundaries if p["code"] == 1 and p.get("rows") == 1
+                ]
+                if label == "escaped_parameter":
+                    expected = [string(ESCAPED_PARAMETER)]
+                    actual = [
+                        bytes.fromhex(body) for body in result_blocks[-1]["_column_bodies"]
+                    ]
+                    if actual != expected:
+                        raise ValueError(f"query {label} column bodies mismatch")
+                elif label == "container_parameter":
+                    expected = [
+                        struct.pack("<Q", 2) + string("user_1") + string("it's"),
+                        b"\x01" + string(""),
+                    ]
+                    actual = [
+                        bytes.fromhex(body) for body in result_blocks[-1]["_column_bodies"]
+                    ]
+                    if actual != expected:
+                        raise ValueError(f"query {label} column bodies mismatch")
         captures[f"tcp_query_{label}_client_rev54460.packet"] = request
         captures[f"tcp_query_{label}_server_rev54460.packets"] = packets
         captures[f"tcp_query_{label}_rev54460.native"] = native
         manifest["queries"][label] = {
             "sql": sql, "query_id": query_id, "parameters": parameters,
-            "packets": boundaries,
+            "packets": public_packets(boundaries),
         }
     all_codes = {p["code"] for q in manifest["queries"].values() for p in q["packets"]}
     if not {1, 2, 3, 5, 6, 7, 8, 10, 14}.issubset(all_codes):
         raise ValueError(f"missing packet coverage: {all_codes}")
+    manifest["client_info_query_log"] = assert_client_info_query_log(
+        opener, args.host, args.http_port, "ch-core-fixture-select"
+    )
     args.output.mkdir(parents=True, exist_ok=True)
     for name, data in captures.items():
         (args.output / name).write_bytes(data)

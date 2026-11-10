@@ -9,18 +9,25 @@ version; patch releases remain backward compatible.
 
 - Add a resumable `BlockScanner` for outer protocols to find one exact Native
   block boundary and inspect its declared row and column counts without
-  materializing decoded column buffers or copying wire bytes. Partial String,
+  materializing decoded column buffers or copying payload bytes. Partial String,
   Nullable, Array, Map, Tuple, LowCardinality, Variant, Dynamic, JSON, and
   AggregateFunction bodies and their runtime type-table prefixes resume within
   the current column instead of re-walking it after each transport read, so
-  incremental feeds scan in linear time. The LowCardinality scan rejects the
+  incremental feeds scan in linear time. Parsed top-level headers are
+  checkpointed for fixed-width bodies too, and incomplete top-level binary
+  descriptors retain grammar progress. The LowCardinality scan rejects the
   same malformed dictionaries and indexes that decode rejects, and the scan
   applies decode's 2 GiB String chunk limit and the Variant and Dynamic i32
   row guards. Flattened JSON scanning also enforces decode's cumulative
   synthetic-allocation budget across nested paths and columns. JSON paths use
-  a counted prefix task rather than retaining one large task per path. Binary
-  runtime descriptor parsing must match the scanned boundary exactly; parser
+  a counted prefix task rather than retaining one large task per path, and
+  scanned paths retain only the count and the last name needed for validation.
+  Binary runtime descriptor parsing must match the scanned boundary exactly; parser
   errors after a complete descriptor are fatal rather than resumable EOF.
+- Reject repeated known `BlockInfo` fields in decode and scan. The server
+  writer never emits repeats; this bounds incremental preamble scanning.
+- Make `DecodeOptions` cloneable and copyable and allow future fields in
+  `BlockBoundary::Complete` without breaking downstream matches using `..`.
 - Treat a partial first VarUInt in either `BlockInfo` or the unframed
   revision-zero column count as `UnexpectedEof`. An entirely empty input
   remains a clean block boundary.
@@ -47,14 +54,15 @@ version; patch releases remain backward compatible.
   end-of-data marker, Totals, Extremes, Log, and ProfileEvents blocks. Block
   buffers grow only with bytes received and never past the cap.
 - `ch-tcp-proto`: a query Exception closes the connection
-  (`State::Failed(FailureKind::ServerException)`) for codes 99, 101, 720, and
-  749, and for code 115 only when its message is `Unknown setting '<name>'`
-  for a name sent with `Query::with_setting`. Code 115 from a SQL `SETTINGS`
-  clause leaves the connection `Ready`.
+  (`State::Failed(FailureKind::ServerException)`) for codes 99, 101, 702,
+  720, and 749, and whenever Exception is the first server response to a query
+  that sent settings. This conservative policy covers failures while parsing
+  setting values before the server creates a query context. Other query
+  exceptions return to `Ready`; transport EOF still requires discarding the
+  connection.
 - `ch-tcp-proto`: setting values and parameter names and values are no longer
   limited to 64 KiB each; only the 64 MiB Query packet bound applies. Setting
-  names keep a 64 KiB cap so a code 115 message naming one is never
-  truncated. The packet bound is exact: a packet of exactly 64 MiB is
+  names retain their existing 64 KiB cap. The packet bound is exact: a packet of exactly 64 MiB is
   accepted, and `QueryOutputTooLarge.length` is the true packet length.
 - `ch-tcp-proto`: `Event::ServerHello` and `Event::Exception` now hold
   `Box<ServerHello>` and `Box<ServerException>`, keeping `Event` at 56 bytes.

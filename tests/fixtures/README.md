@@ -280,10 +280,22 @@ The escaped parameter sends the escaped text of a String holding quote,
 backslash, NUL, newline, carriage return, tab, backspace, and form feed, and
 the replay checks the decoded bytes. The container parameter sends
 `['user_1','it\'s']` for `Array(String)` and `\N` for `Nullable(String)`, and
-the replay checks two elements and a NULL. The generator spot-checks both
-decoded values at capture time.
+the replay checks both element offsets, the two values, and the NULL. At
+capture time the generator parses and compares each complete result column
+body, so a value substring or an adjacent column's length byte cannot satisfy
+the oracle accidentally.
 The capture asserts that the error follows positive-row Data and immediately
 executes SELECT 1 again on the same socket, with no intervening EOS or Ping.
+It also live-probes two first-response Exceptions: `max_threads=abc` returns
+code 27 and closes the socket, while a code 62 syntax error from a query with
+no wire settings leaves the same socket reusable.
+
+ClientInfo uses sentinel OS user, hostname, client version, quota key, initial
+address, and initial start time values. After `SYSTEM FLUSH LOGS`, the generator
+queries the `QueryFinish` row in `system.query_log` by query ID and independently
+checks the fields the server preserves. It separately verifies that the server
+replaced the supplied initial address with a real peer address and positive
+port, as it does for every initial query.
 
 Each matching `.native` file concatenates the result Data bodies while omitting
 the zero-column, zero-row TCP end marker. Schema-only result blocks remain.

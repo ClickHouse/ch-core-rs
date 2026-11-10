@@ -5,29 +5,95 @@
 //! of that one encoded allocation, so feed-size results do not include copying
 //! input into a staging buffer.
 //!
-//! Set `CH_CORE_BENCH_ROWS` to change the default 1,000,000 rows and
+//! Both header modes run at revision 54460, plus text mode at revision zero.
+//! Each run measures two sizes and feeds from 64 bytes through 1 MiB.
+//! Set `CH_CORE_BENCH_ROWS` to change the default maximum 1,000,000 rows and
 //! `CH_CORE_BENCH_MS` to change the approximate measurement time per cell.
 //! `CH_CORE_BENCH_PREFIX_LABELS` controls the default 4,096-label Enum16
 //! descriptor nested in the prefix-heavy Dynamic case.
 //! `CH_CORE_BENCH_FILTER` runs only case names containing that substring.
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ch_core_rs::batch::ColBatch;
+use ch_core_rs::bitmap::Bitmap;
 use ch_core_rs::column::{
     AggregateStateColumn, BoolColumn, Column, DictionaryColumn, DynamicChild, DynamicColumn,
     JsonColumn, PrimitiveColumn, StructuredJson, Utf8Column,
 };
-use ch_core_rs::native::decode::{decode_all_bytes, parse_ch_type, DecodeOptions};
-use ch_core_rs::native::encode::{encode_block, EncodeOptions};
+use ch_core_rs::native::decode::{
+    decode_all_bytes, decode_all_bytes_binary_types, parse_ch_type, DecodeOptions,
+};
+use ch_core_rs::native::encode::{encode_block, encode_block_binary_types, EncodeOptions};
 use ch_core_rs::native::stream_decoder::{BlockBoundary, BlockScanner};
 use ch_core_rs::schema::{ChType, Field, Schema};
 
 const DEFAULT_ROWS: usize = 1_000_000;
 const CHECK_ROWS: usize = 1_024;
 const DEFAULT_CELL_MS: u64 = 350;
-const FEEDS: [usize; 4] = [4 << 10, 16 << 10, 64 << 10, 1 << 20];
+const FEEDS: [usize; 5] = [64, 4 << 10, 16 << 10, 64 << 10, 1 << 20];
+
+// Benchmark-only allocator. Sizes describe requested live heap bytes, not RSS
+// or allocator overhead. Source batches and encoded input predate each sample.
+struct CountingAllocator;
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+
+fn allocated(size: usize) {
+    ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+    let live = LIVE.fetch_add(size, Ordering::Relaxed) + size;
+    PEAK.fetch_max(live, Ordering::Relaxed);
+}
+
+// Safety: all requests are forwarded unchanged to System. Accounting does not
+// inspect allocations or alter their pointers, alignment, or lifetime.
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // Safety: the caller provides a valid allocation layout.
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            allocated(layout.size());
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        // Safety: ptr and layout are the unchanged allocation being released.
+        unsafe { System.dealloc(ptr, layout) };
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // Safety: forward the caller's valid allocation and new size unchanged.
+        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+        if !new_ptr.is_null() {
+            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+            allocated(new_size);
+        }
+        new_ptr
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+#[derive(Clone, Copy)]
+struct Mode {
+    binary: bool,
+    revision: u64,
+}
+
+impl Mode {
+    fn options(self) -> DecodeOptions {
+        let mut options = DecodeOptions::default();
+        options.protocol_revision = self.revision;
+        options
+    }
+}
 
 fn utf8_repeated(rows: usize, width: usize) -> Utf8Column {
     let mut offsets = Vec::with_capacity(rows + 1);
@@ -237,15 +303,21 @@ fn wide_json(rows: usize, flattened: bool) -> (ChType, JsonColumn) {
     )
 }
 
-fn cases(rows: usize, filter: Option<&str>) -> Vec<(&'static str, Vec<u8>)> {
+fn cases(rows: usize, filter: Option<&str>, mode: Mode) -> Vec<(&'static str, Vec<u8>)> {
     // A 32-byte value makes the String, Dynamic, and structured JSON cases
     // about 32 MiB at the default row count, matching a wide result column.
     let string = || utf8_repeated(rows, 32);
     let wanted = |name: &str| filter.map_or(true, |needle| name.contains(needle));
     let mut output = Vec::new();
-    let mut push = |name: &'static str, batch: ColBatch, options: EncodeOptions| {
+    let mut push = |name: &'static str, batch: ColBatch, mut options: EncodeOptions| {
         if wanted(name) {
-            let bytes = encode_block(&batch, &options).expect("encode benchmark");
+            options.protocol_revision = mode.revision;
+            let bytes = if mode.binary {
+                encode_block_binary_types(&batch, &options)
+            } else {
+                encode_block(&batch, &options)
+            }
+            .expect("encode benchmark");
             output.push((name, bytes));
         }
     };
@@ -488,11 +560,130 @@ fn cases(rows: usize, filter: Option<&str>) -> Vec<(&'static str, Vec<u8>)> {
             EncodeOptions::default(),
         );
     }
+    if wanted("MixedColumns") {
+        let schema = Schema::new(vec![
+            Field {
+                name: "number".into(),
+                ch_type: ChType::UInt64,
+            },
+            Field {
+                name: "flag".into(),
+                ch_type: ChType::Bool,
+            },
+            Field {
+                name: "optional".into(),
+                ch_type: ChType::Nullable(Box::new(ChType::Int64)),
+            },
+            Field {
+                name: "text".into(),
+                ch_type: ChType::String,
+            },
+        ]);
+        let null_map = (0..rows)
+            .map(|row| (row % 3 == 0) as u8)
+            .collect::<Vec<_>>();
+        let columns = vec![
+            Column::UInt64(PrimitiveColumn::new(vec![79; rows])),
+            Column::Bool(BoolColumn::from_wire_bytes(
+                &(0..rows).map(|row| (row % 2) as u8).collect::<Vec<_>>(),
+            )),
+            Column::Int64(PrimitiveColumn::new_nullable(
+                vec![13; rows],
+                Bitmap::from_ch_null_map(&null_map),
+            )),
+            Column::Utf8(string()),
+        ];
+        push(
+            "MixedColumns",
+            ColBatch::new(schema, columns, rows),
+            EncodeOptions::default(),
+        );
+    }
+    if wanted("JSONManyPaths") {
+        let paths = (rows / 10).max(1);
+        let dynamic = (0..paths)
+            .map(|path| {
+                (
+                    format!("path_{path:08}"),
+                    DynamicColumn::try_new(&[u32::MAX], Vec::new()).expect("null Dynamic"),
+                )
+            })
+            .collect();
+        let json = StructuredJson::try_new(
+            Vec::new(),
+            dynamic,
+            vec![0, 0],
+            empty_utf8(),
+            empty_utf8(),
+            1,
+        )
+        .expect("many-path JSON");
+        let ch_type = ChType::Json {
+            max_dynamic_paths: 1_024,
+            max_dynamic_types: 32,
+            typed_paths: Vec::new(),
+            skip_paths: Vec::new(),
+            skip_regexps: Vec::new(),
+        };
+        let mut options = EncodeOptions::default();
+        options.flattened_dynamic = true;
+        push(
+            "JSONManyPaths",
+            batch(
+                "paths",
+                ch_type,
+                Column::Json(JsonColumn::structured(json)),
+                1,
+            ),
+            options,
+        );
+    }
+    for (case, name) in [
+        ("TopLevelEnum", "e".to_owned()),
+        ("CombinedHeader", "n".repeat(1 << 20)),
+    ] {
+        if wanted(case) {
+            let variants = (0..256)
+                .map(|value| {
+                    (
+                        format!("label_{value:03}_{}", "x".repeat(205)),
+                        value as u8 as i8,
+                    )
+                })
+                .collect();
+            push(
+                case,
+                batch(
+                    &name,
+                    ChType::Enum8 { variants },
+                    Column::Enum8(PrimitiveColumn::new(vec![13; rows])),
+                    rows,
+                ),
+                EncodeOptions::default(),
+            );
+        }
+    }
+    if wanted("LongName") {
+        push(
+            "LongName",
+            batch(
+                &"n".repeat(1 << 20),
+                ChType::UInt64,
+                Column::UInt64(PrimitiveColumn::new(vec![79; rows])),
+                rows,
+            ),
+            EncodeOptions::default(),
+        );
+    }
     output
 }
 
-fn scan_once(bytes: &[u8], feed: usize) {
-    let mut scanner = BlockScanner::new(DecodeOptions::default());
+fn scan_once(bytes: &[u8], feed: usize, mode: Mode) {
+    let mut scanner = if mode.binary {
+        BlockScanner::new_binary_types(mode.options())
+    } else {
+        BlockScanner::new(mode.options())
+    };
     let mut end = feed.min(bytes.len());
     loop {
         match scanner.scan(black_box(&bytes[..end])).expect("scan") {
@@ -509,12 +700,32 @@ fn scan_once(bytes: &[u8], feed: usize) {
     }
 }
 
-fn one_shot(bytes: &[u8]) {
-    scan_once(bytes, bytes.len());
+fn one_shot(bytes: &[u8], mode: Mode) {
+    scan_once(bytes, bytes.len(), mode);
 }
 
-fn decode(bytes: &[u8]) {
-    black_box(decode_all_bytes(black_box(bytes), &DecodeOptions::default()).expect("decode"));
+fn decode(bytes: &[u8], mode: Mode) {
+    if mode.binary {
+        black_box(
+            decode_all_bytes_binary_types(black_box(bytes), &mode.options()).expect("decode"),
+        );
+    } else {
+        black_box(decode_all_bytes(black_box(bytes), &mode.options()).expect("decode"));
+    }
+}
+
+fn peak_scan(bytes: &[u8], feed: usize, mode: Mode) -> (usize, usize) {
+    let baseline = LIVE.load(Ordering::Relaxed);
+    PEAK.store(baseline, Ordering::Relaxed);
+    ALLOCATIONS.store(0, Ordering::Relaxed);
+    scan_once(bytes, feed, mode);
+    let peak = PEAK.load(Ordering::Relaxed).saturating_sub(baseline);
+    assert_eq!(
+        LIVE.load(Ordering::Relaxed),
+        baseline,
+        "scanner leaked allocation"
+    );
+    (peak, ALLOCATIONS.load(Ordering::Relaxed))
 }
 
 fn measure(target: Duration, mut operation: impl FnMut()) -> Duration {
@@ -563,39 +774,46 @@ fn main() {
             .unwrap_or(DEFAULT_CELL_MS),
     );
     let filter = std::env::var("CH_CORE_BENCH_FILTER").ok();
-    let cases = cases(rows, filter.as_deref());
-
-    // Keep `cargo test --all-targets` useful without spending benchmark time.
-    for (_, bytes) in &cases {
-        one_shot(bytes);
-        scan_once(bytes, 4 << 10);
-        decode(bytes);
-    }
-    if !timing {
-        return;
-    }
-
-    println!(
-        "rows={rows}, best of 5 calibrated batches (best of 3 when one run exceeds target), times in ms"
-    );
-    println!(
-        "{:<20} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}",
-        "column", "MiB", "decode", "one-shot", "4 KiB", "16 KiB", "64 KiB", "1 MiB"
-    );
-    for (name, bytes) in &cases {
-        let decode_time = measure(target, || decode(bytes));
-        let one_shot_time = measure(target, || one_shot(bytes));
-        let feeds = FEEDS.map(|feed| measure(target, || scan_once(bytes, feed)));
-        println!(
-            "{:<20} {:>9.2} {:>9.3} {:>9.3} {:>9.3} {:>9.3} {:>9.3} {:>9.3}",
-            name,
-            bytes.len() as f64 / (1 << 20) as f64,
-            ms(decode_time),
-            ms(one_shot_time),
-            ms(feeds[0]),
-            ms(feeds[1]),
-            ms(feeds[2]),
-            ms(feeds[3]),
-        );
+    // Two sizes expose scaling with row count. Both header modes run at the
+    // TCP pin, while text revision 0 preserves the original HTTP baseline.
+    for size in [rows.div_ceil(4).max(1), rows] {
+        for mode in [
+            Mode {
+                binary: false,
+                revision: 0,
+            },
+            Mode {
+                binary: false,
+                revision: 54460,
+            },
+            Mode {
+                binary: true,
+                revision: 54460,
+            },
+        ] {
+            let cases = cases(size, filter.as_deref(), mode);
+            if timing {
+                println!("rows={size} mode={} revision={} times=ms peak=requested heap bytes (input excluded)",
+                    if mode.binary { "binary" } else { "text" }, mode.revision);
+                println!("column MiB decode one-shot 64B 4KiB 16KiB 64KiB 1MiB peak64B peak1MiB alloc64B alloc1MiB");
+            }
+            for (name, bytes) in &cases {
+                one_shot(bytes, mode);
+                for feed in FEEDS {
+                    scan_once(bytes, feed, mode);
+                }
+                decode(bytes, mode);
+                let (peak_small, alloc_small) = peak_scan(bytes, 64, mode);
+                let (peak_large, alloc_large) = peak_scan(bytes, 1 << 20, mode);
+                if timing {
+                    let decode_time = measure(target, || decode(bytes, mode));
+                    let one_shot_time = measure(target, || one_shot(bytes, mode));
+                    let feeds = FEEDS.map(|feed| measure(target, || scan_once(bytes, feed, mode)));
+                    println!("{name:<20} {:.2} {:.3} {:.3} {:.3} {:.3} {:.3} {:.3} {:.3} {peak_small} {peak_large} {alloc_small} {alloc_large}",
+                        bytes.len() as f64 / (1 << 20) as f64, ms(decode_time), ms(one_shot_time),
+                        ms(feeds[0]), ms(feeds[1]), ms(feeds[2]), ms(feeds[3]), ms(feeds[4]));
+                }
+            }
+        }
     }
 }

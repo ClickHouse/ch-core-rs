@@ -289,11 +289,11 @@ The interesting machinery is how it avoids wasted work on partial data:
   real decode run, so a block arriving over many small feeds allocates its
   column buffers exactly once, when the last byte lands.
 - **Resumable checkpoint.** The scan keeps a `ScanProgress` checkpoint across
-  feeds: verified top-level columns and, inside a column, bodies built from
-  String, fixed-width values, Nullable, Array, Map, Tuple, LowCardinality,
+  feeds: parsed column headers, verified top-level columns and, inside a column,
+  bodies built from String, fixed-width values, Nullable, Array, Map, Tuple, LowCardinality,
   Variant, Dynamic, JSON, and AggregateFunction. Runtime type-table prefixes
-  and nested bodies also retain progress. A block fed in many pieces is
-  therefore walked once overall. The scanner allocates metadata and task
+  and nested bodies also retain progress, including incomplete top-level binary
+  descriptors. A block fed in many pieces is therefore walked once overall. The scanner allocates metadata and task
   state, but no decoded column buffers.
 - **High-water mark.** If a scan found the next block incomplete after
   consuming all N buffered bytes, no block can complete until the buffer grows
@@ -303,8 +303,8 @@ The interesting machinery is how it avoids wasted work on partial data:
 - The `UnexpectedEof`-vs-fatal-error distinction from the decode layer is what
   makes this work: EOF means wait for more bytes, anything else aborts the
   stream. Scan and decode agree on acceptance or rejection and complete-block
-  boundaries, but error wording and timing can differ. An invalid Dynamic
-  index or AggregateFunction zero-state byte in a truncated stream can cause
+  boundaries, but error wording and timing can differ. Header corruption, an
+  invalid Dynamic index or AggregateFunction zero-state byte in a truncated stream can cause
   an invalid-data error before decode reports truncation.
 
 Transport-level backpressure stays a binding/client responsibility; the core

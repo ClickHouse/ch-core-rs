@@ -162,10 +162,12 @@ impl<'a> ByteReader<'a> {
     }
 
     /// Read a LEB128-prefixed UTF-8 string. Invalid UTF-8 is rejected as
-    /// `InvalidData`, matching the previous reader.
+    /// `InvalidData`, matching the previous reader. A length that does not fit
+    /// the platform `usize` reports `UnexpectedEof`, like a declared length
+    /// larger than the available input and the resumable scanner's length path.
     #[inline]
     pub fn read_varint_string(&mut self) -> io::Result<String> {
-        let len = self.read_varint()? as usize;
+        let len = usize::try_from(self.read_varint()?).map_err(|_| unexpected_eof())?;
         let bytes = self.read_slice(len)?;
         std::str::from_utf8(bytes)
             .map(str::to_owned)
@@ -316,6 +318,15 @@ mod tests {
         let data = [0x02u8, 0xFF, 0xFE];
         let err = ByteReader::new(&data).read_varint_string().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_varint_string_rejects_platform_oversized_length() {
+        let mut data = Vec::new();
+        write_varint(&mut data, u64::from(u32::MAX) + 1);
+        data.push(0);
+        let err = ByteReader::new(&data).read_varint_string().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]

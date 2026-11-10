@@ -223,11 +223,13 @@ fn run_select<S: Read + Write>(
 
 ### Decoding results
 
-Every TCP SELECT result starts with a zero-row Data block that carries only
-the schema; the rows follow in later blocks. HTTP `FORMAT Native` sends no
-such block. Core's `StreamDecoder` and `decode_next_block` both return it as a
-zero-row `ch_core_rs::batch::ColBatch`, so bindings must accept zero-row
-batches, and can use the first one to learn the schema of an empty result.
+When a TCP SELECT has a non-empty result header, it starts with a zero-row Data
+block that carries only that schema; the rows follow in later blocks. A query
+with an empty header need not send a schema block. HTTP `FORMAT Native` sends
+no leading schema-only block. Core's `StreamDecoder` and `decode_next_block`
+return a schema-only block as a zero-row `ch_core_rs::batch::ColBatch`, so
+bindings must accept zero-row batches and can use one to learn the schema of
+an empty result.
 
 Either feed the concatenated payloads to `StreamDecoder`, or decode each
 payload as it arrives. The per-payload form is preferred: `StreamDecoder`
@@ -331,32 +333,43 @@ fn health_check<S: Read + Write>(
   pre-query phase: `State::Failed(FailureKind::ServerException)`. At
   `v26.8.1.2041-lts` (`TCPHandler::runImpl`):
   - The handshake catch sends at most one Exception and the connection closes.
-  - Any query-time exception raised before the query context exists is sent
-    and the connection closes. The engine identifies the one such case it can
-    see in the packet: code 115 whose message is `Unknown setting '<name>'` for
-    a name passed to `Query::with_setting`, rejected by `BaseSettings::read`
-    while the Query packet is read. Code 115 for a name in the SQL `SETTINGS`
-    clause comes later, from `AccessControl::checkSettingNameIsAllowed`, and
-    leaves the connection reusable.
-  - Codes 101, 720, and 749 are sent and the connection closes. Code 99 closes
-    without being sent; it is listed defensively.
-  - Every other query-time Exception returns the engine to `Ready`.
+  - `ClientInfo` and wire settings are read before the query context exists.
+    An Exception there is the first query response and the connection closes.
+    Because the packet does not expose the throw site, a first-packet
+    Exception for a query that sent settings fails closed. This covers bad
+    values for known settings as well as unknown names. A later Exception is
+    reusable unless its code is independently terminal. A first-packet SQL
+    syntax error remains reusable when no wire settings were sent.
+  - The conservative rule also marks a first-packet syntax error terminal when
+    that query sent wire settings, even though the server can keep the socket
+    open. The packet does not reveal whether the throw happened while reading
+    settings or after context creation. When the engine reports `Failed`, the
+    driver must close its socket itself rather than wait for server EOF. Where
+    a binding can safely construct one, a SQL `SETTINGS` clause avoids setting
+    the wire-settings flag and therefore avoids this false positive.
+  - Codes 101, 702, 720, and 749 are sent and the connection closes. Code 99
+    closes without being sent; it is listed defensively.
+  - Once a query context exists, other query errors normally leave the
+    connection reusable. The wire does not identify every server throw site,
+    so a driver must still honor transport EOF and I/O failures.
 - There is no Cancel packet and no reset. A driver that abandons a query before
   its EndOfStream or Exception, for example on a timeout, must discard the
   `Connection` and its socket rather than reuse them.
 - `query` queues a revision-54460 Query packet followed by an empty client Data
   block. It accepts string settings and parameter values. See
   `Query::with_parameter` for how parameter values are encoded. Setting names
-  are capped at 64 KiB (`StringTooLong`), so a code 115 message naming one
-  always fits in the retained Exception text. Setting values and parameter
-  names and values have no per-field limit: the server reads them with a 1 GiB
-  string limit, and the engine bounds only the whole packet, at exactly
-  64 MiB (`QueryOutputTooLarge` reports the packet's true length).
-- Every `Query::with_setting` is sent with `IMPORTANT`, so an unknown name is a
-  terminal code 115 Exception instead of being silently ignored. A binding
-  that forwards a user's settings map should forward only names it knows.
-- `Query` reports `initial_address` `0.0.0.0:0` unless
-  `Query::with_initial_address` sets it.
+  are capped at 64 KiB (`StringTooLong`) as an engine policy that independently
+  bounds user-controlled identifiers. Setting values and parameter names and
+  values have no per-field limit: the server reads them with a 1 GiB string
+  limit, and the engine bounds only the whole packet, at exactly 64 MiB
+  (`QueryOutputTooLarge` reports the packet's true length).
+- Every `Query::with_setting` is sent with `IMPORTANT`, so invalid names or
+  values fail instead of being silently ignored. A binding should validate a
+  forwarded settings map where practical.
+- `Query` serializes `initial_address` as `0.0.0.0:0` unless
+  `Query::with_initial_address` sets it. For an initial query, the server
+  overwrites that field with the connection's real peer address before it is
+  recorded in `system.query_log`; the setter does not spoof the logged peer.
 - At revision 54460 the server never echoes the query ID. A binding that needs
   one, to correlate logs or `system.query_log`, must generate it and pass it
   with `Query::with_query_id`.
@@ -386,10 +399,11 @@ fn health_check<S: Read + Write>(
 - `ServerHello::timezone` is the server timezone, the TCP counterpart of HTTP's
   `X-ClickHouse-Timezone` header. Use it for `DateTime` columns that declare
   no timezone.
-- Bytes after a handshake-phase Exception are counted, never parsed, and `feed`
+- Bytes after any terminal Exception are counted, never parsed, and `feed`
   keeps returning `Ok`. `finish` then returns `TrailingInput` if any bytes
-  followed, otherwise `Ok`. The result does not depend on how the stream was
-  split into chunks.
+  followed, otherwise `Ok`. This includes handshake, pre-query, and terminal
+  query Exceptions, and does not depend on how the stream was split into
+  chunks.
 - `ping` is rejected with `InvalidState` while any server packet is partly
   received, even though `state()` still reports `Ready`. Otherwise a Pong
   whose packet code straddled the `ping` call would be accepted as its reply,
