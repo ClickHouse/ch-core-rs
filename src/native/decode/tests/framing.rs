@@ -37,6 +37,47 @@ fn test_protocol_revision_above_supported_ceiling_is_rejected() {
 }
 
 #[test]
+fn complete_binary_dynamic_type_reparse_rejects_trailing_and_incomplete_bytes() {
+    assert_eq!(
+        parse_complete_binary_type(&[0x15], "d").unwrap(),
+        ChType::String
+    );
+    for bytes in [&[0x15, 0x00][..], &[0x16, 0x80][..]] {
+        let err = parse_complete_binary_type(bytes, "d").unwrap_err();
+        assert!(
+            matches!(err, DecodeError::Io(ref error) if error.kind() == io::ErrorKind::InvalidData),
+            "{err:?}"
+        );
+    }
+}
+
+#[test]
+fn resumable_body_rejects_unconsumed_prefix_state() {
+    let mut state = ResumableBodyState {
+        column: "d".to_string(),
+        root_type: ChType::Nothing,
+        num_rows: 1,
+        settings: DecodeSettings::text(&DecodeOptions::default()),
+        prefix_tasks: Vec::new(),
+        states: vec![StatePrefix::Dynamic(DynamicState {
+            kind: DynamicWireKind::Flattened,
+            children: Vec::new(),
+        })],
+        state_cursor: 0,
+        body_seeded: true,
+        allocation_budget: AllocationBudget::new(
+            DecodeOptions::default().max_synthetic_allocation_bytes,
+        ),
+        tasks: Vec::new(),
+        offset: 0,
+    };
+    assert!(matches!(
+        scan_resumable_body(&mut ByteReader::new(&[]), &mut state),
+        Err(DecodeError::InvalidDynamic { .. })
+    ));
+}
+
+#[test]
 fn test_block_end_scans_string_column() {
     // The completeness scan must return the exact end offset of a block whose
     // String column it walks via the per-value length prefixes, and report a
@@ -103,6 +144,24 @@ fn test_block_end_rejects_unsupported_type() {
 fn test_block_end_no_block_at_clean_boundary() {
     // No-framing stream: an empty buffer is a clean boundary, not a block.
     assert_eq!(block_end(&[], &DecodeOptions::default()).unwrap(), None);
+}
+
+#[test]
+fn partial_revision_zero_column_count_is_not_a_clean_boundary() {
+    // A non-canonical multi-byte column-count VarUInt can straddle feeds. Once
+    // its first byte is present, both decode and scan must report truncation.
+    let data = [0x81];
+    let mut reader = ByteReader::new(&data);
+    assert!(matches!(
+        decode_next_block(&mut reader, &DecodeOptions::default()),
+        Err(DecodeError::Io(ref error))
+            if error.kind() == io::ErrorKind::UnexpectedEof
+    ));
+    assert!(matches!(
+        block_end(&data, &DecodeOptions::default()),
+        Err(DecodeError::Io(ref error))
+            if error.kind() == io::ErrorKind::UnexpectedEof
+    ));
 }
 
 #[test]
@@ -1188,4 +1247,107 @@ fn test_block_end_scans_name_decoration_types() {
     // And a full decode consumes it without error.
     let cb = decode_all_bytes(&data, &DecodeOptions::default()).unwrap();
     assert_eq!(cb.num_columns(), 3);
+}
+
+#[test]
+fn test_string_offset_helper_rejects_runs_past_i32_max() {
+    assert_eq!(next_string_offset(0, i32::MAX as usize).unwrap(), i32::MAX);
+    assert_eq!(next_string_offset(i32::MAX - 2, 2).unwrap(), i32::MAX);
+    for (offset, len) in [
+        (0, i32::MAX as usize + 1),
+        (i32::MAX - 1, 2),
+        (1, usize::MAX),
+    ] {
+        let err = next_string_offset(offset, len).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+}
+
+/// The resumable String walk carries its run's running i32 offset across a
+/// park, so a run whose cumulative data passes `i32::MAX` is rejected exactly
+/// like `decode_string_data` rejects it, at the length prefix, before its
+/// payload. The near-limit starting offset stands in for 2 GiB of earlier
+/// values in the same run.
+#[test]
+fn test_resumable_string_walk_rejects_cumulative_i32_overflow_across_park() {
+    let mut state = ResumableBodyState {
+        column: "s".to_string(),
+        root_type: ChType::String,
+        num_rows: 3,
+        settings: DecodeSettings::text(&DecodeOptions::default()),
+        prefix_tasks: Vec::new(),
+        states: Vec::new(),
+        state_cursor: 0,
+        body_seeded: true,
+        allocation_budget: AllocationBudget::new(
+            DecodeOptions::default().max_synthetic_allocation_bytes,
+        ),
+        tasks: vec![BodyScanTask::Strings {
+            rows_remaining: 3,
+            length_value: 0,
+            length_shift: 0,
+            length_complete: false,
+            payload_remaining: 0,
+            data_offset: i32::MAX - 5,
+        }],
+        offset: 0,
+    };
+    // Value 1: "abc" fits (offset MAX - 2); value 2's length 3 does not.
+    let data = [3, b'a', b'b', b'c', 3, b'x', b'y', b'z'];
+
+    let err = scan_resumable_body(&mut ByteReader::new(&data[..2]), &mut state).unwrap_err();
+    assert!(matches!(err, DecodeError::Io(ref e) if e.kind() == io::ErrorKind::UnexpectedEof));
+    assert_eq!(state.offset, 2);
+
+    let mut reader = ByteReader::new(&data);
+    reader.skip(state.offset).unwrap();
+    let err = scan_resumable_body(&mut reader, &mut state).unwrap_err();
+    match err {
+        DecodeError::Io(e) => {
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(
+                e.to_string(),
+                "String column chunk exceeds 2 GiB (i32 offset overflow)"
+            );
+        }
+        other => panic!("expected InvalidData, got {other:?}"),
+    }
+    // Sanity: decode's own message is the same text (single-length form).
+    let single = [0x80, 0x80, 0x80, 0x80, 0x08];
+    let decode_err = decode_string_data(&mut ByteReader::new(&single), 1).unwrap_err();
+    assert_eq!(decode_err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(
+        decode_err.to_string(),
+        "String column chunk exceeds 2 GiB (i32 offset overflow)"
+    );
+}
+
+/// The Variant row guard from `variant_layout_from_discriminators` fires in the
+/// resumable walker before the 2 GiB of discriminators would have to arrive.
+#[test]
+fn test_resumable_variant_rejects_rows_past_i32_max() {
+    let mut tasks = Vec::new();
+    let mut state_cursor = 0;
+    let err = push_value_tasks(
+        &mut tasks,
+        &ChType::Variant(vec![ChType::String]),
+        i32::MAX as usize + 1,
+        "v",
+        &[],
+        &mut state_cursor,
+    )
+    .unwrap_err();
+    match err {
+        DecodeError::InvalidVariant { column, reason } => {
+            assert_eq!(column, "v");
+            assert_eq!(
+                reason,
+                VariantColumnError::ChildOffsetOverflow {
+                    row: i32::MAX as usize
+                }
+                .to_string()
+            );
+        }
+        other => panic!("expected InvalidVariant, got {other:?}"),
+    }
 }

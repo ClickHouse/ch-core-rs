@@ -312,7 +312,10 @@ payload.
   discarding their values. This is revision independent: the 8-byte two-field
   preamble and the 10-byte three-field preamble both decode. An unknown field
   number is rejected with `DecodeError::InvalidBlockInfo`, matching the server,
-  which throws.
+  which throws. Repeated known fields are also rejected by decode and scan.
+  This is deliberately stricter than the server reader, which accepts repeats;
+  `BlockInfo::write` emits each field once. Rejecting repeats bounds preamble
+  work across incremental feeds without retaining a separate preamble parser.
 - When `protocol_revision >= DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION`
   (54454), it reads the per-column custom-serialization marker byte for every
   column, including in zero-row blocks. A 0 means default serialization and

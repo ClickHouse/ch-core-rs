@@ -8,6 +8,9 @@
 
 use std::io;
 
+mod scan;
+pub(crate) use scan::BinaryTypeScanner;
+
 use crate::native::aggregate_function::aggregate_state_codec;
 use crate::native::protocol::MAX_TYPE_DEPTH;
 use crate::native::type_parser::{normalize_variant_alternatives, parse_ch_type};

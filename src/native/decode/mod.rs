@@ -8,10 +8,10 @@ use crate::column::{
     variant_child_counts, variant_layout_from_discriminators, AggregateStateColumn, ArrayColumn,
     BoolColumn, Column, DecimalColumn, DictionaryColumn, DynamicChild, DynamicColumn,
     FixedBinaryColumn, JsonColumn, MapColumn, NothingColumn, PrimitiveColumn, QBitColumn,
-    StructuredJson, TupleColumn, Utf8Column, VariantColumn,
+    StructuredJson, TupleColumn, Utf8Column, VariantColumn, VariantColumnError,
 };
 use crate::native::aggregate_function::{
-    decode_aggregate_states, decode_state_codec, scan_aggregate_states,
+    decode_aggregate_states, decode_state_codec, scan_aggregate_states, AggregateStateCodec,
 };
 use crate::native::qbit::{transpose8, QBitWord};
 use crate::native::varint::ByteReader;
@@ -25,7 +25,7 @@ use crate::native::protocol::{
     LC_HAS_ADDITIONAL_KEYS_BIT, LC_NEED_GLOBAL_DICTIONARY_BIT, LOW_CARDINALITY_KEY_VERSION,
     MAX_TYPE_DEPTH,
 };
-use crate::native::type_binary::{read_binary_type, BinaryTypeError};
+use crate::native::type_binary::{read_binary_type, BinaryTypeError, BinaryTypeScanner};
 use crate::native::type_parser::{
     is_low_cardinality_inner, is_valid_variant_alternative, resolves_to_nothing,
     unsupported_header_type_name,
@@ -50,6 +50,11 @@ pub enum DecodeError {
     /// A `BlockInfo` preamble carried a field number this decoder does not know.
     /// The server rejects unknown field numbers the same way.
     InvalidBlockInfo {
+        field_num: u64,
+    },
+    /// A `BlockInfo` preamble repeated a known field. The server writer emits
+    /// every field exactly once, so repeats are rejected as non-canonical.
+    DuplicateBlockInfo {
         field_num: u64,
     },
     /// A column advertised a custom (non-default) serialization, whose wire
@@ -143,6 +148,9 @@ impl std::fmt::Display for DecodeError {
             DecodeError::InvalidBlockInfo { field_num } => {
                 write!(f, "Unknown BlockInfo field number {field_num}")
             }
+            DecodeError::DuplicateBlockInfo { field_num } => {
+                write!(f, "Duplicate BlockInfo field number {field_num}")
+            }
             DecodeError::UnsupportedSerialization {
                 column,
                 serialization_byte,
@@ -202,6 +210,7 @@ fn ensure_supported_protocol_revision(revision: u64) -> Result<(), DecodeError> 
 }
 
 /// Options for Native format decoding.
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct DecodeOptions {
     /// Negotiated server protocol revision the Native stream was produced with.
@@ -253,6 +262,7 @@ impl Default for DecodeOptions {
 }
 
 /// Cumulative per-block allowance for allocations not bounded by input.
+#[derive(Debug)]
 struct AllocationBudget {
     limit: usize,
     used: usize,
@@ -284,7 +294,7 @@ impl AllocationBudget {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct DecodeSettings {
     protocol_revision: u64,
     types_in_binary_format: bool,
@@ -350,6 +360,15 @@ enum JsonWireKind {
 struct JsonState {
     kind: JsonWireKind,
     dynamic_paths: Vec<String>,
+    /// Number of dynamic paths represented by this state. Allocating decode
+    /// retains their names, while the scan-only path retains only this count.
+    dynamic_path_count: usize,
+}
+
+impl JsonState {
+    fn dynamic_path_count(&self) -> usize {
+        self.dynamic_path_count
+    }
 }
 
 /// One entry in the per-column preorder state vector shared by the prefix, body,
@@ -481,21 +500,30 @@ fn decode_string_data(reader: &mut ByteReader, num_rows: usize) -> io::Result<(V
         // into `data`. This is a fatal error, not UnexpectedEof, so the
         // streaming decoder does not mistake it for "need more bytes". Blocks
         // stay separate chunks, so the 2 GiB cap is per chunk, not per result.
-        offset = i32::try_from(len)
-            .ok()
-            .and_then(|len_i32| offset.checked_add(len_i32))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "String column chunk exceeds 2 GiB (i32 offset overflow)",
-                )
-            })?;
+        offset = next_string_offset(offset, len)?;
         let bytes = reader.read_slice(len)?;
         data.extend_from_slice(bytes);
         offsets.push(offset);
     }
 
     Ok((offsets, data))
+}
+
+/// Advance one String run's running Arrow i32 offset past a value of `len`
+/// bytes, rejecting a run whose data would exceed `i32::MAX` bytes. Shared by
+/// [`decode_string_data`] and both completeness-scan walkers so all three reject
+/// the same runs with the same error, before any payload byte is read.
+#[inline]
+fn next_string_offset(offset: i32, len: usize) -> io::Result<i32> {
+    i32::try_from(len)
+        .ok()
+        .and_then(|len| offset.checked_add(len))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "String column chunk exceeds 2 GiB (i32 offset overflow)",
+            )
+        })
 }
 
 fn decode_fixed_binary_data(
@@ -765,7 +793,7 @@ fn read_state_prefix(
                     } => {
                         let state = read_json_state(reader, *max_dynamic_paths, column, depth)?;
                         let kind = state.kind;
-                        let num_dynamic = state.dynamic_paths.len();
+                        let num_dynamic = state.dynamic_path_count();
                         states.push(StatePrefix::Json(state));
                         if kind != JsonWireKind::Text {
                             for _ in 0..num_dynamic {
@@ -818,7 +846,7 @@ fn read_state_prefix(
                     } => {
                         let state = read_json_state(reader, max_dynamic_paths, column, depth)?;
                         let kind = state.kind;
-                        let num_dynamic = state.dynamic_paths.len();
+                        let num_dynamic = state.dynamic_path_count();
                         states.push(StatePrefix::Json(state));
                         if kind != JsonWireKind::Text {
                             for _ in 0..num_dynamic {
@@ -917,7 +945,7 @@ fn read_state_suffix(
         // state cursor stays aligned (all suffixes are no-ops today).
         ChType::Json { typed_paths, .. } => {
             let state = next_json_state(states, state_cursor, column)?;
-            let (kind, num_dynamic) = (state.kind, state.dynamic_paths.len());
+            let (kind, num_dynamic) = (state.kind, state.dynamic_path_count());
             if kind == JsonWireKind::Text {
                 return Ok(());
             }
@@ -1249,6 +1277,7 @@ fn read_json_state(
 
     Ok(JsonState {
         kind,
+        dynamic_path_count: dynamic_paths.len(),
         dynamic_paths,
     })
 }
@@ -3037,8 +3066,9 @@ fn empty_column(ch_type: &ChType) -> Column {
 // ---------------------------------------------------------------------------
 
 /// Consume the `BlockInfo` preamble that precedes each block when the producer
-/// used a protocol revision > 0 (server `BlockInfo::read` in
-/// `src/Core/BlockInfo.cpp`, confirmed at v26.6.1.1193-stable).
+/// used a protocol revision > 0 (server `BlockInfo::read` and
+/// `BlockInfo::write` in `src/Core/BlockInfo.cpp`, confirmed at
+/// v26.8.1.2041-lts).
 ///
 /// `BlockInfo` is a self-describing, field-tagged structure: each field is a
 /// varint field number followed by the field value, and a field number of 0
@@ -3053,18 +3083,35 @@ fn empty_column(ch_type: &ChType) -> Column {
 /// Parsing by field number is revision independent: the older 8-byte two-field
 /// preamble and the current 10-byte three-field preamble both decode correctly.
 /// An unknown field number is rejected, matching the server, which throws.
+/// A repeated known field is also rejected. The server reader accepts repeats
+/// with last-value-wins semantics, but `BlockInfo::write` emits every declared
+/// field exactly once in declaration order, so repeats are not server output.
 ///
 /// Returns `Ok(false)` if the stream ends cleanly before any block info byte (a
 /// block boundary at end of stream), or `Ok(true)` once a full preamble has been
 /// consumed.
 fn read_block_info(reader: &mut ByteReader) -> Result<bool, DecodeError> {
-    let mut field_num = match reader.read_varint() {
-        Ok(n) => n,
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
-        Err(e) => return Err(e.into()),
-    };
+    if reader.remaining() == 0 {
+        return Ok(false);
+    }
+    // Once any byte of the first field-number VarUInt is present, EOF means
+    // the block is partial rather than a clean boundary. This distinction is
+    // essential for streaming: a non-canonical multi-byte field number may
+    // straddle feeds.
+    let mut field_num = reader.read_varint()?;
+    let mut seen = 0u8;
 
     while field_num != 0 {
+        let bit = match field_num {
+            1 => 1 << 0,
+            2 => 1 << 1,
+            3 => 1 << 2,
+            other => return Err(DecodeError::InvalidBlockInfo { field_num: other }),
+        };
+        if seen & bit != 0 {
+            return Err(DecodeError::DuplicateBlockInfo { field_num });
+        }
+        seen |= bit;
         match field_num {
             1 => reader.skip(1)?, // is_overflows
             2 => reader.skip(4)?, // bucket_num (Int32)
@@ -3073,7 +3120,8 @@ fn read_block_info(reader: &mut ByteReader) -> Result<bool, DecodeError> {
                 let count = varint_usize(reader.read_varint()?, "out_of_order_buckets count")?;
                 reader.skip(count.saturating_mul(4))?;
             }
-            other => return Err(DecodeError::InvalidBlockInfo { field_num: other }),
+            // The field number was validated above.
+            _ => unreachable!("known BlockInfo field matched above"),
         }
         field_num = reader.read_varint()?;
     }
@@ -3094,9 +3142,11 @@ fn read_block_info(reader: &mut ByteReader) -> Result<bool, DecodeError> {
 /// clean end-of-stream at a block boundary returns `Ok(None)`.
 ///
 /// `decode_all_bytes` and `StreamDecoder` both drive the decode through this
-/// entry point. `StreamDecoder` first runs [`block_end`] to confirm a full
-/// block is buffered, so it never reaches the allocating decode for a partial
-/// block.
+/// entry point. `StreamDecoder` first runs the same resumable completeness
+/// scan that backs [`BlockScanner`](crate::native::stream_decoder::BlockScanner),
+/// keeping its `ScanProgress` checkpoint across feeds, so it reaches the
+/// allocating decode only once a whole block is buffered and walks a block fed
+/// in many pieces once overall rather than once per feed.
 ///
 /// [`max_synthetic_allocation_bytes`](DecodeOptions::max_synthetic_allocation_bytes)
 /// bounds synthesized allocations cumulatively across this block's columns.
@@ -3166,12 +3216,12 @@ fn decode_next_block_with_settings_unchecked(
         )?));
     }
 
-    // No protocol framing. End of stream falls on the column-count varint.
-    let num_cols = match reader.read_varint() {
-        Ok(n) => varint_usize(n, "column count")?,
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
+    // No protocol framing. Only an empty reader is a clean block boundary.
+    // Once the column-count VarUInt starts, EOF means the block is partial.
+    if reader.remaining() == 0 {
+        return Ok(None);
+    }
+    let num_cols = varint_usize(reader.read_varint()?, "column count")?;
     let num_rows = varint_usize(reader.read_varint()?, "row count")?;
     Ok(Some(decode_block_body(
         reader, options, num_cols, num_rows,
@@ -3181,9 +3231,9 @@ fn decode_next_block_with_settings_unchecked(
 /// Read one column header: name, type string, and the optional custom
 /// serialization marker. Returns the parsed `ChType` plus the column name.
 ///
-/// Shared by the allocating decode and the allocation-free completeness scan so
-/// the two cannot drift on header framing or on which types and serializations
-/// are accepted.
+/// The resumable completeness walk mirrors this in [`scan_column_header`],
+/// retaining partial strings and binary descriptors across feeds. Both paths
+/// finish with [`validate_header_type`] so acceptance cannot drift.
 fn read_column_header(
     reader: &mut ByteReader,
     options: &DecodeSettings,
@@ -3225,6 +3275,130 @@ fn read_column_header(
     validate_header_type(&col_name, &ch_type)?;
 
     Ok((col_name, ch_type))
+}
+
+/// Resume one top-level column header without reparsing completed strings.
+fn scan_column_header(
+    reader: &mut ByteReader,
+    options: &DecodeSettings,
+    saved: &mut Option<Box<ColumnHeaderScanState>>,
+) -> Result<(String, ChType), DecodeError> {
+    if let Some(state) = saved.as_mut() {
+        reader.skip(state.offset)?;
+        let result = scan_column_header_state(reader, options, state);
+        if !is_unexpected_eof_result(&result) {
+            saved.take();
+        }
+        return result;
+    }
+
+    let mut state = ColumnHeaderScanState {
+        name_scan: PartialStringScan::default(),
+        name: None,
+        text_type_scan: PartialStringScan::default(),
+        descriptor_start: None,
+        descriptor: None,
+        ch_type: None,
+        offset: reader.position(),
+    };
+    let result = scan_column_header_state(reader, options, &mut state);
+    if is_unexpected_eof_result(&result) {
+        *saved = Some(Box::new(state));
+    }
+    result
+}
+
+fn is_unexpected_eof_result<T>(result: &Result<T, DecodeError>) -> bool {
+    matches!(result, Err(DecodeError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof)
+}
+
+fn scan_column_header_state(
+    reader: &mut ByteReader,
+    options: &DecodeSettings,
+    state: &mut ColumnHeaderScanState,
+) -> Result<(String, ChType), DecodeError> {
+    if state.name.is_none() {
+        let Some(name) = state.name_scan.scan(reader)? else {
+            state.offset = reader.position();
+            return Err(need_more_bytes());
+        };
+        state.name = Some(name);
+        state.offset = reader.position();
+    }
+    if state.ch_type.is_none() {
+        let name = state.name.as_deref().unwrap_or("");
+        if options.types_in_binary_format {
+            let descriptor_start = *state.descriptor_start.get_or_insert(reader.position());
+            if state.descriptor.is_none() {
+                let mut probe = ByteReader::new(reader.remaining_slice());
+                match read_binary_type(&mut probe) {
+                    Ok(ch_type) => {
+                        reader.skip(probe.position())?;
+                        state.ch_type = Some(ch_type);
+                    }
+                    Err(BinaryTypeError::Io(error))
+                        if error.kind() == io::ErrorKind::UnexpectedEof =>
+                    {
+                        state.descriptor = Some(BinaryTypeScanner::new());
+                    }
+                    Err(error) => return Err(binary_type_error(error, name)),
+                }
+            }
+            if state.ch_type.is_none() {
+                let Some(descriptor_scanner) = state.descriptor.as_mut() else {
+                    return Err(DecodeError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "binary column header has no descriptor scanner",
+                    )));
+                };
+                if let Err(error) = descriptor_scanner.scan(reader) {
+                    state.offset = reader.position();
+                    return Err(binary_type_error(error, name));
+                }
+                let descriptor = reader.consumed_slice(descriptor_start)?;
+                state.ch_type = Some(parse_complete_binary_type(descriptor, name)?);
+            }
+        } else {
+            let Some(type_name) = state.text_type_scan.scan(reader)? else {
+                state.offset = reader.position();
+                return Err(need_more_bytes());
+            };
+            state.ch_type =
+                Some(
+                    parse_ch_type(&type_name).ok_or_else(|| DecodeError::UnsupportedType {
+                        column: name.to_string(),
+                        type_name,
+                    })?,
+                );
+        }
+        state.offset = reader.position();
+    }
+
+    if options.protocol_revision >= DBMS_MIN_REVISION_WITH_CUSTOM_SERIALIZATION {
+        let marker = reader.read_u8()?;
+        state.offset = reader.position();
+        if marker != 0 {
+            return Err(DecodeError::UnsupportedSerialization {
+                column: state.name.clone().unwrap_or_default(),
+                serialization_byte: marker,
+            });
+        }
+    }
+
+    let Some(ch_type) = state.ch_type.take() else {
+        return Err(DecodeError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "column header scanner returned before its type completed",
+        )));
+    };
+    let name = state.name.take().ok_or_else(|| {
+        DecodeError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "column header scanner returned before its name completed",
+        ))
+    })?;
+    validate_header_type(&name, &ch_type)?;
+    Ok((name, ch_type))
 }
 
 /// Reject a header type this crate parses but cannot decode, at header-read time.
@@ -3340,8 +3514,8 @@ fn decode_block_body(
             // bottoms out in one, can legitimately write ZERO bytes per row (a
             // pathless FLATTENED object under the flattened JSON serialization),
             // so it is bounded by its own read-before-allocate decode instead
-            // (`decode_json`), keeping decode symmetric with the allocation-free
-            // scan, which never applied a row-count guard.
+            // (`decode_json`), keeping decode symmetric with the scan-only
+            // walk, which never applied a row-count guard.
             if has_min_one_byte_per_row(&ch_type) {
                 check_header_count(num_rows, "row count", reader)?;
             }
@@ -3403,21 +3577,27 @@ fn has_min_one_byte_per_row(ch_type: &ChType) -> bool {
 /// - `Err(Io(UnexpectedEof))`: a block has started but is not fully buffered yet
 ///   (the caller should wait for more bytes).
 /// - `Err(_)`: a real decode error (unsupported type/serialization, bad
-///   BlockInfo field, varint overflow, invalid UTF-8 in a header), which is
-///   surfaced even before the whole block is buffered, exactly as the real
-///   decode would surface it.
+///   BlockInfo field, varint overflow, invalid UTF-8 in a header), which may be
+///   surfaced before the whole block is buffered. Scan and decode
+///   agree on acceptance or rejection and complete-block boundaries, not on
+///   error wording or timing. Corrupt partial data can fail with invalid data
+///   while decode still reports truncation.
 ///
-/// The streaming decoder calls this before [`decode_next_block`] so it never
-/// allocates and discards column buffers for a block that has not fully arrived.
-/// It shares `read_block_info` and `read_column_header` with the real
-/// decode; only `skip_column_data` is scan specific, and it walks the exact
-/// same wire bytes the per-type decoders consume.
+/// This is the one-shot form: it restarts from the block start on every call.
+/// `StreamDecoder` and [`BlockScanner`](crate::native::stream_decoder::BlockScanner)
+/// instead run the resumable form of the same scan, which keeps a
+/// `ScanProgress` checkpoint (completed columns, plus a task stack inside a
+/// resumable column) across "need more bytes", so incremental feeds walk each
+/// byte about once. Calling this after every partial read is quadratic in the
+/// number of reads. The scan shares `read_block_info` with the real decode,
+/// mirrors its column-header validation, and its column walkers consume exactly
+/// the wire bytes the per-type decoders consume and reject what they reject.
 pub fn block_end(data: &[u8], options: &DecodeOptions) -> Result<Option<usize>, DecodeError> {
     block_end_with_settings(data, &DecodeSettings::text(options))
 }
 
-/// Allocation-free completeness scan for a block using binary data-type
-/// descriptors. This is the binary-header counterpart of [`block_end`].
+/// Completeness scan for a block using binary data-type descriptors. This is
+/// the binary-header counterpart of [`block_end`].
 pub fn block_end_binary_types(
     data: &[u8],
     options: &DecodeOptions,
@@ -3457,9 +3637,18 @@ pub(crate) struct ScanProgress {
     /// to the offset just past the block header.
     columns_done: usize,
     columns_end: usize,
-    /// Mid-body checkpoint inside the current column, recorded only for the
-    /// flat-resumable String and Nullable(String) bodies.
-    string_body: Option<StringScanState>,
+    /// Partially scanned top-level column header, including incremental name
+    /// and text-type strings or a binary descriptor grammar walk.
+    column_header: Option<Box<ColumnHeaderScanState>>,
+    /// A fully parsed fixed-width top-level column whose body is incomplete.
+    /// Retaining only its byte range avoids both header reparsing and task
+    /// storage on the primitive hot path.
+    fixed_body: Option<FixedBodyState>,
+    /// Mid-column checkpoint inside a column [`is_resumable`] accepts (fixed
+    /// width values, String, Nullable, containers, LowCardinality, Variant,
+    /// Dynamic, JSON, and AggregateFunction), covering prefixes and bodies.
+    body: Option<Box<ResumableBodyState>>,
+    synthetic_allocation_used: usize,
     /// Cumulative bytes the scan advanced over, across resumes. Backs the
     /// O(n) linearity guard in the stream decoder tests.
     #[cfg(test)]
@@ -3470,9 +3659,16 @@ impl ScanProgress {
     /// Offset the next scan resumes from, which is also the largest saved
     /// offset (checkpoints only move forward within a block).
     fn resume_offset(&self) -> usize {
-        match &self.string_body {
+        match &self.body {
             Some(body) => body.offset,
-            None => self.columns_end,
+            None => self.fixed_body.as_ref().map_or_else(
+                || {
+                    self.column_header
+                        .as_ref()
+                        .map_or(self.columns_end, |header| header.offset)
+                },
+                |body| body.start,
+            ),
         }
     }
 
@@ -3482,20 +3678,369 @@ impl ScanProgress {
         self.header = None;
         self.columns_done = 0;
         self.columns_end = 0;
-        self.string_body = None;
+        self.column_header = None;
+        self.fixed_body = None;
+        self.body = None;
+        self.synthetic_allocation_used = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_header_string_bytes(&self) -> usize {
+        self.column_header.as_ref().map_or(0, |header| {
+            header.name.as_ref().map_or(0, |name| name.capacity())
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn header_waits_after_complete_type(&self) -> bool {
+        self.column_header
+            .as_ref()
+            .is_some_and(|header| header.ch_type.is_some() && header.descriptor.is_none())
+    }
+
+    #[cfg(test)]
+    /// Fixed task storage, used only after verifying task-owned heaps are empty.
+    pub(crate) fn retained_task_bytes(&self) -> usize {
+        let Some(body) = self.body.as_deref() else {
+            return 0;
+        };
+        let prefix_boxes = body
+            .prefix_tasks
+            .iter()
+            .map(|task| match task {
+                PrefixScanTask::Dynamic(task) => std::mem::size_of_val(task.as_ref()),
+                PrefixScanTask::Json(task) => {
+                    std::mem::size_of_val(task.as_ref())
+                        + task
+                            .previous_path
+                            .as_ref()
+                            .map_or(0, |path| path.capacity())
+                }
+                _ => 0,
+            })
+            .sum::<usize>();
+        std::mem::size_of::<ResumableBodyState>()
+            + body.prefix_tasks.capacity() * std::mem::size_of::<PrefixScanTask>()
+            + prefix_boxes
+            + body.tasks.capacity() * std::mem::size_of::<BodyScanTask>()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_tasks_have_empty_payloads(&self) -> bool {
+        let Some(body) = self.body.as_deref() else {
+            return true;
+        };
+        body.prefix_tasks.iter().all(|task| match task {
+            PrefixScanTask::Dynamic(task) => {
+                task.typed.capacity() == 0 && task.names.is_empty() && task.binary_scanner.is_none()
+            }
+            PrefixScanTask::DynamicRun { .. } | PrefixScanTask::Word(_) => true,
+            PrefixScanTask::Type { .. } | PrefixScanTask::Json(_) => false,
+        }) && body.tasks.iter().all(|task| match task {
+            BodyScanTask::DynamicValuesRun { .. } | BodyScanTask::ChargeSynthetic { .. } => true,
+            BodyScanTask::DynamicIndexes {
+                children, counts, ..
+            } => children.capacity() == 0 && counts.capacity() == 0,
+            _ => false,
+        })
     }
 }
 
-/// Mid-body scan checkpoint for a String or Nullable(String) column.
+#[derive(Debug, Default)]
+struct PartialStringScan {
+    length: PartialVarint,
+    len: Option<usize>,
+    payload_start: Option<usize>,
+    bytes_read: usize,
+}
+
+impl PartialStringScan {
+    fn scan(&mut self, reader: &mut ByteReader) -> Result<Option<String>, DecodeError> {
+        if self.len.is_none() {
+            let Some(len) = read_partial_varint(reader, &mut self.length)? else {
+                return Ok(None);
+            };
+            self.len = Some(varint_usize(len, "String length")?);
+        }
+        let len = self.len.unwrap_or(0);
+        let payload_start = *self.payload_start.get_or_insert(reader.position());
+        let remaining = len.saturating_sub(self.bytes_read);
+        let take = remaining.min(reader.remaining());
+        reader.skip(take)?;
+        self.bytes_read += take;
+        if self.bytes_read != len {
+            return Ok(None);
+        }
+        std::str::from_utf8(reader.consumed_slice(payload_start)?)
+            .map(str::to_owned)
+            .map(Some)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error).into())
+    }
+}
+
+/// Resumable framing state for one top-level column header.
 #[derive(Debug)]
-struct StringScanState {
-    /// Whether the Nullable null map has been skipped. Starts true for plain
-    /// String, which carries none.
-    null_map_done: bool,
-    /// Rows whose length varint and payload are fully verified.
-    rows_done: usize,
-    /// Offset of the first unverified byte, relative to the block start.
+struct ColumnHeaderScanState {
+    name_scan: PartialStringScan,
+    name: Option<String>,
+    text_type_scan: PartialStringScan,
+    descriptor_start: Option<usize>,
+    descriptor: Option<BinaryTypeScanner>,
+    ch_type: Option<ChType>,
     offset: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FixedBodyState {
+    start: usize,
+    end: usize,
+}
+
+/// Resumable scan state for one top-level column: its static and runtime-shaped
+/// state prefix, retained self-describing states, then its body task stack.
+#[derive(Debug)]
+struct ResumableBodyState {
+    column: String,
+    root_type: ChType,
+    num_rows: usize,
+    settings: DecodeSettings,
+    prefix_tasks: Vec<PrefixScanTask>,
+    states: Vec<StatePrefix>,
+    state_cursor: usize,
+    body_seeded: bool,
+    allocation_budget: AllocationBudget,
+    tasks: Vec<BodyScanTask>,
+    /// Offset of the first unverified byte, relative to the block start. The
+    /// task on top of the stack resumes reading exactly here.
+    offset: usize,
+}
+
+impl ResumableBodyState {
+    /// Seed the prefix traversal for one column. The body is scheduled only
+    /// after every runtime type table and nested prefix is retained.
+    fn new(
+        column: String,
+        ch_type: ChType,
+        num_rows: usize,
+        offset: usize,
+        settings: DecodeSettings,
+    ) -> Self {
+        Self {
+            column,
+            root_type: ch_type.clone(),
+            num_rows,
+            settings,
+            prefix_tasks: vec![PrefixScanTask::Type { ch_type, depth: 0 }],
+            states: Vec::new(),
+            state_cursor: 0,
+            body_seeded: false,
+            allocation_budget: AllocationBudget::new(settings.max_synthetic_allocation_bytes),
+            tasks: Vec::new(),
+            offset,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PartialVarint {
+    value: u64,
+    shift: u32,
+}
+
+#[derive(Debug)]
+enum PrefixScanTask {
+    Type {
+        ch_type: ChType,
+        depth: usize,
+    },
+    Word(PrefixWord),
+    Dynamic(Box<DynamicPrefixTask>),
+    DynamicRun {
+        remaining: usize,
+        max_types: u8,
+        depth: usize,
+    },
+    Json(Box<JsonPrefixTask>),
+}
+
+#[derive(Debug)]
+struct DynamicPrefixTask {
+    max_types: u8,
+    depth: usize,
+    version: Option<u64>,
+    legacy: Option<PartialVarint>,
+    count: Option<usize>,
+    count_varint: PartialVarint,
+    typed: Vec<(String, ChType)>,
+    names: std::collections::BTreeSet<String>,
+    entry_length: PartialVarint,
+    entry_len: Option<usize>,
+    binary_start: Option<usize>,
+    binary_scanner: Option<BinaryTypeScanner>,
+}
+
+impl DynamicPrefixTask {
+    fn new(max_types: u8, depth: usize) -> Self {
+        Self {
+            max_types,
+            depth,
+            version: None,
+            legacy: None,
+            count: None,
+            count_varint: PartialVarint::default(),
+            typed: Vec::new(),
+            names: std::collections::BTreeSet::new(),
+            entry_length: PartialVarint::default(),
+            entry_len: None,
+            binary_start: None,
+            binary_scanner: None,
+        }
+    }
+}
+
+fn dynamic_prefix_task(max_types: u8, depth: usize) -> PrefixScanTask {
+    PrefixScanTask::Dynamic(Box::new(DynamicPrefixTask::new(max_types, depth)))
+}
+
+#[derive(Debug)]
+struct JsonPrefixTask {
+    max_dynamic_paths: u32,
+    max_dynamic_types: u8,
+    typed_paths: Vec<(String, ChType)>,
+    depth: usize,
+    version: Option<u64>,
+    kind: Option<JsonWireKind>,
+    legacy: Option<PartialVarint>,
+    count: Option<usize>,
+    count_varint: PartialVarint,
+    paths_read: usize,
+    previous_path: Option<String>,
+    path_length: PartialVarint,
+    path_len: Option<usize>,
+}
+
+/// One fixed 8-byte bulk-state-prefix word of a resumable column.
+#[derive(Debug, Clone, Copy)]
+enum PrefixWord {
+    /// `LowCardinality` key version, which must be 1
+    /// ([`read_low_cardinality_state`]).
+    LowCardinalityKeyVersion,
+    /// `Variant` discriminator mode, which must be BASIC mode 0
+    /// ([`read_variant_state`]).
+    VariantMode,
+}
+
+/// A bounded piece of the resumable column traversal. Every task that reads a
+/// fixed 8-byte word ([`BodyScanTask::reads_word`]) is parked whole until the
+/// word is buffered, so a word is never split across resumes.
+#[derive(Debug)]
+enum BodyScanTask {
+    Values {
+        ch_type: ChType,
+        num_rows: usize,
+    },
+    DynamicValuesRun {
+        remaining: usize,
+        num_rows: usize,
+    },
+    Bytes {
+        remaining: usize,
+    },
+    Strings {
+        rows_remaining: usize,
+        length_value: u64,
+        length_shift: u32,
+        length_complete: bool,
+        payload_remaining: usize,
+        /// Running Arrow i32 offset of this run, checked exactly as one
+        /// [`decode_string_data`] call checks it.
+        data_offset: i32,
+    },
+    Offsets {
+        rows_remaining: usize,
+        previous: u64,
+        children: Vec<ChType>,
+    },
+    ValidateOffsetCount {
+        count: u64,
+        children: Vec<ChType>,
+    },
+    /// `LowCardinality` index-serialization word, the first body word
+    /// [`decode_low_cardinality`] reads.
+    LowCardinality {
+        dict_type: ChType,
+        num_rows: usize,
+    },
+    /// `LowCardinality` per-block dictionary size word; the dictionary body
+    /// follows as an ordinary value run of `dict_type`.
+    LowCardinalityDictionary {
+        dict_type: ChType,
+        num_rows: usize,
+        index_width: usize,
+    },
+    /// `LowCardinality` index row-count word, after the dictionary body.
+    LowCardinalityRows {
+        num_rows: usize,
+        index_width: usize,
+        num_keys: usize,
+    },
+    /// `LowCardinality` raw index array, validated against the dictionary.
+    LowCardinalityIndexes {
+        rows_remaining: usize,
+        index_width: usize,
+        num_keys: usize,
+    },
+    /// `Variant` one-byte discriminators, counted per alternative; the dense
+    /// alternative runs follow once every row is counted.
+    VariantDiscriminators {
+        alternatives: Vec<ChType>,
+        counts: Vec<usize>,
+        rows_done: usize,
+        rows_remaining: usize,
+    },
+    DynamicIndexes {
+        children: Vec<DynamicStateChild>,
+        counts: Vec<usize>,
+        rows_remaining: usize,
+        width: usize,
+        kind: DynamicWireKind,
+    },
+    AggregateCount {
+        rows_remaining: usize,
+        shift: u32,
+    },
+    AggregateZeroBytes {
+        rows_remaining: usize,
+    },
+    AggregateNullableSum {
+        rows_remaining: usize,
+        state_width: usize,
+    },
+    ChargeSynthetic {
+        bytes: usize,
+        what: &'static str,
+    },
+}
+
+impl BodyScanTask {
+    /// Whether the task begins by reading one fixed 8-byte LE word.
+    fn reads_word(&self) -> bool {
+        matches!(
+            self,
+            BodyScanTask::LowCardinality { .. }
+                | BodyScanTask::LowCardinalityDictionary { .. }
+                | BodyScanTask::LowCardinalityRows { .. }
+        )
+    }
+}
+
+fn is_unexpected_eof(error: &DecodeError) -> bool {
+    matches!(error, DecodeError::Io(error) if error.kind() == io::ErrorKind::UnexpectedEof)
+}
+
+fn need_more_bytes() -> DecodeError {
+    // A bare-kind `io::Error` carries no heap payload.
+    DecodeError::Io(io::Error::from(io::ErrorKind::UnexpectedEof))
 }
 
 /// Resumable [`block_end`]: on "need more bytes" the verified progress is kept
@@ -3524,6 +4069,39 @@ fn block_end_resume_with_settings(
     settings: &DecodeSettings,
     progress: &mut ScanProgress,
 ) -> Result<Option<usize>, DecodeError> {
+    block_scan_resume_with_settings(data, settings, progress)
+        .map(|block| block.map(|block| block.end))
+}
+
+/// Shape and boundary found by the scan-only block walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScannedBlock {
+    pub(crate) end: usize,
+    pub(crate) num_columns: usize,
+    pub(crate) num_rows: usize,
+}
+
+pub(crate) fn scan_block_resume(
+    data: &[u8],
+    options: &DecodeOptions,
+    progress: &mut ScanProgress,
+) -> Result<Option<ScannedBlock>, DecodeError> {
+    block_scan_resume_with_settings(data, &DecodeSettings::text(options), progress)
+}
+
+pub(crate) fn scan_block_binary_types_resume(
+    data: &[u8],
+    options: &DecodeOptions,
+    progress: &mut ScanProgress,
+) -> Result<Option<ScannedBlock>, DecodeError> {
+    block_scan_resume_with_settings(data, &DecodeSettings::binary(options), progress)
+}
+
+fn block_scan_resume_with_settings(
+    data: &[u8],
+    settings: &DecodeSettings,
+    progress: &mut ScanProgress,
+) -> Result<Option<ScannedBlock>, DecodeError> {
     if !progress.revision_validated {
         if let Err(error) = ensure_supported_protocol_revision(settings.protocol_revision) {
             progress.reset();
@@ -3549,7 +4127,7 @@ fn block_end_resume_with_settings(
     let resume_from = progress.resume_offset();
 
     let mut reader = ByteReader::new(data);
-    let result = scan_block_resume(&mut reader, settings, progress);
+    let result = scan_block_body_resume(&mut reader, settings, progress);
 
     #[cfg(test)]
     {
@@ -3566,20 +4144,29 @@ fn block_end_resume_with_settings(
 
 /// Body of the resumable completeness scan. Jumps to the finest checkpoint in
 /// `progress`, then records new progress after the header, after each fully
-/// scanned column, and per row inside a flat-resumable String body.
-fn scan_block_resume(
+/// scanned column, and inside resumable columns ([`is_resumable`]).
+fn scan_block_body_resume(
     reader: &mut ByteReader,
     settings: &DecodeSettings,
     progress: &mut ScanProgress,
-) -> Result<Option<usize>, DecodeError> {
+) -> Result<Option<ScannedBlock>, DecodeError> {
     let (num_cols, num_rows) = if let Some((num_cols, num_rows)) = progress.header {
-        if let Some(body) = progress.string_body.as_mut() {
+        if let Some(body) = progress.body.as_mut() {
             // The wrapper verified `body.offset` lies within the data.
             reader.skip(body.offset)?;
-            skip_string_body_resumable(reader, num_rows, body)?;
-            progress.string_body = None;
+            scan_resumable_body(reader, body)?;
+            progress.synthetic_allocation_used = body.allocation_budget.used;
+            progress.body = None;
             progress.columns_done += 1;
-        } else {
+        } else if let Some(body) = progress.fixed_body {
+            if reader.remaining() < body.end {
+                reader.skip(body.start)?;
+                return Err(need_more_bytes());
+            }
+            reader.skip(body.end)?;
+            progress.fixed_body = None;
+            progress.columns_done += 1;
+        } else if progress.column_header.is_none() {
             reader.skip(progress.columns_end)?;
         }
         (num_cols, num_rows)
@@ -3596,24 +4183,36 @@ fn scan_block_resume(
         progress.header = Some((num_cols, num_rows));
         (num_cols, num_rows)
     };
-    progress.columns_end = reader.position();
+    if progress.column_header.is_none() {
+        progress.columns_end = reader.position();
+    }
 
     while progress.columns_done < num_cols {
-        let (name, ch_type) = read_column_header(reader, settings)?;
+        let (name, ch_type) = scan_column_header(reader, settings, &mut progress.column_header)?;
         if num_rows > 0 {
-            if let Some(nullable) = flat_string_body(&ch_type) {
-                let mut body = StringScanState {
-                    null_map_done: !nullable,
-                    rows_done: 0,
-                    offset: reader.position(),
-                };
-                if let Err(err) = skip_string_body_resumable(reader, num_rows, &mut body) {
-                    if matches!(&err, DecodeError::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof)
-                    {
-                        progress.string_body = Some(body);
-                    }
-                    return Err(err);
+            if let Some(bytes) = fixed_width_top_level_bytes(&ch_type, num_rows, &name)? {
+                if reader.remaining() < bytes {
+                    let start = reader.position();
+                    let end = start.checked_add(bytes).ok_or_else(need_more_bytes)?;
+                    progress.fixed_body = Some(FixedBodyState { start, end });
+                    return Err(need_more_bytes());
                 }
+                reader.skip(bytes)?;
+            } else if is_resumable(&ch_type) {
+                // One pass, complete or partial: the task walker is the only
+                // walker for these types, so a complete buffer is not walked
+                // twice and a partial one keeps its exact checkpoint.
+                let mut body =
+                    ResumableBodyState::new(name, ch_type, num_rows, reader.position(), *settings);
+                body.allocation_budget.used = progress.synthetic_allocation_used;
+                if let Err(error) = scan_resumable_body(reader, &mut body) {
+                    progress.synthetic_allocation_used = body.allocation_budget.used;
+                    if is_unexpected_eof(&error) {
+                        progress.body = Some(Box::new(body));
+                    }
+                    return Err(error);
+                }
+                progress.synthetic_allocation_used = body.allocation_budget.used;
             } else {
                 skip_column_data(reader, &ch_type, num_rows, &name, settings)?;
             }
@@ -3622,44 +4221,1584 @@ fn scan_block_resume(
         progress.columns_end = reader.position();
     }
 
-    Ok(Some(reader.position()))
+    Ok(Some(ScannedBlock {
+        end: reader.position(),
+        num_columns: num_cols,
+        num_rows,
+    }))
 }
 
-/// Whether `ch_type` has a flat-resumable body for the streaming scan: no
-/// state prefix or suffix bytes and a flat per-row walk. True only for the
-/// exact `String` and `Nullable(String)` spellings; returns the nullability,
-/// since a `Nullable(String)` body leads with its null map. Every other type,
-/// including aliases that physically delegate to String, keeps the general
-/// column-boundary checkpointing.
-fn flat_string_body(ch_type: &ChType) -> Option<bool> {
-    match ch_type {
-        ChType::String => Some(false),
-        ChType::Nullable(inner) if matches!(inner.as_ref(), ChType::String) => Some(true),
-        _ => None,
-    }
-}
-
-/// Walk a String body row loop, recording verified progress in `state` so an
-/// `UnexpectedEof` resumes at the last row boundary. The walk is byte-for-byte
-/// the `ChType::String` arm of [`skip_column_body`], preceded by the Nullable
-/// null map skip from [`skip_values`] when the column is `Nullable(String)`.
-fn skip_string_body_resumable(
-    reader: &mut ByteReader,
+/// Compute the complete body size for top-level types whose Native payload is
+/// one fixed byte run and has no state prefix or suffix.
+fn fixed_width_top_level_bytes(
+    ch_type: &ChType,
     num_rows: usize,
-    state: &mut StringScanState,
-) -> Result<(), DecodeError> {
-    if !state.null_map_done {
-        reader.skip(num_rows)?; // null map: 1 byte per row
-        state.null_map_done = true;
-        state.offset = reader.position();
+    column: &str,
+) -> Result<Option<usize>, DecodeError> {
+    if let Some(delegate) = ch_type.physical_delegate_ref() {
+        return fixed_width_top_level_bytes(delegate.as_ref(), num_rows, column);
     }
-    while state.rows_done < num_rows {
-        let len = varint_usize(reader.read_varint()?, "String value length")?;
-        reader.skip(len)?;
-        state.rows_done += 1;
-        state.offset = reader.position();
+    if matches!(ch_type, ChType::Tuple(elements) if elements.is_empty()) {
+        return Ok(Some(num_rows));
+    }
+    if is_fixed_width_leaf(ch_type) {
+        return fixed_width_body_bytes(ch_type, num_rows, column).map(Some);
+    }
+    Ok(None)
+}
+
+/// Whether a top-level column of `ch_type` can use the resumable task walker.
+/// This includes self-describing Dynamic and JSON prefixes and the registered
+/// AggregateFunction state codecs. Returning `false` remains safe: the column
+/// then goes through [`skip_column_data`], the reference walker.
+fn is_resumable(ch_type: &ChType) -> bool {
+    if let Some(delegate) = ch_type.physical_delegate_ref() {
+        return is_resumable(delegate.as_ref());
+    }
+    match ch_type {
+        ChType::Nothing
+        | ChType::Bool
+        | ChType::Int8
+        | ChType::Int16
+        | ChType::Int32
+        | ChType::Int64
+        | ChType::UInt8
+        | ChType::UInt16
+        | ChType::UInt32
+        | ChType::UInt64
+        | ChType::Float32
+        | ChType::Float64
+        | ChType::BFloat16
+        | ChType::QBit { .. }
+        | ChType::Int128
+        | ChType::UInt128
+        | ChType::Int256
+        | ChType::UInt256
+        | ChType::String
+        | ChType::FixedString(_)
+        | ChType::Date
+        | ChType::Date32
+        | ChType::DateTime { .. }
+        | ChType::DateTime64 { .. }
+        | ChType::Time
+        | ChType::Time64 { .. }
+        | ChType::Interval(_)
+        | ChType::Decimal { .. }
+        | ChType::Uuid
+        | ChType::Ipv4
+        | ChType::Ipv6
+        | ChType::Enum8 { .. }
+        | ChType::Enum16 { .. } => true,
+        ChType::Nullable(inner) => is_resumable_nullable_inner(inner),
+        // The dictionary value type is validated by the task itself, exactly
+        // where `decode_low_cardinality` validates it.
+        ChType::LowCardinality(_) => true,
+        ChType::Array(inner) => is_resumable(inner),
+        ChType::Tuple(elements) => elements.iter().all(|(_, element)| is_resumable(element)),
+        ChType::Map(key, value) => is_resumable(key) && is_resumable(value),
+        ChType::Variant(alternatives) => alternatives.iter().all(is_resumable),
+        ChType::Dynamic { .. } | ChType::Json { .. } | ChType::AggregateFunction { .. } => true,
+        // Resolved by `physical_delegate_ref` above; unreachable, and `false`
+        // is the safe answer if that ever changes.
+        ChType::SimpleAggregateFunction { .. }
+        | ChType::Geo(_)
+        | ChType::Geometry
+        | ChType::Nested(_) => false,
+    }
+}
+
+/// Whether `Nullable(inner)` walks the same bytes in the task walker as in
+/// [`skip_values`]. That walker unwraps the null map, expands at most ONE alias
+/// level, then accepts only a Tuple or a leaf body; anything else (a nested
+/// wrapper or container, a chained alias) is an `UnsupportedType` there, so it
+/// must stay on that path here too rather than be silently accepted.
+fn is_resumable_nullable_inner(inner: &ChType) -> bool {
+    let delegate = inner.physical_delegate_ref();
+    let inner = delegate.as_deref().unwrap_or(inner);
+    match inner {
+        ChType::Tuple(elements) => elements.iter().all(|(_, element)| is_resumable(element)),
+        ChType::Json { .. } => true,
+        leaf => is_fixed_width_leaf(leaf) || matches!(leaf, ChType::String),
+    }
+}
+
+fn read_partial_varint(
+    reader: &mut ByteReader,
+    partial: &mut PartialVarint,
+) -> Result<Option<u64>, DecodeError> {
+    while reader.remaining() != 0 {
+        let byte = reader.read_u8()?;
+        partial.value |= u64::from(byte & 0x7f) << partial.shift;
+        if byte & 0x80 == 0 {
+            return Ok(Some(partial.value));
+        }
+        partial.shift += 7;
+        if partial.shift >= 64 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "varint overflow").into());
+        }
+    }
+    Ok(None)
+}
+
+fn push_prefix_type(tasks: &mut Vec<PrefixScanTask>, ch_type: ChType, depth: usize) {
+    tasks.push(PrefixScanTask::Type { ch_type, depth });
+}
+
+fn parse_complete_binary_type(bytes: &[u8], column: &str) -> Result<ChType, DecodeError> {
+    let mut descriptor = ByteReader::new(bytes);
+    let parsed = read_binary_type(&mut descriptor).map_err(|error| match error {
+        BinaryTypeError::Io(error) => DecodeError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("binary type boundary scanner/parser mismatch: {error}"),
+        )),
+        other => binary_type_error(other, column),
+    })?;
+    if descriptor.position() != bytes.len() {
+        return Err(DecodeError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "binary type boundary scanner/parser mismatch for column '{column}': parser consumed {} of {} bytes",
+                descriptor.position(),
+                bytes.len()
+            ),
+        )));
+    }
+    Ok(parsed)
+}
+
+fn binary_type_error(error: BinaryTypeError, column: &str) -> DecodeError {
+    match error {
+        BinaryTypeError::Io(error) => DecodeError::Io(error),
+        BinaryTypeError::Invalid(reason) | BinaryTypeError::Unsupported(reason) => {
+            DecodeError::UnsupportedType {
+                column: column.to_string(),
+                type_name: reason,
+            }
+        }
+    }
+}
+
+fn scan_prefix_task(
+    reader: &mut ByteReader,
+    state: &mut ResumableBodyState,
+    task: PrefixScanTask,
+) -> Result<(), DecodeError> {
+    match task {
+        PrefixScanTask::Word(word) => {
+            if reader.remaining() < 8 {
+                state.prefix_tasks.push(PrefixScanTask::Word(word));
+                return Err(need_more_bytes());
+            }
+            let value = reader.read_u64_le()?;
+            match word {
+                PrefixWord::LowCardinalityKeyVersion if value != LOW_CARDINALITY_KEY_VERSION => {
+                    return Err(DecodeError::InvalidLowCardinality {
+                        column: state.column.clone(),
+                        reason: "key version is not 1 (SharedDictionariesWithAdditionalKeys)",
+                    });
+                }
+                PrefixWord::VariantMode if value != 0 => {
+                    return Err(DecodeError::InvalidVariant {
+                        column: state.column.clone(),
+                        reason: format!(
+                            "discriminator mode {value} is not BASIC mode 0 emitted by FORMAT Native"
+                        ),
+                    });
+                }
+                _ => {}
+            }
+        }
+        PrefixScanTask::Type { ch_type, depth } => {
+            if let Some(delegate) = ch_type.physical_delegate() {
+                push_prefix_type(&mut state.prefix_tasks, delegate, depth + 1);
+            } else {
+                match ch_type {
+                    ChType::LowCardinality(_) => state
+                        .prefix_tasks
+                        .push(PrefixScanTask::Word(PrefixWord::LowCardinalityKeyVersion)),
+                    ChType::Variant(alternatives) => {
+                        for alternative in alternatives.into_iter().rev() {
+                            push_prefix_type(&mut state.prefix_tasks, alternative, depth + 1);
+                        }
+                        state
+                            .prefix_tasks
+                            .push(PrefixScanTask::Word(PrefixWord::VariantMode));
+                    }
+                    ChType::Array(inner) | ChType::Nullable(inner) => {
+                        push_prefix_type(&mut state.prefix_tasks, *inner, depth + 1)
+                    }
+                    ChType::Tuple(elements) => {
+                        for (_, element) in elements.into_iter().rev() {
+                            push_prefix_type(&mut state.prefix_tasks, element, depth + 1);
+                        }
+                    }
+                    ChType::Map(key, value) => {
+                        push_prefix_type(&mut state.prefix_tasks, *value, depth + 1);
+                        push_prefix_type(&mut state.prefix_tasks, *key, depth + 1);
+                    }
+                    ChType::Dynamic { max_types } => state
+                        .prefix_tasks
+                        .push(dynamic_prefix_task(max_types, depth)),
+                    ChType::Json {
+                        max_dynamic_paths,
+                        max_dynamic_types,
+                        typed_paths,
+                        ..
+                    } => state
+                        .prefix_tasks
+                        .push(PrefixScanTask::Json(Box::new(JsonPrefixTask {
+                            max_dynamic_paths,
+                            max_dynamic_types,
+                            typed_paths,
+                            depth,
+                            version: None,
+                            kind: None,
+                            legacy: None,
+                            count: None,
+                            count_varint: PartialVarint::default(),
+                            paths_read: 0,
+                            previous_path: None,
+                            path_length: PartialVarint::default(),
+                            path_len: None,
+                        }))),
+                    _ => {}
+                }
+            }
+        }
+        PrefixScanTask::Dynamic(mut dynamic) => {
+            if dynamic.depth >= MAX_TYPE_DEPTH {
+                return Err(invalid_dynamic(
+                    &state.column,
+                    format!("Dynamic nesting exceeds the maximum type depth {MAX_TYPE_DEPTH}"),
+                ));
+            }
+            if dynamic.version.is_none() {
+                if reader.remaining() < 8 {
+                    state.prefix_tasks.push(PrefixScanTask::Dynamic(dynamic));
+                    return Err(need_more_bytes());
+                }
+                let version = reader.read_u64_le()?;
+                match version {
+                    1 => dynamic.legacy = Some(PartialVarint::default()),
+                    2 | 3 => {}
+                    4 => {
+                        return Err(invalid_dynamic(
+                            &state.column,
+                            "structure word 4 (V3) is not emitted by NativeWriter",
+                        ))
+                    }
+                    other => {
+                        return Err(invalid_dynamic(
+                            &state.column,
+                            format!("unknown structure word {other}"),
+                        ))
+                    }
+                }
+                dynamic.version = Some(version);
+            }
+            if let Some(partial) = dynamic.legacy.as_mut() {
+                if read_partial_varint(reader, partial)?.is_none() {
+                    state.prefix_tasks.push(PrefixScanTask::Dynamic(dynamic));
+                    return Err(need_more_bytes());
+                }
+                dynamic.legacy = None;
+            }
+            if dynamic.count.is_none() {
+                let Some(count) = read_partial_varint(reader, &mut dynamic.count_varint)? else {
+                    state.prefix_tasks.push(PrefixScanTask::Dynamic(dynamic));
+                    return Err(need_more_bytes());
+                };
+                let count = varint_usize(count, "Dynamic runtime type count")?;
+                let variant = dynamic.version != Some(3);
+                if variant && count > 254 {
+                    return Err(invalid_dynamic(
+                        &state.column,
+                        format!("direct runtime type count {count} exceeds 254"),
+                    ));
+                }
+                if variant && count > dynamic.max_types as usize {
+                    return Err(invalid_dynamic(
+                        &state.column,
+                        format!(
+                            "direct runtime type count {count} exceeds max_types={}",
+                            dynamic.max_types
+                        ),
+                    ));
+                }
+                if count >= u32::MAX as usize {
+                    return Err(invalid_dynamic(
+                        &state.column,
+                        "runtime type count exceeds the u32 block-local routing model",
+                    ));
+                }
+                dynamic.typed.reserve(reader.capacity_for(count, 1));
+                dynamic.count = Some(count);
+            }
+            let count = dynamic.count.unwrap_or(0);
+            while dynamic.typed.len() < count {
+                let ch_type = if state.settings.types_in_binary_format {
+                    let start = *dynamic.binary_start.get_or_insert(reader.position());
+                    let scanner = dynamic
+                        .binary_scanner
+                        .get_or_insert_with(BinaryTypeScanner::new);
+                    if let Err(error) = scanner.scan(reader) {
+                        match error {
+                            BinaryTypeError::Io(error)
+                                if error.kind() == io::ErrorKind::UnexpectedEof =>
+                            {
+                                state.prefix_tasks.push(PrefixScanTask::Dynamic(dynamic));
+                                return Err(error.into());
+                            }
+                            BinaryTypeError::Io(error) => return Err(error.into()),
+                            BinaryTypeError::Invalid(reason)
+                            | BinaryTypeError::Unsupported(reason) => {
+                                return Err(invalid_dynamic(&state.column, reason))
+                            }
+                        }
+                    }
+                    let bytes = reader.consumed_slice(start)?;
+                    let parsed = parse_complete_binary_type(bytes, &state.column)?;
+                    dynamic.binary_start = None;
+                    dynamic.binary_scanner = None;
+                    parsed
+                } else {
+                    if dynamic.entry_len.is_none() {
+                        let Some(len) = read_partial_varint(reader, &mut dynamic.entry_length)?
+                        else {
+                            state.prefix_tasks.push(PrefixScanTask::Dynamic(dynamic));
+                            return Err(need_more_bytes());
+                        };
+                        dynamic.entry_len = Some(varint_usize(len, "String length")?);
+                    }
+                    let len = dynamic.entry_len.unwrap_or(0);
+                    if reader.remaining() < len {
+                        state.prefix_tasks.push(PrefixScanTask::Dynamic(dynamic));
+                        return Err(need_more_bytes());
+                    }
+                    let bytes = reader.read_slice(len)?;
+                    let type_name = std::str::from_utf8(bytes)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    let parsed =
+                        parse_ch_type(type_name).ok_or_else(|| DecodeError::UnsupportedType {
+                            column: state.column.clone(),
+                            type_name: type_name.to_string(),
+                        })?;
+                    dynamic.entry_len = None;
+                    dynamic.entry_length = PartialVarint::default();
+                    parsed
+                };
+                let canonical = ch_type.to_string();
+                if resolves_to_nothing(&ch_type) || !is_valid_variant_alternative(&ch_type) {
+                    return Err(invalid_dynamic(
+                        &state.column,
+                        format!("runtime type {canonical} is not legal in Dynamic"),
+                    ));
+                }
+                if let Some(unsupported) = unsupported_header_type_name(&ch_type) {
+                    return Err(DecodeError::UnsupportedType {
+                        column: state.column.clone(),
+                        type_name: unsupported,
+                    });
+                }
+                if !dynamic.names.insert(canonical.clone()) {
+                    return Err(invalid_dynamic(
+                        &state.column,
+                        format!("duplicate canonical runtime type {canonical}"),
+                    ));
+                }
+                dynamic.typed.push((canonical, ch_type));
+            }
+            let kind = if dynamic.version == Some(3) {
+                DynamicWireKind::Flattened
+            } else {
+                DynamicWireKind::Variant
+            };
+            let children = if kind == DynamicWireKind::Variant {
+                if reader.remaining() < 8 {
+                    state.prefix_tasks.push(PrefixScanTask::Dynamic(dynamic));
+                    return Err(need_more_bytes());
+                }
+                let mode = reader.read_u64_le()?;
+                if mode != 0 {
+                    return Err(invalid_dynamic(
+                        &state.column,
+                        format!("Variant discriminator mode {mode} is not BASIC mode 0"),
+                    ));
+                }
+                let mut global: Vec<_> = dynamic
+                    .typed
+                    .into_iter()
+                    .map(|(name, ty)| (name, DynamicStateChild::Typed(ty)))
+                    .collect();
+                global.push(("SharedVariant".to_string(), DynamicStateChild::Shared));
+                global.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                global
+                    .into_iter()
+                    .map(|(_, child)| child)
+                    .collect::<Vec<_>>()
+            } else {
+                dynamic
+                    .typed
+                    .into_iter()
+                    .map(|(_, ty)| DynamicStateChild::Typed(ty))
+                    .collect()
+            };
+            for child in children.iter().rev() {
+                if let DynamicStateChild::Typed(ch_type) = child {
+                    push_prefix_type(&mut state.prefix_tasks, ch_type.clone(), dynamic.depth + 1);
+                }
+            }
+            state
+                .states
+                .push(StatePrefix::Dynamic(DynamicState { kind, children }));
+        }
+        PrefixScanTask::DynamicRun {
+            remaining,
+            max_types,
+            depth,
+        } => {
+            if remaining != 0 {
+                state.prefix_tasks.push(PrefixScanTask::DynamicRun {
+                    remaining: remaining - 1,
+                    max_types,
+                    depth,
+                });
+                state
+                    .prefix_tasks
+                    .push(dynamic_prefix_task(max_types, depth));
+            }
+        }
+        PrefixScanTask::Json(mut json) => {
+            if json.depth >= MAX_TYPE_DEPTH {
+                return Err(invalid_json(
+                    &state.column,
+                    format!("JSON nesting exceeds the maximum type depth {MAX_TYPE_DEPTH}"),
+                ));
+            }
+            if json.version.is_none() {
+                if reader.remaining() < 8 {
+                    state.prefix_tasks.push(PrefixScanTask::Json(json));
+                    return Err(need_more_bytes());
+                }
+                let version = reader.read_u64_le()?;
+                let kind = match version {
+                    0 | 2 => JsonWireKind::Structured,
+                    1 => JsonWireKind::Text,
+                    3 => JsonWireKind::Flattened,
+                    4 => {
+                        return Err(invalid_json(
+                            &state.column,
+                            "structure word 4 (V3) is not emitted by NativeWriter",
+                        ))
+                    }
+                    other => {
+                        return Err(invalid_json(
+                            &state.column,
+                            format!("unknown JSON structure word {other}"),
+                        ))
+                    }
+                };
+                json.version = Some(version);
+                json.kind = Some(kind);
+                if version == 0 {
+                    json.legacy = Some(PartialVarint::default());
+                }
+                if kind == JsonWireKind::Text {
+                    state.states.push(StatePrefix::Json(JsonState {
+                        kind,
+                        dynamic_paths: Vec::new(),
+                        dynamic_path_count: 0,
+                    }));
+                    state.offset = reader.position();
+                    return Ok(());
+                }
+            }
+            if let Some(partial) = json.legacy.as_mut() {
+                if read_partial_varint(reader, partial)?.is_none() {
+                    state.prefix_tasks.push(PrefixScanTask::Json(json));
+                    return Err(need_more_bytes());
+                }
+                json.legacy = None;
+            }
+            if json.count.is_none() {
+                let Some(count) = read_partial_varint(reader, &mut json.count_varint)? else {
+                    state.prefix_tasks.push(PrefixScanTask::Json(json));
+                    return Err(need_more_bytes());
+                };
+                let count = varint_usize(count, "JSON dynamic path count")?;
+                if json.kind == Some(JsonWireKind::Structured)
+                    && count > json.max_dynamic_paths as usize
+                {
+                    return Err(invalid_json(
+                        &state.column,
+                        format!(
+                            "dynamic path count {count} exceeds max_dynamic_paths={}",
+                            json.max_dynamic_paths
+                        ),
+                    ));
+                }
+                json.count = Some(count);
+            }
+            let count = json.count.unwrap_or(0);
+            while json.paths_read < count {
+                if json.path_len.is_none() {
+                    let Some(len) = read_partial_varint(reader, &mut json.path_length)? else {
+                        state.prefix_tasks.push(PrefixScanTask::Json(json));
+                        return Err(need_more_bytes());
+                    };
+                    json.path_len = Some(varint_usize(len, "String length")?);
+                }
+                let len = json.path_len.unwrap_or(0);
+                if reader.remaining() < len {
+                    state.prefix_tasks.push(PrefixScanTask::Json(json));
+                    return Err(need_more_bytes());
+                }
+                let path = std::str::from_utf8(reader.read_slice(len)?)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                    .to_string();
+                if json
+                    .previous_path
+                    .as_ref()
+                    .is_some_and(|last| path <= *last)
+                {
+                    return Err(invalid_json(
+                        &state.column,
+                        "dynamic paths are not strictly increasing (sorted, unique)",
+                    ));
+                }
+                json.previous_path = Some(path);
+                json.paths_read += 1;
+                json.path_len = None;
+                json.path_length = PartialVarint::default();
+            }
+            let kind = json.kind.unwrap_or(JsonWireKind::Text);
+            let num_dynamic = json.paths_read;
+            state.states.push(StatePrefix::Json(JsonState {
+                kind,
+                dynamic_paths: Vec::new(),
+                dynamic_path_count: num_dynamic,
+            }));
+            if num_dynamic != 0 {
+                state.prefix_tasks.push(PrefixScanTask::DynamicRun {
+                    remaining: num_dynamic,
+                    max_types: json.max_dynamic_types,
+                    depth: json.depth + 1,
+                });
+            }
+            for (_, ch_type) in json.typed_paths.into_iter().rev() {
+                push_prefix_type(&mut state.prefix_tasks, ch_type, json.depth + 1);
+            }
+        }
+    }
+    state.offset = reader.position();
+    Ok(())
+}
+
+/// Resume a resumable column without materializing row or column buffers.
+///
+/// Consumes exactly the bytes [`skip_column_data`] (and so `decode_column`)
+/// consumes, with the same acceptance or rejection of complete blocks. Error
+/// wording and timing can differ for corrupt partial input. It can stop at any
+/// byte and continue later from `state.offset`. The task stack is bounded by
+/// type metadata, never by row count.
+fn scan_resumable_body(
+    reader: &mut ByteReader,
+    state: &mut ResumableBodyState,
+) -> Result<(), DecodeError> {
+    while let Some(task) = state.prefix_tasks.pop() {
+        if let Err(error) = scan_prefix_task(reader, state, task) {
+            if is_unexpected_eof(&error) {
+                state.offset = reader.position();
+            }
+            return Err(error);
+        }
+    }
+    if !state.body_seeded {
+        state.tasks.push(BodyScanTask::Values {
+            ch_type: state.root_type.clone(),
+            num_rows: state.num_rows,
+        });
+        state.body_seeded = true;
+    }
+    while let Some(task) = state.tasks.pop() {
+        if task.reads_word() && reader.remaining() < 8 {
+            state.tasks.push(task);
+            return Err(need_more_bytes());
+        }
+        match task {
+            BodyScanTask::Values { ch_type, num_rows } => {
+                if let Err(error) = push_value_tasks(
+                    &mut state.tasks,
+                    &ch_type,
+                    num_rows,
+                    &state.column,
+                    &state.states,
+                    &mut state.state_cursor,
+                ) {
+                    if is_unexpected_eof(&error) {
+                        state.tasks.push(BodyScanTask::Values { ch_type, num_rows });
+                    }
+                    return Err(error);
+                }
+            }
+            BodyScanTask::DynamicValuesRun {
+                remaining,
+                num_rows,
+            } => {
+                if remaining != 0 {
+                    state.tasks.push(BodyScanTask::DynamicValuesRun {
+                        remaining: remaining - 1,
+                        num_rows,
+                    });
+                    state.tasks.push(BodyScanTask::Values {
+                        ch_type: ChType::Dynamic { max_types: 0 },
+                        num_rows,
+                    });
+                }
+            }
+            BodyScanTask::Bytes { mut remaining } => {
+                let consumed = remaining.min(reader.remaining());
+                reader.skip(consumed)?;
+                remaining -= consumed;
+                state.offset = reader.position();
+                if remaining != 0 {
+                    state.tasks.push(BodyScanTask::Bytes { remaining });
+                    return Err(need_more_bytes());
+                }
+            }
+            BodyScanTask::Strings {
+                mut rows_remaining,
+                mut length_value,
+                mut length_shift,
+                mut length_complete,
+                mut payload_remaining,
+                mut data_offset,
+            } => {
+                while rows_remaining != 0 {
+                    if payload_remaining != 0 {
+                        let consumed = payload_remaining.min(reader.remaining());
+                        reader.skip(consumed)?;
+                        payload_remaining -= consumed;
+                        state.offset = reader.position();
+                        if payload_remaining != 0 {
+                            state.tasks.push(BodyScanTask::Strings {
+                                rows_remaining,
+                                length_value,
+                                length_shift,
+                                length_complete,
+                                payload_remaining,
+                                data_offset,
+                            });
+                            return Err(need_more_bytes());
+                        }
+                        rows_remaining -= 1;
+                        continue;
+                    }
+
+                    if !length_complete {
+                        let byte = match reader.read_u8() {
+                            Ok(byte) => byte,
+                            Err(error) => {
+                                state.tasks.push(BodyScanTask::Strings {
+                                    rows_remaining,
+                                    length_value,
+                                    length_shift,
+                                    length_complete,
+                                    payload_remaining,
+                                    data_offset,
+                                });
+                                return Err(error.into());
+                            }
+                        };
+                        state.offset = reader.position();
+                        length_value |= u64::from(byte & 0x7f) << length_shift;
+                        if byte & 0x80 != 0 {
+                            length_shift += 7;
+                            if length_shift >= 64 {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "varint overflow",
+                                )
+                                .into());
+                            }
+                            continue;
+                        }
+                        length_complete = true;
+                    }
+                    payload_remaining = match varint_usize(length_value, "String value length") {
+                        Ok(length) => length,
+                        Err(error) => {
+                            state.tasks.push(BodyScanTask::Strings {
+                                rows_remaining,
+                                length_value,
+                                length_shift,
+                                length_complete,
+                                payload_remaining,
+                                data_offset,
+                            });
+                            return Err(error.into());
+                        }
+                    };
+                    // Fatal `InvalidData`, so nothing is parked.
+                    data_offset = next_string_offset(data_offset, payload_remaining)?;
+                    length_value = 0;
+                    length_shift = 0;
+                    length_complete = false;
+                    if payload_remaining == 0 {
+                        rows_remaining -= 1;
+                    }
+                }
+            }
+            BodyScanTask::Offsets {
+                mut rows_remaining,
+                mut previous,
+                children,
+            } => {
+                while rows_remaining != 0 {
+                    let current = match reader.read_u64_le() {
+                        Ok(current) => current,
+                        Err(error) => {
+                            state.tasks.push(BodyScanTask::Offsets {
+                                rows_remaining,
+                                previous,
+                                children,
+                            });
+                            return Err(error.into());
+                        }
+                    };
+                    state.offset = reader.position();
+                    if current < previous {
+                        return Err(DecodeError::InvalidArray {
+                            column: state.column.clone(),
+                            reason: "offsets are not monotonically non-decreasing",
+                        });
+                    }
+                    if i64::try_from(current).is_err() {
+                        return Err(DecodeError::InvalidArray {
+                            column: state.column.clone(),
+                            reason: "offset exceeds i64::MAX",
+                        });
+                    }
+                    previous = current;
+                    rows_remaining -= 1;
+                }
+                state.tasks.push(BodyScanTask::ValidateOffsetCount {
+                    count: previous,
+                    children,
+                });
+            }
+            BodyScanTask::ValidateOffsetCount { count, children } => {
+                let wire_count = count;
+                let count = match usize::try_from(wire_count) {
+                    Ok(count) => count,
+                    Err(_) => {
+                        state
+                            .tasks
+                            .push(BodyScanTask::ValidateOffsetCount { count, children });
+                        return Err(DecodeError::Io(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "Array element count overflows usize",
+                        )));
+                    }
+                };
+                if let Err(error) = check_header_count(count, "Array element count", reader) {
+                    state.tasks.push(BodyScanTask::ValidateOffsetCount {
+                        count: wire_count,
+                        children,
+                    });
+                    return Err(error);
+                }
+                for child in children.into_iter().rev() {
+                    state.tasks.push(BodyScanTask::Values {
+                        ch_type: child,
+                        num_rows: count,
+                    });
+                }
+            }
+            // The four LowCardinality tasks mirror `decode_low_cardinality`
+            // step for step, with the same rejections in the same order.
+            BodyScanTask::LowCardinality {
+                dict_type,
+                num_rows,
+            } => {
+                let index_word = reader.read_u64_le()?;
+                let index_width = low_cardinality_index_width(index_word, &state.column)?;
+                state.offset = reader.position();
+                state.tasks.push(BodyScanTask::LowCardinalityDictionary {
+                    dict_type,
+                    num_rows,
+                    index_width,
+                });
+            }
+            BodyScanTask::LowCardinalityDictionary {
+                dict_type,
+                num_rows,
+                index_width,
+            } => {
+                // Validate before committing the word: the size and capacity
+                // checks report `UnexpectedEof`, so on those the task is parked
+                // unchanged and the word is re-read once more bytes arrive.
+                let checked = usize::try_from(reader.read_u64_le()?)
+                    .map_err(|_| {
+                        DecodeError::Io(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "LowCardinality dictionary size overflows usize",
+                        ))
+                    })
+                    .and_then(|num_keys| {
+                        check_header_count(num_keys, "LowCardinality dictionary size", reader)
+                            .map(|()| num_keys)
+                    });
+                let num_keys = match checked {
+                    Ok(num_keys) => num_keys,
+                    Err(error) => {
+                        if is_unexpected_eof(&error) {
+                            state.tasks.push(BodyScanTask::LowCardinalityDictionary {
+                                dict_type,
+                                num_rows,
+                                index_width,
+                            });
+                        }
+                        return Err(error);
+                    }
+                };
+                if !is_low_cardinality_inner(&dict_type) {
+                    return Err(DecodeError::UnsupportedType {
+                        column: state.column.clone(),
+                        type_name: format!("LowCardinality({dict_type})"),
+                    });
+                }
+                state.offset = reader.position();
+                state.tasks.push(BodyScanTask::LowCardinalityRows {
+                    num_rows,
+                    index_width,
+                    num_keys,
+                });
+                state.tasks.push(BodyScanTask::Values {
+                    ch_type: dict_type,
+                    num_rows: num_keys,
+                });
+            }
+            BodyScanTask::LowCardinalityRows {
+                num_rows,
+                index_width,
+                num_keys,
+            } => {
+                let wire_rows = match usize::try_from(reader.read_u64_le()?) {
+                    Ok(wire_rows) => wire_rows,
+                    Err(_) => {
+                        state.tasks.push(BodyScanTask::LowCardinalityRows {
+                            num_rows,
+                            index_width,
+                            num_keys,
+                        });
+                        return Err(DecodeError::Io(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "LowCardinality row count overflows usize",
+                        )));
+                    }
+                };
+                if wire_rows != num_rows {
+                    return Err(DecodeError::InvalidLowCardinality {
+                        column: state.column.clone(),
+                        reason: "indexes row count disagrees with the block row count",
+                    });
+                }
+                if num_rows.checked_mul(index_width).is_none() {
+                    // Same overflow report `decode_low_cardinality_indices`
+                    // gives; the bytes for it can never arrive.
+                    state.tasks.push(BodyScanTask::LowCardinalityRows {
+                        num_rows,
+                        index_width,
+                        num_keys,
+                    });
+                    return Err(DecodeError::Io(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "LowCardinality index byte length overflows usize",
+                    )));
+                }
+                state.offset = reader.position();
+                state.tasks.push(BodyScanTask::LowCardinalityIndexes {
+                    rows_remaining: num_rows,
+                    index_width,
+                    num_keys,
+                });
+            }
+            BodyScanTask::LowCardinalityIndexes {
+                mut rows_remaining,
+                index_width,
+                num_keys,
+            } => {
+                // Whole indexes only, so a partial index is re-read next time.
+                let take = rows_remaining.min(reader.remaining() / index_width);
+                // `take * index_width <= reader.remaining()`, so no overflow.
+                let raw = reader.read_slice(take * index_width)?;
+                check_low_cardinality_indexes(raw, index_width, num_keys, &state.column)?;
+                rows_remaining -= take;
+                state.offset = reader.position();
+                if rows_remaining != 0 {
+                    state.tasks.push(BodyScanTask::LowCardinalityIndexes {
+                        rows_remaining,
+                        index_width,
+                        num_keys,
+                    });
+                    return Err(need_more_bytes());
+                }
+            }
+            BodyScanTask::VariantDiscriminators {
+                alternatives,
+                mut counts,
+                mut rows_done,
+                mut rows_remaining,
+            } => {
+                let take = rows_remaining.min(reader.remaining());
+                let raw = reader.read_slice(take)?;
+                for (row, &discriminator) in raw.iter().enumerate() {
+                    if discriminator == u8::MAX {
+                        continue;
+                    }
+                    let Some(count) = counts.get_mut(discriminator as usize) else {
+                        return Err(DecodeError::InvalidVariant {
+                            column: state.column.clone(),
+                            reason: VariantColumnError::InvalidDiscriminator {
+                                row: rows_done + row,
+                                discriminator,
+                                alternatives: alternatives.len(),
+                            }
+                            .to_string(),
+                        });
+                    };
+                    *count += 1;
+                }
+                rows_done += take;
+                rows_remaining -= take;
+                state.offset = reader.position();
+                if rows_remaining != 0 {
+                    state.tasks.push(BodyScanTask::VariantDiscriminators {
+                        alternatives,
+                        counts,
+                        rows_done,
+                        rows_remaining,
+                    });
+                    return Err(need_more_bytes());
+                }
+                for (alternative, count) in alternatives.into_iter().zip(counts).rev() {
+                    state.tasks.push(BodyScanTask::Values {
+                        ch_type: alternative,
+                        num_rows: count,
+                    });
+                }
+            }
+            BodyScanTask::DynamicIndexes {
+                children,
+                mut counts,
+                mut rows_remaining,
+                width,
+                kind,
+            } => {
+                let take = rows_remaining.min(reader.remaining() / width);
+                let raw = reader.read_slice(take * width)?;
+                let null_index = if kind == DynamicWireKind::Variant {
+                    u64::from(u8::MAX)
+                } else {
+                    children.len() as u64
+                };
+                for bytes in raw.chunks_exact(width) {
+                    let index = match width {
+                        1 => u64::from(bytes[0]),
+                        2 => u64::from(u16::from_le_bytes([bytes[0], bytes[1]])),
+                        4 => {
+                            u64::from(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                        }
+                        8 => u64::from_le_bytes([
+                            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                            bytes[7],
+                        ]),
+                        _ => unreachable!("Dynamic index width is selected from 1/2/4/8"),
+                    };
+                    if index == null_index {
+                        continue;
+                    }
+                    let Some(count) = usize::try_from(index)
+                        .ok()
+                        .and_then(|index| counts.get_mut(index))
+                    else {
+                        let reason = if kind == DynamicWireKind::Variant {
+                            format!(
+                                "discriminator {index} does not name one of {} children",
+                                children.len()
+                            )
+                        } else {
+                            format!(
+                                "flattened index {index} is greater than NULL index {}",
+                                children.len()
+                            )
+                        };
+                        return Err(invalid_dynamic(&state.column, reason));
+                    };
+                    *count += 1;
+                }
+                rows_remaining -= take;
+                state.offset = reader.position();
+                if rows_remaining != 0 {
+                    state.tasks.push(BodyScanTask::DynamicIndexes {
+                        children,
+                        counts,
+                        rows_remaining,
+                        width,
+                        kind,
+                    });
+                    return Err(need_more_bytes());
+                }
+                for (child, count) in children.into_iter().zip(counts).rev() {
+                    state.tasks.push(BodyScanTask::Values {
+                        ch_type: match child {
+                            DynamicStateChild::Typed(ch_type) => ch_type,
+                            DynamicStateChild::Shared => ChType::String,
+                        },
+                        num_rows: count,
+                    });
+                }
+            }
+            BodyScanTask::AggregateCount {
+                mut rows_remaining,
+                mut shift,
+            } => {
+                let bytes = reader.remaining_slice();
+                let mut consumed = 0;
+                while rows_remaining != 0 && consumed < bytes.len() {
+                    let byte = bytes[consumed];
+                    consumed += 1;
+                    if byte & 0x80 != 0 {
+                        shift += 7;
+                        if shift >= 64 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "varint overflow",
+                            )
+                            .into());
+                        }
+                    } else {
+                        rows_remaining -= 1;
+                        shift = 0;
+                    }
+                }
+                reader.skip(consumed)?;
+                state.offset = reader.position();
+                if rows_remaining != 0 {
+                    state.tasks.push(BodyScanTask::AggregateCount {
+                        rows_remaining,
+                        shift,
+                    });
+                    return Err(need_more_bytes());
+                }
+            }
+            BodyScanTask::AggregateZeroBytes { mut rows_remaining } => {
+                let take = rows_remaining.min(reader.remaining());
+                if reader.read_slice(take)?.iter().any(|&byte| byte != 0) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "registered AggregateFunction(nothing*) state byte must be zero",
+                    )
+                    .into());
+                }
+                rows_remaining -= take;
+                state.offset = reader.position();
+                if rows_remaining != 0 {
+                    state
+                        .tasks
+                        .push(BodyScanTask::AggregateZeroBytes { rows_remaining });
+                    return Err(need_more_bytes());
+                }
+            }
+            BodyScanTask::AggregateNullableSum {
+                mut rows_remaining,
+                state_width,
+            } => {
+                let bytes = reader.remaining_slice();
+                let mut consumed = 0;
+                while rows_remaining != 0 {
+                    let Some(&flag) = bytes.get(consumed) else {
+                        break;
+                    };
+                    let after_flag = consumed + 1;
+                    if flag == 0 {
+                        consumed = after_flag;
+                        rows_remaining -= 1;
+                        continue;
+                    }
+                    let end = after_flag.checked_add(state_width).ok_or_else(|| {
+                        DecodeError::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "aggregate nullable sum state byte length overflow",
+                        ))
+                    })?;
+                    if bytes.get(after_flag..end).is_none() {
+                        break;
+                    }
+                    consumed = end;
+                    rows_remaining -= 1;
+                }
+                reader.skip(consumed)?;
+                state.offset = reader.position();
+                if rows_remaining != 0 {
+                    state.tasks.push(BodyScanTask::AggregateNullableSum {
+                        rows_remaining,
+                        state_width,
+                    });
+                    return Err(need_more_bytes());
+                }
+            }
+            BodyScanTask::ChargeSynthetic { bytes, what } => {
+                state.allocation_budget.charge(bytes, what)?;
+            }
+        }
+    }
+    if state.state_cursor != state.states.len() {
+        let reason = "body traversal did not consume every prefix state";
+        return Err(match state.states.get(state.state_cursor) {
+            Some(StatePrefix::Json(_)) => invalid_json(&state.column, reason),
+            _ => invalid_dynamic(&state.column, reason),
+        });
     }
     Ok(())
+}
+
+/// Decode and validate a `LowCardinality` index-serialization word, returning
+/// the index width. The same rejections, in the same order, as
+/// [`decode_low_cardinality`].
+fn low_cardinality_index_width(index_word: u64, column: &str) -> Result<usize, DecodeError> {
+    if index_word & LC_NEED_GLOBAL_DICTIONARY_BIT != 0 {
+        return Err(DecodeError::InvalidLowCardinality {
+            column: column.to_string(),
+            reason: "NeedGlobalDictionaryBit is set; Native never uses a global dictionary",
+        });
+    }
+    if index_word & LC_HAS_ADDITIONAL_KEYS_BIT == 0 {
+        return Err(DecodeError::InvalidLowCardinality {
+            column: column.to_string(),
+            reason: "HasAdditionalKeysBit is clear; Native always carries a per-block dictionary",
+        });
+    }
+    match index_word & 0xFF {
+        0 => Ok(1),
+        1 => Ok(2),
+        2 => Ok(4),
+        3 => Ok(8),
+        _ => Err(DecodeError::InvalidLowCardinality {
+            column: column.to_string(),
+            reason: "index width tag is outside 0..=3",
+        }),
+    }
+}
+
+/// Read one raw little-endian `LowCardinality` index of `index_width` bytes.
+/// `chunk` comes from `chunks_exact(index_width)` with a validated width.
+#[inline]
+fn low_cardinality_raw_index(chunk: &[u8]) -> u64 {
+    match *chunk {
+        [a] => u64::from(a),
+        [a, b] => u64::from(u16::from_le_bytes([a, b])),
+        [a, b, c, d] => u64::from(u32::from_le_bytes([a, b, c, d])),
+        [a, b, c, d, e, f, g, h] => u64::from_le_bytes([a, b, c, d, e, f, g, h]),
+        // The width tag admits only 1/2/4/8; anything else cannot index a
+        // dictionary, and reporting it as out of range keeps this panic-free.
+        _ => u64::MAX,
+    }
+}
+
+/// Validate a run of whole `LowCardinality` indexes the way
+/// [`decode_low_cardinality_indices`] does: every index must point inside the
+/// block dictionary and a non-sentinel index must fit i32. The common all-valid
+/// case is one branch-free max reduction; only a run that fails it is re-walked
+/// row by row to report the decode's first error exactly.
+fn check_low_cardinality_indexes(
+    raw: &[u8],
+    index_width: usize,
+    num_keys: usize,
+    column: &str,
+) -> Result<(), DecodeError> {
+    let max = raw
+        .chunks_exact(index_width)
+        .map(low_cardinality_raw_index)
+        .max()
+        .unwrap_or(0);
+    let num_keys = num_keys as u64;
+    if raw.is_empty() || (max < num_keys && max <= i32::MAX as u64) {
+        return Ok(());
+    }
+    for raw_index in raw.chunks_exact(index_width).map(low_cardinality_raw_index) {
+        if raw_index >= num_keys {
+            return Err(DecodeError::InvalidLowCardinality {
+                column: column.to_string(),
+                reason: "index value points outside the block dictionary",
+            });
+        }
+        // A NULL sentinel is index 0, always in range, so no exemption is
+        // needed here.
+        if raw_index > i32::MAX as u64 {
+            return Err(DecodeError::InvalidLowCardinality {
+                column: column.to_string(),
+                reason: "index value exceeds i32::MAX",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Expand one logical value run into bounded scan tasks in wire order. The
+/// dispatch order mirrors [`skip_values`]: alias, LowCardinality, Array, Map,
+/// Variant, then the Nullable unwrap, then Tuple or a leaf body.
+fn push_value_tasks(
+    tasks: &mut Vec<BodyScanTask>,
+    ch_type: &ChType,
+    num_rows: usize,
+    column: &str,
+    states: &[StatePrefix],
+    state_cursor: &mut usize,
+) -> Result<(), DecodeError> {
+    if let Some(delegate) = ch_type.physical_delegate() {
+        tasks.push(BodyScanTask::Values {
+            ch_type: delegate,
+            num_rows,
+        });
+        return Ok(());
+    }
+    match ch_type {
+        // A zero-length LowCardinality run carries no body bytes at all (the
+        // matching gate in `decode_values`).
+        ChType::LowCardinality(_) if num_rows == 0 => {}
+        ChType::LowCardinality(inner) => {
+            // Nullability only changes how decode reads index 0, not the bytes.
+            let (_, dict_type) = low_cardinality_dict_value_type(inner);
+            tasks.push(BodyScanTask::LowCardinality {
+                dict_type: dict_type.clone(),
+                num_rows,
+            });
+        }
+        ChType::Variant(alternatives) => {
+            // `variant_child_counts` with no rows performs exactly the
+            // alternative-count check `decode_variant` applies and returns the
+            // zeroed per-alternative counters, then the same row guard.
+            // The row guard fires before the discriminators arrive: no
+            // completion of these bytes can decode, and waiting would stall.
+            let (counts, _) = variant_child_counts(&[], alternatives.len())
+                .and_then(|counts| check_variant_row_count(num_rows).map(|()| counts))
+                .map_err(|error| DecodeError::InvalidVariant {
+                    column: column.to_string(),
+                    reason: error.to_string(),
+                })?;
+            tasks.push(BodyScanTask::VariantDiscriminators {
+                alternatives: alternatives.clone(),
+                counts,
+                rows_done: 0,
+                rows_remaining: num_rows,
+            });
+        }
+        ChType::Dynamic { .. } => {
+            let state = next_dynamic_state(states, state_cursor, column)?.clone();
+            if num_rows > i32::MAX as usize {
+                return Err(invalid_dynamic(
+                    column,
+                    "row count exceeds Arrow Dense Union's i32 child-offset range",
+                ));
+            }
+            let num_children = state.children.len();
+            let width = match state.kind {
+                DynamicWireKind::Variant => 1,
+                DynamicWireKind::Flattened => {
+                    let values = num_children.checked_add(1).ok_or_else(|| {
+                        invalid_dynamic(column, "flattened child count overflows usize")
+                    })?;
+                    if values <= u8::MAX as usize + 1 {
+                        1
+                    } else if values <= u16::MAX as usize + 1 {
+                        2
+                    } else if values <= u32::MAX as usize {
+                        4
+                    } else {
+                        8
+                    }
+                }
+            };
+            if num_rows.checked_mul(width).is_none() {
+                return Err(DecodeError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Dynamic flattened index byte length overflows usize",
+                )));
+            }
+            tasks.push(BodyScanTask::DynamicIndexes {
+                counts: vec![0; num_children],
+                children: state.children,
+                rows_remaining: num_rows,
+                width,
+                kind: state.kind,
+            });
+        }
+        ChType::Json { typed_paths, .. } => {
+            let json = next_json_state(states, state_cursor, column)?;
+            let kind = json.kind;
+            let num_dynamic = json.dynamic_path_count();
+            if num_rows > i32::MAX as usize {
+                return Err(invalid_json(
+                    column,
+                    "row count exceeds Arrow's i32 offset range",
+                ));
+            }
+            if kind == JsonWireKind::Text {
+                tasks.push(BodyScanTask::Strings {
+                    rows_remaining: num_rows,
+                    length_value: 0,
+                    length_shift: 0,
+                    length_complete: false,
+                    payload_remaining: 0,
+                    data_offset: 0,
+                });
+            } else {
+                if kind == JsonWireKind::Flattened
+                    && typed_paths.is_empty()
+                    && num_dynamic == 0
+                    && num_rows > MAX_PATHLESS_JSON_ROWS
+                {
+                    return Err(invalid_json(column, format!("row count {num_rows} exceeds the pathless FLATTENED block limit {MAX_PATHLESS_JSON_ROWS}")));
+                }
+                if kind == JsonWireKind::Flattened {
+                    let offset_bytes = num_rows
+                        .checked_add(1)
+                        .and_then(|rows| rows.checked_mul(std::mem::size_of::<i64>()))
+                        .unwrap_or(usize::MAX);
+                    tasks.push(BodyScanTask::ChargeSynthetic {
+                        bytes: offset_bytes,
+                        what: "FLATTENED JSON shared offsets",
+                    });
+                }
+                if kind == JsonWireKind::Structured {
+                    tasks.push(BodyScanTask::Offsets {
+                        rows_remaining: num_rows,
+                        previous: 0,
+                        children: vec![ChType::String, ChType::String],
+                    });
+                }
+                if num_dynamic != 0 {
+                    tasks.push(BodyScanTask::DynamicValuesRun {
+                        remaining: num_dynamic,
+                        num_rows,
+                    });
+                }
+                for (_, ch_type) in typed_paths.iter().rev() {
+                    tasks.push(BodyScanTask::Values {
+                        ch_type: ch_type.clone(),
+                        num_rows,
+                    });
+                }
+            }
+        }
+        ChType::AggregateFunction { .. } => match decode_state_codec(ch_type)? {
+            AggregateStateCodec::Count => tasks.push(BodyScanTask::AggregateCount {
+                rows_remaining: num_rows,
+                shift: 0,
+            }),
+            AggregateStateCodec::FixedZeroByte => tasks.push(BodyScanTask::AggregateZeroBytes {
+                rows_remaining: num_rows,
+            }),
+            AggregateStateCodec::Sum { state_width } => tasks.push(BodyScanTask::Bytes {
+                remaining: num_rows.checked_mul(state_width).ok_or_else(|| {
+                    DecodeError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "aggregate sum state byte length overflow",
+                    ))
+                })?,
+            }),
+            AggregateStateCodec::NullableSum { state_width } => {
+                tasks.push(BodyScanTask::AggregateNullableSum {
+                    rows_remaining: num_rows,
+                    state_width,
+                })
+            }
+        },
+        ChType::Nullable(inner) => {
+            tasks.push(BodyScanTask::Values {
+                ch_type: inner.as_ref().clone(),
+                num_rows,
+            });
+            tasks.push(BodyScanTask::Bytes {
+                remaining: num_rows,
+            });
+        }
+        ChType::Array(inner) => {
+            checked_array_offset_bytes(num_rows)?;
+            tasks.push(BodyScanTask::Offsets {
+                rows_remaining: num_rows,
+                previous: 0,
+                children: vec![inner.as_ref().clone()],
+            });
+        }
+        ChType::Map(key, value) => {
+            checked_array_offset_bytes(num_rows)?;
+            tasks.push(BodyScanTask::Offsets {
+                rows_remaining: num_rows,
+                previous: 0,
+                children: vec![key.as_ref().clone(), value.as_ref().clone()],
+            });
+        }
+        ChType::Tuple(elements) if elements.is_empty() => {
+            tasks.push(BodyScanTask::Bytes {
+                remaining: num_rows,
+            });
+        }
+        ChType::Tuple(elements) => {
+            for (_, element) in elements.iter().rev() {
+                tasks.push(BodyScanTask::Values {
+                    ch_type: element.clone(),
+                    num_rows,
+                });
+            }
+        }
+        ChType::String => tasks.push(BodyScanTask::Strings {
+            rows_remaining: num_rows,
+            length_value: 0,
+            length_shift: 0,
+            length_complete: false,
+            payload_remaining: 0,
+            data_offset: 0,
+        }),
+        fixed => {
+            let bytes = fixed_width_body_bytes(fixed, num_rows, column)?;
+            tasks.push(BodyScanTask::Bytes { remaining: bytes });
+        }
+    }
+    Ok(())
+}
+
+fn checked_array_offset_bytes(num_rows: usize) -> Result<usize, DecodeError> {
+    num_rows.checked_mul(8).ok_or_else(|| {
+        DecodeError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "Array offset byte length overflows usize",
+        ))
+    })
+}
+
+/// Whether `ch_type` is a leaf whose body is a computable run of bytes
+/// ([`fixed_width_body_bytes`] accepts it). Exhaustive so a new `ChType`
+/// variant must be classified here.
+fn is_fixed_width_leaf(ch_type: &ChType) -> bool {
+    match ch_type {
+        ChType::Nothing
+        | ChType::Bool
+        | ChType::Int8
+        | ChType::Int16
+        | ChType::Int32
+        | ChType::Int64
+        | ChType::UInt8
+        | ChType::UInt16
+        | ChType::UInt32
+        | ChType::UInt64
+        | ChType::Float32
+        | ChType::Float64
+        | ChType::BFloat16
+        | ChType::QBit { .. }
+        | ChType::Int128
+        | ChType::UInt128
+        | ChType::Int256
+        | ChType::UInt256
+        | ChType::FixedString(_)
+        | ChType::Date
+        | ChType::Date32
+        | ChType::DateTime { .. }
+        | ChType::DateTime64 { .. }
+        | ChType::Time
+        | ChType::Time64 { .. }
+        | ChType::Interval(_)
+        | ChType::Decimal { .. }
+        | ChType::Uuid
+        | ChType::Ipv4
+        | ChType::Ipv6
+        | ChType::Enum8 { .. }
+        | ChType::Enum16 { .. } => true,
+        ChType::String
+        | ChType::Nullable(_)
+        | ChType::LowCardinality(_)
+        | ChType::Array(_)
+        | ChType::Tuple(_)
+        | ChType::Map(..)
+        | ChType::Variant(_)
+        | ChType::Dynamic { .. }
+        | ChType::SimpleAggregateFunction { .. }
+        | ChType::AggregateFunction { .. }
+        | ChType::Geo(_)
+        | ChType::Geometry
+        | ChType::Nested(_)
+        | ChType::Json { .. } => false,
+    }
+}
+
+/// Byte length of a fixed-width value run, the same length
+/// [`skip_column_body`] skips (with the overflow reported as `UnexpectedEof`).
+fn fixed_width_body_bytes(
+    ch_type: &ChType,
+    num_rows: usize,
+    column: &str,
+) -> Result<usize, DecodeError> {
+    let width = match ch_type {
+        ChType::Nothing | ChType::Bool | ChType::Int8 | ChType::UInt8 | ChType::Enum8 { .. } => 1,
+        ChType::Int16
+        | ChType::UInt16
+        | ChType::BFloat16
+        | ChType::Date
+        | ChType::Enum16 { .. } => 2,
+        ChType::Int32
+        | ChType::UInt32
+        | ChType::Float32
+        | ChType::Date32
+        | ChType::DateTime { .. }
+        | ChType::Time
+        | ChType::Ipv4 => 4,
+        ChType::Int64
+        | ChType::UInt64
+        | ChType::Float64
+        | ChType::DateTime64 { .. }
+        | ChType::Time64 { .. }
+        | ChType::Interval(_) => 8,
+        ChType::FixedString(width) => *width,
+        ChType::Uuid | ChType::Ipv6 | ChType::Int128 | ChType::UInt128 => 16,
+        ChType::Int256 | ChType::UInt256 => 32,
+        ChType::Decimal { bits, .. } => usize::from(*bits / 8),
+        ChType::QBit {
+            element_type,
+            dimension,
+        } => {
+            let (_, wire_len, _) = qbit_layout(num_rows, *dimension, element_type.bit_width())?;
+            return Ok(wire_len);
+        }
+        // Not fixed-width leaves; `push_value_tasks` dispatches every
+        // resumable one before reaching here, so this is defense in depth.
+        ChType::String
+        | ChType::Nullable(_)
+        | ChType::LowCardinality(_)
+        | ChType::Array(_)
+        | ChType::Tuple(_)
+        | ChType::Map(..)
+        | ChType::Variant(_)
+        | ChType::Dynamic { .. }
+        | ChType::SimpleAggregateFunction { .. }
+        | ChType::AggregateFunction { .. }
+        | ChType::Geo(_)
+        | ChType::Geometry
+        | ChType::Nested(_)
+        | ChType::Json { .. } => {
+            return Err(DecodeError::UnsupportedType {
+                column: column.to_string(),
+                type_name: ch_type.to_string(),
+            })
+        }
+    };
+    num_rows.checked_mul(width).ok_or_else(|| {
+        DecodeError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "fixed-width byte length overflows usize",
+        ))
+    })
 }
 
 /// Advance `reader` past one column's data without materializing it.
@@ -3782,6 +5921,17 @@ fn skip_values(
     skip_column_body(reader, inner, num_rows)
 }
 
+/// The `i32::MAX` row guard [`variant_layout_from_discriminators`] applies to a
+/// Variant run (Arrow Dense Union child offsets are i32).
+fn check_variant_row_count(num_rows: usize) -> Result<(), VariantColumnError> {
+    if num_rows > i32::MAX as usize {
+        return Err(VariantColumnError::ChildOffsetOverflow {
+            row: i32::MAX as usize,
+        });
+    }
+    Ok(())
+}
+
 /// Walk one BASIC Variant body without allocating its Arrow routing buffers.
 fn skip_variant_data(
     reader: &mut ByteReader,
@@ -3792,12 +5942,11 @@ fn skip_variant_data(
     state_cursor: &mut usize,
 ) -> Result<(), DecodeError> {
     let discriminators = reader.read_slice(num_rows)?;
-    let (counts, _null_count) =
-        variant_child_counts(discriminators, alternatives.len()).map_err(|err| {
-            DecodeError::InvalidVariant {
-                column: column.to_string(),
-                reason: err.to_string(),
-            }
+    let (counts, _null_count) = variant_child_counts(discriminators, alternatives.len())
+        .and_then(|counts| check_variant_row_count(num_rows).map(|()| counts))
+        .map_err(|err| DecodeError::InvalidVariant {
+            column: column.to_string(),
+            reason: err.to_string(),
         })?;
     for (alternative, count) in alternatives.iter().zip(counts) {
         skip_values(reader, alternative, count, column, states, state_cursor)?;
@@ -3816,6 +5965,13 @@ fn skip_dynamic_data(
     state_cursor: &mut usize,
 ) -> Result<(), DecodeError> {
     let num_children = state.children.len();
+    // Same guard, at the same point, as `decode_dynamic`.
+    if num_rows > i32::MAX as usize {
+        return Err(invalid_dynamic(
+            column,
+            "row count exceeds Arrow Dense Union's i32 child-offset range",
+        ));
+    }
     let mut counts = vec![0usize; num_children];
     match state.kind {
         DynamicWireKind::Variant => {
@@ -3892,12 +6048,8 @@ fn skip_dynamic_data(
             DynamicStateChild::Typed(ch_type) => {
                 skip_values(reader, ch_type, count, column, states, state_cursor)?
             }
-            DynamicStateChild::Shared => {
-                for _ in 0..count {
-                    let len = varint_usize(reader.read_varint()?, "Dynamic shared value length")?;
-                    reader.skip(len)?;
-                }
-            }
+            // Decoded by `decode_string_data`, so walked as one String run.
+            DynamicStateChild::Shared => skip_column_body(reader, &ChType::String, count)?,
         }
     }
     Ok(())
@@ -3920,7 +6072,7 @@ fn skip_json_data(
         return Err(invalid_json(column, "not a JSON type"));
     };
     let state = next_json_state(states, state_cursor, column)?;
-    let (kind, num_dynamic) = (state.kind, state.dynamic_paths.len());
+    let (kind, num_dynamic) = (state.kind, state.dynamic_path_count());
 
     if kind == JsonWireKind::Text {
         return skip_column_body(reader, &ChType::String, num_rows);
@@ -4089,8 +6241,10 @@ fn skip_column_body(
         ChType::Int128 | ChType::UInt128 => reader.skip(num_rows.saturating_mul(16))?,
         ChType::Int256 | ChType::UInt256 => reader.skip(num_rows.saturating_mul(32))?,
         ChType::String => {
+            let mut offset = 0i32;
             for _ in 0..num_rows {
                 let len = varint_usize(reader.read_varint()?, "String value length")?;
+                offset = next_string_offset(offset, len)?;
                 reader.skip(len)?;
             }
         }
@@ -4136,8 +6290,11 @@ fn skip_column_body(
 
 /// Walk one `LowCardinality(T)` column block (after its key-version prefix) in
 /// the completeness scan, consuming exactly what [`decode_low_cardinality`]
-/// reads: the index type word, the per-block dictionary, the row count, and the
-/// raw index array. Mirrors the decode path so the two cannot drift.
+/// reads and rejecting what it rejects: the index type word, the per-block
+/// dictionary, the row count, and the raw index array (range-checked against the
+/// dictionary). Shares its validation helpers with the resumable
+/// `BodyScanTask::LowCardinality*` tasks so the walkers cannot drift. Reached
+/// only from the non-resumable walkers (a LowCardinality inside Dynamic or JSON).
 fn skip_low_cardinality_data(
     reader: &mut ByteReader,
     inner: &ChType,
@@ -4147,42 +6304,11 @@ fn skip_low_cardinality_data(
     // Resolve the inner through the shared helper, the scan-side mirror of
     // [`decode_low_cardinality`], so the dictionary body walk matches the decode
     // for `LowCardinality(SAF(anyLast, Nullable(String)))` and chained SAF alike.
-    // The scan does not need the nullability flag: nulls are index-0 sentinels in
-    // the same raw index array it skips regardless.
     let (_, dict_value_type) = low_cardinality_dict_value_type(inner);
 
-    // Index type word. Mirror the decode-side rejections
-    // ([`decode_low_cardinality`]) exactly, not just the index width: a hostile
-    // flags word that sets `NeedGlobalDictionaryBit` or clears
-    // `HasAdditionalKeysBit` would make the scan walk framing the decode refuses,
-    // so the scan would either misreport the block length or stall the
-    // `StreamDecoder` with a misleading truncation error instead of surfacing the
-    // same `InvalidLowCardinality` the decode returns.
-    let index_word = reader.read_u64_le()?;
-    if index_word & LC_NEED_GLOBAL_DICTIONARY_BIT != 0 {
-        return Err(DecodeError::InvalidLowCardinality {
-            column: column.to_string(),
-            reason: "NeedGlobalDictionaryBit is set; Native never uses a global dictionary",
-        });
-    }
-    if index_word & LC_HAS_ADDITIONAL_KEYS_BIT == 0 {
-        return Err(DecodeError::InvalidLowCardinality {
-            column: column.to_string(),
-            reason: "HasAdditionalKeysBit is clear; Native always carries a per-block dictionary",
-        });
-    }
-    let index_width = match index_word & 0xFF {
-        0 => 1usize,
-        1 => 2,
-        2 => 4,
-        3 => 8,
-        _ => {
-            return Err(DecodeError::InvalidLowCardinality {
-                column: column.to_string(),
-                reason: "index width tag is outside 0..=3",
-            })
-        }
-    };
+    // Index type word, with the decode-side flag and width rejections: a hostile
+    // flags word would otherwise make the scan walk framing the decode refuses.
+    let index_width = low_cardinality_index_width(reader.read_u64_le()?, column)?;
 
     // Per-block dictionary: a count then that many inner values. Reject an inner
     // type outside the LowCardinality allowlist exactly as the decode path does,
@@ -4193,6 +6319,7 @@ fn skip_low_cardinality_data(
             "LowCardinality dictionary size overflows usize",
         ))
     })?;
+    check_header_count(num_keys, "LowCardinality dictionary size", reader)?;
     if !is_low_cardinality_inner(dict_value_type) {
         return Err(DecodeError::UnsupportedType {
             column: column.to_string(),
@@ -4201,10 +6328,27 @@ fn skip_low_cardinality_data(
     }
     skip_column_body(reader, dict_value_type, num_keys)?;
 
-    // Row count word, then the raw index array.
-    reader.skip(8)?; // num_rows (re-stated in the indexes stream)
-    reader.skip(num_rows.saturating_mul(index_width))?;
-    Ok(())
+    // Row count word (must restate the run length), then the raw index array.
+    let wire_rows = usize::try_from(reader.read_u64_le()?).map_err(|_| {
+        DecodeError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "LowCardinality row count overflows usize",
+        ))
+    })?;
+    if wire_rows != num_rows {
+        return Err(DecodeError::InvalidLowCardinality {
+            column: column.to_string(),
+            reason: "indexes row count disagrees with the block row count",
+        });
+    }
+    let total = num_rows.checked_mul(index_width).ok_or_else(|| {
+        DecodeError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "LowCardinality index byte length overflows usize",
+        ))
+    })?;
+    let raw = reader.read_slice(total)?;
+    check_low_cardinality_indexes(raw, index_width, num_keys, column)
 }
 
 /// Decode all blocks from a complete byte buffer into a `ChunkedBatch`.

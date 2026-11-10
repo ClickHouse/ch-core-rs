@@ -31,3 +31,7 @@ lz4 = "1.28"
 [[bench]]
 name = "lz4_parity"
 harness = false
+
+[[bench]]
+name = "block_scanner"
+harness = false

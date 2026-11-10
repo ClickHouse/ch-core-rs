@@ -281,13 +281,20 @@ let tail = d.finish()?;   // errors if a truncated block remains
 The interesting machinery is how it avoids wasted work on partial data:
 
 - **Completeness scan first.** Before running the allocating decode, it runs
-  `block_end`, an allocation-free walk of the block framing that shares the
-  exact header-reading code with the real decoder (so the two cannot drift)
-  and skips past column data by computed length (fixed-width types) or by
-  walking the varint length prefixes (strings). Only when the scan confirms a
-  whole block is buffered does the real decode run, so a block arriving over
-  many small feeds allocates its column buffers exactly once, when the last
-  byte lands.
+  `block_end_resume`, the scan-only walk of the block framing that also
+  backs the public `BlockScanner`. It shares the exact header-reading code with
+  the real decoder (so the two cannot drift) and skips past column data by
+  computed length (fixed-width types) or by walking the varint length prefixes
+  (strings). Only when the scan confirms a whole block is buffered does the
+  real decode run, so a block arriving over many small feeds allocates its
+  column buffers exactly once, when the last byte lands.
+- **Resumable checkpoint.** The scan keeps a `ScanProgress` checkpoint across
+  feeds: parsed column headers, verified top-level columns and, inside a column,
+  bodies built from String, fixed-width values, Nullable, Array, Map, Tuple, LowCardinality,
+  Variant, Dynamic, JSON, and AggregateFunction. Runtime type-table prefixes
+  and nested bodies also retain progress, including incomplete top-level binary
+  descriptors. A block fed in many pieces is therefore walked once overall. The scanner allocates metadata and task
+  state, but no decoded column buffers.
 - **High-water mark.** If a scan found the next block incomplete after
   consuming all N buffered bytes, no block can complete until the buffer grows
   past N, so redundant re-scans are skipped.
@@ -295,7 +302,10 @@ The interesting machinery is how it avoids wasted work on partial data:
   internal buffer does not grow without bound.
 - The `UnexpectedEof`-vs-fatal-error distinction from the decode layer is what
   makes this work: EOF means wait for more bytes, anything else aborts the
-  stream.
+  stream. Scan and decode agree on acceptance or rejection and complete-block
+  boundaries, but error wording and timing can differ. Header corruption, an
+  invalid Dynamic index or AggregateFunction zero-state byte in a truncated stream can cause
+  an invalid-data error before decode reports truncation.
 
 Transport-level backpressure stays a binding/client responsibility; the core
 just decodes what it is given.
@@ -368,8 +378,10 @@ Two things differ from decode by nature:
 Encode is at full type parity with decode (every type the crate decodes it also
 encodes). HTTP `INSERT` uses `protocol_revision = 0`; TCP block bodies use the
 connection's effective revision. The separate `compression` module wraps those
-bytes in LZ4 frames. There is no TCP packet engine yet. The per-type encode contract is the
-"Encoding" section of `CODEC_CONTRACT.md`.
+bytes in LZ4 frames. The sans-I/O TCP packet engine is the sibling crate
+`crates/ch-tcp-proto`; it frames packets and leaves Native decode to this
+crate. The per-type encode contract is the "Encoding" section of
+`CODEC_CONTRACT.md`.
 
 ### Error handling
 
@@ -412,7 +424,9 @@ current enumeration, and `CODEC_CONTRACT.md` is the per-type contract. Decode an
 encode are at type parity across all of this: whole-buffer and streaming decode,
 Arrow C Data export, and encode back to Native block bytes for the HTTP `INSERT`
 path. The `compression` module reads LZ4/NONE frames and writes LZ4 frames;
-the native TCP packet protocol remains future work. The growth model
+the sans-I/O TCP engine in the sibling `ch-tcp-proto` crate covers the
+handshake, Ping, and uncompressed SELECT at revision 54460, while compressed
+packets, INSERT, and cancellation over TCP remain future work. The growth model
 is fixed: implement a type once here, following the documented
 confirm-against-server-source workflow in `AGENTS.md`, and every binding gets it
 for free. The roadmap lives in `README.md`.

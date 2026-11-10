@@ -185,8 +185,11 @@ fn replay(user: &str, segments: &[&[u8]], mut chunk_size: impl FnMut() -> usize)
     let mut connection = Connection::new(config(user)).unwrap();
     let mut output = connection.take_output();
     let mut feed = Ok(());
+    let mut seen = Vec::new();
     'segments: for (index, segment) in segments.iter().enumerate() {
         if index > 0 {
+            // `ping` requires every completed event to be drained first.
+            seen.extend(events(&mut connection));
             connection.ping().unwrap();
         }
         let mut rest = *segment;
@@ -202,9 +205,10 @@ fn replay(user: &str, segments: &[&[u8]], mut chunk_size: impl FnMut() -> usize)
     }
     let state_before_finish = connection.state();
     let finish = connection.finish();
+    seen.extend(events(&mut connection));
     Replay {
         feed,
-        events: events(&mut connection),
+        events: seen,
         output,
         state_before_finish,
         finish,

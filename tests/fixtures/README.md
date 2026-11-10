@@ -248,3 +248,73 @@ The matching server source confirms these layouts in
 `src/IO/WriteHelpers.cpp`, `writeException`. All Hello fields after the raw
 server revision are parsed using effective revision 54460. Fields introduced
 at 54461 and above are absent even though the server advertises 54492.
+
+## Revision 54460 SELECT capture workflow
+
+The uncompressed query fixture generator requires the same local
+`26.8.1.2041` server and `.server-ref` pin:
+
+```sh
+no_proxy=127.0.0.1 NO_PROXY=127.0.0.1 python3 -B scripts/gen_tcp_query_fixtures.py
+```
+
+It uses only the Python standard library, loopback, and the `default` user with
+an empty password. It checks both HTTP and TCP versions and bypasses proxies.
+The generated `tcp_query_*_client_rev54460.packet` files hold the Query packet
+and empty client Data block. The corresponding `*_server_rev54460.packets`
+files retain complete responses, including logs, profile events, progress,
+profiles, totals, extremes, and the final EOS or Exception.
+`tcp_query_rev54460.json` records queries, packet boundaries, schemas, and file
+hashes. `tcp_query_oracle_rev54460.rs` is generated from those independently
+parsed boundaries. The replay test uses it to check the exact event sequence,
+Progress and ProfileInfo fields, and every block event payload without adding a
+JSON dependency to the crate.
+
+The queries cover SELECT 1, multiple result blocks, a mid-stream division
+error, totals and extremes, and typed parameters. Every parameter value is the
+text an HTTP `param_<name>` value would carry, the server's escaped text form.
+The Query packet wraps that text in exactly one String Field dump, which
+`readQueryParameters` undoes with one `readQuoted`. The server then parses the
+text with `deserializeTextEscaped` for the declared type, as it does for HTTP.
+The escaped parameter sends the escaped text of a String holding quote,
+backslash, NUL, newline, carriage return, tab, backspace, and form feed, and
+the replay checks the decoded bytes. The container parameter sends
+`['user_1','it\'s']` for `Array(String)` and `\N` for `Nullable(String)`, and
+the replay checks both element offsets, the two values, and the NULL. At
+capture time the generator parses and compares each complete result column
+body, so a value substring or an adjacent column's length byte cannot satisfy
+the oracle accidentally.
+The capture asserts that the error follows positive-row Data and immediately
+executes SELECT 1 again on the same socket, with no intervening EOS or Ping.
+It also live-probes two first-response Exceptions: `max_threads=abc` returns
+code 27 and closes the socket, while a code 62 syntax error from a query with
+no wire settings leaves the same socket reusable.
+
+ClientInfo uses sentinel OS user, hostname, client version, quota key, initial
+address, and initial start time values. After `SYSTEM FLUSH LOGS`, the generator
+queries the `QueryFinish` row in `system.query_log` by query ID and independently
+checks the fields the server preserves. It separately verifies that the server
+replaced the supplied initial address with a real peer address and positive
+port, as it does for every initial query.
+
+Each matching `.native` file concatenates the result Data bodies while omitting
+the zero-column, zero-row TCP end marker. Schema-only result blocks remain.
+`crates/ch-tcp-proto/tests/query_replay.rs` compares those bytes with engine
+output, decodes the result with core, and replays every split, bytewise input,
+and seeded random chunking without sockets. The new captures must be generated
+and these replays must pass before accepting the SELECT slice.
+
+Confirmed source at `v26.8.1.2041-lts`:
+`src/Client/Connection.cpp::sendQuery`,
+`src/Interpreters/ClientInfo.cpp::write/read`,
+`src/Core/BaseSettings.cpp::BaseSettingsHelpers::writeFlags`,
+`src/Core/Settings.cpp::writeQueryParameters/readQueryParameters`,
+`src/Interpreters/ReplaceQueryParameterVisitor.cpp::resolveParameterValueAsField`,
+`src/Server/HTTPHandler.cpp::DynamicQueryHandler::customizeQueryParam`,
+`src/DataTypes/Serializations/SerializationString.cpp::deserializeTextEscaped`,
+`src/Server/TCPHandler.cpp::sendData/sendTotals/sendExtremes/initLogsBlockOutput/initProfileEventsBlockOutput`,
+`src/IO/Progress.cpp::ProgressValues::write`, and
+`src/QueryPipeline/ProfileInfo.cpp::write`.
+Settings flags are VarUInt IMPORTANT, value 1, and parameter flags are CUSTOM,
+value 2. Log and ProfileEvents use revision-54460 Native framing, including
+BlockInfo.
