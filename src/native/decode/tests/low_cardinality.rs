@@ -298,6 +298,304 @@ fn test_low_cardinality_rejects_out_of_range_index() {
 }
 
 #[test]
+fn test_check_low_cardinality_indexes_all_widths_and_tail_positions() {
+    for width in [1, 2, 4, 8] {
+        let mut valid = Vec::new();
+        push_low_cardinality_test_index(&mut valid, 0, width);
+        push_low_cardinality_test_index(&mut valid, 2, width);
+        push_low_cardinality_test_index(&mut valid, 1, width);
+        assert!(
+            check_low_cardinality_indexes(&valid, width, 3, "lc").is_ok(),
+            "valid width {width}"
+        );
+
+        let mut invalid_tail = valid;
+        push_low_cardinality_test_index(&mut invalid_tail, 3, width);
+        assert_eq!(
+            low_cardinality_index_error_reason(check_low_cardinality_indexes(
+                &invalid_tail,
+                width,
+                3,
+                "lc",
+            )),
+            "index value points outside the block dictionary",
+            "invalid tail at width {width}"
+        );
+    }
+
+    assert!(check_low_cardinality_indexes(&[], 1, 0, "lc").is_ok());
+    assert!(check_low_cardinality_indexes(&[], 8, 0, "lc").is_ok());
+}
+
+#[test]
+fn test_check_low_cardinality_indexes_vector_and_tail_lengths() {
+    for width in [1, 2, 4, 8] {
+        for len in [15usize, 16, 17, 31, 32, 33, 63, 64, 65] {
+            for invalid_row in [0, len / 2, len - 1] {
+                let mut raw = Vec::with_capacity(len * width);
+                for row in 0..len {
+                    let index = if row == invalid_row {
+                        3
+                    } else {
+                        (row % 3) as u64
+                    };
+                    push_low_cardinality_test_index(&mut raw, index, width);
+                }
+                assert_eq!(
+                    low_cardinality_index_error_reason(check_low_cardinality_indexes(
+                        &raw, width, 3, "lc",
+                    )),
+                    "index value points outside the block dictionary",
+                    "width {width}, length {len}, invalid row {invalid_row}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_max_raw_low_cardinality_index_exact_values() {
+    fn max_of(indexes: &[u64], width: usize) -> u64 {
+        let mut raw = Vec::new();
+        for &index in indexes {
+            push_low_cardinality_test_index(&mut raw, index, width);
+        }
+        max_raw_low_cardinality_index(&raw, width)
+    }
+
+    for width in [1, 2, 4, 8] {
+        assert_eq!(max_of(&[], width), 0, "empty run at width {width}");
+        assert_eq!(max_of(&[0, 7, 3], width), 7, "small max at width {width}");
+    }
+    assert_eq!(max_of(&[0, u8::MAX as u64, 1], 1), u8::MAX as u64);
+    assert_eq!(max_of(&[0, u16::MAX as u64, 1], 2), u16::MAX as u64);
+    assert_eq!(max_of(&[0, u32::MAX as u64, 1], 4), u32::MAX as u64);
+
+    // Width 8: a zero high half returns the true max, including the largest
+    // low half; any nonzero high half returns u64::MAX.
+    assert_eq!(max_of(&[0, u32::MAX as u64, 1], 8), u32::MAX as u64);
+    for byte in 4..8 {
+        let high = 1u64 << (8 * byte);
+        assert_eq!(max_of(&[1, high, 2], 8), u64::MAX, "high byte {byte}");
+    }
+    assert_eq!(max_of(&[1, (1 << 32) | 1], 8), u64::MAX);
+    assert_eq!(max_of(&[u64::MAX], 8), u64::MAX);
+}
+
+#[test]
+fn test_check_low_cardinality_indexes_rejects_each_index_byte() {
+    for width in [1, 2, 4, 8] {
+        for byte in 0..width {
+            let mut raw = Vec::new();
+            push_low_cardinality_test_index(&mut raw, 1u64 << (8 * byte), width);
+            assert_eq!(
+                low_cardinality_index_error_reason(check_low_cardinality_indexes(
+                    &raw, width, 1, "lc",
+                )),
+                "index value points outside the block dictionary",
+                "byte {byte} at width {width}"
+            );
+        }
+    }
+
+    // Width 8: the low halves alone are valid but one high half is not.
+    let mut raw = Vec::new();
+    push_low_cardinality_test_index(&mut raw, 1, 8);
+    push_low_cardinality_test_index(&mut raw, 2, 8);
+    push_low_cardinality_test_index(&mut raw, (1 << 32) | 1, 8);
+    assert_eq!(
+        low_cardinality_index_error_reason(check_low_cardinality_indexes(&raw, 8, 3, "lc")),
+        "index value points outside the block dictionary",
+        "valid low halves with a nonzero high half"
+    );
+}
+
+#[test]
+fn test_check_low_cardinality_indexes_boundaries_and_error_order() {
+    // The largest index each width can carry, valid against a dictionary of
+    // one more key.
+    for (width, max_index) in [(1, u8::MAX as u64), (2, u16::MAX as u64)] {
+        let mut raw = Vec::new();
+        push_low_cardinality_test_index(&mut raw, max_index, width);
+        assert!(
+            check_low_cardinality_indexes(&raw, width, max_index as usize + 1, "lc").is_ok(),
+            "largest index at width {width}"
+        );
+    }
+
+    for (width, last_valid, num_keys) in [
+        (1, u8::MAX as u64 - 1, u8::MAX as usize),
+        (2, 0xFFFE, 0xFFFF),
+    ] {
+        let mut raw = Vec::new();
+        push_low_cardinality_test_index(&mut raw, last_valid, width);
+        assert!(
+            check_low_cardinality_indexes(&raw, width, num_keys, "lc").is_ok(),
+            "dictionary boundary at width {width}"
+        );
+        push_low_cardinality_test_index(&mut raw, num_keys as u64, width);
+        assert_eq!(
+            low_cardinality_index_error_reason(check_low_cardinality_indexes(
+                &raw, width, num_keys, "lc",
+            )),
+            "index value points outside the block dictionary",
+            "dictionary overflow at width {width}"
+        );
+    }
+
+    // Width 8 with a nonzero high half inside a dictionary larger than u32:
+    // the dictionary bound passes, so the i32 bound must report.
+    #[cfg(target_pointer_width = "64")]
+    {
+        let mut raw = Vec::new();
+        push_low_cardinality_test_index(&mut raw, 1 << 32, 8);
+        assert_eq!(
+            low_cardinality_index_error_reason(check_low_cardinality_indexes(
+                &raw,
+                8,
+                1 << 40,
+                "lc",
+            )),
+            "index value exceeds i32::MAX",
+            "high half within a large dictionary"
+        );
+    }
+
+    let above_i32 = i32::MAX as u64 + 1;
+    let large_dictionary = above_i32 as usize + 1;
+    for width in [4, 8] {
+        let mut at_i32 = Vec::new();
+        push_low_cardinality_test_index(&mut at_i32, i32::MAX as u64, width);
+        assert!(
+            check_low_cardinality_indexes(&at_i32, width, large_dictionary, "lc").is_ok(),
+            "i32 boundary at width {width}"
+        );
+
+        let mut i32_first = Vec::new();
+        push_low_cardinality_test_index(&mut i32_first, above_i32, width);
+        push_low_cardinality_test_index(&mut i32_first, large_dictionary as u64, width);
+        assert_eq!(
+            low_cardinality_index_error_reason(check_low_cardinality_indexes(
+                &i32_first,
+                width,
+                large_dictionary,
+                "lc",
+            )),
+            "index value exceeds i32::MAX",
+            "first invalid row must win at width {width}"
+        );
+
+        let mut dictionary_first = Vec::new();
+        push_low_cardinality_test_index(&mut dictionary_first, 79, width);
+        push_low_cardinality_test_index(&mut dictionary_first, above_i32, width);
+        assert_eq!(
+            low_cardinality_index_error_reason(check_low_cardinality_indexes(
+                &dictionary_first,
+                width,
+                79,
+                "lc",
+            )),
+            "index value points outside the block dictionary",
+            "dictionary bound must be checked first at width {width}"
+        );
+
+        let mut both_bounds = Vec::new();
+        push_low_cardinality_test_index(&mut both_bounds, above_i32, width);
+        assert_eq!(
+            low_cardinality_index_error_reason(check_low_cardinality_indexes(
+                &both_bounds,
+                width,
+                79,
+                "lc",
+            )),
+            "index value points outside the block dictionary",
+            "dictionary bound must win on the same row at width {width}"
+        );
+    }
+}
+
+#[test]
+fn test_fragmented_block_scanner_low_cardinality_indexes_all_widths() {
+    use crate::native::stream_decoder::{BlockBoundary, BlockScanner};
+
+    for width in [1, 2, 4, 8] {
+        let valid = BlockBuilder::new()
+            .header(1, 4)
+            .column_header("lc", "LowCardinality(Nullable(String))")
+            .low_cardinality_string(&["", "user_1", "user_2"], &[0, 2, 1, 0], width)
+            .build();
+        // Cut half of the last index, or the whole of it at width 1, so the
+        // first scan sees a partial final run.
+        let split = valid.len() - width.div_ceil(2);
+        let mut scanner = BlockScanner::new(DecodeOptions::default());
+        assert_eq!(
+            scanner.scan(&valid[..split]).unwrap(),
+            BlockBoundary::NeedMore,
+            "valid split in the last index at width {width}"
+        );
+        assert_eq!(
+            scanner.scan(&valid).unwrap(),
+            BlockBoundary::Complete {
+                consumed: valid.len(),
+                num_columns: 1,
+                num_rows: 4,
+            },
+            "valid completion at width {width}"
+        );
+
+        let invalid = BlockBuilder::new()
+            .header(1, 4)
+            .column_header("lc", "LowCardinality(Nullable(String))")
+            .low_cardinality_string(&["", "user_1", "user_2"], &[0, 2, 1, 3], width)
+            .build();
+        let split = invalid.len() - width.div_ceil(2);
+        let mut scanner = BlockScanner::new(DecodeOptions::default());
+        assert_eq!(
+            scanner.scan(&invalid[..split]).unwrap(),
+            BlockBoundary::NeedMore,
+            "invalid split in the last index at width {width}"
+        );
+        assert_eq!(
+            low_cardinality_index_error_reason(scanner.scan(&invalid).map(|_| ())),
+            "index value points outside the block dictionary",
+            "invalid completion at width {width}"
+        );
+
+        // The bad row is in the first, partial run, so the first scan fails.
+        let invalid_first = BlockBuilder::new()
+            .header(1, 4)
+            .column_header("lc", "LowCardinality(Nullable(String))")
+            .low_cardinality_string(&["", "user_1", "user_2"], &[3, 2, 1, 0], width)
+            .build();
+        let split = invalid_first.len() - width.div_ceil(2);
+        let mut scanner = BlockScanner::new(DecodeOptions::default());
+        assert_eq!(
+            low_cardinality_index_error_reason(scanner.scan(&invalid_first[..split]).map(|_| ())),
+            "index value points outside the block dictionary",
+            "invalid first run at width {width}"
+        );
+    }
+}
+
+fn push_low_cardinality_test_index(raw: &mut Vec<u8>, index: u64, width: usize) {
+    match width {
+        1 => raw.push(index as u8),
+        2 => raw.extend_from_slice(&(index as u16).to_le_bytes()),
+        4 => raw.extend_from_slice(&(index as u32).to_le_bytes()),
+        8 => raw.extend_from_slice(&index.to_le_bytes()),
+        _ => panic!("unsupported test index width {width}"),
+    }
+}
+
+fn low_cardinality_index_error_reason<T>(result: Result<T, DecodeError>) -> &'static str {
+    match result {
+        Err(DecodeError::InvalidLowCardinality { reason, .. }) => reason,
+        Err(other) => panic!("expected InvalidLowCardinality, got {other}"),
+        Ok(_) => panic!("expected InvalidLowCardinality"),
+    }
+}
+
+#[test]
 fn test_low_cardinality_modern_framing_roundtrip() {
     // Full v26.6.1.1193 framing (BlockInfo + per-column custom-serialization
     // byte) ahead of the LowCardinality payload.

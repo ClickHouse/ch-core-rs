@@ -10,8 +10,10 @@ CH_CORE_BENCH_MS=150 cargo bench --bench block_scanner
 
 The default run synthesizes 250,000-row and 1,000,000-row columns through the public column
 model and encodes each one with `encode_block` before timing. It covers a wide
-String, LowCardinality(String), Dynamic(String), structured JSON with a Dynamic
-path, fixed-width AggregateFunction(sum), varint AggregateFunction(count),
+String, LowCardinality(String) with 1-, 2-, 4-, and 8-byte indexes (the wider
+widths are byte-patched after `encode_block`, which selects UInt8 here),
+Dynamic(String), structured JSON with a Dynamic path, fixed-width
+AggregateFunction(sum), varint AggregateFunction(count),
 AggregateFunction(sum, Nullable(Int32)), UInt64, and a prefix-heavy Dynamic
 whose runtime type is an Enum16 with 4,096 long labels. No live server or
 fixture file is required. The additional `TopLevelEnum` and `LongName` cases
@@ -57,6 +59,10 @@ CH_CORE_BENCH_FILTER=Dynamic CH_CORE_BENCH_MS=500 \
 # Change generated shape sizes.
 CH_CORE_BENCH_ROWS=250000 CH_CORE_BENCH_PREFIX_LABELS=1024 \
   cargo bench --bench block_scanner
+
+# Measure TCP INSERT validation and output copying for all LC index widths.
+CH_CORE_BENCH_ROWS=1048576 CH_CORE_BENCH_MS=150 \
+  cargo bench -p ch-tcp-proto --bench insert_data
 ```
 
 When Cargo executes the bench target without `--bench`, such as under
@@ -80,7 +86,8 @@ run. The two AggregateFunction rows use the final 500 ms focused reruns.
 
 The controls remained feed-size independent. In the full final run, the
 31.47 MiB String case ranged from 1.401 to 1.569 ms and the 0.95 MiB
-LowCardinality(String) case ranged from 0.508 to 0.512 ms.
+LowCardinality(String) case ranged from 0.508 to 0.512 ms. That case is
+today's `LowCardinalityW1`.
 
 The runtime-shape and scanner-memory follow-up used 500 ms focused cells on
 the same machine and toolchain. These cases were measured after counted body
@@ -133,3 +140,48 @@ count and only the current name needed for order validation. These are heap
 measurements, not RSS. The comparison uses the same counting-allocator harness
 on c437bbe and the fix tree; timing cells used 5 ms for UInt64/JSON and 10 ms for
 CombinedHeader, so small timing differences should not be over-interpreted.
+
+### LowCardinality index validation
+
+Results from 2026-11-11 compare baseline commit `7504c58` with the width-specialized
+validator. The machine was an Apple M4 Max running macOS 26.7.2, with rustc
+1.96.0 on `aarch64-apple-darwin`. Cargo used its default bench profile with no
+LTO. Each input had 1,048,576 rows, the same four-entry String dictionary, and
+the same logical indexes. Only the self-describing index width changed. Times
+are milliseconds for text headers at revision 54460. Baseline and candidate
+ran back-to-back from separate source and target directories. The scanner used
+`CH_CORE_BENCH_FILTER=LowCardinality CH_CORE_BENCH_ROWS=1048576
+CH_CORE_BENCH_MS=50`; the INSERT benchmark used `CH_CORE_BENCH_ROWS=1048576
+CH_CORE_BENCH_MS=150`. Each benchmark reports the best of five calibrated
+batches, as described above. Each cell below is the best of three such
+scanner runs, or two INSERT runs, per tree. Every timed operation re-reads the
+same buffer, so inputs are cache-resident and the speedups are upper bounds.
+
+| Width | MiB | One-shot before | One-shot after | 64 B before | 64 B after | 4 KiB before | 4 KiB after | 1 MiB before | 1 MiB after |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 1.00 | 0.476 | 0.010 | 0.660 | 0.269 | 0.504 | 0.016 | 0.477 | 0.010 |
+| 2 | 2.00 | 0.481 | 0.020 | 0.923 | 0.479 | 0.487 | 0.030 | 0.480 | 0.021 |
+| 4 | 4.00 | 0.484 | 0.041 | 1.319 | 0.969 | 0.501 | 0.066 | 0.488 | 0.041 |
+| 8 | 8.00 | 0.485 | 0.084 | 2.144 | 1.922 | 0.514 | 0.118 | 0.478 | 0.084 |
+
+One-shot speedups are about 48x, 24x, 12x, and 5.8x for widths 1, 2, 4, and 8.
+At 64 B feeds per-call scanner overhead dominates, and the gains are 2.5x,
+1.9x, 1.4x, and 1.1x.
+
+`Connection::insert_data` scans the same block and copies it into a Data packet.
+The focused benchmark includes `take_output`, so every operation starts with an
+empty output buffer and includes its one block-sized allocation.
+
+| Width | Before | After | Speedup | Peak requested bytes | Allocations |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 0.525 | 0.023 | 22.8x | 1,048,671 | 8 |
+| 2 | 0.543 | 0.046 | 11.8x | 2,097,247 | 8 |
+| 4 | 0.559 | 0.091 | 6.1x | 4,194,399 | 8 |
+| 8 | 0.616 | 0.185 | 3.3x | 8,388,703 | 8 |
+
+Peak requested heap and allocation counts were identical before and after for
+both scanner feeds and `insert_data`. The change adds no allocations or copies.
+The index validator performs one max reduction over each available index run
+and one validity branch per run on valid data. The row-by-row error walk remains
+cold. Full allocating decode was unchanged and stayed near 0.8, 1.0, 1.0, and
+1.4 ms for widths 1, 2, 4, and 8.
