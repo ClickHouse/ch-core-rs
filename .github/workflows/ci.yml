@@ -47,4 +47,4 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check against MSRV
-        run: cargo +1.81 check --workspace --all-targets
+        run: cargo +1.81 check --workspace --all-targets --locked

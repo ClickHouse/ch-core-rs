@@ -17,6 +17,8 @@ const HTTP_LZ4: &[u8] = include_bytes!("fixtures/http_multi_rev54460_lz4.native"
 const TCP_PLAIN: &[u8] = include_bytes!("fixtures/tcp_multi_rev54460.packets");
 const TCP_LZ4: &[u8] = include_bytes!("fixtures/tcp_multi_rev54460_lz4.packets");
 const TCP_LARGE: &[u8] = include_bytes!("fixtures/tcp_large_rev54460_lz4.packets");
+const TCP_ZSTD: &[u8] = include_bytes!("fixtures/tcp_multi_rev54460_zstd.packets");
+const TCP_LARGE_ZSTD: &[u8] = include_bytes!("fixtures/tcp_large_rev54460_zstd.packets");
 
 fn options() -> DecodeOptions {
     let mut options = DecodeOptions::default();
@@ -144,6 +146,49 @@ fn tcp_compressed_and_plain_packets_decode_identically() {
     assert_eq!(plain.last().unwrap().num_columns(), 0);
     assert_eq!(frames, [vec![30], vec![60], vec![60], vec![45], vec![10]]);
     assert_small_values(&plain);
+}
+
+#[test]
+fn tcp_zstd_and_plain_packets_decode_identically() {
+    let (plain, _) = packets(TCP_PLAIN, false);
+    let (compressed, frames) = packets(TCP_ZSTD, true);
+    assert_eq!(compressed, plain);
+    assert_eq!(frames, [vec![30], vec![60], vec![60], vec![45], vec![10]]);
+    assert_small_values(&compressed);
+}
+
+#[test]
+fn tcp_large_zstd_block_matches_lz4_across_frames() {
+    let (expected, expected_frames) = packets(TCP_LARGE, true);
+    let (actual, frames) = packets(TCP_LARGE_ZSTD, true);
+    assert_eq!(actual, expected);
+    assert_eq!(frames, expected_frames);
+    assert_eq!(frames[1], [1_048_576, 51_465]);
+}
+
+#[test]
+fn real_zstd_frame_retries_truncation_and_preserves_packet_suffix() {
+    // Each packet begins with the raw Data code and empty block name.
+    let first = decompress_frame(&TCP_ZSTD[2..], ChecksumMode::Verify).unwrap();
+    let consumed = first.consumed();
+    assert_eq!(TCP_ZSTD[18], 0x90);
+    for length in 0..consumed {
+        assert!(matches!(
+            decompress_frame(&TCP_ZSTD[2..2 + length], ChecksumMode::Verify),
+            Err(CompressionError::Truncated { .. })
+        ));
+    }
+    assert_eq!(&TCP_ZSTD[2 + consumed..][..2], &[1, 0]);
+    assert!(matches!(
+        first.finish_block(first.plaintext().len() - 1),
+        Err(CompressionError::TrailingPlaintext { remaining: 1 })
+    ));
+    let mut corrupted = TCP_ZSTD[2..2 + consumed].to_vec();
+    corrupted[0] ^= 1;
+    assert!(matches!(
+        decompress_frame(&corrupted, ChecksumMode::Verify),
+        Err(CompressionError::ChecksumMismatch { .. })
+    ));
 }
 
 #[test]

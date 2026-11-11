@@ -2,7 +2,7 @@
 
 A shared Rust core for the ClickHouse `FORMAT Native` wire format: it decodes
 Native bytes into typed, Arrow-compatible columnar buffers, and encodes those
-buffers back to Native bytes for `INSERT`. Pure Rust.
+buffers back to Native bytes for `INSERT`.
 The codec is implemented once here. Each language client wraps it with a thin
 binding.
 
@@ -20,7 +20,7 @@ ClickHouse server
       |  FORMAT Native bytes
       v
 +---------------------------+
-|        ch-core-rs         |  pure Rust
+|        ch-core-rs         |  shared codec
 |  type parsing, block      |  decode happens once, here
 |  decode, columnar buffers |
 +---------------------------+
@@ -115,8 +115,10 @@ Implemented:
 - Malformed-input hardening: untrusted wire bytes return errors, never panic.
 - Encode every supported column back to Native block bytes for `INSERT`
   (`native::encode`); accepted by a live server over HTTP.
-- Decode ClickHouse compression frames with LZ4 or NONE and verify CityHash128
-  checksums. Encode LZ4 frames for inserts.
+- Decode ClickHouse compression frames with LZ4, ZSTD, or NONE and verify
+  CityHash128 1.0.2 checksums. Encode LZ4 frames for inserts. LZ4 is
+  hand-written; CityHash128 uses `cityhash-rs` and ZSTD uses the `zstd` crate,
+  which builds libzstd from C source, so a C compiler is needed to build.
 
 Not implemented yet:
 
@@ -158,12 +160,11 @@ Unsupported types raise a decode error rather than guessing.
 In rough priority order:
 
 1. Sparse and replicated column serialization.
-2. ZSTD compression support.
-3. Per-runtime zero-copy adapters: JS `TypedArray` over an external
+2. Per-runtime zero-copy adapters: JS `TypedArray` over an external
    `ArrayBuffer`, NumPy export that does not route through Arrow.
-4. Insert-path completion: a streaming/sink encode API. Type parity is kept as
+3. Insert-path completion: a streaming/sink encode API. Type parity is kept as
    each decoder type lands.
-5. Native TCP protocol engine, the rest of it: compressed query exchanges
+4. Native TCP protocol engine, the rest of it: compressed query exchanges
    and cancellation. The handshake, Ping, uncompressed SELECT, and INSERT at
    revision 54460 ship in `ch-tcp-proto`.
 
@@ -185,6 +186,8 @@ version and patch releases remain backward compatible. Every release is
 documented in `CHANGELOG.md`. The crate is not published to crates.io by design,
 so pin the tag directly. The MSRV (`rust-version = 1.81`) is enforced for git
 dependencies too, so a consuming crate must build on Rust 1.81 or newer.
+On Rust 1.81, a fresh lockfile picks jobserver 0.1.35, which needs Rust 1.85.
+Pin it back once with `cargo update -p jobserver --precise 0.1.34`.
 
 For development you can point at a local checkout or pin an exact commit:
 
@@ -222,7 +225,7 @@ The engine depends on core.
 - `src/batch.rs` - `ColBatch` and `ChunkedBatch` result model.
 - `src/bitmap.rs` - validity bitmap conversion and storage.
 - `src/native/` - Native-format varints, block decode, stream decode, and block encode.
-- `src/compression/` - ClickHouse compression frames, CityHash128, and LZ4.
+- `src/compression/` - ClickHouse compression frames, CityHash128, LZ4, and ZSTD.
 - `src/ffi/mod.rs` - Arrow C Data Interface export.
 
 ## Testing

@@ -146,6 +146,99 @@
           ]
         }
       ]
+    },
+    "tcp_multi_rev54460_zstd.packets": {
+      "length": 379,
+      "network_compression_method": "ZSTD",
+      "packets": [
+        {
+          "offset": 0,
+          "length": 66,
+          "rows": 0,
+          "columns": 2,
+          "name": "",
+          "frame_plain_sizes": [
+            30
+          ]
+        },
+        {
+          "offset": 66,
+          "length": 93,
+          "rows": 2,
+          "columns": 2,
+          "name": "",
+          "frame_plain_sizes": [
+            60
+          ]
+        },
+        {
+          "offset": 159,
+          "length": 93,
+          "rows": 2,
+          "columns": 2,
+          "name": "",
+          "frame_plain_sizes": [
+            60
+          ]
+        },
+        {
+          "offset": 252,
+          "length": 81,
+          "rows": 1,
+          "columns": 2,
+          "name": "",
+          "frame_plain_sizes": [
+            45
+          ]
+        },
+        {
+          "offset": 333,
+          "length": 46,
+          "rows": 0,
+          "columns": 0,
+          "name": "",
+          "frame_plain_sizes": [
+            10
+          ]
+        }
+      ]
+    },
+    "tcp_large_rev54460_zstd.packets": {
+      "length": 272,
+      "network_compression_method": "ZSTD",
+      "packets": [
+        {
+          "offset": 0,
+          "length": 66,
+          "rows": 0,
+          "columns": 2,
+          "name": "",
+          "frame_plain_sizes": [
+            30
+          ]
+        },
+        {
+          "offset": 66,
+          "length": 160,
+          "rows": 1,
+          "columns": 2,
+          "name": "",
+          "frame_plain_sizes": [
+            1048576,
+            51465
+          ]
+        },
+        {
+          "offset": 226,
+          "length": 46,
+          "rows": 0,
+          "columns": 0,
+          "name": "",
+          "frame_plain_sizes": [
+            10
+          ]
+        }
+      ]
     }
   }
 }
