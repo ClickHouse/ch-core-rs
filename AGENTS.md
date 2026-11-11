@@ -38,10 +38,6 @@ Design priorities, in order:
 
 These are the reasons the crate exists. Do not erode them.
 
-- **Zero runtime dependencies.** `Cargo.toml` has no `[dependencies]`. The crate
-  links no Python, Node, Arrow, or third-party crates. If you believe a
-  dependency is justified, stop and raise it with the user first. Do not add one
-  silently.
 - **No binding code.** No PyO3, no napi-rs, no language-specific materialization.
   Bindings live in the client repos and depend on this crate. The core owns
   binary decoding and the columnar model only.
@@ -62,13 +58,22 @@ The repo is a Cargo workspace. The root package is `ch-core-rs`. A second
 crate, `crates/ch-tcp-proto`, is the sans-I/O TCP protocol engine. Its only
 runtime dependency is `ch-core-rs` by path. Core's invariants apply to it as
 well: no panics on untrusted input, the same MSRV (`rust-version = "1.81"`),
-and no new runtime dependencies without asking Joe first. Run checks with
+and the dependency policy below. Run checks with
 `--workspace` so both crates are covered.
+
+### Dependencies
+
+Dependencies are fine where they are the right tool. Treat this like any other
+Rust library. Prefer a well-established crate for a standard format, such as a
+compression codec, over hand-writing it. Pick versions that build on the MSRV
+(`rust-version = "1.81"`). The no-binding-code invariant still holds: the core
+does not depend on language runtimes or binding frameworks (PyO3, napi-rs) and
+exports buffers through the hand-written Arrow C Data Interface.
 
 ## Role
 
-Act like an experienced maintainer of a performance-critical, zero-dependency
-Rust systems library.
+Act like an experienced maintainer of a performance-critical Rust systems
+library.
 
 - Be opinionated from the perspective of a Rust and binary-protocol expert.
 - Favor idiomatic, safe, fast Rust, but stay practical. Do not over-engineer.
@@ -320,8 +325,7 @@ and so on) stays in the bindings, never here.
 - Fix the real problem, not a nearby symptom.
 - Keep changes small, safe, and directly tied to the task.
 - Do not bundle cosmetic cleanup into unrelated changes.
-- Do not add dependencies. Do not add abstractions for hypothetical future
-  needs.
+- Do not add abstractions for hypothetical future needs.
 - Preserve backward compatibility and the public buffer layout by default.
 - If a workaround papers over a deeper wire-format question, say so plainly and
   go confirm against the server source.

@@ -103,8 +103,8 @@ pub enum CompressionError {
     /// "Checksum doesn't match" diagnostic.
     ChecksumMismatch { expected: u128, actual: u128 },
     /// The method byte selects a codec this crate does not decode. ZSTD (0x90)
-    /// reports here pending a dependency decision; unknown bytes also report
-    /// here rather than being guessed at.
+    /// is not implemented yet; unknown bytes also report here rather than being
+    /// guessed at.
     UnsupportedCodec { method: u8 },
     /// The LZ4 payload is malformed: a length, offset, or copy that runs out of
     /// bounds. The decoder rejects it instead of panicking or reading past the
@@ -153,8 +153,8 @@ impl std::fmt::Display for CompressionError {
                 if *method == METHOD_ZSTD {
                     write!(
                         f,
-                        "unsupported codec ZSTD (method byte 0x90): ZSTD decode is pending a \
-                         dependency decision and is not implemented in the zero-dependency core"
+                        "unsupported codec ZSTD (method byte 0x90): ZSTD decode is not \
+                         implemented yet"
                     )
                 } else {
                     write!(f, "unsupported compression method byte 0x{method:02x}")
@@ -1007,17 +1007,17 @@ mod tests {
     }
 
     #[test]
-    fn zstd_reports_pending_dependency() {
+    fn zstd_reports_unsupported_codec() {
         let raw = b"payload";
         let block = frame_block(METHOD_ZSTD, raw.len() as u32, raw);
         let err = decompress_native_stream(&block, ChecksumMode::Verify).unwrap_err();
         match err {
             CompressionError::UnsupportedCodec { method } => {
                 assert_eq!(method, METHOD_ZSTD);
-                // The message names ZSTD and the pending dependency decision.
+                // The message names ZSTD and says it is not implemented.
                 let msg = err.to_string();
                 assert!(msg.contains("ZSTD"), "message was: {msg}");
-                assert!(msg.contains("dependency"), "message was: {msg}");
+                assert!(msg.contains("not implemented"), "message was: {msg}");
             }
             other => panic!("expected UnsupportedCodec, got {other:?}"),
         }
