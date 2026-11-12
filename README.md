@@ -2,7 +2,7 @@
 
 A shared Rust core for the ClickHouse `FORMAT Native` wire format: it decodes
 Native bytes into typed, Arrow-compatible columnar buffers, and encodes those
-buffers back to Native bytes for `INSERT`. Pure Rust, zero runtime dependencies.
+buffers back to Native bytes for `INSERT`. Pure Rust.
 The codec is implemented once here. Each language client wraps it with a thin
 binding.
 
@@ -20,7 +20,7 @@ ClickHouse server
       |  FORMAT Native bytes
       v
 +---------------------------+
-|        ch-core-rs         |  pure Rust, zero dependencies
+|        ch-core-rs         |  pure Rust
 |  type parsing, block      |  decode happens once, here
 |  decode, columnar buffers |
 +---------------------------+
@@ -116,7 +116,7 @@ Implemented:
 - Encode every supported column back to Native block bytes for `INSERT`
   (`native::encode`); accepted by a live server over HTTP.
 - Decode ClickHouse compression frames with LZ4 or NONE and verify CityHash128
-  checksums. Encode LZ4 frames for inserts, with no runtime dependencies.
+  checksums. Encode LZ4 frames for inserts.
 
 Not implemented yet:
 
@@ -158,7 +158,7 @@ Unsupported types raise a decode error rather than guessing.
 In rough priority order:
 
 1. Sparse and replicated column serialization.
-2. ZSTD compression support, deferred under the zero-dependency policy.
+2. ZSTD compression support, not yet implemented.
 3. Per-runtime zero-copy adapters: JS `TypedArray` over an external
    `ArrayBuffer`, NumPy export that does not route through Arrow.
 4. Insert-path completion: a streaming/sink encode API. Type parity is kept as
@@ -215,7 +215,7 @@ The root package remains `ch-core-rs`. The workspace also contains
 [`ch-tcp-proto`](crates/ch-tcp-proto/README.md), a sans-I/O TCP protocol engine.
 Its current scope is the revision-54460 handshake, Ping/Pong, and uncompressed
 SELECT and INSERT exchanges with Native byte output and query metadata events.
-The engine depends on core; core has no runtime dependencies.
+The engine depends on core; core does not depend on the engine.
 
 - `src/schema.rs` - ClickHouse logical type model.
 - `src/column.rs` - Arrow-compatible physical column buffers.
