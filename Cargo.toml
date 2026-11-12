@@ -22,16 +22,8 @@ readme = "README.md"
 # against an accidental `cargo publish`.
 publish = false
 
-# Test and bench only, never linked into the library. liblz4 (through the
-# safe `lz4` wrapper over `lz4-sys`) is the reference implementation for the
-# LZ4 differential tests and the `lz4_parity` bench.
+# Test only, never linked into the library. liblz4 (through the safe `lz4`
+# wrapper over `lz4-sys`) is the reference implementation for the LZ4
+# differential tests.
 [dev-dependencies]
 lz4 = "1.28"
-
-[[bench]]
-name = "lz4_parity"
-harness = false
-
-[[bench]]
-name = "block_scanner"
-harness = false
