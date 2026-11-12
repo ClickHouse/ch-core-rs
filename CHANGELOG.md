@@ -7,6 +7,10 @@ version; patch releases remain backward compatible.
 
 ## Unreleased
 
+- `parse_ch_type` ignores whitespace between tokens, as the server does, so
+  the multi-line `DESCRIBE TABLE` output (`print_pretty_type_names = 1`) and
+  spellings like `Array( UInt8 )` parse. Canonical names, which is all a
+  Native header carries, are parsed without allocating.
 - Add a resumable `BlockScanner` for outer protocols to find one exact Native
   block boundary and inspect its declared row and column counts without
   materializing decoded column buffers or copying payload bytes. Partial String,
