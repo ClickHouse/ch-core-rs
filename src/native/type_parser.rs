@@ -4,6 +4,8 @@
 //! No wire I/O lives here: the parser takes a `&str` and returns an
 //! `Option<ChType>`, so it is self-contained.
 
+use std::borrow::Cow;
+
 use crate::native::aggregate_function::aggregate_state_codec;
 use crate::native::protocol::MAX_TYPE_DEPTH;
 use crate::schema::{
@@ -27,8 +29,93 @@ use crate::schema::{
 /// rendered type string round-trips (a header this parser rejects is one the
 /// server rejects too), and by bindings that map type names to columns without
 /// decoding a block.
+///
+/// Whitespace between tokens is insignificant, as it is for the server, so the
+/// multi-line form that `DESCRIBE TABLE` and `system.columns` print by default
+/// (`print_pretty_type_names = 1`) parses to the same type as the canonical
+/// form. See [`normalize_type_whitespace`].
 pub fn parse_ch_type(type_name: &str) -> Option<ChType> {
-    parse_ch_type_depth(type_name, 0)
+    parse_ch_type_depth(&normalize_type_whitespace(type_name), 0)
+}
+
+/// Rewrite insignificant whitespace in a type name to the canonical spacing
+/// the arms of [`parse_ch_type_depth`] expect, leaving quoted text untouched.
+///
+/// Outside `'...'` and `` `...` `` spans (backslash escapes honored, as in
+/// [`split_top_level_commas`]), every run of ASCII whitespace becomes one
+/// space, and that space is dropped at either end of the string, after `(`,
+/// and before `(`, `)`, or `,`. The single space after a comma is kept,
+/// because the canonical form has it and some arms store their arguments
+/// verbatim (an `AggregateFunction` parameter list, for example), so removing
+/// it would change what `Display` writes back.
+///
+/// A canonical name, which is everything a Native block header carries, needs
+/// no rewrite and is returned borrowed, so the decode path does not allocate.
+/// An unterminated quote is copied through as is and left for the parser to
+/// reject.
+fn normalize_type_whitespace(s: &str) -> Cow<'_, str> {
+    let bytes = s.as_bytes();
+    // Allocated on the first byte that differs from the input.
+    let mut out: Option<Vec<u8>> = None;
+    let mut last: Option<u8> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            // Keep one space only between two tokens that are not parens or a
+            // comma on the right, and never at either end of the string.
+            let keep = !matches!(
+                (last, bytes.get(i)),
+                (None, _) | (_, None) | (Some(b'('), _) | (_, Some(b'(' | b')' | b','))
+            );
+            let unchanged = keep && i - start == 1 && bytes[start] == b' ';
+            if !unchanged && out.is_none() {
+                out = Some(bytes[..start].to_vec());
+            }
+            if keep {
+                if let Some(o) = out.as_mut() {
+                    o.push(b' ');
+                }
+                last = Some(b' ');
+            }
+            continue;
+        }
+        let end = if b == b'\'' || b == b'`' {
+            quoted_span_end(bytes, i)
+        } else {
+            i + 1
+        };
+        if let Some(o) = out.as_mut() {
+            o.extend_from_slice(&bytes[i..end]);
+        }
+        last = Some(bytes[end - 1]);
+        i = end;
+    }
+    match out {
+        None => Cow::Borrowed(s),
+        // Only ASCII whitespace bytes were dropped or replaced, and every other
+        // byte was copied in order, so the output is still valid UTF-8.
+        Some(o) => Cow::Owned(String::from_utf8(o).unwrap_or_else(|_| s.to_owned())),
+    }
+}
+
+/// End (exclusive) of the quoted span opening at `bytes[start]`, or the end of
+/// the input when the quote is unterminated.
+fn quoted_span_end(bytes: &[u8], start: usize) -> usize {
+    let quote = bytes[start];
+    let mut i = start + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b if b == quote => return i + 1,
+            _ => i += 1,
+        }
+    }
+    bytes.len()
 }
 
 /// Parse a ClickHouse type name at nesting depth `depth`, rejecting anything past
@@ -1527,5 +1614,65 @@ pub(crate) fn is_valid_map_key_type(key: &ChType) -> bool {
         ChType::Nullable(_) => false,
         ChType::LowCardinality(inner) => !matches!(inner.as_ref(), ChType::Nullable(_)),
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod whitespace_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_names_are_borrowed() {
+        for name in [
+            "UInt8",
+            "Tuple(x Float64, y Float64)",
+            "Enum8('a b' = 1, 'c,d' = 2)",
+            "AggregateFunction(quantiles(0.5, 0.9), Float64)",
+            "JSON(max_dynamic_paths=10, `a.b` UInt32, SKIP REGEXP 'x.*')",
+        ] {
+            assert!(
+                matches!(normalize_type_whitespace(name), Cow::Borrowed(_)),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrites_insignificant_whitespace_only() {
+        assert_eq!(
+            normalize_type_whitespace("  Array( UInt8 ) "),
+            "Array(UInt8)"
+        );
+        assert_eq!(
+            normalize_type_whitespace("Tuple(\n    a UInt8,\n    b String)"),
+            "Tuple(a UInt8, b String)"
+        );
+        assert_eq!(
+            normalize_type_whitespace("Enum8( 'x  y' = 1 )"),
+            "Enum8('x  y' = 1)"
+        );
+        assert_eq!(
+            normalize_type_whitespace("Enum8('it\\'s  ' = 1 )"),
+            "Enum8('it\\'s  ' = 1)"
+        );
+    }
+
+    #[test]
+    fn malformed_input_does_not_panic() {
+        for name in [
+            "",
+            " ",
+            "'",
+            "`",
+            "Enum8('unterminated  ",
+            "Enum8('a\\",
+            "(((",
+            " ) , (",
+        ] {
+            let _ = normalize_type_whitespace(name);
+            let _ = parse_ch_type(name);
+        }
+        assert_eq!(normalize_type_whitespace(""), "");
+        assert_eq!(normalize_type_whitespace("   "), "");
     }
 }
