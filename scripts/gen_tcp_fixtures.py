@@ -50,9 +50,15 @@ class Reader:
         self.record = bytearray()
 
     def read(self, size):
-        data = self.source.read(size)
-        if len(data) != size:
-            raise EOFError(f"wanted {size} bytes, got {len(data)}")
+        # Loop because an unbuffered socket source may return short reads;
+        # never read past `size` so select() on the socket stays reliable.
+        data = bytearray()
+        while len(data) < size:
+            chunk = self.source.read(size - len(data))
+            if not chunk:
+                raise EOFError(f"wanted {size} bytes, got {len(data)}")
+            data += chunk
+        data = bytes(data)
         self.record.extend(data)
         return data
 
