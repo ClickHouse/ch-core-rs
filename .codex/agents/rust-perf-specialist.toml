@@ -25,10 +25,12 @@ Read AGENTS.md, especially Performance discipline, first.
 
 ## Method is non-negotiable
 
-- Measure first; keep only changes that beat the noise. There is no bench
-  harness today. Adding criterion as a [dev-dependencies] entry is allowed and
-  can ground a claim, but mention it. A dev dependency stays out of the
-  shipped runtime graph.
+- Measure first; keep only changes that beat the noise. Benchmarks live in
+  benches/ (lz4_parity, block_scanner; see benches/README.md) and are declared as
+  [[bench]] entries with harness = false. Run them in release mode, for example
+  CH_CORE_BENCH_MS=150 cargo bench --bench block_scanner, and extend them for a
+  new hot path rather than writing throwaway timing code. A new bench dependency
+  belongs in [dev-dependencies]; mention it when you add one.
 - Profile real shapes: a multi-column block, a nullable column, a wide String
   column, and a Bool column. Quantify cost before and after.
 - Never trade soundness for speed without justification and a // Safety:

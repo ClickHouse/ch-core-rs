@@ -19,7 +19,7 @@ Read `AGENTS.md` (the FFI bullet under "Unsafe discipline") and `CODEC_CONTRACT.
 - Field accounting: `n_buffers`, `null_count`, `offset`, the buffer ORDER (validity at index 0, then offsets and data per type), the null validity pointer for non-nullable columns, the `+s` struct array with a single null buffer, and the `num_rows + 1` offsets for variable-length columns including the zero-row `[0]` case. Cross-check each against `CODEC_CONTRACT.md`.
 
 ## No panic may cross the boundary
-- A panic that unwinds out of an `extern "C"` callback (`stream_get_schema`, `stream_get_next`, `release_*`) is undefined behavior. The callbacks must not panic.
+- A panic that unwinds out of an `extern "C"` callback (`stream_get_schema`, `stream_get_next`, `release_*`) aborts the process (extern "C" unwind aborts from Rust 1.81). The callbacks must not panic, because an abort takes down the host interpreter.
 - Wire-derived strings are the trap: column names and `DateTime` / `DateTime64` timezones come from untrusted bytes and are only UTF-8 validated, so they can carry an interior NUL that makes `CString::new(...).unwrap()` panic. Build C strings from such input without panicking (strip the NUL). For defense in depth, consider `catch_unwind` at the callback trampolines, returning the spec's error code and stashing the message for `get_last_error`.
 
 ## Zero-copy and bulk

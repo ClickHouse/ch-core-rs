@@ -8,7 +8,7 @@ allowed-tools: Read, Grep, Glob, Bash, Agent, Write, Edit, AskUserQuestion
 # PR Review (ch-core-rs)
 
 This is the repo-local review skill for `ch-core-rs`. It shadows the global
-`review-pr`. The crate is a zero-dependency Rust core that decodes and encodes
+`review-pr`. The crate is a Rust core that decodes and encodes
 ClickHouse `FORMAT Native` wire bytes into Arrow-compatible columnar buffers.
 Review against that framing, not a Python client's.
 
@@ -83,10 +83,9 @@ a `file:line`, or a cited server source. "Looks fine" is not an answer.
    fallback, encode vs decode parity).
 4. **Right layer, core invariants intact.** The fix belongs in the core's
    decode/encode/FFI layer, not in host value policy that belongs in a binding.
-   Re-check the non-negotiables in `AGENTS.md`: zero runtime dependencies
-   (`Cargo.toml` has no `[dependencies]`), no binding code (PyO3/napi), columnar
+   Re-check the non-negotiables in `AGENTS.md`: no binding code (PyO3/napi), columnar
    not row-major, blocks stay separate `ColBatch` chunks, Arrow-compatible buffer
-   layout. A new dependency or a row-building API is an automatic finding.
+   layout. A row-building API is an automatic finding.
 5. **Scoped tight.** Every hunk traces to the task. No drive-by refactors,
    renames, or "while here" fixes. No cosmetic churn bundled in.
 6. **No perf or safety regression on the hot path.** Decode is the product. If

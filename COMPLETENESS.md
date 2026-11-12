@@ -691,7 +691,7 @@ where the across-release churn lives.
 
 - [x] Native block compression framing - `compression` exposes LZ4/NONE decode,
       CityHash128 verification, a frame-at-a-time reader, and an LZ4 frame writer.
-      Hand-written Rust keeps the crate zero-dependency. Callers unwrap frames
+      Callers unwrap frames
       before passing plaintext to the Native decoder. HTTP `compress=1` and
       revision-54460 TCP captures ground the frame/block boundary tests.
       ZSTD (0x90) remains deferred and returns `UnsupportedCodec`. HTTP transport
@@ -731,7 +731,7 @@ where the across-release churn lives.
 - [x] Binary-encoded type headers (`DataTypesBinaryEncoding`) - explicit
       `*_binary_types` decode/encode APIs cover outer Native headers and Dynamic
       runtime type tables without changing the existing options structs. The
-      zero-dependency descriptor parser is depth/complexity/count bounded and
+      descriptor parser is depth/complexity/count bounded and
       rejects illegal semantic wrappers and unsupported/reserved tags rather
       than partially consuming them. A live HTTP INSERT/SELECT test verifies the
       paired server input/output settings against the pinned server.
@@ -993,7 +993,7 @@ decoding block N with reading block N+1 off the socket.
 required to enable it.** `encode_block(&ColBatch)` is a synchronous, stateless,
 per-block call that returns owned bytes. The binding gets the overlap by running
 the two stages concurrently on its own threads/tasks (threading stays a binding
-concern; the core is zero-dep, synchronous, and does no I/O):
+concern; the core is synchronous, and does no I/O):
 
 ```
 encode(batch_1)  encode(batch_2)  encode(batch_3)   <- CPU

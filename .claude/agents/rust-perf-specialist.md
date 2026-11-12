@@ -17,7 +17,7 @@ Read `AGENTS.md` (the "Performance discipline" section) first; it is canonical.
 - Do not add copies or bounds checks to these loops. If you change them, reason explicitly about allocations, bounds checks, and copies per row and per column, and say what you expect.
 
 ## Method (non-negotiable)
-- Measure first; keep only changes that beat the noise. There is no bench harness in the repo today. Adding `criterion` as a `[dev-dependencies]` entry is allowed (a dev dependency does NOT break the zero-RUNTIME-dependency invariant) and is the right way to ground a claim. Mention it when you add it.
+- Measure first; keep only changes that beat the noise. Benchmarks live in `benches/` (`lz4_parity`, `block_scanner`; see `benches/README.md`) and are declared as `[[bench]]` entries with `harness = false`. Run them in release mode, for example `CH_CORE_BENCH_MS=150 cargo bench --bench block_scanner`, and extend them for a new hot path rather than writing throwaway timing code. A new bench dependency belongs in `[dev-dependencies]`; mention it when you add one.
 - Profile real shapes: a multi-column block, a nullable column, a wide `String` column, a `Bool` column. Quantify the cost (allocations, copies, branches per row or per column) before and after.
 - Never trade soundness for speed without a justification and a `// Safety:` comment.
 

@@ -10,7 +10,7 @@ correctly, in one place.
 
 The idea in one sentence: **turn ClickHouse `FORMAT Native` wire bytes into
 typed, Arrow-shaped columnar buffers and back again, as fast and as safely as
-possible, with zero dependencies, and let each language binding decide how to
+possible, and let each language binding decide how to
 expose those buffers to its own runtime.**
 
 ```
@@ -19,7 +19,7 @@ ClickHouse server
       |  FORMAT Native bytes (compact columnar wire format)
       v
 +---------------------------+
-|        ch-core-rs         |   pure Rust, zero dependencies
+|        ch-core-rs         |   pure Rust
 |                           |
 |  parse type strings       |
 |  decode blocks -> columns |   one correct implementation,
@@ -99,8 +99,6 @@ undefined behavior, no panics on malformed input), speed, leanness.
 
 Non-negotiable invariants:
 
-- **Zero runtime dependencies.** `Cargo.toml` has no `[dependencies]`. No
-  Arrow crate, no Python, no Node, nothing.
 - **No binding code in the core.** No PyO3, no napi-rs, no language-specific
   materialization.
 - **Columnar, not row-major.** Row materialization was measured to throw away

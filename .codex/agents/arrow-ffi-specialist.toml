@@ -45,8 +45,9 @@ not against memory.
 ## No panic may cross the boundary
 
 - A panic that unwinds out of an extern "C" callback (stream_get_schema,
-  stream_get_next, release_*) is undefined behavior. The callbacks must not
-  panic.
+  stream_get_next, release_*) aborts the process (extern "C" unwind aborts from
+  Rust 1.81). The callbacks must not panic, because an abort takes down the host
+  interpreter.
 - Wire-derived strings are the trap: column names and DateTime or DateTime64
   timezones come from untrusted bytes and are only UTF-8 validated, so they can
   carry an interior NUL that makes CString::new(...).unwrap() panic. Build C
