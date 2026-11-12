@@ -7,6 +7,12 @@ version; patch releases remain backward compatible.
 
 ## Unreleased
 
+- Add `native::binary_value::write_binary_type_prefix` and
+  `encode_binary_value`, the inverses of `read_binary_type_prefix` and
+  `decode_binary_value`. They write one row of a decoded column as a binary
+  type descriptor plus `serializeBinary` value, so bindings can build Dynamic
+  SharedVariant cells and JSON shared data for `encode_block`. Coverage
+  matches the decoder; server-written cells re-encode byte for byte.
 - Add a resumable `BlockScanner` for outer protocols to find one exact Native
   block boundary and inspect its declared row and column counts without
   materializing decoded column buffers or copying payload bytes. Partial String,

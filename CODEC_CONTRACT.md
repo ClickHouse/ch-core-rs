@@ -2412,7 +2412,12 @@ are globally sorted by canonical type name before discriminators are assigned.
 `255` is NULL. SharedVariant cells are String-framed opaque blobs containing one
 binary data-type descriptor followed by exactly one value's `serializeBinary`
 payload. The core keeps each blob opaque instead of introducing a per-row type
-parse and value materialization into the bulk path.
+parse and value materialization into the bulk path. On demand,
+`read_binary_type_prefix` plus `decode_binary_value` turn one blob into a
+one-row column, and `write_binary_type_prefix` plus `encode_binary_value` write
+one row of a column back as a blob, so a caller can build the SharedVariant
+child or JSON shared data that `encode_block` takes. The encode side covers the
+same types as the decode side and reproduces the server's cells byte for byte.
 
 FLATTENED has no SharedVariant child and no Variant mode word. Index `K` is
 NULL; `0..K-1` select the table entries and values above K are malformed. The

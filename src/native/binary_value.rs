@@ -1,4 +1,5 @@
-//! Single-value ClickHouse binary decoding for Dynamic `SharedVariant` cells.
+//! Single-value ClickHouse binary decoding and encoding for Dynamic
+//! `SharedVariant` cells and JSON shared-data values.
 //!
 //! Each cell is a binary type descriptor (`DataTypesBinaryEncoding`, parsed by
 //! [`read_binary_type_prefix`]) followed by exactly one value in the server's
@@ -24,6 +25,10 @@
 //! descriptors the crate does not parse (JSON), so a caller can keep
 //! those cells as raw bytes. Truncated payloads and trailing bytes after the
 //! value are `Invalid`.
+//!
+//! [`write_binary_type_prefix`] and [`encode_binary_value`] are the inverses:
+//! they write the descriptor and one value of a decoded column, so a binding
+//! can build SharedVariant cells and JSON shared data for `encode_block`.
 
 use std::io;
 
@@ -32,8 +37,8 @@ use crate::column::{
     ArrayColumn, BoolColumn, Column, DecimalColumn, FixedBinaryColumn, MapColumn, NothingColumn,
     PrimitiveColumn, QBitColumn, TupleColumn, Utf8Column,
 };
-use crate::native::type_binary::{read_binary_type, BinaryTypeError};
-use crate::native::varint::ByteReader;
+use crate::native::type_binary::{read_binary_type, write_binary_type, BinaryTypeError};
+use crate::native::varint::{write_varint, ByteReader};
 use crate::schema::ChType;
 
 /// Cap for element counts whose element type consumes zero payload bytes
@@ -781,11 +786,280 @@ fn push_end_offset(offsets: &mut Vec<i64>, count: usize) -> Result<(), BinaryVal
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Encoding
+// ---------------------------------------------------------------------------
+
+/// Append the binary type descriptor (`DataTypesBinaryEncoding`) for
+/// `ch_type`, the inverse of [`read_binary_type_prefix`].
+///
+/// A SharedVariant cell or a JSON shared-data value is this descriptor
+/// followed by [`encode_binary_value`] for the same type.
+pub fn write_binary_type_prefix(buf: &mut Vec<u8>, ch_type: &ChType) {
+    write_binary_type(buf, ch_type);
+}
+
+/// Append row `row` of `column`, read as `ch_type`, in the server's
+/// `serializeBinary` row format: the inverse of [`decode_binary_value`], with
+/// the same layout and type coverage (see the module docs).
+///
+/// `column` has the shape the bulk decoder builds for `ch_type`, so a column
+/// from a decoded block can be passed directly with any row index. For a
+/// `LowCardinality(T)` type both the bulk `Dictionary` column and the plain
+/// inner column that [`decode_binary_value`] returns are accepted. A `Nullable`
+/// type reads the row's null bit from the column's validity bitmap.
+///
+/// `Variant`, `Dynamic`, `JSON`, `AggregateFunction`, and non-null `Nothing`
+/// values are `Unsupported`, matching the decoder. A row out of range or a
+/// column whose shape does not match `ch_type` is `Invalid`. The column is
+/// caller memory rather than wire input, but malformed buffers still return an
+/// error instead of panicking. On error `buf` is left as it was.
+pub fn encode_binary_value(
+    buf: &mut Vec<u8>,
+    ch_type: &ChType,
+    column: &Column,
+    row: usize,
+) -> Result<(), BinaryValueError> {
+    let start = buf.len();
+    let result = encode_value(buf, ch_type, column, row, 0);
+    if result.is_err() {
+        buf.truncate(start);
+    }
+    result
+}
+
+/// Bound for recursive encode, the same depth the type parser accepts.
+const MAX_ENCODE_DEPTH: usize = crate::native::protocol::MAX_TYPE_DEPTH + 8;
+
+fn mismatch(ch_type: &ChType) -> BinaryValueError {
+    BinaryValueError::Invalid(format!("column does not match type {ch_type}"))
+}
+
+fn out_of_range(row: usize, len: usize) -> BinaryValueError {
+    BinaryValueError::Invalid(format!("row {row} is out of range for {len} rows"))
+}
+
+/// The null bit of `row` from an optional validity bitmap, bounds checked.
+fn is_null(validity: Option<&Bitmap>, row: usize) -> Result<bool, BinaryValueError> {
+    match validity {
+        None => Ok(false),
+        Some(bm) if row < bm.len() && row / 8 < bm.as_bytes().len() => Ok(!bm.is_valid(row)),
+        Some(bm) => Err(out_of_range(row, bm.len())),
+    }
+}
+
+/// `[start, end)` element range of `row` in an Arrow offsets buffer.
+fn offset_range(offsets: &[i64], row: usize) -> Result<(usize, usize), BinaryValueError> {
+    let (Some(&start), Some(&end)) = (offsets.get(row), offsets.get(row + 1)) else {
+        return Err(out_of_range(row, offsets.len().saturating_sub(1)));
+    };
+    match (usize::try_from(start), usize::try_from(end)) {
+        (Ok(start), Ok(end)) if start <= end => Ok((start, end)),
+        _ => Err(BinaryValueError::Invalid(format!(
+            "row {row} has invalid offsets {start}..{end}"
+        ))),
+    }
+}
+
+fn fixed_slice(data: &[u8], width: usize, row: usize) -> Result<&[u8], BinaryValueError> {
+    row.checked_mul(width)
+        .and_then(|start| data.get(start..start.checked_add(width)?))
+        .ok_or_else(|| out_of_range(row, data.len().checked_div(width).unwrap_or(0)))
+}
+
+fn encode_value(
+    buf: &mut Vec<u8>,
+    ch_type: &ChType,
+    column: &Column,
+    row: usize,
+    depth: usize,
+) -> Result<(), BinaryValueError> {
+    if depth > MAX_ENCODE_DEPTH {
+        return Err(BinaryValueError::Invalid("type nesting too deep".into()));
+    }
+    if let Some(delegate) = ch_type.physical_delegate_ref() {
+        return encode_value(buf, delegate.as_ref(), column, row, depth + 1);
+    }
+
+    macro_rules! le {
+        ($c:expr) => {{
+            let v = $c
+                .values
+                .get(row)
+                .ok_or_else(|| out_of_range(row, $c.values.len()))?;
+            buf.extend_from_slice(&v.to_le_bytes());
+        }};
+    }
+
+    match (ch_type, column) {
+        // Mirror the bulk null map: 0x00 then the value, or 0x01 and nothing.
+        (ChType::Nullable(inner), _) => {
+            if is_null(column.validity(), row)? {
+                buf.push(1);
+            } else {
+                buf.push(0);
+                encode_value(buf, inner, column, row, depth + 1)?;
+            }
+        }
+        (ChType::LowCardinality(inner), Column::Dictionary(dict)) => {
+            let index = *dict
+                .indices
+                .get(row)
+                .ok_or_else(|| out_of_range(row, dict.indices.len()))?;
+            let (nullable, value_type) =
+                crate::native::type_parser::low_cardinality_dict_value_type(inner);
+            if nullable {
+                // LowCardinality(Nullable(T)) keeps nulls in the index validity;
+                // its single value is the Nullable(T) form.
+                if is_null(dict.validity.as_ref(), row)? {
+                    buf.push(1);
+                    return Ok(());
+                }
+                buf.push(0);
+            }
+            let index = usize::try_from(index).map_err(|_| {
+                BinaryValueError::Invalid(format!("row {row} has negative dictionary index"))
+            })?;
+            encode_value(buf, value_type, &dict.values, index, depth + 1)?;
+        }
+        // The plain inner column, as decode_binary_value returns it.
+        (ChType::LowCardinality(inner), _) => encode_value(buf, inner, column, row, depth + 1)?,
+
+        (ChType::Nothing, Column::Nothing(_)) => {
+            return Err(BinaryValueError::Unsupported("Nothing".into()))
+        }
+        (ChType::Bool, Column::Bool(c)) => {
+            if row >= c.len {
+                return Err(out_of_range(row, c.len));
+            }
+            let byte = c
+                .bitmap
+                .get(row / 8)
+                .ok_or_else(|| out_of_range(row, c.len))?;
+            buf.push((byte >> (row % 8)) & 1);
+        }
+        (ChType::Int8, Column::Int8(c)) | (ChType::Enum8 { .. }, Column::Enum8(c)) => le!(c),
+        (ChType::Int16, Column::Int16(c)) | (ChType::Enum16 { .. }, Column::Enum16(c)) => le!(c),
+        (ChType::Int32, Column::Int32(c))
+        | (ChType::Date32, Column::Date32(c))
+        | (ChType::Time, Column::Time(c)) => le!(c),
+        (ChType::Int64, Column::Int64(c))
+        | (ChType::DateTime64 { .. }, Column::DateTime64(c))
+        | (ChType::Time64 { .. }, Column::Time64(c))
+        | (ChType::Interval(_), Column::Interval(c)) => le!(c),
+        (ChType::UInt8, Column::UInt8(c)) => le!(c),
+        (ChType::UInt16, Column::UInt16(c)) | (ChType::Date, Column::Date(c)) => le!(c),
+        (ChType::UInt32, Column::UInt32(c))
+        | (ChType::DateTime { .. }, Column::DateTime(c))
+        | (ChType::Ipv4, Column::Ipv4(c)) => le!(c),
+        (ChType::UInt64, Column::UInt64(c)) => le!(c),
+        (ChType::Float32, Column::Float32(c)) => le!(c),
+        (ChType::Float64, Column::Float64(c)) => le!(c),
+        (ChType::BFloat16, Column::BFloat16(c)) => {
+            let v = c
+                .values
+                .get(row)
+                .ok_or_else(|| out_of_range(row, c.values.len()))?;
+            buf.extend_from_slice(v);
+        }
+        (
+            ChType::QBit {
+                element_type,
+                dimension,
+            },
+            Column::QBit(c),
+        ) => {
+            if c.dimension != *dimension {
+                return Err(mismatch(ch_type));
+            }
+            write_varint(buf, *dimension as u64);
+            let first = row
+                .checked_mul(*dimension)
+                .ok_or_else(|| out_of_range(row, c.len()))?;
+            let element = element_type.ch_type();
+            for i in 0..*dimension {
+                encode_value(buf, &element, &c.values, first + i, depth + 1)?;
+            }
+        }
+        (ChType::String, Column::Utf8(c)) => {
+            let (Some(&start), Some(&end)) = (c.offsets.get(row), c.offsets.get(row + 1)) else {
+                return Err(out_of_range(row, c.len()));
+            };
+            let bytes = usize::try_from(start)
+                .ok()
+                .zip(usize::try_from(end).ok())
+                .and_then(|(start, end)| c.data.get(start..end))
+                .ok_or_else(|| {
+                    BinaryValueError::Invalid(format!("row {row} has invalid String offsets"))
+                })?;
+            write_varint(buf, bytes.len() as u64);
+            buf.extend_from_slice(bytes);
+        }
+        (ChType::FixedString(width), Column::FixedBinary(c)) if c.width == *width => {
+            buf.extend_from_slice(fixed_slice(&c.data, c.width, row)?);
+        }
+        (ChType::Uuid, Column::Uuid(c))
+        | (ChType::Ipv6, Column::Ipv6(c))
+        | (ChType::Int128, Column::Int128(c))
+        | (ChType::UInt128, Column::UInt128(c))
+            if c.width == 16 =>
+        {
+            buf.extend_from_slice(fixed_slice(&c.data, 16, row)?);
+        }
+        (ChType::Int256, Column::Int256(c)) | (ChType::UInt256, Column::UInt256(c))
+            if c.width == 32 =>
+        {
+            buf.extend_from_slice(fixed_slice(&c.data, 32, row)?);
+        }
+        (ChType::Decimal { bits, .. }, Column::Decimal(c))
+            if matches!(bits, 32 | 64 | 128 | 256) && c.width == *bits as usize / 8 =>
+        {
+            buf.extend_from_slice(fixed_slice(&c.data, c.width, row)?);
+        }
+        (ChType::Array(inner), Column::Array(c)) => {
+            let (start, end) = offset_range(&c.offsets, row)?;
+            write_varint(buf, (end - start) as u64);
+            for i in start..end {
+                encode_value(buf, inner, &c.values, i, depth + 1)?;
+            }
+        }
+        (ChType::Map(key, value), Column::Map(c)) => {
+            let Column::Tuple(entries) = c.entries.as_ref() else {
+                return Err(mismatch(ch_type));
+            };
+            let [keys, values] = entries.fields.as_slice() else {
+                return Err(mismatch(ch_type));
+            };
+            let (start, end) = offset_range(&c.offsets, row)?;
+            write_varint(buf, (end - start) as u64);
+            for i in start..end {
+                encode_value(buf, key, keys, i, depth + 1)?;
+                encode_value(buf, value, values, i, depth + 1)?;
+            }
+        }
+        (ChType::Tuple(elements), Column::Tuple(c)) if elements.len() == c.fields.len() => {
+            if row >= c.len {
+                return Err(out_of_range(row, c.len));
+            }
+            for ((_, element), field) in elements.iter().zip(&c.fields) {
+                encode_value(buf, element, field, row, depth + 1)?;
+            }
+        }
+        (
+            ChType::Variant(_)
+            | ChType::Dynamic { .. }
+            | ChType::Json { .. }
+            | ChType::AggregateFunction { .. },
+            _,
+        ) => return Err(BinaryValueError::Unsupported(ch_type.to_string())),
+        _ => return Err(mismatch(ch_type)),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native::type_binary::write_binary_type;
-    use crate::native::varint::write_varint;
     use crate::schema::{GeoKind, QBitElementType};
 
     fn parse(name: &str) -> ChType {
@@ -1294,5 +1568,309 @@ mod tests {
             panic!("expected UInt8 elements")
         };
         assert_eq!(elems.values, vec![1, 2, 3]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Encoding
+    // -----------------------------------------------------------------------
+
+    fn le<const N: usize>(bytes: [u8; N]) -> Vec<u8> {
+        bytes.to_vec()
+    }
+
+    fn string_value(s: &[u8]) -> Vec<u8> {
+        let mut out = varint(s.len() as u64);
+        out.extend_from_slice(s);
+        out
+    }
+
+    fn concat(parts: &[Vec<u8>]) -> Vec<u8> {
+        parts.concat()
+    }
+
+    fn encode_one(ch_type: &ChType, column: &Column, row: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        encode_binary_value(&mut buf, ch_type, column, row)
+            .unwrap_or_else(|e| panic!("encode {ch_type} row {row}: {e}"));
+        buf
+    }
+
+    /// Value bytes laid out per the module docs, for every type the decoder
+    /// supports. Each must survive decode -> encode unchanged.
+    fn value_cases() -> Vec<(&'static str, Vec<u8>)> {
+        let mut uuid = Vec::new();
+        uuid.extend_from_slice(&0x11e7_5cb3_61f0_c404u64.to_le_bytes());
+        uuid.extend_from_slice(&0xa600_6ad3_dba0_907bu64.to_le_bytes());
+        let mut ipv6 = vec![0x20, 0x01, 0x0d, 0xb8];
+        ipv6.extend_from_slice(&[0; 11]);
+        ipv6.push(0x01);
+        vec![
+            ("Bool", vec![1]),
+            ("Bool", vec![0]),
+            ("Int8", le((-13i8).to_le_bytes())),
+            ("Int16", le((-1300i16).to_le_bytes())),
+            ("Int32", le((-79i32).to_le_bytes())),
+            ("Int64", le(i64::MIN.to_le_bytes())),
+            ("UInt8", vec![255]),
+            ("UInt16", le(65535u16.to_le_bytes())),
+            ("UInt32", le(13u32.to_le_bytes())),
+            ("UInt64", le(u64::MAX.to_le_bytes())),
+            ("Float32", le(1.5f32.to_le_bytes())),
+            ("Float64", le((-0.125f64).to_le_bytes())),
+            ("BFloat16", vec![0x80, 0x3f]),
+            ("Int128", (0..16).collect()),
+            ("UInt128", vec![0xff; 16]),
+            ("Int256", (0..32).collect()),
+            ("UInt256", vec![0x7f; 32]),
+            ("Date", le(19782u16.to_le_bytes())),
+            ("Date32", le((-25567i32).to_le_bytes())),
+            ("DateTime", le(1_704_164_645u32.to_le_bytes())),
+            ("DateTime('UTC')", le(13u32.to_le_bytes())),
+            (
+                "DateTime64(3, 'UTC')",
+                le(1_704_164_645_678i64.to_le_bytes()),
+            ),
+            ("Time", le((-3600i32).to_le_bytes())),
+            ("Time64(6)", le(45_296_789_000i64.to_le_bytes())),
+            ("IntervalSecond", le(79i64.to_le_bytes())),
+            ("Decimal(9, 2)", le((-314i32).to_le_bytes())),
+            ("Decimal(18, 3)", le(123_456_789i64.to_le_bytes())),
+            ("Decimal(38, 10)", (0..16).collect()),
+            ("Decimal(76, 20)", (0..32).collect()),
+            ("UUID", uuid),
+            ("IPv4", le(0xc0a8_01feu32.to_le_bytes())),
+            ("IPv6", ipv6),
+            ("Enum8('a' = -1, 'b' = 13)", vec![13]),
+            (
+                "Enum16('y' = 1000, 'z' = -1000)",
+                le((-1000i16).to_le_bytes()),
+            ),
+            ("String", string_value(b"")),
+            ("String", string_value("user_1 \u{4e16}".as_bytes())),
+            ("FixedString(4)", b"ab\0\0".to_vec()),
+            (
+                "QBit(Float32, 3)",
+                concat(&[
+                    varint(3),
+                    le(1.5f32.to_le_bytes()),
+                    le((-2.5f32).to_le_bytes()),
+                    le(13f32.to_le_bytes()),
+                ]),
+            ),
+            (
+                "QBit(BFloat16, 2)",
+                concat(&[varint(2), vec![0x80, 0x3f, 0, 0]]),
+            ),
+            ("Nullable(Int32)", vec![1]),
+            (
+                "Nullable(Int32)",
+                concat(&[vec![0], le(13i32.to_le_bytes())]),
+            ),
+            (
+                "Nullable(String)",
+                concat(&[vec![0], string_value(b"user_2")]),
+            ),
+            ("Nullable(Nothing)", vec![1]),
+            ("LowCardinality(String)", string_value(b"user_1")),
+            ("LowCardinality(Nullable(String))", vec![1]),
+            (
+                "LowCardinality(Nullable(String))",
+                concat(&[vec![0], string_value(b"x")]),
+            ),
+            ("Array(UInt8)", concat(&[varint(3), vec![1, 2, 3]])),
+            ("Array(String)", varint(0)),
+            (
+                "Array(Nullable(Int64))",
+                concat(&[varint(2), vec![1], vec![0], le(79i64.to_le_bytes())]),
+            ),
+            (
+                "Array(Array(Int32))",
+                concat(&[varint(2), varint(1), le(13i32.to_le_bytes()), varint(0)]),
+            ),
+            (
+                "Array(LowCardinality(Nullable(String)))",
+                concat(&[varint(2), vec![1], vec![0], string_value(b"x")]),
+            ),
+            (
+                "Map(String, UInt64)",
+                concat(&[
+                    varint(2),
+                    string_value(b"k1"),
+                    le(13u64.to_le_bytes()),
+                    string_value(b"k2"),
+                    le(79u64.to_le_bytes()),
+                ]),
+            ),
+            (
+                "Map(UInt8, Array(String))",
+                concat(&[varint(1), vec![7], varint(1), string_value(b"v")]),
+            ),
+            ("Tuple()", vec![]),
+            (
+                "Tuple(UInt8, String)",
+                concat(&[vec![13], string_value(b"user_1")]),
+            ),
+            ("Tuple(a UInt8, b Nullable(String))", vec![79, 1]),
+            ("Nullable(Tuple(a UInt8))", vec![1]),
+            ("Nullable(Tuple(a UInt8))", vec![0, 13]),
+            (
+                "Point",
+                concat(&[le(1.5f64.to_le_bytes()), le((-2.5f64).to_le_bytes())]),
+            ),
+            (
+                "Ring",
+                concat(&[varint(1), le(0f64.to_le_bytes()), le(1f64.to_le_bytes())]),
+            ),
+            (
+                "SimpleAggregateFunction(sum, UInt64)",
+                le(13u64.to_le_bytes()),
+            ),
+            (
+                "Nested(id UInt8, s String)",
+                concat(&[varint(1), vec![13], string_value(b"s")]),
+            ),
+        ]
+    }
+
+    #[test]
+    fn encode_inverts_decode_for_every_supported_type() {
+        for (name, bytes) in value_cases() {
+            let ch_type = parse(name);
+            let column = decode_binary_value(&ch_type, &bytes)
+                .unwrap_or_else(|e| panic!("decode {name} {bytes:?}: {e}"));
+            assert_eq!(encode_one(&ch_type, &column, 0), bytes, "{name}");
+        }
+    }
+
+    #[test]
+    fn encode_full_cell_round_trips_through_read_binary_type_prefix() {
+        for (name, bytes) in value_cases() {
+            let ch_type = parse(name);
+            let column = decode_binary_value(&ch_type, &bytes).unwrap();
+            let mut cell = Vec::new();
+            write_binary_type_prefix(&mut cell, &ch_type);
+            encode_binary_value(&mut cell, &ch_type, &column, 0).unwrap();
+
+            let (parsed, consumed) = read_binary_type_prefix(&cell).unwrap();
+            assert_eq!(&cell[consumed..], bytes.as_slice(), "{name}");
+            let again = decode_binary_value(&parsed, &cell[consumed..]).unwrap();
+            assert_eq!(again, column, "{name}");
+        }
+    }
+
+    #[test]
+    fn encode_reads_any_row_of_bulk_columns() {
+        // LowCardinality(Nullable(String)) in its bulk Dictionary shape: index 0
+        // is the NULL slot, nulls live in the index validity.
+        let dict = Column::Dictionary(crate::column::DictionaryColumn::new_nullable(
+            vec![1, 0, 2, 1],
+            Column::Utf8(Utf8Column::new(vec![0, 0, 6, 12], b"user_1user_2".to_vec())),
+            Bitmap::from_ch_null_map(&[0, 1, 0, 0]),
+        ));
+        let lc = parse("LowCardinality(Nullable(String))");
+        assert_eq!(
+            encode_one(&lc, &dict, 0),
+            concat(&[vec![0], string_value(b"user_1")])
+        );
+        assert_eq!(encode_one(&lc, &dict, 1), vec![1]);
+        assert_eq!(
+            encode_one(&lc, &dict, 2),
+            concat(&[vec![0], string_value(b"user_2")])
+        );
+
+        let plain = Column::Dictionary(crate::column::DictionaryColumn::new(
+            vec![1, 0],
+            Column::Utf8(Utf8Column::new(vec![0, 1, 3], b"abc".to_vec())),
+        ));
+        assert_eq!(
+            encode_one(&parse("LowCardinality(String)"), &plain, 0),
+            string_value(b"bc")
+        );
+
+        // Array(Nullable(Int32)) with rows [13, NULL], [], [-79].
+        let array = Column::Array(ArrayColumn::new(
+            vec![0, 2, 2, 3],
+            Column::Int32(PrimitiveColumn::new_nullable(
+                vec![13, 0, -79],
+                Bitmap::from_ch_null_map(&[0, 1, 0]),
+            )),
+        ));
+        let at = parse("Array(Nullable(Int32))");
+        assert_eq!(
+            encode_one(&at, &array, 0),
+            concat(&[varint(2), vec![0], le(13i32.to_le_bytes()), vec![1]])
+        );
+        assert_eq!(encode_one(&at, &array, 1), varint(0));
+        assert_eq!(
+            encode_one(&at, &array, 2),
+            concat(&[varint(1), vec![0], le((-79i32).to_le_bytes())])
+        );
+
+        // Bool past the first bitmap byte.
+        let bools = Column::Bool(BoolColumn::from_wire_bytes(&[0, 0, 0, 0, 0, 0, 0, 0, 1, 0]));
+        assert_eq!(encode_one(&ChType::Bool, &bools, 8), vec![1]);
+        assert_eq!(encode_one(&ChType::Bool, &bools, 9), vec![0]);
+
+        // QBit row 1 reads its own dimension-sized slice.
+        let qbit = Column::QBit(QBitColumn::new(
+            Column::Float32(PrimitiveColumn::new(vec![1.0, 2.0, 13.0, 79.0])),
+            2,
+        ));
+        assert_eq!(
+            encode_one(&parse("QBit(Float32, 2)"), &qbit, 1),
+            concat(&[varint(2), le(13f32.to_le_bytes()), le(79f32.to_le_bytes())])
+        );
+    }
+
+    #[test]
+    fn encode_rejects_bad_input_and_leaves_buf_unchanged() {
+        let ints = Column::Int32(PrimitiveColumn::new(vec![13]));
+        let strings = Column::Utf8(Utf8Column::new(vec![0, 4], b"oops".to_vec()));
+        let check = |ch_type: &ChType, column: &Column, row: usize, unsupported: bool| {
+            let mut buf = vec![0xaa];
+            let err = encode_binary_value(&mut buf, ch_type, column, row).unwrap_err();
+            assert_eq!(buf, vec![0xaa], "{ch_type}: {err}");
+            assert_eq!(
+                matches!(err, BinaryValueError::Unsupported(_)),
+                unsupported,
+                "{ch_type}: {err}"
+            );
+        };
+        // Row out of range, including a Nullable whose bitmap is too short.
+        check(&ChType::Int32, &ints, 1, false);
+        check(&parse("Nullable(Int32)"), &ints, 1, false);
+        // Column shape that does not match the type.
+        check(&ChType::Int64, &ints, 0, false);
+        check(&ChType::String, &ints, 0, false);
+        check(&parse("FixedString(3)"), &strings, 0, false);
+        check(&parse("Array(Int32)"), &ints, 0, false);
+        // An error deep inside a container still restores buf.
+        let nested = Column::Array(ArrayColumn::new(vec![0, 2], ints.clone()));
+        check(&parse("Array(Int32)"), &nested, 0, false);
+        // Corrupt offsets.
+        let backwards = Column::Array(ArrayColumn::new(vec![1, 0], ints.clone()));
+        check(&parse("Array(Int32)"), &backwards, 0, false);
+        let bad_string = Column::Utf8(Utf8Column::new(vec![0, 9], b"short".to_vec()));
+        check(&ChType::String, &bad_string, 0, false);
+        let bad_index = Column::Dictionary(crate::column::DictionaryColumn::new(
+            vec![-1],
+            strings.clone(),
+        ));
+        check(&parse("LowCardinality(String)"), &bad_index, 0, false);
+        // Types with no single-value encoding, as on the decode side.
+        check(&parse("Variant(String, UInt64)"), &ints, 0, true);
+        check(&parse("Dynamic"), &ints, 0, true);
+        check(
+            &ChType::Nothing,
+            &Column::Nothing(NothingColumn::new(1)),
+            0,
+            true,
+        );
+        check(
+            &parse("Nullable(Nothing)"),
+            &Column::Nothing(NothingColumn::new_nullable(1, Bitmap::all_valid(1))),
+            0,
+            true,
+        );
     }
 }

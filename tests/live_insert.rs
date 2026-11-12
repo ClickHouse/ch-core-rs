@@ -49,6 +49,7 @@ const DYNAMIC_TABLE: &str = "ch_core_rs_encode_dynamic_test";
 const DYNAMIC_BINARY_TABLE: &str = "ch_core_rs_encode_dynamic_binary_test";
 const JSON_TABLE: &str = "ch_core_rs_encode_json_test";
 const JSON_BINARY_TABLE: &str = "ch_core_rs_encode_json_binary_test";
+const SHARED_CELLS_TABLE: &str = "ch_core_rs_encode_shared_cells_test";
 
 /// The canonical `JSON` type declaration reused by the JSON round-trip tests.
 /// `max_dynamic_paths=1` forces overflow to shared data; the typed path never
@@ -2216,4 +2217,211 @@ fn single_block(batch: &ColBatch) -> ch_core_rs::batch::ChunkedBatch {
         schema: batch.schema.clone(),
         chunks: vec![std::sync::Arc::new(batch.clone())],
     }
+}
+
+/// One value per type, each cast to `Dynamic(max_types=0)` so the server
+/// stores it in SharedVariant as a binary descriptor plus serializeBinary
+/// value. Re-encoding every cell must reproduce the server's bytes exactly.
+#[test]
+#[ignore = "requires a live ClickHouse server matching .server-ref; run with --ignored"]
+fn server_shared_cells_reencode_for_every_type() {
+    use ch_core_rs::native::binary_value::{
+        decode_binary_value, encode_binary_value, read_binary_type_prefix, write_binary_type_prefix,
+    };
+
+    let values = [
+        "true",
+        "toInt8(-13)",
+        "toInt16(-1300)",
+        "toInt32(-79)",
+        "toInt64(-9223372036854775808)",
+        "toUInt8(255)",
+        "toUInt16(65535)",
+        "toUInt32(13)",
+        "toUInt64(18446744073709551615)",
+        "toInt128('-170141183460469231731687303715884105728')",
+        "toUInt128('340282366920938463463374607431768211455')",
+        "toInt256('-13')",
+        "toUInt256('79')",
+        "toFloat32(1.5)",
+        "toFloat64(-0.125)",
+        "toBFloat16(1.5)",
+        "toDecimal32(-3.14, 2)",
+        "toDecimal64(123456.789, 3)",
+        "toDecimal128('-0.000000000000000001', 18)",
+        "toDecimal256('12345678901234567890.123456789', 9)",
+        "toDate('2024-02-29')",
+        "toDate32('1900-01-01')",
+        "toDateTime('2024-01-02 03:04:05', 'UTC')",
+        "toDateTime64('2024-01-02 03:04:05.678', 3, 'UTC')",
+        "toTime('12:34:56')",
+        "toTime64('12:34:56.789', 3)",
+        "toIntervalDay(13)",
+        "toUUID('61f0c404-5cb3-11e7-907b-a6006ad3dba0')",
+        "toIPv4('192.168.1.254')",
+        "toIPv6('2001:db8::1')",
+        "CAST('b', 'Enum8(\\'a\\' = -1, \\'b\\' = 13)')",
+        "CAST('z', 'Enum16(\\'y\\' = 1000, \\'z\\' = -1000)')",
+        "'user_1'",
+        "toFixedString('ab', 4)",
+        "[1, 2, 3]",
+        "[[toInt32(13)], [], [toInt32(-79)]]",
+        "['user_1', NULL]",
+        "map('k1', toUInt64(13), 'k2', toUInt64(79))",
+        "map(toUInt8(7), ['v'])",
+        "(toUInt8(13), 'user_2')",
+        "CAST((13, 'x'), 'Tuple(a UInt8, b Nullable(String))')",
+        "CAST([1., 2., 3.], 'QBit(Float32, 3)')",
+        "CAST((1.5, -2.5), 'Point')",
+        "CAST([(0., 0.), (1., 1.)], 'Ring')",
+    ];
+    let columns: Vec<String> = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| format!("CAST({v}, 'Dynamic(max_types=0)') AS c{i}"))
+        .collect();
+    let server = Server::from_env();
+    let native = server.select_with_params(
+        &format!("SELECT {} FORMAT Native", columns.join(", ")),
+        "?allow_experimental_dynamic_type=1&enable_time_time64_type=1&allow_experimental_qbit_type=1&allow_experimental_bfloat16_type=1",
+    );
+    let decoded = decode_all_bytes(&native, &DecodeOptions::default()).expect("decode");
+
+    let mut checked = 0;
+    for chunk in &decoded.chunks {
+        for (field, column) in chunk.schema.fields.iter().zip(&chunk.columns) {
+            let Column::Dynamic(c) = column else {
+                panic!("{}: expected Dynamic, got {column:?}", field.name);
+            };
+            for child in &c.children {
+                let DynamicChild::Shared(cells) = child else {
+                    panic!(
+                        "{}: max_types=0 must route every value to SharedVariant",
+                        field.name
+                    );
+                };
+                for i in 0..cells.len() {
+                    let cell = cells.value(i);
+                    let (ch_type, consumed) =
+                        read_binary_type_prefix(cell).expect("descriptor parses");
+                    let value = decode_binary_value(&ch_type, &cell[consumed..])
+                        .unwrap_or_else(|e| panic!("{}: decode {ch_type}: {e}", field.name));
+                    let mut again = Vec::new();
+                    write_binary_type_prefix(&mut again, &ch_type);
+                    encode_binary_value(&mut again, &ch_type, &value, 0)
+                        .unwrap_or_else(|e| panic!("{}: encode {ch_type}: {e}", field.name));
+                    assert_eq!(again, cell, "{}: {ch_type}", field.name);
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(checked, values.len());
+}
+
+/// Build SharedVariant cells with `encode_binary_value`, INSERT a
+/// `Dynamic(max_types=1)` column carrying them, and read back the runtime
+/// types and values the server stored.
+#[test]
+#[ignore = "requires a live ClickHouse server matching .server-ref; run with --ignored"]
+fn encoded_shared_cells_insert_through_server() {
+    use ch_core_rs::native::binary_value::{encode_binary_value, write_binary_type_prefix};
+
+    let cell = |name: &str, column: Column| -> Vec<u8> {
+        let ch_type = parse_ch_type(name).expect("type parses");
+        let mut out = Vec::new();
+        write_binary_type_prefix(&mut out, &ch_type);
+        encode_binary_value(&mut out, &ch_type, &column, 0).expect("cell encodes");
+        out
+    };
+    let shared_cells = [
+        cell("UInt64", Column::UInt64(PrimitiveColumn::new(vec![13]))),
+        cell(
+            "Array(Int32)",
+            Column::Array(ArrayColumn::new(
+                vec![0, 2],
+                Column::Int32(PrimitiveColumn::new(vec![79, -13])),
+            )),
+        ),
+        cell(
+            "Map(String, Nullable(Float64))",
+            Column::Map(MapColumn::new(
+                vec![0, 2],
+                Column::Tuple(TupleColumn::new(
+                    vec![
+                        Column::Utf8(utf8_column(&[b"k1", b"k2"])),
+                        Column::Float64(PrimitiveColumn::new_nullable(
+                            vec![1.5, 0.0],
+                            Bitmap::from_ch_null_map(&[0, 1]),
+                        )),
+                    ],
+                    2,
+                )),
+            )),
+        ),
+        cell(
+            "Decimal(18, 3)",
+            Column::Decimal(DecimalColumn::new(
+                123_456i64.to_le_bytes().to_vec(),
+                8,
+                18,
+                3,
+            )),
+        ),
+    ];
+    let shared: Vec<&[u8]> = shared_cells.iter().map(Vec::as_slice).collect();
+
+    // Rows: user_1 (typed String), the four shared cells, then NULL.
+    let dynamic = DynamicColumn::try_new(
+        &[1, 0, 0, 0, 0, u32::MAX],
+        vec![
+            DynamicChild::Shared(utf8_column(&shared)),
+            DynamicChild::Typed {
+                ch_type: ChType::String,
+                values: Column::Utf8(utf8_column(&[b"user_1"])),
+            },
+        ],
+    )
+    .expect("Dynamic routing is consistent");
+    let batch = ColBatch::new(
+        Schema::new(vec![
+            Field {
+                name: "id".into(),
+                ch_type: ChType::UInt8,
+            },
+            Field {
+                name: "v".into(),
+                ch_type: parse_ch_type("Dynamic(max_types=1)").unwrap(),
+            },
+        ]),
+        vec![
+            Column::UInt8(PrimitiveColumn::new(vec![0, 1, 2, 3, 4, 5])),
+            Column::Dynamic(dynamic),
+        ],
+        6,
+    );
+
+    let server = Server::from_env();
+    server.ddl(&format!("DROP TABLE IF EXISTS {SHARED_CELLS_TABLE}"));
+    server.ddl(&format!(
+        "CREATE TABLE {SHARED_CELLS_TABLE} (id UInt8, v Dynamic(max_types=1)) ENGINE = Memory"
+    ));
+    let bytes = encode_block(&batch, &EncodeOptions::default()).expect("encode");
+    server.insert_native_into(SHARED_CELLS_TABLE, &bytes);
+    let tsv = server.select(&format!(
+        "SELECT dynamicType(v), toString(v) FROM {SHARED_CELLS_TABLE} ORDER BY id FORMAT TSV"
+    ));
+    server.ddl(&format!("DROP TABLE IF EXISTS {SHARED_CELLS_TABLE}"));
+
+    // TSV escapes the quotes inside the Map rendering; a NULL Dynamic renders
+    // as an empty string through toString.
+    assert_eq!(
+        String::from_utf8(tsv).unwrap(),
+        "String\tuser_1\n\
+         UInt64\t13\n\
+         Array(Int32)\t[79,-13]\n\
+         Map(String, Nullable(Float64))\t{\\'k1\\':1.5,\\'k2\\':NULL}\n\
+         Decimal(18, 3)\t123.456\n\
+         None\t\n"
+    );
 }
