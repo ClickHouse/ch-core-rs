@@ -7,3 +7,6 @@ __pycache__/
 # Local ClickHouse server source checkout for agent reference (see AGENTS.md)
 /.server-src/
 .server-ref
+
+# Local Codex settings (keep shared agent definitions tracked)
+.codex/config.toml
