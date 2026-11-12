@@ -425,8 +425,8 @@ encode are at type parity across all of this: whole-buffer and streaming decode,
 Arrow C Data export, and encode back to Native block bytes for the HTTP `INSERT`
 path. The `compression` module reads LZ4/NONE frames and writes LZ4 frames;
 the sans-I/O TCP engine in the sibling `ch-tcp-proto` crate covers the
-handshake, Ping, and uncompressed SELECT at revision 54460, while compressed
-packets, INSERT, and cancellation over TCP remain future work. The growth model
+handshake, Ping, and uncompressed SELECT and INSERT at revision 54460, while
+compressed packets and cancellation over TCP remain future work. The growth model
 is fixed: implement a type once here, following the documented
 confirm-against-server-source workflow in `AGENTS.md`, and every binding gets it
 for free. The roadmap lives in `README.md`.

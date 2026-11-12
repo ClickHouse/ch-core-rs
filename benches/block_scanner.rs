@@ -137,6 +137,88 @@ fn batch(name: &str, ch_type: ChType, column: Column, rows: usize) -> ColBatch {
     )
 }
 
+// Keep the byte patching below in sync with the copy in
+// `crates/ch-tcp-proto/benches/insert_data.rs`.
+fn low_cardinality_bytes(rows: usize, index_width: usize, mode: Mode) -> Vec<u8> {
+    let dictionary = Column::Utf8(Utf8Column::new(
+        vec![0, 0, 6, 12, 18],
+        b"user_1user_2user_3".to_vec(),
+    ));
+    let indices = (0..rows)
+        .map(|row| (row % 3 + 1) as i32)
+        .collect::<Vec<_>>();
+    let source = batch(
+        "lc",
+        ChType::LowCardinality(Box::new(ChType::String)),
+        Column::Dictionary(DictionaryColumn::new(indices, dictionary)),
+        rows,
+    );
+    let mut options = EncodeOptions::default();
+    options.protocol_revision = mode.revision;
+    let mut bytes = if mode.binary {
+        encode_block_binary_types(&source, &options)
+    } else {
+        encode_block(&source, &options)
+    }
+    .expect("encode LowCardinality benchmark");
+
+    // The encoder selects UInt8 for this four-entry dictionary. Widen only the
+    // self-describing index word and final index run so every case has the same
+    // dictionary and logical values. The fixed dictionary body is:
+    // empty sentinel plus three six-byte strings, each with a one-byte length.
+    const DICTIONARY_WIRE_BYTES: usize = 22;
+    const INDEX_WORD_BYTES: usize = 8;
+    const KEY_COUNT_BYTES: usize = 8;
+    const ROW_COUNT_BYTES: usize = 8;
+    // `HasAdditionalKeysBit` in the index word.
+    const HAS_ADDITIONAL_KEYS_BIT: u64 = 1 << 9;
+    let old_indexes = bytes.len() - rows;
+    let index_word_offset =
+        old_indexes - ROW_COUNT_BYTES - DICTIONARY_WIRE_BYTES - KEY_COUNT_BYTES - INDEX_WORD_BYTES;
+    let read_u64 = |offset: usize| {
+        u64::from_le_bytes(
+            bytes[offset..offset + 8]
+                .try_into()
+                .expect("complete LowCardinality u64 field"),
+        )
+    };
+    let old_word = read_u64(index_word_offset);
+    assert_eq!(old_word & 0xff, 0, "encoder did not select UInt8 indexes");
+    assert_ne!(
+        old_word & HAS_ADDITIONAL_KEYS_BIT,
+        0,
+        "encoder did not set HasAdditionalKeysBit"
+    );
+    assert_eq!(
+        read_u64(index_word_offset + INDEX_WORD_BYTES),
+        4,
+        "unexpected LowCardinality dictionary key count"
+    );
+    assert_eq!(
+        read_u64(old_indexes - ROW_COUNT_BYTES),
+        rows as u64,
+        "unexpected LowCardinality index row count"
+    );
+    let width_tag = match index_width {
+        1 => 0,
+        2 => 1,
+        4 => 2,
+        8 => 3,
+        _ => panic!("LowCardinality benchmark width must be 1, 2, 4, or 8"),
+    };
+    bytes[index_word_offset..index_word_offset + INDEX_WORD_BYTES]
+        .copy_from_slice(&(old_word | width_tag).to_le_bytes());
+    if index_width != 1 {
+        let mut widened = Vec::with_capacity(rows * index_width);
+        for &index in &bytes[old_indexes..] {
+            widened.extend_from_slice(&(index as u64).to_le_bytes()[..index_width]);
+        }
+        bytes.truncate(old_indexes);
+        bytes.extend_from_slice(&widened);
+    }
+    bytes
+}
+
 fn multi_type_dynamic(rows: usize) -> DynamicColumn {
     const ALTERNATIVES: usize = 6;
     let counts = (0..ALTERNATIVES)
@@ -309,6 +391,16 @@ fn cases(rows: usize, filter: Option<&str>, mode: Mode) -> Vec<(&'static str, Ve
     let string = || utf8_repeated(rows, 32);
     let wanted = |name: &str| filter.map_or(true, |needle| name.contains(needle));
     let mut output = Vec::new();
+    for (name, index_width) in [
+        ("LowCardinalityW1", 1),
+        ("LowCardinalityW2", 2),
+        ("LowCardinalityW4", 4),
+        ("LowCardinalityW8", 8),
+    ] {
+        if wanted(name) {
+            output.push((name, low_cardinality_bytes(rows, index_width, mode)));
+        }
+    }
     let mut push = |name: &'static str, batch: ColBatch, mut options: EncodeOptions| {
         if wanted(name) {
             options.protocol_revision = mode.revision;
@@ -326,23 +418,6 @@ fn cases(rows: usize, filter: Option<&str>, mode: Mode) -> Vec<(&'static str, Ve
         push(
             "String",
             batch("s", ChType::String, Column::Utf8(string()), rows),
-            EncodeOptions::default(),
-        );
-    }
-    if wanted("LowCardinality") {
-        let dictionary = Column::Utf8(Utf8Column::new(
-            vec![0, 0, 6, 12, 18],
-            b"user_1user_2user_3".to_vec(),
-        ));
-        let indices = (0..rows).map(|row| (row % 3 + 1) as i32).collect();
-        push(
-            "LowCardinality",
-            batch(
-                "lc",
-                ChType::LowCardinality(Box::new(ChType::String)),
-                Column::Dictionary(DictionaryColumn::new(indices, dictionary)),
-                rows,
-            ),
             EncodeOptions::default(),
         );
     }
@@ -767,6 +842,7 @@ fn main() {
         .ok()
         .and_then(|value| value.parse().ok());
     let rows = configured_rows.unwrap_or(if timing { DEFAULT_ROWS } else { CHECK_ROWS });
+    assert!(rows > 0, "CH_CORE_BENCH_ROWS must be positive");
     let target = Duration::from_millis(
         std::env::var("CH_CORE_BENCH_MS")
             .ok()

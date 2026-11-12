@@ -125,7 +125,7 @@ dispatch. It reports Progress, ProfileInfo, Log, ProfileEvents, Totals,
 Extremes, Exception, and EndOfStream as typed events. It does not own sockets,
 TLS, timeouts, pooling, or cancellation: there is no Cancel packet yet, so a
 driver that abandons a query mid-stream must discard the connection. The first
-engine handles uncompressed SELECT only. See `crates/ch-tcp-proto/README.md`
+engine handles uncompressed SELECT and INSERT. See `crates/ch-tcp-proto/README.md`
 for the driver loop and a tested `run_select` example.
 
 The engine conservatively fails a query when its first response is an
@@ -135,6 +135,30 @@ a reusable syntax error as terminal. A driver must close its socket whenever
 the engine enters `State::Failed`, even if the server has not closed its side.
 Where a binding can safely construct it, an SQL `SETTINGS` clause avoids the
 wire-settings flag and this conservative false positive.
+
+For a client-fed INSERT, such as `INSERT INTO t VALUES` without inline rows,
+call `Connection::insert(Query)`, flush its output, and wait for
+`Event::InsertSchema`, EndOfStream, or Exception. Fully specified inline
+VALUES, INSERT SELECT, and inline async INSERTs complete without requesting
+client blocks. They can use `query` or `insert`; an EndOfStream before
+InsertSchema means success with no upload. Do not use `query` for a client-fed
+INSERT. At default settings it fails on the leading TableColumns packet with
+`UnexpectedPacket { packet: 11, state: Querying }`. If
+`input_format_defaults_for_omitted_fields=0` suppresses that packet, it has no
+upload API and both driver and server can wait indefinitely.
+
+When InsertSchema arrives, decode that zero-row Native block at
+`effective_revision()` to obtain the expected columns. Encode each client
+batch with `EncodeOptions::protocol_revision` set to that same revision, then
+pass one encoded block at a time to `insert_data`. Flush queued output between
+blocks. `finish_insert` queues the upload end marker; continue reading through
+EndOfStream or Exception. `finish` marks transport EOF and does not finish an
+upload. After consuming the schema event, upload calls can continue through
+partial or queued Log/ProfileEvents packets. Match column names and types to
+the schema, since the server can reorder columns, fill omitted columns, drop
+unknown columns, and coerce mismatched types. TableColumns metadata preserves
+raw bytes, including non-UTF-8 literals. Its retention cap can truncate the
+metadata without failing the upload. The engine stays sans-I/O throughout.
 
 Each `Event::Data` payload is exactly one complete Native block at the
 connection's `effective_revision()`, and the payloads concatenate into one

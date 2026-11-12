@@ -13,3 +13,7 @@ publish = false
 # Native block validation and streaming boundaries. This is the only runtime
 # dependency and it is in-repo.
 ch-core-rs = { path = "../.." }
+
+[[bench]]
+name = "insert_data"
+harness = false

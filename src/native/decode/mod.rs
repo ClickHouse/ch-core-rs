@@ -5407,6 +5407,51 @@ fn low_cardinality_raw_index(chunk: &[u8]) -> u64 {
     }
 }
 
+/// Largest raw index in a run of whole `LowCardinality` indexes, or
+/// `u64::MAX` when the run cannot be valid (an 8-byte index with a nonzero
+/// high half, or an unsupported width). An empty run returns 0.
+#[inline]
+fn max_raw_low_cardinality_index(raw: &[u8], index_width: usize) -> u64 {
+    // One arm per width so each reduction is inlined with a constant width and
+    // vectorizes. Mapping `low_cardinality_raw_index` here would reuse the
+    // shared runtime-width fold, which stays scalar.
+    match index_width {
+        1 => raw.iter().copied().max().map_or(0, u64::from),
+        // Measured on aarch64 at width 2: `try_into` lowers to plain u16
+        // loads, while indexing the two bytes vectorized as a deinterleave
+        // plus reassembly at about half the speed. The `u16::MAX` fallback is
+        // unreachable because `chunks_exact(2)` yields only 2-byte chunks.
+        2 => raw
+            .chunks_exact(2)
+            .map(|chunk| chunk.try_into().map_or(u16::MAX, u16::from_le_bytes))
+            .fold(0, u16::max)
+            .into(),
+        4 => raw
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .max()
+            .map_or(0, u64::from),
+        // NEON has no 64-bit unsigned max. Any nonzero high half exceeds
+        // i32::MAX and must fail, so take the max of the low halves and OR the
+        // high halves; the caller's re-walk reports the exact error.
+        8 => {
+            let (mut low, mut high) = (0u32, 0u32);
+            for chunk in raw.chunks_exact(8) {
+                low = low.max(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                high |= u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+            }
+            if high == 0 {
+                u64::from(low)
+            } else {
+                u64::MAX
+            }
+        }
+        // `low_cardinality_index_width` admits only 1/2/4/8. This arm only
+        // routes an impossible width to the caller's re-walk.
+        _ => u64::MAX,
+    }
+}
+
 /// Validate a run of whole `LowCardinality` indexes the way
 /// [`decode_low_cardinality_indices`] does: every index must point inside the
 /// block dictionary and a non-sentinel index must fit i32. The common all-valid
@@ -5418,11 +5463,7 @@ fn check_low_cardinality_indexes(
     num_keys: usize,
     column: &str,
 ) -> Result<(), DecodeError> {
-    let max = raw
-        .chunks_exact(index_width)
-        .map(low_cardinality_raw_index)
-        .max()
-        .unwrap_or(0);
+    let max = max_raw_low_cardinality_index(raw, index_width);
     let num_keys = num_keys as u64;
     if raw.is_empty() || (max < num_keys && max <= i32::MAX as u64) {
         return Ok(());

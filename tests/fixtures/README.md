@@ -318,3 +318,108 @@ Confirmed source at `v26.8.1.2041-lts`:
 Settings flags are VarUInt IMPORTANT, value 1, and parameter flags are CUSTOM,
 value 2. Log and ProfileEvents use revision-54460 Native framing, including
 BlockInfo.
+
+## Revision 54460 INSERT capture workflow
+
+The INSERT fixtures were captured on 2026-11-10 from local ClickHouse
+`26.8.1.2041`, matched to source tag `v26.8.1.2041-lts`, at revision 54460.
+Regenerate using only Python's standard library:
+
+```sh
+no_proxy=127.0.0.1 NO_PROXY=127.0.0.1 python3 -B scripts/gen_tcp_insert_fixtures.py
+```
+
+Run the offline parser, request-byte, and oracle regression check without a
+server. It also fails if `tcp_insert_oracle_rev54460.rs` differs from the
+oracle regenerated from the manifest:
+
+```sh
+python3 -B scripts/gen_tcp_insert_fixtures.py --check
+```
+
+Use `--cases <case> ...` to refresh selected cases while preserving the other
+captures. Unknown labels are rejected before connecting, and a partial refresh
+updates the capture date and server version. The generator restricts the host
+to `127.0.0.1`, bypasses proxies, checks HTTP and TCP versions and
+`.server-ref`, and uses `default` with an empty password. Its Query packet has
+fixed INSERT-specific ClientInfo values and settings, independent of the
+SELECT fixture generator's sentinels. It creates
+`ch_core_tcp_insert_fixture`, a Memory table with UInt64 `n`, String `s`, and a
+constraint `n < 100`, then drops it in cleanup. It independently checks stored
+rows through HTTP JSONEachRow after every applicable exchange. The
+`before_schema` missing-table case records HTTP verification as not applicable.
+
+Each `tcp_insert_<case>_*_rev54460.bytes` set separates the client Query request
+plus external-table terminator, server initial response, client upload blocks,
+server telemetry received between upload blocks, client upload terminator, and
+server completion response. The manifest builds `exchange_order` from the
+stages actually sent or received. The initial response retains the historical
+`schema` filename even when it ends in EOS without a schema. Empty files mean
+that stage did not occur. Nine cases cover:
+
+- `multi`: two upload blocks containing `(13, user_1)`, `(79, user_2)`, and
+  `(17, empty String)`. HTTP verifies all three rows.
+- `empty`: no upload blocks, followed by the upload terminator. HTTP verifies
+  the table remains empty.
+- `zero_rows`: one schema-bearing upload block with zero rows, followed by the
+  zero-column upload terminator. HTTP verifies the table remains empty. This
+  distinguishes valid zero-row data from the terminator.
+- `before_schema`: an unknown table raises Exception code 60 before a schema
+  is sent. No upload or terminator is sent.
+- `completion_exception`: UInt64 179 violates the constraint, raising
+  Exception code 469. Before sending the terminator, the generator waits 250
+  ms and records any complete telemetry or Exception packet. The manifest
+  records the observed phase. HTTP verifies no rows were stored.
+- `midupload`: the client sends block 1 with `(13, user_1)`, reads complete
+  Log and ProfileEvents packets from the live socket, then sends block 2
+  with `(79, user_2)` and the terminator. HTTP verifies both rows. These are
+  actual packets received before the second block was sent.
+- `inline_values`: SQL contains both `(13, user_1)` and `(79, user_2)`, and
+  completes with EOS without requesting an upload schema.
+- `insert_select`: SQL inserts `(13, user_1)` from SELECT and completes with
+  EOS without requesting an upload schema.
+- `inline_async`: SQL enables `async_insert=1, wait_for_async_insert=1` and
+  contains `(79, user_2)`. It completes with EOS without requesting an upload
+  schema. HTTP verifies the completed insertion.
+
+The streaming schema responses include Log, TableColumns, and a zero-row
+schema-bearing Data packet. Inline and SELECT responses include actual
+Progress, Log, and ProfileEvents before EOS. The manifest
+`tcp_insert_rev54460.json` records packet boundaries, schema, uploads, HTTP
+results, exception phase, file hashes, and the ordered full-duplex exchange.
+For `midupload`, the order is request, schema, first upload block, server
+telemetry, second upload block, client terminator, then completion.
+`tcp_insert_oracle_rev54460.rs` is generated from the independent Python
+parser. It compares exact block payloads, raw TableColumns bytes, Progress and
+ProfileInfo fields, and Exception fields. TableColumns fields are raw bytes:
+the manifest's `external_table_hex` and `columns_description_hex` keys are
+lossless and authoritative, the matching text keys are lossy UTF-8 for
+reading, and the oracle emits them as Rust byte strings with hex escapes for
+any non-printable or non-ASCII byte. No boundaries are inferred by
+searching byte patterns.
+
+`crates/ch-tcp-proto/tests/insert_replay.rs` checks every two-chunk split of
+each initial and completion response, bytewise reads, seeded random chunking,
+and every truncated prefix. A separate test feeds every prefix of the real
+mid-upload telemetry without draining completed events, sends the second
+block and terminator, then feeds the suffix and completion. This covers both
+partial packets and complete queued Log/ProfileEvents while writing. Query
+and terminator bytes must match the captures. Upload blocks are constructed
+through core's `encode_block` and their complete Data packets must match the
+accepted uploads. The schema is also decoded through core. INSERT Exceptions
+conservatively fail the engine connection.
+
+The constraint capture's `completion_probe` and `exception_phase` fields state
+whether the server produced the failure before or after the upload terminator.
+Synthetic engine tests cover Exceptions while uploading. The mid-upload
+telemetry fixture makes no claim about connection reuse after an Exception.
+
+Confirmed source at `v26.8.1.2041-lts`:
+`src/Client/Connection.cpp::sendData`,
+`src/Server/TCPHandler.cpp::startInsertQuery/processInsertQuery/receivePacketsExpectData/processData/sendData/sendTableColumns/sendEndOfStream/skipData`,
+`src/Server/TCPHandler.cpp::sendLogs/sendInsertProfileEvents`, and
+`src/Formats/NativeReader.cpp::NativeReader::read` describe schema delivery,
+client Data framing, per-block telemetry, the zero-column upload terminator,
+and error drain behavior. The server-reader findings distinguish that
+confirmed framing from the conservative engine policy of retiring failed
+INSERT connections.
