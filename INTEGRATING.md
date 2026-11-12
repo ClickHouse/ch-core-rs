@@ -64,7 +64,6 @@ to obtain typed columnar buffers.
 
 ### Features
 
-- It has zero runtime dependencies. i.e. `Cargo.toml` has no `[dependencies]`.
 - It is downstream agnostic. The core owns binary decoding and the shared columnar model. It does not build host-language objects or make language-specific policy decisions.
 - The decoder accepts either a complete byte buffer or streamed byte chunks. The streaming API lets a binding overlap network reads with decode and emit decoded blocks as they complete.
 
