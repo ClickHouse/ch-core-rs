@@ -13,7 +13,7 @@ ch-core-rs is distributed as a git dependency pinned to a release tag, never via
 
 ### 1. Validate the version argument
 
-The user must supply a semver version number (e.g. `0.2.0`, no `v` prefix). If `$ARGUMENTS` is empty or missing, ask the user to provide one and stop. Tags follow semver: no breaking changes on patch or minor releases. If the `## Unreleased` changelog section contains an entry that looks breaking and `$ARGUMENTS` is not a major bump, flag it to the user before proceeding.
+The user must supply a semver version number (e.g. `0.2.0`, no `v` prefix). If `$ARGUMENTS` is empty or missing, ask the user to provide one and stop. Tags follow semver. Before 1.0, breaking changes bump the minor version (as `CHANGELOG.md` states), so a breaking entry belongs in a minor release like `0.3.0`, not a patch. From 1.0 on, breaking changes need a major bump. If the `## Unreleased` changelog section contains an entry that looks breaking and `$ARGUMENTS` is a patch bump (or a minor bump at 1.0 or later), flag it to the user before proceeding.
 
 ### 2. Ensure you are on the correct release branch
 
