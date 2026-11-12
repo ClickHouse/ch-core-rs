@@ -33,4 +33,4 @@ Only push and open the PR if the user clearly asks (for example "open a PR", "cr
 - Run `gh pr create --title "..." --body "..."` with the drafted text.
 - Print the PR URL.
 
-Follow the attribution rule for PR bodies from the session's instructions when one is given.
+Never add "Generated with Claude Code" or any similar attribution suffix to the title or body. End the body with the last real sentence.
