@@ -2527,3 +2527,99 @@ fn assert_validity(column: &Column, expected: &[bool]) {
         assert_eq!(validity.is_valid(row), *expected_valid, "row {row}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Single binary values: re-encode the server's own SharedVariant cells
+// ---------------------------------------------------------------------------
+
+/// Collect every Dynamic SharedVariant cell and JSON shared-data value inside
+/// `column`, recursing through containers and typed children.
+fn collect_shared_cells(column: &Column, out: &mut Vec<Vec<u8>>) {
+    fn utf8_cells(c: &Utf8Column, out: &mut Vec<Vec<u8>>) {
+        out.extend((0..c.len()).map(|i| c.value(i).to_vec()));
+    }
+    fn dynamic(c: &ch_core_rs::column::DynamicColumn, out: &mut Vec<Vec<u8>>) {
+        for child in &c.children {
+            match child {
+                DynamicChild::Shared(cells) => utf8_cells(cells, out),
+                DynamicChild::Typed { values, .. } => collect_shared_cells(values, out),
+            }
+        }
+    }
+    match column {
+        Column::Dynamic(c) => dynamic(c, out),
+        Column::Json(JsonColumn {
+            body: JsonBody::Structured(s),
+            ..
+        }) => {
+            utf8_cells(&s.shared_values, out);
+            for (_, c) in &s.dynamic {
+                dynamic(c, out);
+            }
+            for (_, c) in &s.typed {
+                collect_shared_cells(c, out);
+            }
+        }
+        Column::Array(c) => collect_shared_cells(&c.values, out),
+        Column::Map(c) => collect_shared_cells(&c.entries, out),
+        Column::Tuple(c) => c.fields.iter().for_each(|f| collect_shared_cells(f, out)),
+        Column::Variant(c) => c.variants.iter().for_each(|v| collect_shared_cells(v, out)),
+        Column::Dictionary(c) => collect_shared_cells(&c.values, out),
+        _ => {}
+    }
+}
+
+/// Every SharedVariant cell and JSON shared-data value the server wrote into
+/// the committed fixtures is a binary type descriptor plus one serializeBinary
+/// value. The types in these fixtures have canonical binary descriptors, so
+/// writing the decoded cells back must reproduce the server's bytes exactly.
+#[test]
+fn server_shared_cells_reencode_byte_for_byte() {
+    use ch_core_rs::native::binary_value::{
+        decode_binary_value, encode_binary_value, read_binary_type_prefix, write_binary_type_prefix,
+    };
+
+    let fixtures: [(&str, &[u8], u64); 3] = [
+        (
+            "all_types_rev0",
+            include_bytes!("fixtures/all_types_rev0.native"),
+            0,
+        ),
+        (
+            "all_types_rev54460",
+            include_bytes!("fixtures/all_types_rev54460.native"),
+            54460,
+        ),
+        (
+            "all_types_rev54485",
+            include_bytes!("fixtures/all_types_rev54485.native"),
+            DBMS_TCP_PROTOCOL_VERSION,
+        ),
+    ];
+    for (name, bytes, revision) in fixtures {
+        let mut options = DecodeOptions::default();
+        options.protocol_revision = revision;
+        let batch = decode_all_bytes(bytes, &options).expect("fixture decodes");
+        let mut cells = Vec::new();
+        for chunk in &batch.chunks {
+            for column in &chunk.columns {
+                collect_shared_cells(column, &mut cells);
+            }
+        }
+        // Dynamic: UInt64 and Array(Int32). JSON shared data: Int64 and
+        // Array(Nullable(Int64)).
+        assert!(
+            cells.len() >= 4,
+            "{name}: found only {} shared cells",
+            cells.len()
+        );
+        for cell in &cells {
+            let (ch_type, consumed) = read_binary_type_prefix(cell).expect("descriptor parses");
+            let value = decode_binary_value(&ch_type, &cell[consumed..]).expect("value decodes");
+            let mut again = Vec::new();
+            write_binary_type_prefix(&mut again, &ch_type).expect("descriptor encodes");
+            encode_binary_value(&mut again, &ch_type, &value, 0).expect("value encodes");
+            assert_eq!(&again, cell, "{name}: {ch_type}");
+        }
+    }
+}

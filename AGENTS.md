@@ -325,7 +325,8 @@ and so on) stays in the bindings, never here.
 - Fix the real problem, not a nearby symptom.
 - Keep changes small, safe, and directly tied to the task.
 - Do not bundle cosmetic cleanup into unrelated changes.
-- Do not add abstractions for hypothetical future needs.
+- Do not add dependencies the task does not need. Do not add abstractions for
+  hypothetical future needs.
 - Preserve backward compatibility and the public buffer layout by default.
 - If a workaround papers over a deeper wire-format question, say so plainly and
   go confirm against the server source.

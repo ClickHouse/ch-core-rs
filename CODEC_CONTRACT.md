@@ -2438,7 +2438,49 @@ are globally sorted by canonical type name before discriminators are assigned.
 `255` is NULL. SharedVariant cells are String-framed opaque blobs containing one
 binary data-type descriptor followed by exactly one value's `serializeBinary`
 payload. The core keeps each blob opaque instead of introducing a per-row type
-parse and value materialization into the bulk path.
+parse and value materialization into the bulk path. On demand,
+`read_binary_type_prefix` plus `decode_binary_value` turn one blob into a
+one-row column, and `write_binary_type_prefix` plus `encode_binary_value` write
+one row of a column back as a blob, so a caller can build the SharedVariant
+child or JSON shared data that `encode_block` takes. The encode side covers the
+same types as the decode side and reproduces the server's value bytes.
+Descriptors also match, except SimpleAggregateFunction and AggregateFunction
+use the custom-name `0x2c` form that the server accepts instead of its native
+aggregate descriptor forms. The server writes SimpleAggregateFunction with
+`0x2e` and AggregateFunction with `0x25`; AggregateFunction value encoding
+remains unsupported.
+
+For a top-level SharedVariant or JSON shared cell, strip the top-level
+`Nullable(T)` to `T`, or `LowCardinality(Nullable(T))` to `LowCardinality(T)`,
+before writing both the descriptor and value. Route null rows as Dynamic NULL
+instead of encoding a cell, and omit null JSON shared paths. Nested Nullable
+types still carry their null flag. This also removes SimpleAggregateFunction
+aliases around those nullable forms: the server stores
+`SimpleAggregateFunction(anyLast, Nullable(String))` as `String` and
+`SimpleAggregateFunction(anyLast, LowCardinality(Nullable(String)))` as
+`LowCardinality(String)`. These stored descriptors and Dynamic NULL routing
+were confirmed by a live Native capture at `v26.8.1.2041-lts`.
+The prefix writer returns an error for types whose descriptors cannot round-trip,
+and both writers restore the destination buffer on error. A null row under a
+non-nullable type is Invalid.
+
+Compute the prefix once per type and cache it for reuse across cells. Prefix
+validation writes and rereads the descriptor and allocates metadata, so it costs
+far more than writing a value. SimpleAggregateFunction
+and geo names also allocate when rendered. These costs belong to per-type setup;
+reuse the cached bytes when writing each cell's value.
+
+These descriptor forms and null representations are **CONFIRMED** at
+`v26.8.1.2041-lts` in `src/DataTypes/DataTypesBinaryEncoding.cpp`
+(`getBinaryTypeIndex`, `encodeDataTypeImpl`, `decodeDataTypeImpl`),
+`src/DataTypes/DataTypeNullable.cpp` (`removeNullableOrLowCardinalityNullable`),
+`src/DataTypes/Serializations/SerializationDynamic.cpp` (`serializeBinary`),
+and `src/Columns/ColumnObject.cpp`
+(`serializePathAndValueIntoSharedData`). Stripping the top-level Nullable
+before calling the cell writers is a caller rule inferred from those
+representations and `src/DataTypes/DataTypeVariant.cpp`'s
+`checkAllowedInsideVariant`;
+`ColumnDynamic::serializeValueIntoSharedVariant` writes the type it receives.
 
 FLATTENED has no SharedVariant child and no Variant mode word. Index `K` is
 NULL; `0..K-1` select the table entries and values above K are malformed. The
