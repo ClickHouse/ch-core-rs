@@ -1839,7 +1839,7 @@ fn validate_json<'a>(
 /// [`validate_column`] uses it to reject a wrong-buffer or not-yet-encodable
 /// column before any bytes are written, which is what lets [`write_block_into`]
 /// treat the body match as structurally infallible.
-pub(crate) fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
+fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
     // A name-decoration alias (SimpleAggregateFunction, geo, Nested) matches the
     // column its physical delegate would, since decode produces the delegate's
     // Column variant (no new variant). Expand and recurse before the pair checks

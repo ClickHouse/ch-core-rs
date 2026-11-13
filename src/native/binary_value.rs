@@ -153,13 +153,24 @@ pub fn decode_binary_value(ch_type: &ChType, bytes: &[u8]) -> Result<Column, Bin
 /// or a `Tuple` of only such types). Their element counts cannot be bounded by
 /// the remaining input.
 fn has_zero_width_values(ch_type: &ChType) -> bool {
+    needs_element_count_cap(ch_type, false)
+}
+
+/// Encoding also caps Nullable wrappers around unbacked values. Nullable(Nothing)
+/// nulls have validity bits, and a non-null Nothing fails on its first value.
+fn needs_element_count_cap(ch_type: &ChType, encoding: bool) -> bool {
     if let Some(delegate) = ch_type.physical_delegate_ref() {
-        return has_zero_width_values(delegate.as_ref());
+        return needs_element_count_cap(delegate.as_ref(), encoding);
     }
     match ch_type {
         ChType::Nothing => true,
-        ChType::LowCardinality(inner) => has_zero_width_values(inner),
-        ChType::Tuple(elements) => elements.iter().all(|(_, t)| has_zero_width_values(t)),
+        ChType::Nullable(inner) if encoding => {
+            !matches!(inner.as_ref(), ChType::Nothing) && needs_element_count_cap(inner, encoding)
+        }
+        ChType::LowCardinality(inner) => needs_element_count_cap(inner, encoding),
+        ChType::Tuple(elements) => elements
+            .iter()
+            .all(|(_, t)| needs_element_count_cap(t, encoding)),
         _ => false,
     }
 }
@@ -1063,10 +1074,10 @@ fn check_type(
     }
 }
 
-/// Descriptor validation ignores column shape and single-value coverage.
-fn check_type_depth(ch_type: &ChType) -> Result<bool, BinaryValueError> {
+/// Check descriptor depth without column shape or single-value coverage.
+fn check_type_depth(ch_type: &ChType) -> Result<(), BinaryValueError> {
     check_type(ch_type, None, 0)
-        .map(|check| check.supported)
+        .map(|_| ())
         .ok_or_else(too_deep)
 }
 
@@ -1077,7 +1088,7 @@ fn check_type_depth(ch_type: &ChType) -> Result<bool, BinaryValueError> {
 #[inline]
 fn scalar_variant_matches(ch_type: &ChType, column: &Column) -> bool {
     match (ch_type, column) {
-        (ChType::FixedString(width), Column::FixedBinary(c)) => c.width == *width,
+        (ChType::FixedString(width), Column::FixedBinary(c)) => *width != 0 && c.width == *width,
         (ChType::Uuid, Column::Uuid(c))
         | (ChType::Ipv6, Column::Ipv6(c))
         | (ChType::Int128, Column::Int128(c))
@@ -1085,10 +1096,22 @@ fn scalar_variant_matches(ch_type: &ChType, column: &Column) -> bool {
         (ChType::Int256, Column::Int256(c)) | (ChType::UInt256, Column::UInt256(c)) => {
             c.width == 32
         }
-        (ChType::Decimal { bits, .. }, Column::Decimal(c)) => {
-            matches!(bits, 32 | 64 | 128 | 256) && c.width == *bits as usize / 8
+        (
+            ChType::Decimal {
+                bits,
+                precision,
+                scale,
+            },
+            Column::Decimal(c),
+        ) => {
+            matches!(bits, 32 | 64 | 128 | 256)
+                && c.width == *bits as usize / 8
+                && c.precision == *precision
+                && c.scale == *scale
         }
-        (ChType::QBit { dimension, .. }, Column::QBit(c)) => c.dimension == *dimension,
+        (ChType::QBit { dimension, .. }, Column::QBit(c)) => {
+            *dimension != 0 && c.dimension == *dimension
+        }
         _ => matches!(
             (ch_type, column),
             (ChType::Nothing, Column::Nothing(_))
@@ -1111,9 +1134,7 @@ fn scalar_variant_matches(ch_type: &ChType, column: &Column) -> bool {
                 | (ChType::Time, Column::Time(_))
                 | (ChType::Time64 { .. }, Column::Time64(_))
                 | (ChType::Interval(_), Column::Interval(_))
-                | (ChType::Uuid, Column::Uuid(_))
                 | (ChType::Ipv4, Column::Ipv4(_))
-                | (ChType::Ipv6, Column::Ipv6(_))
                 | (ChType::String, Column::Utf8(_))
                 | (ChType::Enum8 { .. }, Column::Enum8(_))
                 | (ChType::Enum16 { .. }, Column::Enum16(_))
@@ -1434,15 +1455,24 @@ fn encode_value(
             reject_null(c.validity.as_ref(), row)?;
             buf.extend_from_slice(fixed_slice(&c.data, 32, row)?);
         }
-        (ChType::Decimal { bits, .. }, Column::Decimal(c))
-            if matches!(bits, 32 | 64 | 128 | 256) && c.width == *bits as usize / 8 =>
+        (
+            ChType::Decimal {
+                bits,
+                precision,
+                scale,
+            },
+            Column::Decimal(c),
+        ) if matches!(bits, 32 | 64 | 128 | 256)
+            && c.width == *bits as usize / 8
+            && c.precision == *precision
+            && c.scale == *scale =>
         {
             reject_null(c.validity.as_ref(), row)?;
             buf.extend_from_slice(fixed_slice(&c.data, c.width, row)?);
         }
         (ChType::Array(inner), Column::Array(c)) => {
             let (start, end) = offset_range(&c.offsets, row)?;
-            check_zero_width_count(end - start, || has_zero_width_values(inner))?;
+            check_zero_width_count(end - start, || needs_element_count_cap(inner, true))?;
             write_varint(buf, (end - start) as u64);
             for i in start..end {
                 encode_value(buf, inner, &c.values, i)?;
@@ -1454,7 +1484,9 @@ fn encode_value(
             };
             let (start, end) = offset_range(&c.offsets, row)?;
             check_zero_width_count(end - start, || {
-                fields.iter().all(|(_, ty)| has_zero_width_values(ty))
+                fields
+                    .iter()
+                    .all(|(_, ty)| needs_element_count_cap(ty, true))
             })?;
             write_varint(buf, (end - start) as u64);
             for i in start..end {
@@ -1470,7 +1502,7 @@ fn encode_value(
             };
             let (start, end) = offset_range(&c.offsets, row)?;
             check_zero_width_count(end - start, || {
-                has_zero_width_values(key) && has_zero_width_values(value)
+                needs_element_count_cap(key, true) && needs_element_count_cap(value, true)
             })?;
             write_varint(buf, (end - start) as u64);
             for i in start..end {
@@ -2629,6 +2661,117 @@ mod tests {
             ));
             assert_eq!(buf, [0xaa]);
         }
+    }
+
+    #[test]
+    fn encode_rejects_decimal_metadata_mismatches() {
+        let ch_type = parse("Decimal(9, 2)");
+        let bytes = (-314i32).to_le_bytes();
+        let matching = Column::Decimal(DecimalColumn::new(bytes.to_vec(), 4, 9, 2));
+        assert_eq!(encode_one(&ch_type, &matching, 0), bytes);
+        let decoded = decode_binary_value(&ch_type, &bytes).unwrap();
+        assert_eq!(encode_one(&ch_type, &decoded, 0), bytes);
+
+        let mut rejected = Vec::new();
+        for (precision, scale) in [(9, 4), (8, 2)] {
+            let column = Column::Decimal(DecimalColumn::new(bytes.to_vec(), 4, precision, scale));
+            let mut buf = vec![0xaa];
+            let result = encode_binary_value(&mut buf, &ch_type, &column, 0);
+            rejected.push((
+                matches!(result, Err(BinaryValueError::Invalid(_))),
+                buf == [0xaa],
+            ));
+        }
+        assert_eq!(rejected, [(true, true); 2]);
+    }
+
+    #[test]
+    fn encode_caps_nullable_zero_width_container_counts() {
+        let count = MAX_ZERO_WIDTH_ELEMENTS + 1;
+        let empty = || Column::Tuple(TupleColumn::new(vec![], count));
+        let wrapped = || Column::Tuple(TupleColumn::new(vec![empty()], count));
+        let array = |values| Column::Array(ArrayColumn::new(vec![0, count as i64], values));
+        let mut rejected = Vec::new();
+        for (ch_type, column) in [
+            (parse("Array(Nullable(Tuple()))"), array(empty())),
+            (parse("Array(Tuple(Nullable(Tuple())))"), array(wrapped())),
+            (
+                parse("Array(LowCardinality(Nullable(Tuple())))"),
+                array(empty()),
+            ),
+            (
+                parse("Array(SimpleAggregateFunction(anyLast, Nullable(Tuple())))"),
+                array(empty()),
+            ),
+            (
+                parse("Map(Tuple(), Nullable(Tuple()))"),
+                Column::Map(MapColumn::new(
+                    vec![0, count as i64],
+                    Column::Tuple(TupleColumn::new(vec![empty(), empty()], count)),
+                )),
+            ),
+            (parse("Nested(value Nullable(Tuple()))"), array(wrapped())),
+        ] {
+            let mut buf = vec![0xaa];
+            let result = encode_binary_value(&mut buf, &ch_type, &column, 0);
+            rejected.push((
+                ch_type.to_string(),
+                matches!(result, Err(BinaryValueError::Invalid(_))) && buf == [0xaa],
+            ));
+        }
+
+        let nulls = Column::Nothing(NothingColumn::new_nullable(
+            count,
+            Bitmap::from_ch_null_map(&vec![1; count]),
+        ));
+        let mut buf = vec![0xaa];
+        encode_binary_value(
+            &mut buf,
+            &parse("Array(Nullable(Nothing))"),
+            &array(nulls),
+            0,
+        )
+        .unwrap();
+        let mut expected = vec![0xaa];
+        expected.extend(varint(count as u64));
+        expected.resize(expected.len() + count, 1);
+        assert_eq!(buf, expected);
+        assert!(rejected.iter().all(|(_, ok)| *ok), "{rejected:?}");
+    }
+
+    #[test]
+    fn encode_rejects_zero_width_scalar_descriptors() {
+        let fixed = Column::FixedBinary(FixedBinaryColumn::new(vec![], 0));
+        let qbit = Column::QBit(QBitColumn::new(
+            Column::Float32(PrimitiveColumn::new(vec![])),
+            0,
+        ));
+        let qbit_type = ChType::QBit {
+            element_type: QBitElementType::Float32,
+            dimension: 0,
+        };
+        let mut rejected = Vec::new();
+        for (ch_type, column) in [(ChType::FixedString(0), fixed), (qbit_type, qbit)] {
+            for row in [0, usize::MAX] {
+                let mut buf = vec![0xaa];
+                let result = encode_binary_value(&mut buf, &ch_type, &column, row);
+                rejected.push((
+                    matches!(result, Err(BinaryValueError::Invalid(_))),
+                    buf == [0xaa],
+                ));
+            }
+            let array_type = ChType::Array(Box::new(ch_type));
+            for end in [0, 1] {
+                let array = Column::Array(ArrayColumn::new(vec![0, end], column.clone()));
+                let mut buf = vec![0xaa];
+                let result = encode_binary_value(&mut buf, &array_type, &array, 0);
+                rejected.push((
+                    matches!(result, Err(BinaryValueError::Invalid(_))),
+                    buf == [0xaa],
+                ));
+            }
+        }
+        assert_eq!(rejected, [(true, true); 8]);
     }
 
     #[test]
