@@ -10,7 +10,8 @@ fn parse_nothing_and_nullable_nothing_are_case_sensitive() {
     assert_eq!(ChType::Nothing.to_string(), "Nothing");
     assert_eq!(parse_ch_type("nothing"), None);
     assert_eq!(parse_ch_type("NOTHING"), None);
-    assert_eq!(parse_ch_type("Nothing "), None);
+    // Surrounding whitespace is insignificant, as it is for the server.
+    assert_eq!(parse_ch_type("Nothing "), Some(ChType::Nothing));
 }
 
 #[test]
@@ -1400,4 +1401,92 @@ fn test_parse_nullable_geo_legality() {
     );
     // Nullable(Nested) is illegal (it is an Array).
     assert_eq!(parse_ch_type("Nullable(Nested(a UInt32))"), None);
+}
+
+/// `DESCRIBE TABLE` output at the default `print_pretty_type_names = 1`, paired
+/// with the compact form `system.columns` reports for the same column. Captured
+/// from a live 26.9.19.9 server.
+const PRETTY_TYPE_NAMES: &[(&str, &str)] = &[
+    (
+        "Tuple(\n    x Float64,\n    y Float64)",
+        "Tuple(x Float64, y Float64)",
+    ),
+    (
+        "Tuple(\n    a Tuple(\n        b Array(Tuple(\n            c UInt8,\n            d String))),\n    e Map(String, Tuple(\n        f Int32)))",
+        "Tuple(a Tuple(b Array(Tuple(c UInt8, d String))), e Map(String, Tuple(f Int32)))",
+    ),
+    (
+        "Variant(String, Tuple(\n    p UInt8,\n    q String))",
+        "Variant(String, Tuple(p UInt8, q String))",
+    ),
+    (
+        "Tuple(\n    `my col` String,\n    x UInt8)",
+        "Tuple(`my col` String, x UInt8)",
+    ),
+];
+
+#[test]
+fn test_parse_pretty_printed_type_names() {
+    for (pretty, compact) in PRETTY_TYPE_NAMES {
+        let expected = parse_ch_type(compact).expect("compact form parses");
+        assert_eq!(parse_ch_type(pretty), Some(expected.clone()), "{pretty:?}");
+        assert_eq!(expected.to_string(), *compact);
+    }
+}
+
+#[test]
+fn test_parse_ignores_insignificant_whitespace() {
+    let cases: &[(&str, &str)] = &[
+        ("Array( UInt8 )", "Array(UInt8)"),
+        ("Array(UInt8 )", "Array(UInt8)"),
+        ("Array (UInt8)", "Array(UInt8)"),
+        ("Nullable( String )", "Nullable(String)"),
+        (
+            "LowCardinality( Nullable( String ) )",
+            "LowCardinality(Nullable(String))",
+        ),
+        ("  UInt8", "UInt8"),
+        ("UInt8\n", "UInt8"),
+        ("Map(String ,\tArray(UInt64))", "Map(String, Array(UInt64))"),
+        ("Decimal(\n  10,\n  2\n)", "Decimal(10, 2)"),
+        ("DateTime64( 3 , 'UTC' )", "DateTime64(3, 'UTC')"),
+        (
+            "Tuple(id  UInt8,\r\n name String)",
+            "Tuple(id UInt8, name String)",
+        ),
+        (
+            "SimpleAggregateFunction( sum , Nullable( UInt64 ) )",
+            "SimpleAggregateFunction(sum, Nullable(UInt64))",
+        ),
+        ("Dynamic( max_types = 3 )", "Dynamic(max_types=3)"),
+    ];
+    for (spaced, canonical) in cases {
+        let expected = parse_ch_type(canonical).expect("canonical form parses");
+        assert_eq!(parse_ch_type(spaced), Some(expected.clone()), "{spaced:?}");
+        assert_eq!(expected.to_string(), *canonical);
+    }
+}
+
+#[test]
+fn test_parse_whitespace_inside_quotes_is_preserved() {
+    let ChType::Enum8 { variants } =
+        parse_ch_type("Enum8(\n  'user  1' = 1,\n  'a,b (c)' = 2\n)").unwrap()
+    else {
+        panic!("expected Enum8");
+    };
+    assert_eq!(
+        variants,
+        vec![("user  1".to_string(), 1), ("a,b (c)".to_string(), 2)]
+    );
+
+    assert_eq!(
+        parse_ch_type("DateTime( 'America/New_York' )"),
+        Some(ChType::DateTime {
+            timezone: Some("America/New_York".to_string())
+        })
+    );
+    assert_eq!(
+        parse_ch_type("Tuple(\n    `my  col` String)").map(|t| t.to_string()),
+        Some("Tuple(`my  col` String)".to_string())
+    );
 }

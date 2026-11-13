@@ -51,7 +51,7 @@ use super::type_parser::{
 };
 use super::varint::write_varint;
 
-mod validate;
+pub(crate) mod validate;
 use validate::validate_block;
 
 /// Options for Native format encoding, the mirror of

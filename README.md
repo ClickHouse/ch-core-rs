@@ -158,7 +158,7 @@ Unsupported types raise a decode error rather than guessing.
 In rough priority order:
 
 1. Sparse and replicated column serialization.
-2. ZSTD compression support.
+2. ZSTD compression support, not yet implemented.
 3. Per-runtime zero-copy adapters: JS `TypedArray` over an external
    `ArrayBuffer`, NumPy export that does not route through Arrow.
 4. Insert-path completion: a streaming/sink encode API. Type parity is kept as
@@ -215,7 +215,7 @@ The root package remains `ch-core-rs`. The workspace also contains
 [`ch-tcp-proto`](crates/ch-tcp-proto/README.md), a sans-I/O TCP protocol engine.
 Its current scope is the revision-54460 handshake, Ping/Pong, and uncompressed
 SELECT and INSERT exchanges with Native byte output and query metadata events.
-The engine depends on core.
+The engine depends on core; core does not depend on the engine.
 
 - `src/schema.rs` - ClickHouse logical type model.
 - `src/column.rs` - Arrow-compatible physical column buffers.

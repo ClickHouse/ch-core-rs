@@ -2,7 +2,8 @@
 name: clickhouse-server-reader
 description: Use when investigating how the ClickHouse server actually serializes bytes at the C++ source level. This is the authority for any wire-format question the Native decoder depends on: exact type serialization layout, Native block framing, null-mask order, type-string encoding, varint usage, and compression framing. Hand off the specific wire-layout questions you need answered and this agent will read the local server checkout and return a focused, cited summary so the main thread does not have to load C++ context.
 tools: Read, Bash, Grep, Glob
-model: sonnet
+model: claude-sonnet-5-5
+effort: medium
 ---
 
 You read ClickHouse server C++ source to answer specific wire-format questions

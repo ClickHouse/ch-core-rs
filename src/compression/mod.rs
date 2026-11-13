@@ -103,8 +103,8 @@ pub enum CompressionError {
     /// "Checksum doesn't match" diagnostic.
     ChecksumMismatch { expected: u128, actual: u128 },
     /// The method byte selects a codec this crate does not decode. ZSTD (0x90)
-    /// is not implemented yet; unknown bytes also report here rather than being
-    /// guessed at.
+    /// reports here as not implemented; unknown bytes also report
+    /// here rather than being guessed at.
     UnsupportedCodec { method: u8 },
     /// The LZ4 payload is malformed: a length, offset, or copy that runs out of
     /// bounds. The decoder rejects it instead of panicking or reading past the
@@ -154,7 +154,7 @@ impl std::fmt::Display for CompressionError {
                     write!(
                         f,
                         "unsupported codec ZSTD (method byte 0x90): ZSTD decode is not \
-                         implemented yet"
+                         implemented"
                     )
                 } else {
                     write!(f, "unsupported compression method byte 0x{method:02x}")
@@ -1007,7 +1007,7 @@ mod tests {
     }
 
     #[test]
-    fn zstd_reports_unsupported_codec() {
+    fn zstd_reports_not_implemented() {
         let raw = b"payload";
         let block = frame_block(METHOD_ZSTD, raw.len() as u32, raw);
         let err = decompress_native_stream(&block, ChecksumMode::Verify).unwrap_err();
