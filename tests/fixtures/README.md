@@ -133,12 +133,21 @@ chosen revision 54460 independently of the core's revision ceiling.
 | `tcp_multi_rev54460.packets` | 215 | Five plain server Data packets |
 | `tcp_multi_rev54460_lz4.packets` | 337 | The same five Data packets with LZ4 bodies |
 | `tcp_large_rev54460_lz4.packets` | 4522 | Schema packet, one large row, end packet |
+| `tcp_multi_rev54460_zstd.packets` | 379 | Five Data packets with ZSTD bodies |
+| `tcp_large_rev54460_zstd.packets` | 272 | ZSTD block spanning two compression frames |
 | `tcp_rev54460.json` | variable | Queries, version pin, packet offsets and frame sizes |
 
-Regenerate these six files using only Python's standard library:
+The ZSTD captures were added on 2026-11-11 against the same server and source
+tag. The TCP Query settings explicitly send `network_compression_method='ZSTD'`.
+The generator checks every received method byte is `0x90` and validates the
+decompressed block boundary independently using the `zstd` CLI. Rust fixture
+tests verify checksums and decode values, compare ZSTD to the existing plain
+and LZ4 captures, and exercise truncated frames and final-frame boundaries.
+
+Regenerate these files using Python's standard library and the `zstd` CLI:
 
 ```sh
-python3 scripts/gen_tcp_fixtures.py
+no_proxy=127.0.0.1,localhost python3 scripts/gen_tcp_fixtures.py
 ```
 
 The capture defaults to `127.0.0.1:8123` for HTTP and `127.0.0.1:9000` for TCP,

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Capture revision-54460 HTTP Native streams and raw TCP Data packets.
 
-Uses only Python's standard library. This is a deliberately narrow fixture
-client, not a general ClickHouse driver. See tests/fixtures/README.md.
+Uses Python's standard library and the zstd CLI for ZSTD capture validation.
+This is a deliberately narrow fixture client, not a general ClickHouse driver.
+See tests/fixtures/README.md.
 """
 
 import argparse
@@ -11,6 +12,7 @@ import json
 from pathlib import Path
 import socket
 import struct
+import subprocess
 import urllib.parse
 import urllib.request
 
@@ -138,13 +140,15 @@ def native_block(reader):
     return rows, columns
 
 
-def compressed_block(reader):
+def compressed_block(reader, expected_method):
     plain = bytearray()
     frames = []
     while True:
         reader.read(16)  # Checksums are verified by the Rust fixture tests.
         header = reader.read(9)
         method, compressed_size, plain_size = struct.unpack("<BII", header)
+        if method != expected_method:
+            raise ValueError(f"expected method {expected_method:#x}, got {method:#x}")
         if not 9 <= compressed_size <= 0x40000000 or not 0 < plain_size <= 0x40000000:
             raise ValueError("invalid compressed frame sizes")
         payload = reader.read(compressed_size - 9)
@@ -154,6 +158,14 @@ def compressed_block(reader):
             if len(payload) != plain_size:
                 raise ValueError("NONE size mismatch")
             plain.extend(payload)
+        elif method == 0x90:
+            decoded = subprocess.run(
+                ["zstd", "--decompress", "--stdout", "--quiet"],
+                input=payload, capture_output=True, check=True,
+            ).stdout
+            if len(decoded) != plain_size:
+                raise ValueError("ZSTD size mismatch")
+            plain.extend(decoded)
         else:
             raise ValueError(f"unexpected compression method {method}")
         frames.append(plain_size)
@@ -173,7 +185,7 @@ def http(opener, host, port, query, **settings):
         return response.read()
 
 
-def tcp_capture(host, port, query, compressed):
+def tcp_capture(host, port, query, compressed, method="LZ4"):
     with socket.create_connection((host, port), timeout=30) as sock:
         sock.sendall(
             varuint(0) + string("ch-core-fixture") + varuint(26) + varuint(8)
@@ -198,7 +210,9 @@ def tcp_capture(host, port, query, compressed):
         )
         settings = (
             string("send_profile_events") + varuint(0) + string("0")
-            + string("send_logs_level") + varuint(0) + string("none") + string("")
+            + string("send_logs_level") + varuint(0) + string("none")
+            + string("network_compression_method") + varuint(0) + string(method)
+            + string("")
         )
         sock.sendall(
             varuint(1) + string("") + client_info + settings + string("")
@@ -217,7 +231,9 @@ def tcp_capture(host, port, query, compressed):
             if code == 1:
                 block_name = reader.string()
                 if compressed:
-                    rows, columns, frames = compressed_block(reader)
+                    rows, columns, frames = compressed_block(
+                        reader, {"LZ4": 0x82, "ZSTD": 0x90}[method],
+                    )
                 else:
                     rows, columns = native_block(reader)
                     frames = []
@@ -280,6 +296,14 @@ def main():
     data, boundaries = tcp_capture(args.host, args.tcp_port, LARGE_QUERY, True)
     (args.output / name).write_bytes(data)
     manifest["files"][name] = {"length": len(data), "packets": boundaries}
+    for label, query in (("multi", SMALL_QUERY), ("large", LARGE_QUERY)):
+        name = f"tcp_{label}_rev54460_zstd.packets"
+        data, boundaries = tcp_capture(args.host, args.tcp_port, query, True, "ZSTD")
+        (args.output / name).write_bytes(data)
+        manifest["files"][name] = {
+            "length": len(data), "network_compression_method": "ZSTD",
+            "packets": boundaries,
+        }
     (args.output / "tcp_rev54460.json").write_text(json.dumps(manifest, indent=2) + "\n")
     for name, entry in manifest["files"].items():
         print(f"{name}: {entry['length']} bytes")

@@ -4,7 +4,7 @@ This is a high-level guide for maintainers of the ClickHouse language clients wh
 
 This crate decodes ClickHouse `FORMAT Native` result bytes into owned, typed,
 columnar buffers, and encodes those buffers back into `FORMAT Native` bytes for
-`INSERT`. It also reads ClickHouse LZ4/NONE compression frames and writes LZ4
+`INSERT`. It also reads ClickHouse LZ4/ZSTD/NONE compression frames and writes LZ4
 frames. Transport, TCP packets, query APIs, and host object materialization stay
 outside core.
 
@@ -60,10 +60,15 @@ to obtain typed columnar buffers.
 
 ## What This Is
 
-`ch-core-rs` is a pure Rust codec for the ClickHouse `FORMAT Native` wire format. On the read side a client asks the server for Native output, obtains the response bytes, and passes those bytes to the core, which parses column names and type strings, decodes one Native block at a time, and stores the values in Arrow-shaped buffers. On the write side the core encodes those same buffers back into Native block bytes for `INSERT ... FORMAT Native`.
+`ch-core-rs` is a Rust codec for the ClickHouse `FORMAT Native` wire format. On the read side a client asks the server for Native output, obtains the response bytes, and passes those bytes to the core, which parses column names and type strings, decodes one Native block at a time, and stores the values in Arrow-shaped buffers. On the write side the core encodes those same buffers back into Native block bytes for `INSERT ... FORMAT Native`.
 
 ### Features
 
+- Runtime dependencies are `cityhash-rs` for CityHash128 and the `zstd` crate
+  for ZSTD frames. LZ4 is hand-written. `zstd` builds libzstd from C source, so
+  building this crate needs a C compiler.
+- A crate building on Rust 1.81 must pin jobserver after a fresh lockfile,
+  because 0.1.35 needs Rust 1.85: `cargo update -p jobserver --precise 0.1.34`.
 - It is downstream agnostic. The core owns binary decoding and the shared columnar model. It does not build host-language objects or make language-specific policy decisions.
 - The decoder accepts either a complete byte buffer or streamed byte chunks. The streaming API lets a binding overlap network reads with decode and emit decoded blocks as they complete.
 

@@ -7,6 +7,23 @@ version; patch releases remain backward compatible.
 
 ## Unreleased
 
+- ZSTD compression frames (method byte 0x90) now decode. Before, they returned
+  `CompressionError::UnsupportedCodec`. A ZSTD frame that claims more output
+  than its payload can hold fails early with `InvalidUncompressedSize`. Real
+  server TCP ZSTD fixtures at revision 54460 cover this.
+- New error variants: `CompressionError::ZstdMalformed`, for a ZSTD payload
+  that libzstd rejects or that decodes to more than the claimed size, and
+  `CompressionError::ZstdContextAllocationFailed`, for when libzstd cannot
+  allocate its decompression context. Neither has fields.
+- `CompressionError` now implements `Clone`, `PartialEq` and `Eq`.
+- The new `zstd` dependency builds libzstd from C source, so building the crate
+  now needs a C compiler.
+- Crates that build on Rust 1.81 and make a fresh lockfile get jobserver
+  0.1.35, which needs Rust 1.85. Run `cargo update -p jobserver --precise 0.1.34` once
+  to fix it.
+- CityHash128 now comes from the `cityhash-rs` crate. Checksums are the same.
+- LZ4 is unchanged. It stays hand-written, and frames it writes are the same
+  bytes as before.
 - Add `native::binary_value::write_binary_type_prefix` and
   `encode_binary_value`, the inverses of `read_binary_type_prefix` and
   `decode_binary_value`. They write one row of a decoded column as a binary

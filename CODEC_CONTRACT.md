@@ -66,8 +66,8 @@ or output allocation. Rejecting zero plaintext is a core reader policy: the
 server writer never emits it, although the server's release reader only has
 a debug assertion for that case.
 
-Decode accepts NONE (`0x02`, payload length must equal plaintext size) and
-standard LZ4 (`0x82`, also used by LZ4HC). ZSTD (`0x90`) and unknown methods
+Decode accepts NONE (`0x02`, payload length must equal plaintext size),
+standard LZ4 (`0x82`, also used by LZ4HC), and ZSTD (`0x90`). Unknown methods
 return `CompressionError::UnsupportedCodec` as soon as a complete, size-valid
 header is available, without waiting for the payload. Checksums are verified
 by default; callers can explicitly select `ChecksumMode::Skip`.
@@ -76,13 +76,21 @@ native `u128` values with the wire's low64 in the low bits.
 
 `decompress_frame` decodes exactly one frame and returns its plaintext and
 compressed bytes consumed, leaving a following frame or packet untouched.
-NONE plaintext borrows the input; LZ4 plaintext owns a newly allocated buffer.
+NONE plaintext borrows the input; LZ4 and ZSTD plaintext own newly allocated buffers.
 `decompress_frame_into` appends one frame directly to a caller's `Vec<u8>`,
 reuses its capacity, and restores its contents on error. Its `FrameInfo`
 reports compressed bytes consumed and plaintext bytes appended without
 retaining a borrow of either buffer.
 LZ4 rejects output sizes exceeding the conservative `payload_len * 255 + 24`
-expansion bound before allocation. Output reservations are fallible and return
+expansion bound before allocation, as `CompressionError::Lz4Malformed`. ZSTD
+rejects output sizes exceeding `payload_len * 32768` before allocation, as
+`CompressionError::InvalidUncompressedSize`. So LZ4 reports an impossible
+claim as `Lz4Malformed`, while ZSTD uses `InvalidUncompressedSize`. The ZSTD
+bound is the RFC 8878 maximum for conforming frames (section 3.1.1.2.4: a
+4-byte RLE block expands to at most the 128 KiB Block_Maximum_Size). libzstd
+accepts larger RLE blocks, so this check is deliberately stricter than libzstd
+and the server; no conforming encoder emits such blocks. Output reservations
+are fallible and return
 `CompressionError::AllocationFailed` if capacity cannot be obtained.
 `CompressionError::Truncated` reports how many bytes the caller needs to buffer
 before retrying; malformed headers and codec payloads return other errors.
@@ -94,8 +102,26 @@ maximum frame size. Writers reject empty plaintext and frame limits outside
 ensures even incompressible input fits the 1 GiB compressed-size limit.
 They accept plaintext Native bytes independently of revision or
 type layout and write payloads directly after the reserved header, avoiding a
-separate payload copy. The LZ4 encoder keeps its 16 KiB match table on the
-stack, so it allocates nothing per frame beyond the output.
+separate payload copy. LZ4 block coding is hand-written safe Rust, checksums
+use `cityhash-rs::cityhash_102_128`, and ZSTD decode uses the `zstd` crate over
+libzstd. ZSTD grows the output `Vec` by exactly the claimed plaintext size,
+zero-filled, and libzstd decodes into that slice with a reused per-thread
+context, so it never writes past the claim. A payload libzstd rejects,
+including invalid trailing bytes and output larger than the claim, returns
+`CompressionError::ZstdMalformed`, as the server also fails. Output smaller
+than the claim returns `CompressionError::SizeMismatch`. The result does not
+depend on the caller's spare capacity. If libzstd cannot allocate its context,
+the error is `CompressionError::ZstdContextAllocationFailed`.
+
+Confirmed ZSTD server references at `v26.8.1.2041-lts`:
+`src/Compression/CompressionCodecZSTD.cpp`,
+`CompressionCodecZSTD::doCompressData` writes one standard ZSTD frame per
+block with a single `ZSTD_compress2` call and no ClickHouse-specific prefix;
+`CompressionCodecZSTD::doDecompressData` and
+`src/Compression/ICompressionCodec.cpp`, `ICompressionCodec::decompress`,
+require successful decompression with the declared output size. Accepting
+several concatenated or skippable frames in one payload is inferred from the
+`ZSTD_decompress` API, not confirmed in ClickHouse source.
 
 TCP flushes compression at each Native block boundary. A block may occupy many
 frames, but a frame never spans blocks. Readers therefore finish a TCP body

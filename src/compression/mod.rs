@@ -34,17 +34,14 @@
 //! is over `compressed_size` bytes starting at the method byte, never over the
 //! checksum bytes themselves. Method bytes: `0x02` NONE (payload is the raw
 //! bytes, copied verbatim), `0x82` LZ4 and LZ4HC (identical block format and
-//! decompressor), `0x90` ZSTD (not implemented here, see below). Any other
-//! method byte is rejected. `compressed_size` above `DBMS_MAX_COMPRESSED_SIZE`
-//! (1 GiB) is rejected as corrupt, and `uncompressed_size` is bounded the same
-//! way since it is attacker-controlled and sizes the output allocation. This
-//! core also rejects zero-size frames because the server writer never emits
+//! decompressor), `0x90` ZSTD (decoded by libzstd through the `zstd` crate).
+//! The server writes one standard ZSTD frame per block. This decoder also
+//! accepts concatenated and skippable frames, which the server is inferred to
+//! accept too. Any other method byte is rejected. `compressed_size` above
+//! `DBMS_MAX_COMPRESSED_SIZE` (1 GiB) is rejected as corrupt, and
+//! `uncompressed_size` is bounded the same way since it is attacker-controlled
+//! and sizes the output allocation. This core also rejects zero-size frames because the server writer never emits
 //! them, although release server readers accept them.
-//!
-//! ZSTD (`0x90`) is intentionally not implemented: a correct ZSTD decoder is far
-//! larger than LZ4 and would force a dependency, which this crate forbids. It
-//! surfaces as [`CompressionError::UnsupportedCodec`] with a clear message so
-//! callers can fall back rather than misread bytes.
 //!
 //! [`decompress_frame`] reads exactly one compressed frame from an input slice.
 //! It reports the compressed byte count separately, so a protocol engine can
@@ -57,6 +54,7 @@ use std::borrow::Cow;
 
 mod cityhash;
 mod lz4;
+mod zstd;
 
 use cityhash::city_hash128;
 
@@ -83,7 +81,7 @@ const MAX_DECOMPRESSED_SIZE: u32 = 0x4000_0000;
 pub const MAX_LZ4_FRAME_PLAINTEXT: usize = 1_069_547_496;
 
 /// Errors from decoding the compressed-block envelope.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CompressionError {
     /// The buffer ended before a full block (checksum + header + payload) was
@@ -96,20 +94,27 @@ pub enum CompressionError {
     /// `uncompressed_size` from the header is zero or above the decompressed-size
     /// cap. The core deliberately rejects zero-size frames because the server
     /// writer never emits them. Bounding the size keeps a crafted header from
-    /// forcing a huge output allocation.
+    /// forcing a huge output allocation. A ZSTD frame also reports here when
+    /// the size is more than its payload can expand to, checked before any
+    /// reservation.
     InvalidUncompressedSize { uncompressed_size: u32 },
     /// The stored checksum does not match `CityHash128` over the header and
     /// payload. Carries both for reporting, matching the server's
     /// "Checksum doesn't match" diagnostic.
     ChecksumMismatch { expected: u128, actual: u128 },
-    /// The method byte selects a codec this crate does not decode. ZSTD (0x90)
-    /// reports here as not implemented; unknown bytes also report
-    /// here rather than being guessed at.
+    /// The method byte selects a codec this crate does not decode. Unknown
+    /// bytes report here rather than being guessed at.
     UnsupportedCodec { method: u8 },
     /// The LZ4 payload is malformed: a length, offset, or copy that runs out of
     /// bounds. The decoder rejects it instead of panicking or reading past the
     /// buffer.
     Lz4Malformed,
+    /// libzstd rejected the ZSTD payload: a corrupt or truncated frame,
+    /// invalid trailing bytes, or output larger than the header's
+    /// `uncompressed_size`.
+    /// Like [`Self::Lz4Malformed`], this carries no libzstd error detail, so
+    /// the public API does not depend on libzstd's error codes.
+    ZstdMalformed,
     /// Decompression produced a different number of bytes than the header's
     /// `uncompressed_size`, or a NONE block's payload length did not equal it.
     /// The server makes the same check after decompressing.
@@ -123,6 +128,9 @@ pub enum CompressionError {
     InvalidFrameSize { frame_size: usize },
     /// The requested output buffer reservation could not be satisfied.
     AllocationFailed { requested: usize },
+    /// libzstd could not allocate its decompression context. libzstd sizes
+    /// the context itself and does not report the size it asked for.
+    ZstdContextAllocationFailed,
 }
 
 impl std::fmt::Display for CompressionError {
@@ -138,7 +146,8 @@ impl std::fmt::Display for CompressionError {
             ),
             CompressionError::InvalidUncompressedSize { uncompressed_size } => write!(
                 f,
-                "invalid uncompressed_size {uncompressed_size}: zero or above the 1 GiB limit"
+                "invalid uncompressed_size {uncompressed_size}: zero, above the 1 GiB limit, \
+                 or more than the payload can expand to"
             ),
             CompressionError::ChecksumMismatch { expected, actual } => write!(
                 f,
@@ -150,17 +159,10 @@ impl std::fmt::Display for CompressionError {
                 (*actual >> 64) as u64
             ),
             CompressionError::UnsupportedCodec { method } => {
-                if *method == METHOD_ZSTD {
-                    write!(
-                        f,
-                        "unsupported codec ZSTD (method byte 0x90): ZSTD decode is not \
-                         implemented"
-                    )
-                } else {
-                    write!(f, "unsupported compression method byte 0x{method:02x}")
-                }
+                write!(f, "unsupported compression method byte 0x{method:02x}")
             }
             CompressionError::Lz4Malformed => write!(f, "malformed LZ4 block"),
+            CompressionError::ZstdMalformed => write!(f, "malformed ZSTD block"),
             CompressionError::SizeMismatch { expected, actual } => write!(
                 f,
                 "decompressed size {actual} differs from header uncompressed_size {expected}"
@@ -179,6 +181,9 @@ impl std::fmt::Display for CompressionError {
                     f,
                     "could not reserve {requested} bytes for compression output"
                 )
+            }
+            CompressionError::ZstdContextAllocationFailed => {
+                write!(f, "could not allocate a ZSTD decompression context")
             }
         }
     }
@@ -201,10 +206,10 @@ pub enum ChecksumMode {
 
 /// One decoded ClickHouse compression frame.
 ///
-/// LZ4 plaintext is owned because decompression creates new bytes. A NONE
-/// frame borrows its payload from the input slice and performs no allocation or
-/// copy. [`Self::consumed`] is the exact compressed frame length, including its
-/// checksum and header.
+/// LZ4 and ZSTD plaintext is owned because decompression creates new bytes. A
+/// NONE frame borrows its payload from the input slice and performs no
+/// allocation or copy. [`Self::consumed`] is the exact compressed frame length,
+/// including its checksum and header.
 #[derive(Debug)]
 pub struct DecodedFrame<'a> {
     plaintext: Cow<'a, [u8]>,
@@ -338,7 +343,7 @@ fn parse_block_header(data: &[u8], pos: usize) -> Result<BlockHeader, Compressio
     }
     // Codec support is known from the fixed header. Reject it before waiting
     // for an attacker-controlled payload length.
-    if method != METHOD_NONE && method != METHOD_LZ4 {
+    if method != METHOD_NONE && method != METHOD_LZ4 && method != METHOD_ZSTD {
         return Err(CompressionError::UnsupportedCodec { method });
     }
     let compressed_size = compressed_size as usize;
@@ -432,6 +437,7 @@ pub fn decompress_frame(
             Cow::Borrowed(payload)
         }
         METHOD_LZ4 => Cow::Owned(lz4::decompress_block(payload, header.uncompressed_size)?),
+        METHOD_ZSTD => Cow::Owned(zstd::decompress_block(payload, header.uncompressed_size)?),
         other => return Err(CompressionError::UnsupportedCodec { method: other }),
     };
 
@@ -478,6 +484,7 @@ pub fn decompress_frame_into(
             }
         }
         METHOD_LZ4 => lz4::decompress_block_into(payload, header.uncompressed_size, out),
+        METHOD_ZSTD => zstd::decompress_block_into(payload, header.uncompressed_size, out),
         other => Err(CompressionError::UnsupportedCodec { method: other }),
     };
     if let Err(err) = result {
@@ -977,22 +984,19 @@ mod tests {
 
     #[test]
     fn unsupported_method_is_rejected_before_payload_arrives() {
-        for method in [0x7f, METHOD_ZSTD] {
-            for mode in [ChecksumMode::Verify, ChecksumMode::Skip] {
-                let mut block = vec![0u8; CHECKSUM_SIZE + HEADER_SIZE];
-                let header_start = CHECKSUM_SIZE;
-                block[header_start] = method;
-                block[header_start + 1..header_start + 5]
-                    .copy_from_slice(&MAX_COMPRESSED_SIZE.to_le_bytes());
-                block[header_start + 5..header_start + 9].copy_from_slice(&13u32.to_le_bytes());
+        for mode in [ChecksumMode::Verify, ChecksumMode::Skip] {
+            let mut block = vec![0u8; CHECKSUM_SIZE + HEADER_SIZE];
+            let header_start = CHECKSUM_SIZE;
+            block[header_start] = 0x7f;
+            block[header_start + 1..header_start + 5]
+                .copy_from_slice(&MAX_COMPRESSED_SIZE.to_le_bytes());
+            block[header_start + 5..header_start + 9].copy_from_slice(&13u32.to_le_bytes());
 
-                let err = decompress_frame(&block, mode).unwrap_err();
-                assert!(matches!(
-                    err,
-                    CompressionError::UnsupportedCodec { method: actual }
-                        if actual == method
-                ));
-            }
+            let err = decompress_frame(&block, mode).unwrap_err();
+            assert!(matches!(
+                err,
+                CompressionError::UnsupportedCodec { method: 0x7f }
+            ));
         }
 
         let mut invalid_size = vec![0u8; CHECKSUM_SIZE + HEADER_SIZE];
@@ -1007,20 +1011,132 @@ mod tests {
     }
 
     #[test]
-    fn zstd_reports_not_implemented() {
-        let raw = b"payload";
-        let block = frame_block(METHOD_ZSTD, raw.len() as u32, raw);
-        let err = decompress_native_stream(&block, ChecksumMode::Verify).unwrap_err();
-        match err {
-            CompressionError::UnsupportedCodec { method } => {
-                assert_eq!(method, METHOD_ZSTD);
-                // The message names ZSTD and says it is not implemented.
-                let msg = err.to_string();
-                assert!(msg.contains("ZSTD"), "message was: {msg}");
-                assert!(msg.contains("not implemented"), "message was: {msg}");
-            }
-            other => panic!("expected UnsupportedCodec, got {other:?}"),
+    fn zstd_roundtrips_and_appends() {
+        let raw = b"ZSTD compressed Native bytes, user_1 and user_2";
+        let payload = ::zstd::bulk::compress(raw, 1).unwrap();
+        let block = frame_block(METHOD_ZSTD, raw.len() as u32, &payload);
+
+        let decoded = decompress_frame(&block, ChecksumMode::Verify).unwrap();
+        assert_eq!(decoded.plaintext(), raw);
+
+        let mut out = b"prefix:".to_vec();
+        let info = decompress_frame_into(&block, ChecksumMode::Verify, &mut out).unwrap();
+        assert_eq!(info.consumed(), block.len());
+        assert_eq!(info.plaintext_len(), raw.len());
+        assert_eq!(out, [b"prefix:".as_slice(), raw].concat());
+    }
+
+    #[test]
+    fn zstd_accepts_concatenated_frames() {
+        let first = b"first half, ";
+        let second = b"then the second half";
+        let mut payload = ::zstd::bulk::compress(first, 1).unwrap();
+        payload.extend_from_slice(&::zstd::bulk::compress(second, 1).unwrap());
+        let expected = [first.as_slice(), second.as_slice()].concat();
+        let block = frame_block(METHOD_ZSTD, expected.len() as u32, &payload);
+
+        let decoded = decompress_frame(&block, ChecksumMode::Verify).unwrap();
+        assert_eq!(decoded.plaintext(), expected);
+
+        let mut out = b"prefix:".to_vec();
+        let info = decompress_frame_into(&block, ChecksumMode::Verify, &mut out).unwrap();
+        assert_eq!(info.plaintext_len(), expected.len());
+        assert_eq!(out, [b"prefix:".as_slice(), &expected].concat());
+
+        // Concatenated frames that decode to more than the claim fail as
+        // malformed, however much spare capacity `out` has.
+        let short = frame_block(METHOD_ZSTD, first.len() as u32, &payload);
+        for spare in [0, 1 << 20] {
+            let mut out = Vec::with_capacity(spare);
+            let err = decompress_frame_into(&short, ChecksumMode::Verify, &mut out).unwrap_err();
+            assert!(matches!(err, CompressionError::ZstdMalformed), "{err:?}");
+            assert!(out.is_empty());
         }
+    }
+
+    #[test]
+    fn zstd_malformed_payloads_roll_back_with_exact_errors() {
+        let raw = b"ZSTD compressed Native bytes";
+        let payload = ::zstd::bulk::compress(raw, 1).unwrap();
+        let mut with_garbage = payload.clone();
+        with_garbage.extend_from_slice(b"garbage");
+
+        let garbage = frame_block(METHOD_ZSTD, raw.len() as u32, b"not a ZSTD frame");
+        let truncated = frame_block(METHOD_ZSTD, raw.len() as u32, &payload[..payload.len() - 1]);
+        let trailing = frame_block(METHOD_ZSTD, raw.len() as u32, &with_garbage);
+        for block in [&garbage, &truncated, &trailing] {
+            let mut out = b"keep me".to_vec();
+            let err = decompress_frame_into(block, ChecksumMode::Verify, &mut out).unwrap_err();
+            assert!(matches!(err, CompressionError::ZstdMalformed), "{err:?}");
+            assert_eq!(out, b"keep me");
+            let err = decompress_frame(block, ChecksumMode::Verify).unwrap_err();
+            assert!(matches!(err, CompressionError::ZstdMalformed), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn zstd_wrong_size_rolls_back_with_exact_errors() {
+        let raw = b"ZSTD compressed Native bytes";
+        let payload = ::zstd::bulk::compress(raw, 1).unwrap();
+        let n = raw.len();
+
+        // A claim above the real size decodes fully and reports both sizes.
+        let too_big = frame_block(METHOD_ZSTD, n as u32 + 1, &payload);
+        let mut out = b"keep me".to_vec();
+        let err = decompress_frame_into(&too_big, ChecksumMode::Verify, &mut out).unwrap_err();
+        assert!(
+            matches!(err, CompressionError::SizeMismatch { expected, actual }
+                if expected == n + 1 && actual == n),
+            "{err:?}"
+        );
+        assert_eq!(out, b"keep me");
+
+        // A claim below the real size runs libzstd out of room in the
+        // claim-sized slice. Spare capacity in `out` does not change that.
+        let too_small = frame_block(METHOD_ZSTD, n as u32 - 1, &payload);
+        for spare in [0, 1 << 20] {
+            let mut out = Vec::with_capacity(spare);
+            out.extend_from_slice(b"keep me");
+            let err =
+                decompress_frame_into(&too_small, ChecksumMode::Verify, &mut out).unwrap_err();
+            assert!(matches!(err, CompressionError::ZstdMalformed), "{err:?}");
+            assert_eq!(out, b"keep me");
+        }
+        let err = decompress_frame(&too_small, ChecksumMode::Verify).unwrap_err();
+        assert!(matches!(err, CompressionError::ZstdMalformed), "{err:?}");
+    }
+
+    #[test]
+    fn zstd_oversized_claim_fails_before_reserving() {
+        // A tiny frame with a valid checksum that claims the full 1 GiB.
+        let payload = ::zstd::bulk::compress(b"tiny", 1).unwrap();
+        let block = frame_block(METHOD_ZSTD, MAX_DECOMPRESSED_SIZE, &payload);
+
+        let mut out = b"keep me".to_vec();
+        let capacity_before = out.capacity();
+        let err = decompress_frame_into(&block, ChecksumMode::Verify, &mut out).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CompressionError::InvalidUncompressedSize {
+                    uncompressed_size: MAX_DECOMPRESSED_SIZE
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(out, b"keep me");
+        assert_eq!(out.capacity(), capacity_before);
+
+        let err = decompress_frame(&block, ChecksumMode::Verify).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CompressionError::InvalidUncompressedSize {
+                    uncompressed_size: MAX_DECOMPRESSED_SIZE
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]

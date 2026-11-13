@@ -19,7 +19,7 @@ ClickHouse server
       |  FORMAT Native bytes (compact columnar wire format)
       v
 +---------------------------+
-|        ch-core-rs         |   pure Rust
+|        ch-core-rs         |   shared codec
 |                           |
 |  parse type strings       |
 |  decode blocks -> columns |   one correct implementation,
@@ -422,7 +422,7 @@ over the supported inner types. The "Supported types" list in `README.md` is the
 current enumeration, and `CODEC_CONTRACT.md` is the per-type contract. Decode and
 encode are at type parity across all of this: whole-buffer and streaming decode,
 Arrow C Data export, and encode back to Native block bytes for the HTTP `INSERT`
-path. The `compression` module reads LZ4/NONE frames and writes LZ4 frames;
+path. The `compression` module reads LZ4/ZSTD/NONE frames and writes LZ4 frames;
 the sans-I/O TCP engine in the sibling `ch-tcp-proto` crate covers the
 handshake, Ping, and uncompressed SELECT and INSERT at revision 54460, while
 compressed packets and cancellation over TCP remain future work. The growth model

@@ -47,14 +47,18 @@ point-in-time snapshot for the next agent, not a changelog. Keep it short. Alway
 include a "Recommended next" with a one-line reason, so the next agent has a
 default; the user may override it.
 
-- **Last updated:** 2026-08-31. `MultiPoint` is complete at decode/encode parity
-  against `v26.8.1.2041-lts`. It is a custom name over `Array(Point)`, with no
-  new column buffer or body codec. Geometry now uses the server's explicit fixed
-  order `LineString`, `MultiLineString`, `MultiPolygon`, `Point`, `Polygon`,
-  `Ring`, `MultiPoint`: existing discriminators 0 through 5 remain unchanged,
-  MultiPoint is 6, and intrinsic NULL is 255. Standalone and Geometry decode,
-  encode, zero-row, multi-block, Arrow, captured-fixture, and live INSERT
-  coverage are present.
+- **Last updated:** 2026-11-11. Compression frames with method byte 0x90 now
+  decode through the `zstd` crate, which builds libzstd from C source.
+  CityHash128 uses `cityhash-rs`. LZ4 stays hand-written: `lz4_flex` was
+  measured and rejected because it is much slower on repeated data. The type work before
+  this, from 2026-08-31, is unchanged: `MultiPoint` is complete at
+  decode/encode parity against `v26.8.1.2041-lts`. It is a custom name over
+  `Array(Point)`, with no new column buffer or body codec. Geometry now uses
+  the server's explicit fixed order `LineString`, `MultiLineString`,
+  `MultiPolygon`, `Point`, `Polygon`, `Ring`, `MultiPoint`: existing
+  discriminators 0 through 5 remain unchanged, MultiPoint is 6, and intrinsic
+  NULL is 255. Standalone and Geometry decode, encode, zero-row, multi-block,
+  Arrow, captured-fixture, and live INSERT coverage are present.
 - **Protocol checkpoint:** the 26.8 server advertises revision 54492, which
   enables cumulative-offset String size-stream serialization throughout nested
   types. This crate does not implement that separate layout yet, so
@@ -75,8 +79,12 @@ default; the user may override it.
   Arrow contract decisions, synthetic tests, captured fixtures, and live-server
   semantic checks. Resume only for a concrete binding or workload requirement,
   not as an open-ended completeness exercise.
-- **TCP work, 2026-11-05:** compression framing is now in scope as a separate
-  byte codec. The first packet engine will advertise revision 54460, separately
+- **Compression checkpoint, 2026-11-11:** frame decode supports LZ4, ZSTD, and
+  NONE with CityHash128 1.0.2 verification. LZ4 is hand-written, CityHash128
+  uses `cityhash-rs`, and ZSTD uses the `zstd` crate. Frame encoding stays
+  LZ4. Revision-54460 TCP ZSTD fixtures cover small blocks and a block
+  spanning multiple frames at `v26.8.1.2041-lts`.
+  The packet engine advertises revision 54460, separately
   from core's 54485 ceiling. Sparse and replicated serialization remain deferred
   until the engine pin rises above 54464.
 - **Sequencing:** type completeness remains ahead of encode-API polish. The
@@ -84,9 +92,11 @@ default; the user may override it.
   `encode_block` allocation as material. Further open-ended
   `AggregateFunction` work also remains paused because each signature needs a
   separately confirmed unframed state-boundary codec.
-- **Recommended next:** phase 1 compression and revision-54460 fixture
-  validation are complete. Get release approval before tagging core and starting
-  the sibling packet engine crate. Revision-54492 String size streams and
+- **Recommended next:** wire compressed frames into the sibling packet engine.
+  Core now decodes every method `network_compression_method` accepts at
+  `v26.8.1.2041-lts`: NONE, LZ4, LZ4HC (the same 0x82 byte), and ZSTD. Its
+  revision-54460 uncompressed SELECT and INSERT support is complete, and real-server
+  LZ4/ZSTD fixtures are present. Revision-54492 String size streams and
   sparse/replicated serialization remain on the broader codec roadmap.
 - **Key references:** the MultiPoint and Geometry contract is in
   `CODEC_CONTRACT.md`. The logical and column models are in
@@ -689,13 +699,14 @@ where the across-release churn lives.
 
 ## Wire / protocol features for the decode path
 
-- [x] Native block compression framing - `compression` exposes LZ4/NONE decode,
-      CityHash128 verification, a frame-at-a-time reader, and an LZ4 frame writer.
-      Callers unwrap frames
-      before passing plaintext to the Native decoder. HTTP `compress=1` and
-      revision-54460 TCP captures ground the frame/block boundary tests.
-      ZSTD (0x90) remains deferred and returns `UnsupportedCodec`. HTTP transport
-      compression such as gzip stays in the bindings.
+- [x] Native block compression framing - `compression` exposes LZ4/ZSTD/NONE
+      decode, CityHash128 verification, a frame-at-a-time reader, and an LZ4
+      frame writer. LZ4 is hand-written; `cityhash-rs` and `zstd` supply the
+      checksum and ZSTD. Callers unwrap frames before passing plaintext to the
+      Native decoder. HTTP `compress=1` and revision-54460 TCP captures ground
+      the frame/block boundary tests. Revision-54460 TCP ZSTD captures cover
+      method 0x90. HTTP transport compression such as gzip stays in the
+      bindings.
 - [ ] Sparse column serialization - the nonzero custom-serialization marker the
       decoder currently rejects. Needed wherever the server emits sparse columns.
       Resolve before opening the binding POC to outside workloads (2026-07-15
