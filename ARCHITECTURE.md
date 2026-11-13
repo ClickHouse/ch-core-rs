@@ -100,7 +100,8 @@ undefined behavior, no panics on malformed input), speed, leanness.
 Non-negotiable invariants:
 
 - **No binding code in the core.** No PyO3, no napi-rs, no language-specific
-  materialization.
+  materialization, and no dependency on a language runtime. Standard-format
+  crates such as compression codecs are fine.
 - **Columnar, not row-major.** Row materialization was measured to throw away
   the core's advantage; it stays a binding concern.
 - **Blocks stay separate chunks.** Native blocks are never concatenated or

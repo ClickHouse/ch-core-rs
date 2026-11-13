@@ -110,8 +110,7 @@ const MIN_PROTOCOL_VERSION_WITH_QUOTA_KEY: u64 = 54_458;
 /// version defaults to `0.0`; drivers should report their own version.
 /// `Debug` redacts the password and quota key. `Clone` copies the plaintext
 /// password like any other field, and neither this type nor [`Connection`]
-/// zeroizes secrets on drop: this crate has no dependencies and makes no
-/// zeroization promise.
+/// zeroizes secrets on drop. This crate makes no zeroization promise.
 #[derive(Clone)]
 pub struct ClientHello {
     client_name: String,

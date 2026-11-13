@@ -993,7 +993,7 @@ decoding block N with reading block N+1 off the socket.
 required to enable it.** `encode_block(&ColBatch)` is a synchronous, stateless,
 per-block call that returns owned bytes. The binding gets the overlap by running
 the two stages concurrently on its own threads/tasks (threading stays a binding
-concern; the core is synchronous, and does no I/O):
+concern; the core is synchronous and does no I/O):
 
 ```
 encode(batch_1)  encode(batch_2)  encode(batch_3)   <- CPU
