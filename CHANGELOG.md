@@ -12,7 +12,9 @@ version; patch releases remain backward compatible.
   `decode_binary_value`. They write one row of a decoded column as a binary
   type descriptor plus `serializeBinary` value, so bindings can build Dynamic
   SharedVariant cells and JSON shared data for `encode_block`. Coverage
-  matches the decoder; server-written cells re-encode byte for byte.
+  matches the decoder, and value bytes match the server's output. Descriptors
+  match except SimpleAggregateFunction and AggregateFunction, which use the
+  custom-name `0x2c` form that the server also accepts.
 - `parse_ch_type` ignores whitespace between tokens, as the server does, so
   the multi-line `DESCRIBE TABLE` output (`print_pretty_type_names = 1`) and
   spellings like `Array( UInt8 )` parse. Canonical names, which is all a

@@ -2221,10 +2221,11 @@ fn single_block(batch: &ColBatch) -> ch_core_rs::batch::ChunkedBatch {
 
 /// One value per type, each cast to `Dynamic(max_types=0)` so the server
 /// stores it in SharedVariant as a binary descriptor plus serializeBinary
-/// value. Re-encoding every cell must reproduce the server's bytes exactly.
+/// value. Re-encoding must reproduce the value bytes and descriptor type.
+/// SimpleAggregateFunction uses the accepted custom-name descriptor form.
 #[test]
 #[ignore = "requires a live ClickHouse server matching .server-ref; run with --ignored"]
-fn server_shared_cells_reencode_for_every_type() {
+fn server_shared_cells_reencode_values_and_descriptor_types() {
     use ch_core_rs::native::binary_value::{
         decode_binary_value, encode_binary_value, read_binary_type_prefix, write_binary_type_prefix,
     };
@@ -2274,6 +2275,7 @@ fn server_shared_cells_reencode_for_every_type() {
         "CAST([1., 2., 3.], 'QBit(Float32, 3)')",
         "CAST((1.5, -2.5), 'Point')",
         "CAST([(0., 0.), (1., 1.)], 'Ring')",
+        "CAST(toUInt64(13), 'SimpleAggregateFunction(sum, UInt64)')",
     ];
     let columns: Vec<String> = values
         .iter()
@@ -2288,6 +2290,7 @@ fn server_shared_cells_reencode_for_every_type() {
     let decoded = decode_all_bytes(&native, &DecodeOptions::default()).expect("decode");
 
     let mut checked = 0;
+    let mut saf_checked = 0;
     for chunk in &decoded.chunks {
         for (field, column) in chunk.schema.fields.iter().zip(&chunk.columns) {
             let Column::Dynamic(c) = column else {
@@ -2307,16 +2310,41 @@ fn server_shared_cells_reencode_for_every_type() {
                     let value = decode_binary_value(&ch_type, &cell[consumed..])
                         .unwrap_or_else(|e| panic!("{}: decode {ch_type}: {e}", field.name));
                     let mut again = Vec::new();
-                    write_binary_type_prefix(&mut again, &ch_type);
+                    write_binary_type_prefix(&mut again, &ch_type).expect("descriptor encodes");
+                    let (again_type, again_consumed) =
+                        read_binary_type_prefix(&again).expect("encoded descriptor parses");
+                    assert_eq!(again_type, ch_type, "{}: descriptor type", field.name);
+                    assert_eq!(
+                        again_consumed,
+                        again.len(),
+                        "{}: descriptor size",
+                        field.name
+                    );
                     encode_binary_value(&mut again, &ch_type, &value, 0)
                         .unwrap_or_else(|e| panic!("{}: encode {ch_type}: {e}", field.name));
-                    assert_eq!(again, cell, "{}: {ch_type}", field.name);
+                    assert_eq!(
+                        &again[again_consumed..],
+                        &cell[consumed..],
+                        "{}: {ch_type} value bytes",
+                        field.name
+                    );
+                    if matches!(ch_type, ChType::SimpleAggregateFunction { .. }) {
+                        assert_eq!(cell[0], 0x2e, "server SimpleAggregateFunction tag");
+                        assert_eq!(again[0], 0x2c, "custom-name descriptor tag");
+                        saf_checked += 1;
+                    } else {
+                        assert_eq!(again, cell, "{}: {ch_type}", field.name);
+                    }
                     checked += 1;
                 }
             }
         }
     }
     assert_eq!(checked, values.len());
+    assert!(
+        saf_checked > 0,
+        "expected a SimpleAggregateFunction shared cell"
+    );
 }
 
 /// Build SharedVariant cells with `encode_binary_value`, INSERT a
@@ -2330,7 +2358,7 @@ fn encoded_shared_cells_insert_through_server() {
     let cell = |name: &str, column: Column| -> Vec<u8> {
         let ch_type = parse_ch_type(name).expect("type parses");
         let mut out = Vec::new();
-        write_binary_type_prefix(&mut out, &ch_type);
+        write_binary_type_prefix(&mut out, &ch_type).expect("descriptor encodes");
         encode_binary_value(&mut out, &ch_type, &column, 0).expect("cell encodes");
         out
     };

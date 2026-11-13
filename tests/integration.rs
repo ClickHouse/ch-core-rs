@@ -2571,8 +2571,8 @@ fn collect_shared_cells(column: &Column, out: &mut Vec<Vec<u8>>) {
 
 /// Every SharedVariant cell and JSON shared-data value the server wrote into
 /// the committed fixtures is a binary type descriptor plus one serializeBinary
-/// value. Decoding it and writing it back with `write_binary_type_prefix` and
-/// `encode_binary_value` must reproduce the server's bytes exactly.
+/// value. The types in these fixtures have canonical binary descriptors, so
+/// writing the decoded cells back must reproduce the server's bytes exactly.
 #[test]
 fn server_shared_cells_reencode_byte_for_byte() {
     use ch_core_rs::native::binary_value::{
@@ -2617,7 +2617,7 @@ fn server_shared_cells_reencode_byte_for_byte() {
             let (ch_type, consumed) = read_binary_type_prefix(cell).expect("descriptor parses");
             let value = decode_binary_value(&ch_type, &cell[consumed..]).expect("value decodes");
             let mut again = Vec::new();
-            write_binary_type_prefix(&mut again, &ch_type);
+            write_binary_type_prefix(&mut again, &ch_type).expect("descriptor encodes");
             encode_binary_value(&mut again, &ch_type, &value, 0).expect("value encodes");
             assert_eq!(&again, cell, "{name}: {ch_type}");
         }

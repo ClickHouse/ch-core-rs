@@ -508,13 +508,13 @@ fn validate_saf_func_spellings(field: &Field, ch_type: &ChType) -> Result<(), En
 
 /// Count the deepest wrapper/container nesting of `ch_type`, iteratively.
 ///
-/// Used by [`validate_column`] to reject a pathologically deep
+/// Used by block validation to reject a pathologically deep
 /// caller-constructed type before any of the encoder's recursive walks touch
 /// it, so this must not recurse itself. `Tuple` is a multi-child container, so
 /// the walk is an explicit worklist over `(type, depth)` pairs taking the
 /// maximum leaf depth; memory is bounded by the fan-out (one pending entry per
 /// unvisited sibling) and time is linear in the number of type nodes.
-pub(super) fn type_depth(ch_type: &ChType) -> usize {
+pub(crate) fn type_depth(ch_type: &ChType) -> usize {
     let mut max_depth = 0usize;
     let mut work: Vec<(&ChType, usize)> = vec![(ch_type, 0)];
     while let Some((current, depth)) = work.pop() {
@@ -1839,7 +1839,7 @@ fn validate_json<'a>(
 /// [`validate_column`] uses it to reject a wrong-buffer or not-yet-encodable
 /// column before any bytes are written, which is what lets [`write_block_into`]
 /// treat the body match as structurally infallible.
-fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
+pub(crate) fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
     // A name-decoration alias (SimpleAggregateFunction, geo, Nested) matches the
     // column its physical delegate would, since decode produces the delegate's
     // Column variant (no new variant). Expand and recurse before the pair checks
