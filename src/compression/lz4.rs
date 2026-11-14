@@ -92,6 +92,23 @@ pub(super) fn decompress_block_into(
     decompress_block_into_windowed::<FILL_WINDOW>(src, uncompressed_size, out)
 }
 
+/// Reject an `uncompressed_size` that no `payload_len`-byte LZ4 block can
+/// produce, as [`CompressionError::Lz4Malformed`].
+pub(super) fn check_claim(
+    payload_len: usize,
+    uncompressed_size: usize,
+) -> Result<(), CompressionError> {
+    // Each LZ4 extension byte can account for at most 255 output bytes. The
+    // fixed 24-byte allowance covers token nibbles and MIN_MATCH. This is a
+    // deliberately loose upper bound, but it prevents a tiny payload from
+    // claiming an enormous output allocation.
+    let max_output = payload_len.saturating_mul(255).saturating_add(24);
+    if uncompressed_size > max_output {
+        return Err(CompressionError::Lz4Malformed);
+    }
+    Ok(())
+}
+
 /// [`decompress_block_into`] with the frontier fill window `W` as a parameter,
 /// so tests can force frequent phase hand-offs.
 #[inline(always)]
@@ -100,14 +117,7 @@ fn decompress_block_into_windowed<const W: usize>(
     uncompressed_size: usize,
     out: &mut Vec<u8>,
 ) -> Result<(), CompressionError> {
-    // Each LZ4 extension byte can account for at most 255 output bytes. The
-    // fixed 24-byte allowance covers token nibbles and MIN_MATCH. This is a
-    // deliberately loose upper bound, but it prevents a tiny payload from
-    // claiming an enormous output allocation.
-    let max_output = src.len().saturating_mul(255).saturating_add(24);
-    if uncompressed_size > max_output {
-        return Err(CompressionError::Lz4Malformed);
-    }
+    check_claim(src.len(), uncompressed_size)?;
 
     let base = out.len();
     out.try_reserve(uncompressed_size)

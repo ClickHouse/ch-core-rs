@@ -77,13 +77,7 @@ pub(super) fn decompress_block_into(
     uncompressed_size: usize,
     out: &mut Vec<u8>,
 ) -> Result<(), CompressionError> {
-    if uncompressed_size > src.len().saturating_mul(MAX_EXPANSION) {
-        return Err(CompressionError::InvalidUncompressedSize {
-            // parse_block_header bounds the size to 1 GiB, so this always
-            // converts. Saturate instead of panicking if that ever changes.
-            uncompressed_size: u32::try_from(uncompressed_size).unwrap_or(u32::MAX),
-        });
-    }
+    check_claim(src.len(), uncompressed_size)?;
 
     let start = out.len();
     out.try_reserve(uncompressed_size)
@@ -107,6 +101,22 @@ pub(super) fn decompress_block_into(
     };
     out.truncate(start);
     Err(err)
+}
+
+/// Reject an `uncompressed_size` above what a conforming `payload_len`-byte
+/// payload can expand to, as [`CompressionError::InvalidUncompressedSize`].
+pub(super) fn check_claim(
+    payload_len: usize,
+    uncompressed_size: usize,
+) -> Result<(), CompressionError> {
+    if uncompressed_size > payload_len.saturating_mul(MAX_EXPANSION) {
+        return Err(CompressionError::InvalidUncompressedSize {
+            // Header parsing bounds the size to 1 GiB, so this always
+            // converts. Saturate instead of panicking if that ever changes.
+            uncompressed_size: u32::try_from(uncompressed_size).unwrap_or(u32::MAX),
+        });
+    }
+    Ok(())
 }
 
 /// Run one-shot decompression into `dst` with this thread's cached context.

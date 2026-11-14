@@ -74,6 +74,19 @@ by default; callers can explicitly select `ChecksumMode::Skip`.
 `CompressionError` and `ChecksumMode` are non-exhaustive. Checksum errors carry
 native `u128` values with the wire's low64 in the low bits.
 
+`frame_header` reads the fixed checksum prefix and codec header without
+requiring the payload or allocating output. It returns the method, compressed
+size, plaintext size, and total frame length. `Truncated` means more header
+bytes are needed. Sizes and method are validated, and the plaintext size must
+fit the codec expansion bound below for a payload of `compressed_size - 9`
+bytes. A larger claim returns the same error decode returns for it:
+`Lz4Malformed` for LZ4, `InvalidUncompressedSize` for ZSTD, and
+`SizeMismatch` for NONE. The checksum and payload are not yet verified.
+Callers must apply their own memory budget before buffering or decompressing
+a frame. `decompress_frame` and `decompress_frame_into` verify the checksum
+before applying the expansion bound, so a corrupt frame reports
+`ChecksumMismatch` first.
+
 `decompress_frame` decodes exactly one frame and returns its plaintext and
 compressed bytes consumed, leaving a following frame or packet untouched.
 NONE plaintext borrows the input; LZ4 and ZSTD plaintext own newly allocated buffers.
@@ -129,7 +142,30 @@ only when the block decoder has consumed all plaintext in its final frame.
 `FrameInfo::finish_block` checks that final-frame count, and `DecodedFrame`
 forwards the same check for the convenience reader. This check is an
 inferred reader constraint from confirmed server flush behavior, and does not
-apply to HTTP. HTTP output normally auto-flushes after each chunk, so captured
+apply to HTTP.
+
+The TCP engine opts into compression with
+`Connection::with_compression(true)`. At revision 54460, it decompresses Data,
+Totals, and Extremes, while their packet codes and table names remain raw.
+Log, ProfileEvents, TableColumns, and scalar packets remain raw.
+`TCPHandler::initLogsBlockOutput`, `initProfileEventsBlockOutput`, and
+`sendTableColumns` in `src/Server/TCPHandler.cpp` gate compressed metadata
+at `DBMS_MIN_REVISION_WITH_COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS`, revision
+54481 in `src/Core/ProtocolDefines.h`. These are confirmed at
+`v26.8.1.2041-lts`. The engine keeps one compressed frame and one plaintext
+Native block buffer. Before decompression it compares the frame's compressed
+size and plaintext size separately against the remaining `max_block_bytes`
+budget. It runs the resumable block scanner on the plaintext and enforces
+`finish_block` at completion. A corrupt frame fails the connection with
+`ProtocolError::Compression`.
+
+The compression flag is sent on every Query. The empty client Data block
+after Query is LZ4-framed too, as required by `TCPHandler::initBlockInput`
+and `processData` in `src/Server/TCPHandler.cpp` at the same tag. The engine
+does not send `network_compression_method` and accepts each supported method
+per frame. Client-fed compressed INSERT remains unsupported.
+
+HTTP output normally auto-flushes after each chunk, so captured
 Native frames align with blocks. Confirmed HTTP response buffering through
 `wait_end_of_query=1` or `http_response_buffer_size>0` can merge chunks before
 compression, so HTTP readers accept arbitrary frame/block boundaries. `INTEGRATING.md`
