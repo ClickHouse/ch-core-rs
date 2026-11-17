@@ -20,7 +20,8 @@ use crate::schema::{
     JSON_MAX_TYPED_PATHS, QBIT_MAX_DIMENSION,
 };
 
-const MAX_BINARY_TYPE_COMPLEXITY: usize = 1_000;
+// Crate policy: a JSON root plus 1000 Nullable scalar typed paths.
+pub(crate) const MAX_BINARY_TYPE_COMPLEXITY: usize = 2 * JSON_MAX_TYPED_PATHS + 1;
 const MAX_BINARY_TYPE_LIST: usize = 1_000_000;
 
 #[derive(Debug)]
@@ -1177,5 +1178,50 @@ mod tests {
             read_binary_type(&mut ByteReader::new(&over_paths)),
             Err(BinaryTypeError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn json_maximum_typed_paths_fit_the_descriptor_budget() {
+        for value_type in ["Int64", "Nullable(Int64)"] {
+            let paths = (0..JSON_MAX_TYPED_PATHS)
+                .map(|index| format!("p{index:04} {value_type}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let json = parse_ch_type(&format!("JSON({paths})")).unwrap();
+            let mut bytes = Vec::new();
+            write_binary_type(&mut bytes, &json);
+            assert_eq!(
+                read_binary_type(&mut ByteReader::new(&bytes)).unwrap(),
+                json
+            );
+            let mut scanner = BinaryTypeScanner::new();
+            let mut consumed = 0;
+            for end in (1..bytes.len())
+                .step_by(79)
+                .chain(std::iter::once(bytes.len()))
+            {
+                let mut reader = ByteReader::new(&bytes[consumed..end]);
+                let result = scanner.scan(&mut reader);
+                if end == bytes.len() {
+                    result.unwrap();
+                } else {
+                    assert!(
+                        matches!(result, Err(BinaryTypeError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof)
+                    );
+                }
+                consumed += reader.position();
+            }
+            assert_eq!(consumed, bytes.len());
+            if value_type == "Nullable(Int64)" {
+                let mut oversized = Vec::new();
+                write_binary_type(&mut oversized, &ChType::Array(Box::new(json)));
+                assert!(matches!(read_binary_type(&mut ByteReader::new(&oversized)),
+                    Err(BinaryTypeError::Invalid(reason)) if reason.contains("complexity")));
+                assert!(
+                    matches!(BinaryTypeScanner::new().scan(&mut ByteReader::new(&oversized)),
+                    Err(BinaryTypeError::Invalid(reason)) if reason.contains("complexity"))
+                );
+            }
+        }
     }
 }

@@ -547,6 +547,24 @@ FORMAT Native
 SQL
 )
 
+json_shared_query=$(
+  cat <<'SQL'
+WITH number AS n
+SELECT
+    CAST(multiIf(n = 0, '{"n":{"x":13},"z":79,"a":17}', n = 1, '{}', n = 2, '{"n":{"x":null}}', '{"n":{"x":79}}')::JSON, 'Dynamic(max_types=0)') AS j,
+    CAST([multiIf(n = 0, '{"k":1}', n = 1, '{}', n = 2, '{"other":null}', '{"k":79}')::JSON, '{}'::JSON], 'Dynamic(max_types=0)') AS aj,
+    CAST(tuple('{"k":79}'::JSON, toUInt8(17)), 'Dynamic(max_types=0)') AS tj,
+    CAST(map('user_1', '{"k":13}'::JSON), 'Dynamic(max_types=0)') AS mj,
+    CAST(multiIf(n = 0, '{"a":13,"b":"user_1","d":79,"dropped":17,"omit_me":1}', n = 1, '{}', n = 2, '{"a":null,"d":null}', '{"a":79,"later":13}') AS JSON(max_dynamic_paths=0, max_dynamic_types=0, a Nullable(Int64), b String, SKIP dropped, SKIP REGEXP '^omit')) AS typed,
+    CAST(typed, 'Dynamic(max_types=0)') AS typed_shared,
+    CAST('{"mix":[1,"user_1",null]}'::JSON, 'Dynamic(max_types=0)') AS heterogeneous,
+    CAST('{"child":{"k":13}}' AS JSON(child JSON)) AS nested,
+    CAST(nested, 'Dynamic(max_types=0)') AS nested_shared
+FROM numbers(4)
+FORMAT Native
+SQL
+)
+
 capture() {
   local name="$1"
   local query="$2"
@@ -582,5 +600,42 @@ capture "json_flattened_rev0.native" "${json_aux_query}" \
   --data-urlencode "output_format_native_use_flattened_dynamic_and_json_serialization=1"
 
 capture "zero_width_dynamic_rev0.native" "${zero_width_dynamic_query}"
+
+# JSON single-value payloads inside Dynamic SharedVariant cells. Revisions 0
+# and 54460 exercise Dynamic V1, while 54485 exercises V2.
+json_mixed_rows_query=$(
+  cat <<'SQL'
+SELECT CAST(multiIf(number = 0, '{}', number = 1, '{"mix":[1,"user_1",null]}', number = 2, '{"mix":13}', '{"mix":[]}') AS JSON) AS j
+FROM numbers(4)
+FORMAT Native
+SQL
+)
+capture "json_mixed_rows_rev0.native" "${json_mixed_rows_query}"
+capture "json_shared_rev0.native" "${json_shared_query}"
+capture "json_shared_rev54460.native" "${json_shared_query}" \
+  --data-urlencode "client_protocol_version=54460"
+capture "json_shared_rev54485.native" "${json_shared_query}" \
+  --data-urlencode "client_protocol_version=54485"
+
+json_table="ch_core_json_shared_fixture_$$"
+execute() {
+  curl -sS --fail "${url}" --user "${user}:${password}" --data-binary "$1"
+}
+cleanup_json_table() {
+  execute "DROP TABLE IF EXISTS ${json_table}" >/dev/null
+}
+trap cleanup_json_table EXIT
+execute "CREATE TABLE ${json_table} (id UInt8, d Dynamic) ENGINE=MergeTree ORDER BY id"
+execute "SYSTEM STOP MERGES ${json_table}"
+execute "INSERT INTO ${json_table} SELECT 0, '{\"n\":{\"x\":13}}'::JSON"
+execute "INSERT INTO ${json_table} SELECT 1, ['{\"k\":1}'::JSON]"
+json_multipart_query="SELECT id, d FROM ${json_table} ORDER BY id FORMAT Native"
+capture "json_multipart_rev0.native" "${json_multipart_query}"
+capture "json_multipart_rev54460.native" "${json_multipart_query}" \
+  --data-urlencode "client_protocol_version=54460"
+capture "json_multipart_rev54485.native" "${json_multipart_query}" \
+  --data-urlencode "client_protocol_version=54485"
+cleanup_json_table
+trap - EXIT
 
 echo "Wrote fixtures to ${fixture_dir}"

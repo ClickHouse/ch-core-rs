@@ -64,6 +64,11 @@ default; the user may override it.
   types. This crate does not implement that separate layout yet, so
   `DBMS_TCP_PROTOCOL_VERSION` and the framed fixture intentionally remain at
   negotiated revision 54485. BlockInfo and Geometry framing are unchanged.
+- **JSON shared-cell checkpoint, 2026-11-17:** the single-value binary codec
+  decodes and encodes JSON, including JSON nested in containers. Typed paths
+  retain their declared columns, and other paths retain tagged shared cells.
+  Real-server regressions at `v26.8.1.2041-lts` cover revisions 0, 54460 and
+  54485. Bulk Dynamic and JSON shared buffers stay opaque.
 - **AggregateFunction checkpoint:** decode, encode, streaming, Arrow LargeBinary
   export, real-server fixtures, and live INSERT coverage are complete for exact
   base `count` with zero or one argument, canonical
@@ -651,7 +656,10 @@ where the across-release churn lives.
       under the type-aware row-count guard. `Nullable(JSON)` is legal (top-level
       null map), `LowCardinality(JSON)` illegal, and JSON composes in
       Array/Tuple/Map/Variant/Dynamic and as its own typed path (nested), bounded
-      by `MAX_TYPE_DEPTH`. Arrow export is a struct of the typed paths, the
+      by `MAX_TYPE_DEPTH`. The single-value binary helpers also decode and
+      encode JSON inside shared cells, preserving typed children and retaining
+      other paths as tagged shared values. Arrow export is a struct of the
+      typed paths, the
       result-wide dynamic-path Dense Unions, and a `_shared_data` LargeList of
       `{paths utf8, values binary}`, with a Text body exporting as utf8; binary
       type descriptor tag 0x30. Legacy `Object('json')` is not registered at the
