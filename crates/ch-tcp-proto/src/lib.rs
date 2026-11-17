@@ -1195,7 +1195,9 @@ impl Connection {
     /// size before checksum verification and decompression. That size is at
     /// most this limit and at most what the frame's received payload can
     /// expand to under its codec. Its requested capacity never exceeds this
-    /// limit.
+    /// limit. The compressed frame is buffered separately, up to the
+    /// worst-case compressed size of this limit, so one compressed block can
+    /// hold about twice this limit in memory.
     /// The same value is the retention budget shared by both fields of a later
     /// [`Event::TableColumns`]: bytes past it are skipped and the event has
     /// `truncated: true`, so metadata size alone does not fail the INSERT. A

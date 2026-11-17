@@ -24,8 +24,8 @@ version; patch releases remain backward compatible.
 - CityHash128 now comes from the `cityhash-rs` crate. Checksums are the same.
 - LZ4 is unchanged. It stays hand-written, and frames it writes are the same
   bytes as before.
-- Add `compression::frame_header` and `FrameHeader`. They read a frame's method
-  and declared sizes from its fixed 25-byte prefix, with the same limit and
+- Add `compression::frame_header` and `FrameHeader`. They read a frame's
+  declared sizes from its fixed 25-byte prefix, with the same limit and
   codec checks as decode, before the payload arrives. They also reject a
   plaintext size larger than the payload can expand to under the frame's
   codec, with the error decode returns for that case. Callers can check the

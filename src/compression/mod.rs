@@ -299,16 +299,6 @@ pub struct FrameHeader {
 }
 
 impl FrameHeader {
-    /// Compression method byte carried on the wire.
-    pub fn method(&self) -> u8 {
-        self.method
-    }
-
-    /// Header plus compressed payload bytes, excluding the 16-byte checksum.
-    pub fn compressed_size(&self) -> usize {
-        self.compressed_size
-    }
-
     /// Declared decompressed payload length.
     pub fn plaintext_size(&self) -> usize {
         self.plaintext_size
@@ -904,8 +894,8 @@ mod tests {
         }
 
         let header = frame_header(&frame[..CHECKSUM_SIZE + HEADER_SIZE]).unwrap();
-        assert_eq!(header.method(), METHOD_NONE);
-        assert_eq!(header.compressed_size(), HEADER_SIZE + raw.len());
+        assert_eq!(header.method, METHOD_NONE);
+        assert_eq!(header.compressed_size, HEADER_SIZE + raw.len());
         assert_eq!(header.plaintext_size(), raw.len());
         assert_eq!(header.frame_len(), frame.len());
         assert!(matches!(
