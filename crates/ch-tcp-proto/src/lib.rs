@@ -5,6 +5,9 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
+use ch_core_rs::compression::{
+    decompress_frame_into, frame_header, ChecksumMode, CompressionError, FrameHeader,
+};
 use ch_core_rs::native::decode::{DecodeError, DecodeOptions};
 use ch_core_rs::native::stream_decoder::{BlockBoundary, BlockScanner};
 
@@ -89,6 +92,17 @@ const SERVER_PACKET_LOG: u64 = 10;
 const SERVER_PACKET_TABLE_COLUMNS: u64 = 11;
 const SERVER_PACKET_PROFILE_EVENTS: u64 = 14;
 
+/// Native `Block::empty()` body at revision 54460.
+const EMPTY_NATIVE_BLOCK: &[u8] = &[1, 0, 2, 0xff, 0xff, 0xff, 0xff, 0, 0, 0];
+/// `EMPTY_NATIVE_BLOCK` as one ClickHouse LZ4 frame.
+const EMPTY_NATIVE_BLOCK_LZ4: &[u8] = &[
+    0xa7, 0x83, 0xac, 0x6c, 0xd5, 0x5c, 0x7a, 0x7c, 0xb5, 0xac, 0x46, 0xbd, 0xdb, 0x86, 0xe2, 0x14,
+    0x82, 0x14, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0xa0, 0x01, 0x00, 0x02, 0xff, 0xff, 0xff,
+    0xff, 0x00, 0x00, 0x00,
+];
+/// Checksum plus header bytes before a compression frame's payload.
+const FRAME_PREFIX_LEN: usize = 25;
+
 // Thresholds from `src/Core/ProtocolDefines.h` at v26.8.1.2041-lts.
 const MIN_REVISION_WITH_SERVER_TIMEZONE: u64 = 54_058;
 const MIN_REVISION_WITH_SERVER_DISPLAY_NAME: u64 = 54_372;
@@ -99,6 +113,16 @@ const MIN_PROTOCOL_VERSION_WITH_ADDENDUM: u64 = 54_458;
 /// key. This is not `DBMS_MIN_REVISION_WITH_QUOTA_KEY_IN_CLIENT_INFO` (54060),
 /// which gates the quota key inside the Query packet's ClientInfo.
 const MIN_PROTOCOL_VERSION_WITH_QUOTA_KEY: u64 = 54_458;
+const _: () = {
+    // Keep this threshold local to its guard: Rust 1.81 does not count a use
+    // in an anonymous const when checking module constants for dead code.
+    // `DBMS_MIN_REVISION_WITH_COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS`.
+    const MIN_REVISION_WITH_COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS: u64 = 54_481;
+    assert!(
+        ENGINE_REVISION < MIN_REVISION_WITH_COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS,
+        "raising ENGINE_REVISION requires framing Log, ProfileEvents, and TableColumns when compression is enabled"
+    );
+};
 
 // ---------------------------------------------------------------------------
 // Public values
@@ -177,7 +201,7 @@ impl fmt::Debug for ClientHello {
     }
 }
 
-/// An uncompressed initial query for SELECT or client-fed INSERT.
+/// An initial query for SELECT or client-fed INSERT.
 ///
 /// Settings use the server's string representation. Parameter values are
 /// quoted as ClickHouse string literals on the wire.
@@ -627,6 +651,17 @@ pub enum ProtocolError {
     /// then fails with [`ProtocolError::Decode`] on the first block. Keep the
     /// setting disabled server-side.
     BinaryNativeTypeEncodingUnsupported,
+    /// Client-fed INSERT compression is not implemented yet.
+    ///
+    /// A connection configured with [`Connection::with_compression`] may run
+    /// queries, including inline INSERT forms that need no later client data,
+    /// but [`Connection::insert`] is rejected before writing anything.
+    CompressedInsertUnsupported,
+    /// Core rejected a ClickHouse compression frame.
+    ///
+    /// The connection fails because the next packet boundary cannot be found
+    /// safely. The [`CompressionError`] is also returned by [`Error::source`].
+    Compression(CompressionError),
     /// An inbound Native block exceeded the per-packet limit. Always fatal:
     /// the connection fails with [`FailureKind::Protocol`].
     ///
@@ -716,6 +751,10 @@ impl fmt::Display for ProtocolError {
             Self::BinaryNativeTypeEncodingUnsupported => formatter.write_str(
                 "output_format_native_encode_types_in_binary_format accepts only \"0\"",
             ),
+            Self::CompressedInsertUnsupported => {
+                formatter.write_str("compressed client-fed INSERT is not supported")
+            }
+            Self::Compression(_) => formatter.write_str("compression frame decode failed"),
             Self::NativeBlockTooLarge { limit } => {
                 write!(formatter, "Native block exceeds the {limit} byte limit")
             }
@@ -816,6 +855,8 @@ impl PartialEq for ProtocolError {
             (InvalidInsertBlock(left), InvalidInsertBlock(right)) => left == right,
             (InvalidInsertSchema, InvalidInsertSchema) => true,
             (BinaryNativeTypeEncodingUnsupported, BinaryNativeTypeEncodingUnsupported) => true,
+            (CompressedInsertUnsupported, CompressedInsertUnsupported) => true,
+            (Compression(left), Compression(right)) => left == right,
             (NativeBlockTooLarge { limit: left }, NativeBlockTooLarge { limit: right }) => {
                 left == right
             }
@@ -847,6 +888,7 @@ impl Error for ProtocolError {
         match self {
             Self::Decode(error) => Some(error.as_ref()),
             Self::InvalidInsertBlock(error) => Some(error),
+            Self::Compression(error) => Some(error),
             _ => None,
         }
     }
@@ -855,6 +897,12 @@ impl Error for ProtocolError {
 impl From<DecodeError> for ProtocolError {
     fn from(error: DecodeError) -> Self {
         Self::Decode(Arc::new(error))
+    }
+}
+
+impl From<CompressionError> for ProtocolError {
+    fn from(error: CompressionError) -> Self {
+        Self::Compression(error)
     }
 }
 
@@ -959,7 +1007,8 @@ struct ClientIdentity {
     version_minor: u64,
 }
 
-/// Incremental handshake, Ping/Pong, and uncompressed Query engine.
+/// Incremental handshake, Ping/Pong, and Query engine with optional compressed
+/// SELECT.
 ///
 /// Events have exactly one channel: [`Self::feed`] reports only errors, and
 /// every completed packet is queued for [`Self::poll_event`]. A `Vec` return
@@ -995,6 +1044,8 @@ pub struct Connection {
     /// Queued events that must be drained before the next INSERT write.
     barrier_events: usize,
     max_block_bytes: usize,
+    /// Whether every Query requests ClickHouse compression.
+    compression: bool,
     quota_key: String,
     identity: ClientIdentity,
     effective_revision: Option<u64>,
@@ -1002,6 +1053,8 @@ pub struct Connection {
     active_query_sent_settings: bool,
     /// Whether any server packet code has been read for the active query.
     active_query_has_server_packet: bool,
+    /// Compression flag snapshotted when the active Query was written.
+    active_query_compression: bool,
     /// The error that moved the engine to `Failed(Protocol)`, returned again
     /// by `finish`.
     protocol_error: Option<ProtocolError>,
@@ -1032,6 +1085,7 @@ impl fmt::Debug for Connection {
             )
             .field("queued_events", &self.events.len())
             .field("max_block_bytes", &self.max_block_bytes)
+            .field("compression", &self.compression)
             .field("quota_key", &"<redacted>")
             .field("finish_result", &self.finish_result)
             .finish_non_exhaustive()
@@ -1096,6 +1150,7 @@ impl Connection {
             events: VecDeque::new(),
             barrier_events: 0,
             max_block_bytes: DEFAULT_MAX_BLOCK_BYTES,
+            compression: false,
             quota_key: hello.quota_key,
             identity: ClientIdentity {
                 user: hello.user,
@@ -1106,6 +1161,7 @@ impl Connection {
             effective_revision: None,
             active_query_sent_settings: false,
             active_query_has_server_packet: false,
+            active_query_compression: false,
             protocol_error: None,
             finish_result: None,
             input_limit: INPUT_LIMIT,
@@ -1133,17 +1189,41 @@ impl Connection {
     /// [`InsertBlockError::TooLarge`] before output or state changes; it does
     /// not fail the connection.
     ///
-    /// Block memory is only ever allocated from bytes actually received,
-    /// never from a declared length, and the block buffer's capacity never
-    /// exceeds this limit. The same value is the retention budget shared by
-    /// both fields of a later [`Event::TableColumns`]: bytes past it are
-    /// skipped and the event has `truncated: true`, so metadata size alone
-    /// does not fail the INSERT. A declared TableColumns field length above
-    /// 64 times this limit (saturating) is treated as corruption and fails
-    /// the connection with [`ProtocolError::StringTooLong`]. Both are
-    /// snapshotted when the TableColumns packet begins.
+    /// Plain block memory is allocated from bytes actually received. For a
+    /// compressed block, the engine waits for the complete frame, then grows
+    /// the plaintext buffer geometrically from the frame's declared plaintext
+    /// size before checksum verification and decompression. That size is at
+    /// most this limit and at most what the frame's received payload can
+    /// expand to under its codec. Its requested capacity never exceeds this
+    /// limit. The compressed frame is buffered separately, up to the
+    /// worst-case compressed size of this limit, so one compressed block can
+    /// hold about twice this limit in memory.
+    /// The same value is the retention budget shared by both fields of a later
+    /// [`Event::TableColumns`]: bytes past it are skipped and the event has
+    /// `truncated: true`, so metadata size alone does not fail the INSERT. A
+    /// declared TableColumns field length above 64 times this limit
+    /// (saturating) is treated as corruption and fails the connection with
+    /// [`ProtocolError::StringTooLong`]. Both are snapshotted when the
+    /// TableColumns packet begins.
     pub fn with_max_block_bytes(mut self, limit: usize) -> Self {
         self.max_block_bytes = limit.max(MIN_MAX_BLOCK_BYTES);
+        self
+    }
+
+    /// Enables or disables ClickHouse compression for every later Query.
+    ///
+    /// The default is `false`. When enabled, the Query compression flag is
+    /// one, the empty external-tables terminator is one LZ4 frame, and server
+    /// Data, Totals, and Extremes bodies are decoded frame by frame. NONE,
+    /// LZ4/LZ4HC, and ZSTD frame methods are accepted according to each frame's
+    /// method byte. Packet codes and table names remain raw.
+    ///
+    /// Client-fed compressed INSERT is deferred: [`Self::insert`] returns
+    /// [`ProtocolError::CompressedInsertUnsupported`] without changing the
+    /// connection. Inline INSERT forms sent through [`Self::query`] remain
+    /// supported because they need no later client Data packet.
+    pub fn with_compression(mut self, enabled: bool) -> Self {
+        self.compression = enabled;
         self
     }
 
@@ -1192,13 +1272,14 @@ impl Connection {
         Some(event)
     }
 
-    /// Queues an uncompressed query and its empty external-data block.
+    /// Queues a query and its empty external-data block.
     ///
     /// Use this for exchanges that need no later client Data, including SELECT,
     /// inline `INSERT ... VALUES`, and `INSERT ... SELECT`. Use
     /// [`Self::insert`] when the client will upload encoded Native blocks.
-    /// `input()`, external tables, parallel-replica exchanges, cancellation,
-    /// and compressed packets are unsupported.
+    /// `input()`, external tables, parallel-replica exchanges, and cancellation
+    /// are unsupported. [`Self::with_compression`] controls both the Query flag
+    /// and compressed result-block decoding.
     ///
     /// Rejected with [`ProtocolError::InvalidState`] unless the connection is
     /// `Ready`, every event is drained, and no server packet is partly
@@ -1247,6 +1328,9 @@ impl Connection {
     /// queued upload bytes are discarded so they cannot leak into a later
     /// exchange.
     pub fn insert(&mut self, query: Query) -> Result<(), ProtocolError> {
+        if self.compression {
+            return Err(ProtocolError::CompressedInsertUnsupported);
+        }
         self.start_query(
             query,
             State::AwaitingInsertSchema,
@@ -1325,12 +1409,21 @@ impl Connection {
                 });
             }
         }
-        let packet_size = query_packet_len(&query, &self.identity, &self.quota_key).ok_or(
-            ProtocolError::QueryOutputTooLarge {
-                length: usize::MAX,
-                limit: QUERY_OUTPUT_LIMIT,
-            },
-        )?;
+        let empty_data_body = if self.compression {
+            EMPTY_NATIVE_BLOCK_LZ4
+        } else {
+            EMPTY_NATIVE_BLOCK
+        };
+        let packet_size = query_packet_len(
+            &query,
+            &self.identity,
+            &self.quota_key,
+            empty_data_body.len(),
+        )
+        .ok_or(ProtocolError::QueryOutputTooLarge {
+            length: usize::MAX,
+            limit: QUERY_OUTPUT_LIMIT,
+        })?;
         if packet_size > QUERY_OUTPUT_LIMIT {
             return Err(ProtocolError::QueryOutputTooLarge {
                 length: packet_size,
@@ -1373,7 +1466,7 @@ impl Connection {
         put_string(packet, "");
         put_string(packet, ""); // empty interserver secret hash
         put_varuint(packet, 2); // QueryProcessingStage::Complete
-        put_varuint(packet, 0); // uncompressed
+        put_varuint(packet, u64::from(self.compression));
         put_string(packet, &query.sql);
         for (name, value) in &query.parameters {
             put_string(packet, name);
@@ -1384,10 +1477,13 @@ impl Connection {
             }
         }
         put_string(packet, "");
-        put_empty_data_packet(packet);
+        put_varuint(packet, CLIENT_PACKET_DATA);
+        put_string(packet, "");
+        packet.extend_from_slice(empty_data_body);
         debug_assert_eq!(packet.len() - start, packet_size);
         self.active_query_sent_settings = !query.settings.is_empty();
         self.active_query_has_server_packet = false;
+        self.active_query_compression = self.compression;
         self.state = next_state;
         Ok(())
     }
@@ -1838,6 +1934,7 @@ impl Connection {
                         }
                         self.active_query_sent_settings = false;
                         self.active_query_has_server_packet = false;
+                        self.active_query_compression = false;
                         let next_state = if terminal {
                             State::Failed(FailureKind::ServerException)
                         } else {
@@ -1967,6 +2064,7 @@ impl Connection {
             (State::Querying, SERVER_PACKET_END_OF_STREAM) => {
                 self.active_query_sent_settings = false;
                 self.active_query_has_server_packet = false;
+                self.active_query_compression = false;
                 self.queue_event(Event::EndOfStream, Some(State::Ready));
             }
             (State::AwaitingInsertSchema, SERVER_PACKET_TABLE_COLUMNS) => {
@@ -1996,11 +2094,13 @@ impl Connection {
             (State::FinishingInsert, SERVER_PACKET_END_OF_STREAM) => {
                 self.active_query_sent_settings = false;
                 self.active_query_has_server_packet = false;
+                self.active_query_compression = false;
                 self.queue_event(Event::EndOfStream, Some(State::Ready));
             }
             (State::AwaitingInsertSchema, SERVER_PACKET_END_OF_STREAM) => {
                 self.active_query_sent_settings = false;
                 self.active_query_has_server_packet = false;
+                self.active_query_compression = false;
                 self.queue_event(Event::EndOfStream, Some(State::Ready));
             }
             (state, packet) => {
@@ -2015,10 +2115,17 @@ impl Connection {
 
     fn start_block(&mut self, kind: BlockKind) {
         let revision = self.effective_revision.unwrap_or(ENGINE_REVISION);
+        let compressed = self.active_query_compression
+            && self.state == State::Querying
+            && matches!(
+                kind,
+                BlockKind::Data | BlockKind::Totals | BlockKind::Extremes
+            );
         self.pending = Some(PendingPacket::Block(BlockProgress::new(
             kind,
             revision,
             self.max_block_bytes,
+            compressed,
         )));
     }
 
@@ -2124,6 +2231,10 @@ struct BlockProgress {
     table_name_done: bool,
     scanner: BlockScanner,
     native: Vec<u8>,
+    compressed: bool,
+    frame: Vec<u8>,
+    /// Header of the frame being buffered, once its prefix has arrived.
+    frame_header: Option<FrameHeader>,
     limit: usize,
 }
 
@@ -2136,12 +2247,15 @@ struct CompletedBlock {
 }
 
 impl BlockProgress {
-    fn new(kind: BlockKind, revision: u64, limit: usize) -> Self {
+    fn new(kind: BlockKind, revision: u64, limit: usize, compressed: bool) -> Self {
         Self {
             kind,
             table_name_done: false,
             scanner: native_scanner(revision),
             native: Vec::new(),
+            compressed,
+            frame: Vec::new(),
+            frame_header: None,
             limit,
         }
     }
@@ -2153,6 +2267,13 @@ impl BlockProgress {
             self.table_name_done = true;
             return Ok((cursor.position(), None));
         }
+        if self.compressed {
+            return self.step_compressed(bytes);
+        }
+        self.step_plain(bytes)
+    }
+
+    fn step_plain(&mut self, bytes: &[u8]) -> ParseResult<(usize, Option<CompletedBlock>)> {
         if bytes.is_empty() {
             return Err(ParseError::NeedMore(1));
         }
@@ -2242,6 +2363,127 @@ impl BlockProgress {
             }));
         }
         Ok((offered, None))
+    }
+
+    fn step_compressed(&mut self, bytes: &[u8]) -> ParseResult<(usize, Option<CompletedBlock>)> {
+        if bytes.is_empty() {
+            return Err(ParseError::NeedMore(1));
+        }
+
+        let remaining = self.limit.saturating_sub(self.native.len());
+        if remaining == 0 {
+            return Err(ParseError::Protocol(ProtocolError::NativeBlockTooLarge {
+                limit: self.limit,
+            }));
+        }
+
+        let frame_cap = max_frame_len(self.limit);
+        let mut consumed = 0;
+        let header = match self.frame_header {
+            Some(header) => header,
+            None => {
+                let prefix_needed = FRAME_PREFIX_LEN.saturating_sub(self.frame.len());
+                let take = prefix_needed.min(bytes.len());
+                extend_bounded(&mut self.frame, &bytes[..take], frame_cap);
+                consumed += take;
+                if self.frame.len() < FRAME_PREFIX_LEN {
+                    return Ok((consumed, None));
+                }
+
+                // Core bounds the plaintext claim by the payload length.
+                let header = frame_header(&self.frame)
+                    .map_err(ProtocolError::from)
+                    .map_err(ParseError::Protocol)?;
+                if header.plaintext_size() > remaining
+                    || header.frame_len() > max_frame_len(remaining)
+                {
+                    return Err(ParseError::Protocol(ProtocolError::NativeBlockTooLarge {
+                        limit: self.limit,
+                    }));
+                }
+                self.frame_header = Some(header);
+                header
+            }
+        };
+
+        let frame_len = header.frame_len();
+        let frame_needed = frame_len.saturating_sub(self.frame.len());
+        let take = frame_needed.min(bytes.len().saturating_sub(consumed));
+        extend_bounded(
+            &mut self.frame,
+            &bytes[consumed..consumed + take],
+            frame_cap,
+        );
+        consumed += take;
+        if self.frame.len() < frame_len {
+            return Ok((consumed, None));
+        }
+
+        let previous = self.native.len();
+        let needed = previous.saturating_add(header.plaintext_size());
+        if needed > self.native.capacity() {
+            let target = self
+                .native
+                .capacity()
+                .saturating_mul(2)
+                .max(needed)
+                .min(self.limit);
+            self.native
+                .try_reserve_exact(target.saturating_sub(previous))
+                .map_err(|_| {
+                    ParseError::Protocol(ProtocolError::Compression(
+                        CompressionError::AllocationFailed { requested: target },
+                    ))
+                })?;
+        }
+        let info = decompress_frame_into(&self.frame, ChecksumMode::Verify, &mut self.native)
+            .map_err(ProtocolError::from)
+            .map_err(ParseError::Protocol)?;
+        self.frame.clear();
+        self.frame_header = None;
+
+        let boundary = self
+            .scanner
+            .scan(&self.native)
+            .map_err(ProtocolError::from)
+            .map_err(ParseError::Protocol)?;
+        if let BlockBoundary::Complete {
+            consumed: native_consumed,
+            num_columns,
+            num_rows,
+            ..
+        } = boundary
+        {
+            debug_assert!(native_consumed > previous);
+            if native_consumed <= previous {
+                return Err(ParseError::Protocol(
+                    ProtocolError::InconsistentBlockBoundary {
+                        consumed: native_consumed,
+                        buffered: previous,
+                    },
+                ));
+            }
+            info.finish_block(native_consumed - previous)
+                .map_err(ProtocolError::from)
+                .map_err(ParseError::Protocol)?;
+            self.native.truncate(native_consumed);
+            return Ok((
+                consumed,
+                Some(CompletedBlock {
+                    kind: self.kind,
+                    native: std::mem::take(&mut self.native),
+                    num_columns,
+                    num_rows,
+                    is_empty_sentinel: num_rows == 0 && num_columns == 0,
+                }),
+            ));
+        }
+        if self.native.len() == self.limit {
+            return Err(ParseError::Protocol(ProtocolError::NativeBlockTooLarge {
+                limit: self.limit,
+            }));
+        }
+        Ok((consumed, None))
     }
 }
 
@@ -2363,6 +2605,16 @@ impl TableColumnsProgress {
             }),
         }
     }
+}
+
+/// Largest compression frame, checksum included, a server writes for
+/// `plaintext` bytes: the prefix plus the larger of `LZ4_compressBound`,
+/// `n + n/255 + 16`, and `ZSTD_compressBound`, at most `n + n/256 + 64`.
+fn max_frame_len(plaintext: usize) -> usize {
+    FRAME_PREFIX_LEN
+        .saturating_add(plaintext)
+        .saturating_add(plaintext / 255)
+        .saturating_add(64)
 }
 
 /// Appends received block bytes, growing capacity geometrically but never
@@ -2603,11 +2855,7 @@ fn put_string(output: &mut Vec<u8>, value: &str) {
 fn put_empty_data_packet(output: &mut Vec<u8>) {
     put_varuint(output, CLIENT_PACKET_DATA);
     put_string(output, "");
-    // BlockInfo field 1 = overflow false, field 2 = bucket -1, terminator 0,
-    // then zero columns and zero rows.
-    output.extend_from_slice(&[1, 0, 2]);
-    output.extend_from_slice(&(-1_i32).to_le_bytes());
-    output.extend_from_slice(&[0, 0, 0]);
+    output.extend_from_slice(EMPTY_NATIVE_BLOCK);
 }
 
 fn escaped_content_len(value: &[u8]) -> Option<usize> {
@@ -2667,13 +2915,18 @@ fn put_escaped_content(output: &mut Vec<u8>, value: &[u8]) {
 
 /// Exact encoded length of the Query packet and its empty Data block, in the
 /// order `Connection::query` writes them. `None` on `usize` overflow.
-fn query_packet_len(query: &Query, identity: &ClientIdentity, quota_key: &str) -> Option<usize> {
+fn query_packet_len(
+    query: &Query,
+    identity: &ClientIdentity,
+    quota_key: &str,
+    empty_data_body_len: usize,
+) -> Option<usize> {
     // Fixed-width fields: packet code, query kind, start time, interface,
     // the OpenTelemetry flag, the five zero VarUInts after the quota key, the
     // two empty strings, stage and compression after the settings, the
-    // empty parameter terminator, Data packet code, empty table name, and
-    // the 10-byte empty block. Every one of these encodes in the bytes
-    // counted here.
+    // empty parameter terminator, Data packet code, empty table name, and the
+    // possibly compressed empty block body. Every one of these encodes in the
+    // bytes counted here.
     let fixed = varuint_len(CLIENT_PACKET_QUERY)
         + 1 // ClientInfo::QueryKind::INITIAL_QUERY
         + 8 // initial_query_start_time_microseconds
@@ -2683,12 +2936,12 @@ fn query_packet_len(query: &Query, identity: &ClientIdentity, quota_key: &str) -
         + string_len("") // settings terminator
         + string_len("") // interserver secret hash
         + varuint_len(2) // QueryProcessingStage::Complete
-        + varuint_len(0) // uncompressed
+        + varuint_len(0) // compression boolean, either value is one byte
         + string_len("") // parameters terminator
         + varuint_len(CLIENT_PACKET_DATA)
-        + string_len("") // external table name
-        + 10; // BlockInfo, zero columns, zero rows
+        + string_len(""); // external table name
     let mut length = fixed
+        .checked_add(empty_data_body_len)?
         .checked_add(varuint_len(identity.version_major))?
         .checked_add(varuint_len(identity.version_minor))?
         .checked_add(varuint_len(ENGINE_REVISION))?;

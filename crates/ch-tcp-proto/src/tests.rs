@@ -1,4 +1,5 @@
 use super::*;
+use ch_core_rs::compression::{compress_lz4_frame, write_lz4_frame};
 
 const EXCEPTION_FAILED: State = State::Failed(FailureKind::ServerException);
 const PROTOCOL_FAILED: State = State::Failed(FailureKind::Protocol);
@@ -935,6 +936,14 @@ fn data_packet(block: &[u8]) -> Vec<u8> {
     bytes
 }
 
+fn compressed_packet(packet: u64, plaintext_frames: &[&[u8]]) -> Vec<u8> {
+    let mut bytes = vec![packet as u8, 0];
+    for plaintext in plaintext_frames {
+        write_lz4_frame(plaintext, &mut bytes).unwrap();
+    }
+    bytes
+}
+
 fn table_columns_packet(table_name: &str, description: &str) -> Vec<u8> {
     table_columns_bytes_packet(table_name.as_bytes(), description.as_bytes())
 }
@@ -1055,6 +1064,374 @@ fn query_queues_request_and_filters_tcp_empty_data_sentinel() {
         [Event::Data(block), Event::EndOfStream]
     );
     assert_eq!(engine.state(), State::Ready);
+}
+
+#[test]
+fn compressed_query_frames_request_and_decodes_split_result_frames() {
+    let mut engine = ready_engine().with_compression(true);
+    let query = Query::new("SELECT 13");
+    let mut expected_frame = Vec::new();
+    write_lz4_frame(EMPTY_NATIVE_BLOCK, &mut expected_frame).unwrap();
+    let expected_len = query_packet_len(
+        &query,
+        &engine.identity,
+        &engine.quota_key,
+        expected_frame.len(),
+    )
+    .unwrap();
+    engine.query(query).unwrap();
+    let output = engine.take_output();
+    assert_eq!(output.len(), expected_len);
+    assert!(output
+        .windows(3)
+        .any(|window| window == [2, 1, b"SELECT 13".len() as u8]));
+    let mut expected_suffix = vec![CLIENT_PACKET_DATA as u8, 0];
+    expected_suffix.extend_from_slice(&expected_frame);
+    assert!(output.ends_with(&expected_suffix));
+
+    let block = framed_int64_block(&[13, 79]);
+    let split = block.len() / 2;
+    let response = compressed_packet(SERVER_PACKET_DATA, &[&block[..split], &block[split..]]);
+    for byte in response {
+        engine.feed(&[byte]).unwrap();
+    }
+    assert_eq!(events(&mut engine), [Event::Data(block)]);
+}
+
+#[test]
+fn active_query_snapshots_compression_setting() {
+    let block = framed_int64_block(&[13]);
+
+    let mut compressed = ready_engine().with_compression(true);
+    compressed.query(Query::new("SELECT 13")).unwrap();
+    compressed = compressed.with_compression(false);
+    compressed
+        .feed(&compressed_packet(SERVER_PACKET_DATA, &[&block]))
+        .unwrap();
+    assert_eq!(events(&mut compressed), [Event::Data(block.clone())]);
+
+    let mut plain = ready_engine();
+    plain.query(Query::new("SELECT 13")).unwrap();
+    plain = plain.with_compression(true);
+    plain.feed(&data_packet(&block)).unwrap();
+    assert_eq!(events(&mut plain), [Event::Data(block)]);
+}
+
+#[test]
+fn compressed_client_fed_insert_is_rejected_atomically() {
+    let mut engine = ready_engine().with_compression(true);
+    assert_eq!(
+        engine.insert(Query::new("INSERT INTO items VALUES")),
+        Err(ProtocolError::CompressedInsertUnsupported)
+    );
+    assert_eq!(engine.state(), State::Ready);
+    assert!(engine.take_output().is_empty());
+}
+
+#[test]
+fn compressed_result_rejects_malformed_frames() {
+    let block = framed_int64_block(&[13]);
+
+    let mut bad_checksum = compressed_packet(SERVER_PACKET_DATA, &[&block]);
+    bad_checksum[2] ^= 1;
+    let mut engine = ready_engine().with_compression(true);
+    engine.query(Query::new("SELECT 13")).unwrap();
+    assert!(matches!(
+        engine.feed(&bad_checksum),
+        Err(ProtocolError::Compression(
+            CompressionError::ChecksumMismatch { .. }
+        ))
+    ));
+
+    let mut unknown = compressed_packet(SERVER_PACKET_DATA, &[&block]);
+    unknown[2 + 16] = 0x7f;
+    let mut engine = ready_engine().with_compression(true);
+    engine.query(Query::new("SELECT 13")).unwrap();
+    assert_eq!(
+        engine.feed(&unknown[..2 + 25]),
+        Err(ProtocolError::Compression(
+            CompressionError::UnsupportedCodec { method: 0x7f }
+        ))
+    );
+
+    let mut zero_plaintext = compressed_packet(SERVER_PACKET_DATA, &[&block]);
+    zero_plaintext[2 + 21..2 + 25].copy_from_slice(&0_u32.to_le_bytes());
+    let mut engine = ready_engine().with_compression(true);
+    engine.query(Query::new("SELECT 13")).unwrap();
+    assert_eq!(
+        engine.feed(&zero_plaintext[..2 + 25]),
+        Err(ProtocolError::Compression(
+            CompressionError::InvalidUncompressedSize {
+                uncompressed_size: 0
+            }
+        ))
+    );
+
+    let mut trailing_plaintext = block.clone();
+    trailing_plaintext.push(0);
+    let trailing = compressed_packet(SERVER_PACKET_DATA, &[&trailing_plaintext]);
+    let mut engine = ready_engine().with_compression(true);
+    engine.query(Query::new("SELECT 13")).unwrap();
+    assert_eq!(
+        engine.feed(&trailing),
+        Err(ProtocolError::Compression(
+            CompressionError::TrailingPlaintext { remaining: 1 }
+        ))
+    );
+}
+
+#[test]
+fn compressed_result_checks_both_declared_sizes_before_payload() {
+    let block = framed_int64_block(&[13]);
+    let limit = MIN_MAX_BLOCK_BYTES;
+
+    let over_compressed = max_frame_len(limit) - 16 + 1;
+    for (size_offset, size) in [(17, over_compressed), (21, limit + 1)] {
+        let mut packet = compressed_packet(SERVER_PACKET_DATA, &[&block]);
+        packet[2 + size_offset..2 + size_offset + 4].copy_from_slice(&(size as u32).to_le_bytes());
+        let mut engine = ready_engine()
+            .with_max_block_bytes(limit)
+            .with_compression(true);
+        engine.query(Query::new("SELECT 13")).unwrap();
+        assert_eq!(
+            engine.feed(&packet[..2 + 25]),
+            Err(ProtocolError::NativeBlockTooLarge { limit }),
+            "header offset {size_offset}"
+        );
+        assert_eq!(engine.state(), PROTOCOL_FAILED);
+    }
+}
+
+#[test]
+fn compressed_result_checks_second_frame_sizes_against_remaining_budget() {
+    let block = framed_string_block(900);
+    let limit = MIN_MAX_BLOCK_BYTES;
+    let split = 600;
+    let mut first = Vec::new();
+    write_lz4_frame(&block[..split], &mut first).unwrap();
+    let mut second = Vec::new();
+    write_lz4_frame(&block[split..], &mut second).unwrap();
+    let remaining = limit - split;
+
+    let over_compressed = max_frame_len(remaining) - 16 + 1;
+    for (size_offset, size) in [(17, over_compressed), (21, remaining + 1)] {
+        let mut malformed_second = second.clone();
+        malformed_second[size_offset..size_offset + 4]
+            .copy_from_slice(&(size as u32).to_le_bytes());
+        let mut response = vec![SERVER_PACKET_DATA as u8, 0];
+        response.extend_from_slice(&first);
+        response.extend_from_slice(&malformed_second[..25]);
+
+        let mut engine = ready_engine()
+            .with_max_block_bytes(limit)
+            .with_compression(true);
+        engine.query(Query::new("SELECT repeat('x', 900)")).unwrap();
+        assert_eq!(
+            engine.feed(&response),
+            Err(ProtocolError::NativeBlockTooLarge { limit }),
+            "header offset {size_offset}"
+        );
+    }
+}
+
+#[test]
+fn compressed_result_fixed_header_is_incremental() {
+    let block = framed_int64_block(&[13]);
+    let packet = compressed_packet(SERVER_PACKET_DATA, &[&block]);
+    let mut engine = ready_engine().with_compression(true);
+    engine.query(Query::new("SELECT 13")).unwrap();
+    for byte in &packet[..2 + 24] {
+        engine.feed(std::slice::from_ref(byte)).unwrap();
+    }
+    assert!(events(&mut engine).is_empty());
+    for byte in &packet[2 + 24..] {
+        engine.feed(std::slice::from_ref(byte)).unwrap();
+    }
+    assert_eq!(events(&mut engine), [Event::Data(block)]);
+}
+
+#[test]
+fn finish_rejects_truncated_compression_prefix_and_payload() {
+    let block = framed_int64_block(&[13]);
+    let packet = compressed_packet(SERVER_PACKET_DATA, &[&block]);
+    for end in [2 + 24, packet.len() - 1] {
+        let mut engine = ready_engine().with_compression(true);
+        engine.query(Query::new("SELECT 13")).unwrap();
+        engine.feed(&packet[..end]).unwrap();
+        assert_eq!(engine.finish(), Err(ProtocolError::UnexpectedEof));
+        assert_eq!(engine.state(), PROTOCOL_FAILED);
+    }
+}
+
+#[test]
+fn compressed_plaintext_capacity_stays_within_block_limit() {
+    let block = framed_string_block(900);
+    let limit = MIN_MAX_BLOCK_BYTES;
+    assert!(block.len() < limit);
+    let split = 600;
+    let packet = compressed_packet(SERVER_PACKET_DATA, &[&block[..split], &block[split..]]);
+    let mut engine = ready_engine()
+        .with_max_block_bytes(limit)
+        .with_compression(true);
+    engine.query(Query::new("SELECT repeat('x', 900)")).unwrap();
+    engine.feed(&packet).unwrap();
+    let [Event::Data(decoded)]: [Event; 1] = events(&mut engine).try_into().unwrap() else {
+        panic!("expected Data");
+    };
+    assert_eq!(decoded, block);
+    assert!(decoded.capacity() <= limit);
+}
+
+/// One NONE compression frame carrying `plaintext`.
+fn none_frame(plaintext: &[u8]) -> Vec<u8> {
+    let mut header = vec![0x02];
+    header.extend_from_slice(&(9 + plaintext.len() as u32).to_le_bytes());
+    header.extend_from_slice(&(plaintext.len() as u32).to_le_bytes());
+    header.extend_from_slice(plaintext);
+    let hash = cityhash_rs::cityhash_102_128(&header);
+    let mut frame = Vec::with_capacity(16 + header.len());
+    frame.extend_from_slice(&((hash >> 64) as u64).to_le_bytes());
+    frame.extend_from_slice(&(hash as u64).to_le_bytes());
+    frame.extend_from_slice(&header);
+    frame
+}
+
+/// A one-String-row block of exactly `len` bytes, its value filled by `fill`.
+fn framed_string_block_of_len(len: usize, fill: impl Fn(usize) -> u8) -> Vec<u8> {
+    let value_len = (0..len)
+        .find(|&n| framed_string_block(n).len() == len)
+        .unwrap();
+    let mut block = framed_string_block(value_len);
+    for (i, byte) in block[len - value_len..].iter_mut().enumerate() {
+        *byte = fill(i);
+    }
+    block
+}
+
+#[test]
+fn empty_native_block_lz4_matches_the_writer() {
+    assert_eq!(
+        EMPTY_NATIVE_BLOCK_LZ4,
+        compress_lz4_frame(EMPTY_NATIVE_BLOCK).unwrap()
+    );
+}
+
+#[test]
+fn compressed_impossible_claim_fails_before_reserving() {
+    let mut frame = vec![0; 16];
+    frame.push(0x82);
+    frame.extend_from_slice(&10_u32.to_le_bytes());
+    frame.extend_from_slice(&((1_u32 << 30) - 1).to_le_bytes());
+    frame.push(0);
+
+    let mut progress = BlockProgress::new(
+        BlockKind::Data,
+        ENGINE_REVISION,
+        DEFAULT_MAX_BLOCK_BYTES,
+        true,
+    );
+    assert!(matches!(progress.step(&[0]), Ok((1, None))));
+    assert!(matches!(
+        progress.step(&frame),
+        Err(ParseError::Protocol(ProtocolError::Compression(
+            CompressionError::Lz4Malformed
+        )))
+    ));
+    assert!(progress.native.capacity() <= 4096);
+    assert!(progress.frame.capacity() <= 4096);
+
+    let mut packet = vec![SERVER_PACKET_DATA as u8, 0];
+    packet.extend_from_slice(&frame);
+    let mut engine = ready_engine().with_compression(true);
+    engine.query(Query::new("SELECT 13")).unwrap();
+    assert_eq!(
+        engine.feed(&packet),
+        Err(ProtocolError::Compression(CompressionError::Lz4Malformed))
+    );
+}
+
+#[test]
+fn compressed_none_frame_at_the_block_limit_is_accepted() {
+    let limit = MIN_MAX_BLOCK_BYTES;
+    let block = framed_string_block_of_len(limit, |_| b'x');
+    let mut packet = vec![SERVER_PACKET_DATA as u8, 0];
+    packet.extend_from_slice(&none_frame(&block));
+    let mut engine = ready_engine()
+        .with_max_block_bytes(limit)
+        .with_compression(true);
+    engine.query(Query::new("SELECT 13")).unwrap();
+    engine.feed(&packet).unwrap();
+    assert_eq!(events(&mut engine), [Event::Data(block)]);
+}
+
+#[test]
+fn compressed_incompressible_lz4_block_at_the_limit_is_accepted() {
+    let limit = MIN_MAX_BLOCK_BYTES;
+    let mut state = 0x2545_f491_u32;
+    let random: Vec<u8> = (0..limit)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    let block = framed_string_block_of_len(limit, |i| random[i]);
+    let packet = compressed_packet(SERVER_PACKET_DATA, &[&block]);
+    assert!(
+        packet.len() - 2 - 16 > limit,
+        "frame must be incompressible"
+    );
+    let mut engine = ready_engine()
+        .with_max_block_bytes(limit)
+        .with_compression(true);
+    engine.query(Query::new("SELECT 13")).unwrap();
+    engine.feed(&packet).unwrap();
+    assert_eq!(events(&mut engine), [Event::Data(block)]);
+}
+
+#[test]
+fn compressed_frame_over_the_plaintext_budget_is_too_large() {
+    let limit = MIN_MAX_BLOCK_BYTES;
+    let plaintext = vec![0; limit + 1];
+    let mut packet = vec![SERVER_PACKET_DATA as u8, 0];
+    packet.extend_from_slice(&none_frame(&plaintext));
+    let mut engine = ready_engine()
+        .with_max_block_bytes(limit)
+        .with_compression(true);
+    engine.query(Query::new("SELECT 13")).unwrap();
+    assert_eq!(
+        engine.feed(&packet[..2 + 25]),
+        Err(ProtocolError::NativeBlockTooLarge { limit })
+    );
+}
+
+#[test]
+fn compression_frames_only_data_totals_and_extremes_at_revision_54460() {
+    let block = framed_int64_block(&[13]);
+    let mut response = compressed_packet(SERVER_PACKET_DATA, &[&block]);
+    response.extend(compressed_packet(SERVER_PACKET_TOTALS, &[&block]));
+    response.extend(compressed_packet(SERVER_PACKET_EXTREMES, &[&block]));
+    let mut log = data_packet(&block);
+    log[0] = SERVER_PACKET_LOG as u8;
+    response.extend(log);
+    let mut profile_events = data_packet(&block);
+    profile_events[0] = SERVER_PACKET_PROFILE_EVENTS as u8;
+    response.extend(profile_events);
+
+    let mut engine = ready_engine().with_compression(true);
+    engine.query(Query::new("SELECT 13")).unwrap();
+    engine.feed(&response).unwrap();
+    assert_eq!(
+        events(&mut engine),
+        [
+            Event::Data(block.clone()),
+            Event::Totals(block.clone()),
+            Event::Extremes(block.clone()),
+            Event::Log(block.clone()),
+            Event::ProfileEvents(block),
+        ]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2297,11 +2674,23 @@ fn setting_names_over_the_cap_are_rejected() {
 #[test]
 fn query_output_limit_is_exact() {
     let engine = ready_engine();
-    let base = query_packet_len(&Query::new(""), &engine.identity, &engine.quota_key).unwrap();
+    let base = query_packet_len(
+        &Query::new(""),
+        &engine.identity,
+        &engine.quota_key,
+        EMPTY_NATIVE_BLOCK.len(),
+    )
+    .unwrap();
     let mut sql_len = QUERY_OUTPUT_LIMIT - base;
     let length = |sql_len: usize| {
         let query = Query::new("x".repeat(sql_len));
-        query_packet_len(&query, &engine.identity, &engine.quota_key).unwrap()
+        query_packet_len(
+            &query,
+            &engine.identity,
+            &engine.quota_key,
+            EMPTY_NATIVE_BLOCK.len(),
+        )
+        .unwrap()
     };
     // The SQL length prefix grows by a few bytes; step back to fit exactly.
     while length(sql_len) > QUERY_OUTPUT_LIMIT {
@@ -2343,7 +2732,13 @@ fn query_packet_len_matches_the_written_packet() {
     ];
     for query in queries {
         let mut engine = ready_engine();
-        let expected = query_packet_len(&query, &engine.identity, &engine.quota_key).unwrap();
+        let expected = query_packet_len(
+            &query,
+            &engine.identity,
+            &engine.quota_key,
+            EMPTY_NATIVE_BLOCK.len(),
+        )
+        .unwrap();
         engine.query(query).unwrap();
         assert_eq!(engine.take_output().len(), expected);
     }
@@ -2355,7 +2750,13 @@ fn query_packet_len_matches_the_written_packet() {
     let _ = events(&mut engine);
     let _ = engine.take_output();
     let query = Query::new("SELECT 1").with_setting("a", "b");
-    let expected = query_packet_len(&query, &engine.identity, &engine.quota_key).unwrap();
+    let expected = query_packet_len(
+        &query,
+        &engine.identity,
+        &engine.quota_key,
+        EMPTY_NATIVE_BLOCK.len(),
+    )
+    .unwrap();
     engine.query(query).unwrap();
     assert_eq!(engine.take_output().len(), expected);
 }

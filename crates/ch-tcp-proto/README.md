@@ -6,12 +6,21 @@ sockets, TLS, timeouts, cancellation, and connection pooling. The engine
 accepts arbitrary byte chunks, queues protocol events, and queues ordered bytes
 to send.
 
-The initial scope is deliberately small: handshake, Ping/Pong, and uncompressed
-initial SELECT and INSERT queries at protocol revision 54460. SELECT results emit complete
-Native block bytes plus typed Progress, ProfileInfo, ProfileEvents, Log, Totals,
+The initial scope is deliberately small: handshake, Ping/Pong, SELECT with
+optional compression, and uncompressed INSERT at protocol revision 54460.
+SELECT results emit complete Native block bytes plus typed Progress, ProfileInfo, ProfileEvents, Log, Totals,
 Extremes, Exception, and EndOfStream events. INSERT emits its schema separately
 before accepting client blocks. Cancellation, external tables, and compressed
-TCP packets are not implemented yet.
+INSERT are not implemented yet.
+
+Enable compression with `Connection::new(hello)?.with_compression(true)`.
+The engine writes the compression flag into every Query and compresses the
+empty external-data marker with LZ4. Server Data, Totals, and Extremes bodies
+are decompressed before their Native bytes are emitted. Each frame selects its
+own codec: NONE, LZ4, or ZSTD. The engine does not send
+`network_compression_method`; server settings choose the response codec.
+`insert` on a compressed connection returns
+`ProtocolError::CompressedInsertUnsupported` before queuing any bytes.
 
 ## Driver loop
 
@@ -453,7 +462,7 @@ parsed, so a known pending failure cannot be bypassed by another upload call.
   initial SELECT result exchange, including fully specified inline INSERTs
   and INSERT SELECT. Use `insert` for a client-fed INSERT.
   input(), external tables,
-  parallel-replica exchanges, cancellation, and compressed packets are not
+  parallel-replica exchanges, cancellation, and compressed INSERT are not
   supported. The engine does not parse SQL to classify statements.
 - The engine frames result blocks with core's scanner, so a result column type
   core cannot decode fails the whole connection with `ProtocolError::Decode`.
@@ -538,9 +547,20 @@ block over the cap returns `InvalidInsertBlock(InsertBlockError::TooLarge)`
 and leaves state and output unchanged. HTTP has no per-block
 cap, so a low value can reject results HTTP returns: `SELECT
 randomString(1100) FROM numbers(100000)` produces blocks of about 72 MB. Block
-memory grows only with bytes actually received, never from a declared length,
-and the block buffer's capacity never exceeds the cap. Core's scan-only
-boundary parser finds the block's exact end without allocating decoded
+memory in the uncompressed path grows only with bytes actually received, never
+from a declared length, and the block buffer's capacity never exceeds the cap.
+For compressed Data, Totals, and Extremes, the engine buffers one frame at a
+time. Core rejects a declared plaintext size larger than the frame's payload
+can expand to under its codec. The engine then checks the plaintext size
+against the remaining block budget, and the frame length against the
+worst-case compressed size for that budget, before buffering the payload. The
+plaintext buffer grows by each frame's declared size, within that budget,
+before checksum verification. Compressed frame storage is separate from the
+plaintext buffer and holds at most one frame, up to the worst-case compressed
+size of `max_block_bytes`. A malformed frame returns `ProtocolError::Compression` and
+fails the connection. No extra plaintext may remain when a block ends.
+Log, ProfileEvents, and TableColumns remain raw at revision 54460.
+Core's scan-only boundary parser finds the block's exact end without allocating decoded
 columns. Malformed inbound bodies surface as `ProtocolError::Decode` and fail
 the connection; malformed outbound INSERT bodies return `InvalidInsertBlock`
 and leave the connection usable. Failure to reserve the outbound copy returns
@@ -551,6 +571,15 @@ prefixes, including Dynamic, JSON, AggregateFunction, and nested containers.
 Scanning stays linear across transport read sizes.
 
 ## Server reference
+
+Compression is confirmed at `v26.8.1.2041-lts` in
+`src/Server/TCPHandler.cpp`,
+`TCPHandler::{initBlockInput,processData,initBlockOutput,sendData,sendTotals,sendExtremes}`.
+Each outgoing Native block is flushed before the next packet. Enforcing no
+trailing plaintext at that boundary is an inferred reader constraint.
+`TCPHandler::{initLogsBlockOutput,initProfileEventsBlockOutput,sendTableColumns}`
+and `DBMS_MIN_REVISION_WITH_COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS` in
+`src/Core/ProtocolDefines.h` keep metadata raw below revision 54481.
 
 The INSERT sequence is confirmed at `v26.8.1.2041-lts` in
 `src/Server/TCPHandler.cpp`, `TCPHandler::{readTemporaryTables,startInsertQuery,processInsertQuery,receivePacketsExpectData,processData,sendTableColumns,sendEndOfStream}`.

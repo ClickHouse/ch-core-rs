@@ -282,6 +282,34 @@ impl FrameInfo {
     }
 }
 
+/// The untrusted fixed header of one ClickHouse compression frame.
+///
+/// Obtain this with [`frame_header`]. The values have passed the core framing
+/// limits, the codec check, and the codec's expansion bound for the declared
+/// payload length, so the plaintext size is at most what that many payload
+/// bytes can decode to. The checksum has not been verified and the payload
+/// need not be present yet. Callers must continue treating both sizes as
+/// attacker-controlled until [`decompress_frame`] or [`decompress_frame_into`]
+/// succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameHeader {
+    method: u8,
+    compressed_size: usize,
+    plaintext_size: usize,
+}
+
+impl FrameHeader {
+    /// Declared decompressed payload length.
+    pub fn plaintext_size(&self) -> usize {
+        self.plaintext_size
+    }
+
+    /// Complete wire length, including the 16-byte checksum.
+    pub fn frame_len(&self) -> usize {
+        CHECKSUM_SIZE + self.compressed_size
+    }
+}
+
 /// One parsed compressed block: where it ends in the input and how to produce
 /// its decompressed bytes.
 struct BlockHeader {
@@ -298,58 +326,103 @@ struct BlockHeader {
     block_end: usize,
 }
 
-/// Parse and validate one compressed block's framing at `data[pos..]`.
+/// Parse and validate one frame's fixed checksum-plus-header prefix.
 ///
-/// Returns the parsed header on success. Does not verify the checksum or
-/// decompress; that is the caller's job so the checksum can be made optional
-/// and the payload borrowed without copying.
-fn parse_block_header(data: &[u8], pos: usize) -> Result<BlockHeader, CompressionError> {
-    let available = data.len() - pos;
-    // Need at least the checksum and the 9-byte header to read the sizes.
-    if available < CHECKSUM_SIZE + HEADER_SIZE {
+/// This needs only the first 25 bytes. It does not require or inspect the
+/// payload and does not verify the checksum, whose covered bytes include that
+/// payload. [`CompressionError::Truncated`] therefore means only that the
+/// fixed prefix is incomplete.
+///
+/// Besides the absolute size limits and the method check, the declared
+/// plaintext size must fit the codec's expansion bound for the declared
+/// payload length, `compressed_size - 9`. A larger claim returns the error the
+/// decoder returns for it: [`CompressionError::Lz4Malformed`] for LZ4,
+/// [`CompressionError::InvalidUncompressedSize`] for ZSTD, and
+/// [`CompressionError::SizeMismatch`] for NONE, whose payload length must equal
+/// the plaintext size. The returned sizes remain untrusted declarations.
+pub fn frame_header(data: &[u8]) -> Result<FrameHeader, CompressionError> {
+    let header = parse_frame_prefix(data)?;
+    check_expansion(
+        header.method,
+        header.compressed_size - HEADER_SIZE,
+        header.plaintext_size,
+    )?;
+    Ok(header)
+}
+
+/// [`frame_header`] without the codec expansion bound.
+fn parse_frame_prefix(data: &[u8]) -> Result<FrameHeader, CompressionError> {
+    if data.len() < CHECKSUM_SIZE + HEADER_SIZE {
         return Err(CompressionError::Truncated {
             needed: CHECKSUM_SIZE + HEADER_SIZE,
-            available,
+            available: data.len(),
         });
     }
 
-    let header_start = pos + CHECKSUM_SIZE;
+    let header_start = CHECKSUM_SIZE;
     let method = data[header_start];
-
-    // compressed_size and uncompressed_size are 4-byte LE, at header offsets
-    // 1 and 5 (server `readCompressedBlockSize` / `readDecompressedBlockSize`).
     let compressed_size = u32::from_le_bytes([
         data[header_start + 1],
         data[header_start + 2],
         data[header_start + 3],
         data[header_start + 4],
     ]);
-    let uncompressed_size = u32::from_le_bytes([
+    let plaintext_size = u32::from_le_bytes([
         data[header_start + 5],
         data[header_start + 6],
         data[header_start + 7],
         data[header_start + 8],
     ]);
 
-    // compressed_size must include the header and stay under the 1 GiB cap.
     if compressed_size > MAX_COMPRESSED_SIZE || (compressed_size as usize) < HEADER_SIZE {
         return Err(CompressionError::InvalidCompressedSize { compressed_size });
     }
-    // uncompressed_size drives the output allocation, so bound it before the
-    // caller reserves. The core rejects zero because server writers do not emit
-    // it; a value above the cap is refused instead of forcing a huge allocation.
-    if uncompressed_size == 0 || uncompressed_size > MAX_DECOMPRESSED_SIZE {
-        return Err(CompressionError::InvalidUncompressedSize { uncompressed_size });
+    if plaintext_size == 0 || plaintext_size > MAX_DECOMPRESSED_SIZE {
+        return Err(CompressionError::InvalidUncompressedSize {
+            uncompressed_size: plaintext_size,
+        });
     }
-    // Codec support is known from the fixed header. Reject it before waiting
-    // for an attacker-controlled payload length.
     if method != METHOD_NONE && method != METHOD_LZ4 && method != METHOD_ZSTD {
         return Err(CompressionError::UnsupportedCodec { method });
     }
-    let compressed_size = compressed_size as usize;
+
+    Ok(FrameHeader {
+        method,
+        compressed_size: compressed_size as usize,
+        plaintext_size: plaintext_size as usize,
+    })
+}
+
+/// Reject a plaintext size that a `payload_len`-byte payload of `method` cannot
+/// decode to, with the same error the decoder returns.
+fn check_expansion(
+    method: u8,
+    payload_len: usize,
+    plaintext_size: usize,
+) -> Result<(), CompressionError> {
+    match method {
+        METHOD_NONE if payload_len != plaintext_size => Err(CompressionError::SizeMismatch {
+            expected: plaintext_size,
+            actual: payload_len,
+        }),
+        METHOD_LZ4 => lz4::check_claim(payload_len, plaintext_size),
+        METHOD_ZSTD => zstd::check_claim(payload_len, plaintext_size),
+        _ => Ok(()),
+    }
+}
+
+/// Parse and validate one compressed block's framing at `data[pos..]`.
+///
+/// Returns the parsed header on success. Does not verify the checksum,
+/// apply the codec expansion bound, or decompress. Callers verify the
+/// checksum first, then the decoders apply the bound.
+fn parse_block_header(data: &[u8], pos: usize) -> Result<BlockHeader, CompressionError> {
+    let available = data.len() - pos;
+    let fixed = parse_frame_prefix(&data[pos..])?;
+    let header_start = pos + CHECKSUM_SIZE;
 
     // The whole block is checksum + compressed_size bytes.
-    let block_total = CHECKSUM_SIZE + compressed_size;
+    let block_total = fixed.frame_len();
     if available < block_total {
         return Err(CompressionError::Truncated {
             needed: block_total,
@@ -358,9 +431,9 @@ fn parse_block_header(data: &[u8], pos: usize) -> Result<BlockHeader, Compressio
     }
 
     Ok(BlockHeader {
-        method,
-        compressed_size,
-        uncompressed_size: uncompressed_size as usize,
+        method: fixed.method,
+        compressed_size: fixed.compressed_size,
+        uncompressed_size: fixed.plaintext_size,
         header_start,
         payload_start: header_start + HEADER_SIZE,
         block_end: pos + block_total,
@@ -802,6 +875,96 @@ mod tests {
             CompressionError::Truncated { needed, available: got }
                 if needed == frame.len() && got == available
         ));
+    }
+
+    #[test]
+    fn header_peek_needs_only_the_fixed_prefix() {
+        let raw = b"payload need not be present";
+        let mut frame = frame_block(METHOD_NONE, raw.len() as u32, raw);
+        frame[0] ^= 0xff;
+
+        for split in 0..CHECKSUM_SIZE + HEADER_SIZE {
+            assert_eq!(
+                frame_header(&frame[..split]),
+                Err(CompressionError::Truncated {
+                    needed: CHECKSUM_SIZE + HEADER_SIZE,
+                    available: split,
+                })
+            );
+        }
+
+        let header = frame_header(&frame[..CHECKSUM_SIZE + HEADER_SIZE]).unwrap();
+        assert_eq!(header.method, METHOD_NONE);
+        assert_eq!(header.compressed_size, HEADER_SIZE + raw.len());
+        assert_eq!(header.plaintext_size(), raw.len());
+        assert_eq!(header.frame_len(), frame.len());
+        assert!(matches!(
+            decompress_frame(&frame, ChecksumMode::Verify),
+            Err(CompressionError::ChecksumMismatch { .. })
+        ));
+    }
+
+    /// A 25-byte prefix with a zero checksum and the given header fields.
+    fn prefix(method: u8, compressed_size: u32, plaintext_size: u32) -> Vec<u8> {
+        let mut prefix = vec![0u8; CHECKSUM_SIZE];
+        prefix.push(method);
+        prefix.extend_from_slice(&compressed_size.to_le_bytes());
+        prefix.extend_from_slice(&plaintext_size.to_le_bytes());
+        prefix
+    }
+
+    #[test]
+    fn header_peek_rejects_claims_past_the_codec_expansion_bound() {
+        let payload = 1u32;
+        let compressed = HEADER_SIZE as u32 + payload;
+        let lz4_max = 255 + 24;
+        let zstd_max = 32 * 1024;
+
+        assert!(frame_header(&prefix(METHOD_LZ4, compressed, lz4_max)).is_ok());
+        assert_eq!(
+            frame_header(&prefix(METHOD_LZ4, compressed, lz4_max + 1)),
+            Err(CompressionError::Lz4Malformed)
+        );
+        assert_eq!(
+            frame_header(&prefix(METHOD_LZ4, compressed, MAX_DECOMPRESSED_SIZE - 1)),
+            Err(CompressionError::Lz4Malformed)
+        );
+
+        assert!(frame_header(&prefix(METHOD_ZSTD, compressed, zstd_max)).is_ok());
+        assert_eq!(
+            frame_header(&prefix(METHOD_ZSTD, compressed, zstd_max + 1)),
+            Err(CompressionError::InvalidUncompressedSize {
+                uncompressed_size: zstd_max + 1
+            })
+        );
+
+        assert!(frame_header(&prefix(METHOD_NONE, compressed, payload)).is_ok());
+        assert_eq!(
+            frame_header(&prefix(METHOD_NONE, compressed, payload + 1)),
+            Err(CompressionError::SizeMismatch {
+                expected: payload as usize + 1,
+                actual: payload as usize,
+            })
+        );
+    }
+
+    #[test]
+    fn decode_checks_checksum_before_expansion_bound() {
+        let mut block = prefix(METHOD_LZ4, HEADER_SIZE as u32 + 1, 1024);
+        block.push(0);
+        assert!(matches!(
+            decompress_frame(&block, ChecksumMode::Verify),
+            Err(CompressionError::ChecksumMismatch { .. })
+        ));
+        let mut out = Vec::new();
+        assert!(matches!(
+            decompress_frame_into(&block, ChecksumMode::Verify, &mut out),
+            Err(CompressionError::ChecksumMismatch { .. })
+        ));
+        assert_eq!(
+            decompress_frame(&block, ChecksumMode::Skip).unwrap_err(),
+            CompressionError::Lz4Malformed
+        );
     }
 
     #[test]

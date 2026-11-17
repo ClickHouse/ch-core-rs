@@ -36,6 +36,10 @@ INITIAL_QUERY_START_TIME_MICROSECONDS = 1791500000000013
 OS_USER = "fixture_os_user_13"
 CLIENT_HOSTNAME = "fixture_host_79"
 EMPTY_BLOCK = bytes.fromhex("010002ffffffff000000")
+EMPTY_COMPRESSED_LZ4 = bytes.fromhex(
+    "a783ac6cd55c7a7cb5ac46bddb86e214"
+    "82140000000a000000a0010002ffffffff000000"
+)
 QUERIES = {
     "select": "SELECT 1",
     "multi": (
@@ -103,7 +107,13 @@ def dump_query_parameter(text):
     return dump_field_string(text)
 
 
-def query_packet(query, query_id, parameters=(), settings=CAPTURE_SETTINGS):
+def query_packet(
+    query,
+    query_id,
+    parameters=(),
+    settings=CAPTURE_SETTINGS,
+    compression=False,
+):
     client_info = (
         b"\x01" + string("default") + string(query_id) + string(INITIAL_ADDRESS)
         + struct.pack("<Q", INITIAL_QUERY_START_TIME_MICROSECONDS)
@@ -125,8 +135,9 @@ def query_packet(query, query_id, parameters=(), settings=CAPTURE_SETTINGS):
     )
     return (
         varuint(1) + string(query_id) + client_info + encoded_settings + string("")
-        + varuint(2) + varuint(0) + string(query) + params + string("")
-        + varuint(2) + string("") + EMPTY_BLOCK
+        + varuint(2) + varuint(int(compression)) + string(query) + params + string("")
+        + varuint(2) + string("")
+        + (EMPTY_COMPRESSED_LZ4 if compression else EMPTY_BLOCK)
     )
 
 

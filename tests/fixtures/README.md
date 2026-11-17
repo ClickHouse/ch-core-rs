@@ -328,6 +328,73 @@ Settings flags are VarUInt IMPORTANT, value 1, and parameter flags are CUSTOM,
 value 2. Log and ProfileEvents use revision-54460 Native framing, including
 BlockInfo.
 
+## Revision 54460 compressed SELECT capture workflow
+
+The full compressed-query fixtures were captured on 2026-11-11 from local
+ClickHouse `26.8.1.2041`, matched to source tag `v26.8.1.2041-lts`, at
+revision 54460. Regenerate them with Python's standard library and the `zstd`
+CLI:
+
+```sh
+no_proxy=127.0.0.1 NO_PROXY=127.0.0.1 python3 -B scripts/gen_tcp_compressed_query_fixtures.py
+```
+
+Run the independent parser and hash check without a server:
+
+```sh
+python3 -B scripts/gen_tcp_compressed_query_fixtures.py --check
+```
+
+The generator checks the live HTTP version and `.server-ref`, uses `default`
+with an empty password, and sends compression flag 1. Each Query explicitly
+sets `network_compression_method` to LZ4, NONE, or ZSTD. The client
+external-table terminator is the same LZ4 frame emitted by
+`Connection::with_compression(true)`. The server response files retain every
+packet from the first Log through EOS or Exception. Client files retain the
+Query and external-table terminator. The cancel client file appends one raw
+Client::Cancel packet.
+
+The nine captures cover:
+
+- LZ4 Data split into multiple result blocks.
+- One 1,100,000-byte String whose Native block spans frame plaintext lengths
+  1,048,576 and 51,465.
+- LZ4 Totals and Extremes.
+- A mid-stream division Exception after positive-row Data, followed by a
+  successful query on the same connection without an intervening EOS.
+- A raw Cancel ending in EOS, followed by a successful query on the same
+  connection.
+- NONE and ZSTD frames selected through ordinary query settings.
+
+At revision 54460, only Data, Totals, and Extremes Native bodies are
+compressed. Packet codes and table names stay raw. Log and ProfileEvents
+blocks also stay raw because
+`DBMS_MIN_REVISION_WITH_COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS` is 54481.
+Progress, ProfileInfo, Exception, and EOS are scalar raw packets. The captures
+include raw Log and ProfileEvents interleaved with framed result blocks, so the
+replay verifies the parser switches sources at the correct packet boundary.
+
+`tcp_compressed_query_rev54460.json` records query text, method, raw packet
+offsets, schemas, frame headers, decompressed lengths and SHA-256 hashes, and
+wire-file hashes. Plaintext Native files are deliberately omitted, including
+for the large block. `--check` decompresses the committed wire bytes, finds
+each Native boundary independently, and verifies those hashes.
+
+`crates/ch-tcp-proto/tests/compressed_query_replay.rs` checks captured request
+bytes, semantic result values, packet kinds, exception and cancel reuse, and
+chunk-boundary independence. Every small response is replayed at every
+two-chunk split, one byte at a time, and with deterministic random chunks. The
+large multi-frame response uses one linear bytewise feed plus random chunks to
+cover every wire boundary without a quadratic full replay.
+
+Confirmed server source at `v26.8.1.2041-lts`:
+`src/Server/TCPHandler.cpp::processQuery/sendData/sendTotals/sendExtremes/sendLogs/sendProfileEvents/sendEndOfStream`,
+`src/Client/Connection.cpp::sendQuery/sendCancel`, and
+`src/Core/ProtocolDefines.h`. The server flushes the compressor after each
+Native block. It can emit multiple compression frames for one block, and an
+Exception can follow already flushed Data. Cancel normally ends the exchange
+with raw EOS at this revision.
+
 ## Revision 54460 INSERT capture workflow
 
 The INSERT fixtures were captured on 2026-11-10 from local ClickHouse

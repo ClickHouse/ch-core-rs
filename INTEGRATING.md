@@ -129,7 +129,12 @@ dispatch. It reports Progress, ProfileInfo, Log, ProfileEvents, Totals,
 Extremes, Exception, and EndOfStream as typed events. It does not own sockets,
 TLS, timeouts, pooling, or cancellation: there is no Cancel packet yet, so a
 driver that abandons a query mid-stream must discard the connection. The first
-engine handles uncompressed SELECT and INSERT. See `crates/ch-tcp-proto/README.md`
+engine handles SELECT with optional compression and uncompressed INSERT.
+Use `Connection::with_compression(true)` to enable compressed SELECT responses.
+The engine decodes NONE, LZ4, and ZSTD frames without choosing the server's
+codec. Client-fed INSERT on that connection returns
+`ProtocolError::CompressedInsertUnsupported`.
+See `crates/ch-tcp-proto/README.md`
 for the driver loop and a tested `run_select` example.
 
 The engine conservatively fails a query when its first response is an
@@ -362,7 +367,8 @@ columns. Advance the outer input by the `consumed` field from
 retains incomplete block bytes, supplies the decode options, and imposes its
 own block byte limit.
 
-`ch-tcp-proto` uses this scanner for uncompressed revision-54460 SELECTs.
+`ch-tcp-proto` uses this scanner for revision-54460 SELECTs, compressed or not.
+With compression it scans the decompressed frames of each block.
 Its `Event::Data` payloads concatenate into a framed Native result stream for
 the ordinary streaming API above. The TCP empty end-of-data marker is consumed
 by the engine; schema-only result blocks remain in the byte stream. Other

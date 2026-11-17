@@ -24,6 +24,23 @@ version; patch releases remain backward compatible.
 - CityHash128 now comes from the `cityhash-rs` crate. Checksums are the same.
 - LZ4 is unchanged. It stays hand-written, and frames it writes are the same
   bytes as before.
+- Add `compression::frame_header` and `FrameHeader`. They read a frame's
+  declared sizes from its fixed 25-byte prefix, with the same limit and
+  codec checks as decode, before the payload arrives. They also reject a
+  plaintext size larger than the payload can expand to under the frame's
+  codec, with the error decode returns for that case. Callers can check the
+  sizes against their own memory budget before decompressing.
+- `ch-tcp-proto`: add compressed SELECT with `Connection::with_compression`.
+  Every Query on the connection then sets the compression flag and sends the
+  external-data terminator as one LZ4 frame. Server Data, Totals and Extremes
+  bodies are decoded frame by frame. Each frame picks NONE, LZ4 or ZSTD by its
+  method byte. Plaintext size is checked against `max_block_bytes`, and frame
+  length against the worst-case compressed size for that budget, before the
+  payload is buffered. A bad frame fails the connection with
+  `ProtocolError::Compression`. `insert` on a compressed connection returns
+  `ProtocolError::CompressedInsertUnsupported` and queues nothing. Real server
+  fixtures at revision 54460 cover LZ4, NONE and ZSTD, multi-frame blocks,
+  Totals and Extremes, a mid-stream exception, cancel, and reuse.
 - Add `native::binary_value::write_binary_type_prefix` and
   `encode_binary_value`, the inverses of `read_binary_type_prefix` and
   `decode_binary_value`. They write one row of a decoded column as a binary
