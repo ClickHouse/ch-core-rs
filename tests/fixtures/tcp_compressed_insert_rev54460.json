@@ -1,0 +1,723 @@
+{
+  "captured_on": "2026-11-17",
+  "server_version": "26.8.1.2041",
+  "source_tag": "v26.8.1.2041-lts",
+  "declared_revision": 54460,
+  "client_encoder": "ch-tcp-proto Connection and core write_lz4_frame",
+  "cases": {
+    "multi": {
+      "sql": "INSERT INTO ch_core_tcp_compressed_insert_fixture (n, s) VALUES",
+      "compression": true,
+      "blocks": [
+        "tcp_compressed_insert_multi_block0_rev54460.bytes",
+        "tcp_compressed_insert_multi_block1_rev54460.bytes"
+      ],
+      "block_oracles": [
+        {
+          "rows": 1,
+          "columns": 2,
+          "schema": [
+            [
+              "n",
+              "UInt64"
+            ],
+            [
+              "s",
+              "String"
+            ]
+          ],
+          "wire_length": 70,
+          "frames": [
+            {
+              "method": 130,
+              "compressed_size": 54,
+              "uncompressed_size": 45,
+              "checksum": "0d3f64c1607002d3dc7114218385d76b"
+            }
+          ],
+          "native_length": 45,
+          "native_sha256": "7b111c8bb8757adb1cd64945123d79daa7d80bd63da292080242ddf6f8f73f3d"
+        },
+        {
+          "rows": 1,
+          "columns": 2,
+          "schema": [
+            [
+              "n",
+              "UInt64"
+            ],
+            [
+              "s",
+              "String"
+            ]
+          ],
+          "wire_length": 4423,
+          "frames": [
+            {
+              "method": 130,
+              "compressed_size": 4170,
+              "uncompressed_size": 1048576,
+              "checksum": "c77342b6569950d7a088226e2e327b3b"
+            },
+            {
+              "method": 130,
+              "compressed_size": 221,
+              "uncompressed_size": 51465,
+              "checksum": "088d55522e79831b6df763eab274e3d9"
+            }
+          ],
+          "native_length": 1100041,
+          "native_sha256": "6cbf647fbe95af41327f44a863b726e191b385744fec90d24584c97cebdacdaf"
+        }
+      ],
+      "request": "tcp_compressed_insert_multi_request_rev54460.bytes",
+      "schema": "tcp_compressed_insert_multi_schema_rev54460.bytes",
+      "schema_packets": [
+        {
+          "code": 11,
+          "offset": 0,
+          "table_hex": "",
+          "description_hex": "636f6c756d6e7320666f726d61742076657273696f6e3a20310a3220636f6c756d6e733a0a606e602055496e7436340a60736020537472696e670a",
+          "length": 62
+        },
+        {
+          "code": 1,
+          "offset": 62,
+          "name": "",
+          "rows": 0,
+          "columns": 2,
+          "schema": [
+            [
+              "n",
+              "UInt64"
+            ],
+            [
+              "s",
+              "String"
+            ]
+          ],
+          "wire_length": 57,
+          "frames": [
+            {
+              "method": 130,
+              "compressed_size": 41,
+              "uncompressed_size": 30,
+              "checksum": "04217e7711b14b1c73d53bc33b58d36f"
+            }
+          ],
+          "native_length": 30,
+          "native_sha256": "624d5c6e30f14627e2b48f99477009116fbadd01b455aadf502b3040d726775e",
+          "length": 59
+        }
+      ],
+      "finish": "tcp_compressed_insert_multi_finish_rev54460.bytes",
+      "exception_phase": null,
+      "completion": "tcp_compressed_insert_multi_completion_rev54460.bytes",
+      "completion_packets": [
+        {
+          "code": 5,
+          "offset": 0,
+          "length": 1
+        }
+      ],
+      "recovery_sql": "SELECT n, s FROM ch_core_tcp_compressed_insert_fixture ORDER BY n",
+      "recovery_request": "tcp_compressed_insert_multi_recovery_request_rev54460.bytes",
+      "recovery": "tcp_compressed_insert_multi_recovery_rev54460.bytes",
+      "recovery_packets": [
+        {
+          "code": 1,
+          "offset": 0,
+          "name": "",
+          "rows": 0,
+          "columns": 2,
+          "schema": [
+            [
+              "n",
+              "UInt64"
+            ],
+            [
+              "s",
+              "String"
+            ]
+          ],
+          "wire_length": 57,
+          "frames": [
+            {
+              "method": 130,
+              "compressed_size": 41,
+              "uncompressed_size": 30,
+              "checksum": "04217e7711b14b1c73d53bc33b58d36f"
+            }
+          ],
+          "native_length": 30,
+          "native_sha256": "624d5c6e30f14627e2b48f99477009116fbadd01b455aadf502b3040d726775e",
+          "length": 59
+        },
+        {
+          "code": 1,
+          "offset": 59,
+          "name": "",
+          "rows": 2,
+          "columns": 2,
+          "schema": [
+            [
+              "n",
+              "UInt64"
+            ],
+            [
+              "s",
+              "String"
+            ]
+          ],
+          "wire_length": 4436,
+          "frames": [
+            {
+              "method": 130,
+              "compressed_size": 4183,
+              "uncompressed_size": 1048576,
+              "checksum": "4f74151148416f0e1c8056b84d304605"
+            },
+            {
+              "method": 130,
+              "compressed_size": 221,
+              "uncompressed_size": 51480,
+              "checksum": "8f198795914cd3d7946ed8f5ca00e3b8"
+            }
+          ],
+          "native_length": 1100056,
+          "native_sha256": "226491c9227769c1b256e1e7221c4c106f5f160346a078acc04e1f4cbe46b8e6",
+          "length": 4438
+        },
+        {
+          "code": 6,
+          "offset": 4497,
+          "profile": [
+            2,
+            1,
+            2097664
+          ],
+          "applied_limit": 0,
+          "rows_before_limit": 0,
+          "obsolete": 1,
+          "length": 10
+        },
+        {
+          "code": 3,
+          "offset": 4507,
+          "progress": [
+            2,
+            1100038,
+            2,
+            0,
+            0,
+            3411875
+          ],
+          "length": 12
+        },
+        {
+          "code": 1,
+          "offset": 4519,
+          "name": "",
+          "rows": 0,
+          "columns": 0,
+          "schema": [],
+          "wire_length": 36,
+          "frames": [
+            {
+              "method": 130,
+              "compressed_size": 20,
+              "uncompressed_size": 10,
+              "checksum": "a783ac6cd55c7a7cb5ac46bddb86e214"
+            }
+          ],
+          "native_length": 10,
+          "native_sha256": "e07d2d762f3e51b34b91f72c628ffbb4f0384ec1c38dd7c35e4b6b4f238f85b4",
+          "length": 38
+        },
+        {
+          "code": 3,
+          "offset": 4557,
+          "progress": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            7292
+          ],
+          "length": 8
+        },
+        {
+          "code": 5,
+          "offset": 4565,
+          "length": 1
+        }
+      ],
+      "verified_http_rows": {
+        "count": 2,
+        "length": 1100038,
+        "sha256": "71efed192a89b576e9e17e455e4ffdfe9b9ccf59b83f38fb9154f5830c644718"
+      }
+    },
+    "rejected": {
+      "sql": "INSERT INTO ch_core_tcp_compressed_insert_fixture (n, s) VALUES",
+      "compression": true,
+      "blocks": [
+        "tcp_compressed_insert_rejected_block0_rev54460.bytes"
+      ],
+      "block_oracles": [
+        {
+          "rows": 1,
+          "columns": 2,
+          "schema": [
+            [
+              "n",
+              "UInt64"
+            ],
+            [
+              "s",
+              "String"
+            ]
+          ],
+          "wire_length": 72,
+          "frames": [
+            {
+              "method": 130,
+              "compressed_size": 56,
+              "uncompressed_size": 47,
+              "checksum": "5ee5b7704bf9733c545af8dca455823e"
+            }
+          ],
+          "native_length": 47,
+          "native_sha256": "7456d9725bebac36f53e969c4748e84b3d3747d0c5aca27b2e8ec07534e52567"
+        }
+      ],
+      "request": "tcp_compressed_insert_rejected_request_rev54460.bytes",
+      "schema": "tcp_compressed_insert_rejected_schema_rev54460.bytes",
+      "schema_packets": [
+        {
+          "code": 11,
+          "offset": 0,
+          "table_hex": "",
+          "description_hex": "636f6c756d6e7320666f726d61742076657273696f6e3a20310a3220636f6c756d6e733a0a606e602055496e7436340a60736020537472696e670a",
+          "length": 62
+        },
+        {
+          "code": 1,
+          "offset": 62,
+          "name": "",
+          "rows": 0,
+          "columns": 2,
+          "schema": [
+            [
+              "n",
+              "UInt64"
+            ],
+            [
+              "s",
+              "String"
+            ]
+          ],
+          "wire_length": 57,
+          "frames": [
+            {
+              "method": 130,
+              "compressed_size": 41,
+              "uncompressed_size": 30,
+              "checksum": "04217e7711b14b1c73d53bc33b58d36f"
+            }
+          ],
+          "native_length": 30,
+          "native_sha256": "624d5c6e30f14627e2b48f99477009116fbadd01b455aadf502b3040d726775e",
+          "length": 59
+        }
+      ],
+      "finish": "tcp_compressed_insert_rejected_finish_rev54460.bytes",
+      "exception_phase": "after_upload_terminator_sent",
+      "completion": "tcp_compressed_insert_rejected_completion_rev54460.bytes",
+      "completion_packets": [
+        {
+          "code": 2,
+          "offset": 0,
+          "exception_code": 469,
+          "exception_name": "DB::Exception",
+          "message": "DB::Exception: Constraint `small` for table default.ch_core_tcp_compressed_insert_fixture (36a711d9-484c-4b24-b48c-e7934e44ab61) is violated at row 1. Expression: (n < 100). Column values: n = 179",
+          "stack_trace": "0. DB::Exception::Exception(DB::Exception::MessageMasked&&, int, bool) @ 0x0000000014335694\n1. DB::Exception::Exception(String&&, int, String, bool) @ 0x000000000ef10e58\n2. DB::Exception::Exception(PreformattedMessage&&, int) @ 0x000000000ef106cc\n3. DB::Exception::Exception<String, String, unsigned long, String, String&>(int, FormatStringHelperImpl<std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<unsigned long>::type, std::type_identity<String>::type, std::type_identity<String&>::type>, String&&, String&&, unsigned long&&, String&&, String&) @ 0x0000000017cc62a8\n4. DB::CheckConstraintsTransform::onConsume(DB::Chunk) @ 0x000000001aeca4d0\n5. void std::__function::__policy_func<void ()>::__call_func[abi:fqe220101]<DB::ExceptionKeepingTransform::work()::$_1>(std::__function::__policy_storage const*) @ 0x000000001aedf044\n6. DB::runStep(std::function<void ()>, std::shared_ptr<DB::ThreadGroup>&) @ 0x000000001aedee90\n7. DB::ExceptionKeepingTransform::work() @ 0x000000001aede348\n8. DB::ExecutionThreadContext::executeTask() @ 0x000000001abea5ec\n9. DB::PipelineExecutor::executeStepImpl(unsigned long, DB::WorkloadResources&&, std::atomic<bool>*) @ 0x000000001abdc028\n10. void std::__function::__policy_func<void ()>::__call_func[abi:fqe220101]<DB::PipelineExecutor::spawnThreads(std::shared_ptr<DB::IAcquiredSlot>)::$_0>(std::__function::__policy_storage const*) @ 0x000000001abdd3e8\n11. ThreadPoolImpl<ThreadFromGlobalPoolImpl<false, true>>::ThreadFromThreadPool::worker() @ 0x000000001455d0d0\n12. void std::__function::__policy_func<void ()>::__call_func[abi:fqe220101]<startThreadFromGlobalPool(std::shared_ptr<ThreadFromGlobalPoolState>, std::function<void ()>, unsigned long, unsigned long, bool, bool)::$_0>(std::__function::__policy_storage const*) @ 0x000000001456613c\n13. ThreadPoolImpl<std::thread>::ThreadFromThreadPool::worker() @ 0x000000001455aeec\n14. void* std::__thread_proxy[abi:fqe220101]<std::tuple<std::unique_ptr<std::__thread_struct, std::default_delete<std::__thread_struct>>, void (ThreadPoolImpl<std::thread>::ThreadFromThreadPool::*)(), ThreadPoolImpl<std::thread>::ThreadFromThreadPool*>>(void*) @ 0x00000000145635dc\n15. ? @ 0x00000000000803c8\n16. ? @ 0x00000000000e9edc\n",
+          "has_nested": false,
+          "length": 2462
+        }
+      ],
+      "verified_http_rows": {
+        "count": 0,
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "before_schema": {
+      "sql": "INSERT INTO ch_core_tcp_compressed_insert_missing (n, s) VALUES",
+      "compression": true,
+      "blocks": [],
+      "block_oracles": [],
+      "request": "tcp_compressed_insert_before_schema_request_rev54460.bytes",
+      "completion": "tcp_compressed_insert_before_schema_completion_rev54460.bytes",
+      "completion_packets": [
+        {
+          "code": 2,
+          "offset": 0,
+          "exception_code": 60,
+          "exception_name": "DB::Exception",
+          "message": "DB::Exception: Table default.ch_core_tcp_compressed_insert_missing does not exist. Maybe you meant default.ch_core_tcp_compressed_insert_fixture?",
+          "stack_trace": "0. DB::Exception::Exception(DB::Exception::MessageMasked&&, int, bool) @ 0x0000000014335694\n1. DB::Exception::Exception(String&&, int, String, bool) @ 0x000000000ef10e58\n2. DB::Exception::Exception(PreformattedMessage&&, int) @ 0x000000000ef106cc\n3. DB::Exception::Exception<String, String, String, String>(int, FormatStringHelperImpl<std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type>, String&&, String&&, String&&, String&&) @ 0x000000000f014b64\n4. DB::IDatabase::getTable(String const&, std::shared_ptr<DB::Context const>) const @ 0x0000000017e473ec\n5. DB::DatabaseCatalog::getTableImpl(DB::StorageID const&, std::shared_ptr<DB::Context const>, std::optional<DB::Exception>*) const @ 0x0000000018da9420\n6. DB::Context::getOrCacheStorage(DB::StorageID const&, std::function<std::pair<std::shared_ptr<DB::IDatabase>, std::shared_ptr<DB::IStorage>> ()>) const @ 0x0000000018c51e70\n7. DB::DatabaseCatalog::getTable(DB::StorageID const&, std::shared_ptr<DB::Context const>) const @ 0x0000000018db4cb8\n8. DB::InterpreterInsertQuery::getTable(DB::ASTInsertQuery&) @ 0x0000000018f5ced0\n9. DB::InterpreterInsertQuery::execute() @ 0x0000000018f64494\n10. DB::executeQueryImpl(char const*, char const*, std::shared_ptr<DB::Context>, DB::QueryFlags, DB::QueryProcessingStage::Enum, std::unique_ptr<DB::ReadBuffer, std::default_delete<DB::ReadBuffer>>&, boost::intrusive_ptr<DB::IAST>&, std::shared_ptr<DB::ImplicitTransactionControlExecutor>, std::function<void ()>, DB::QueryResultDetails&) @ 0x000000001947b908\n11. DB::executeQuery(std::basic_string_view<char, std::char_traits<char>>, std::shared_ptr<DB::Context>, DB::QueryFlags, DB::QueryProcessingStage::Enum) @ 0x00000000194754ec\n12. DB::TCPHandler::runImpl() @ 0x000000001aa3bbd8\n13. DB::TCPHandler::run() @ 0x000000001aa5b348\n14. Poco::Net::TCPServerConnection::start() @ 0x000000001fde8f18\n15. Poco::Net::TCPServerDispatcher::run() @ 0x000000001fde9520\n16. Poco::PooledThread::run() @ 0x000000001fdaad78\n17. Poco::ThreadImpl::runnableEntry(void*) @ 0x000000001fda8ff0\n18. ? @ 0x00000000000803c8\n19. ? @ 0x00000000000e9edc\n",
+          "has_nested": false,
+          "length": 2326
+        }
+      ],
+      "recovery_sql": "SELECT toUInt64(13) AS n, 'user_1' AS s",
+      "recovery_request": "tcp_compressed_insert_before_schema_recovery_request_rev54460.bytes",
+      "recovery": "tcp_compressed_insert_before_schema_recovery_rev54460.bytes",
+      "recovery_packets": [
+        {
+          "code": 1,
+          "offset": 0,
+          "name": "",
+          "rows": 0,
+          "columns": 2,
+          "schema": [
+            [
+              "n",
+              "UInt64"
+            ],
+            [
+              "s",
+              "String"
+            ]
+          ],
+          "wire_length": 57,
+          "frames": [
+            {
+              "method": 130,
+              "compressed_size": 41,
+              "uncompressed_size": 30,
+              "checksum": "04217e7711b14b1c73d53bc33b58d36f"
+            }
+          ],
+          "native_length": 30,
+          "native_sha256": "624d5c6e30f14627e2b48f99477009116fbadd01b455aadf502b3040d726775e",
+          "length": 59
+        },
+        {
+          "code": 1,
+          "offset": 59,
+          "name": "",
+          "rows": 1,
+          "columns": 2,
+          "schema": [
+            [
+              "n",
+              "UInt64"
+            ],
+            [
+              "s",
+              "String"
+            ]
+          ],
+          "wire_length": 70,
+          "frames": [
+            {
+              "method": 130,
+              "compressed_size": 54,
+              "uncompressed_size": 45,
+              "checksum": "0d3f64c1607002d3dc7114218385d76b"
+            }
+          ],
+          "native_length": 45,
+          "native_sha256": "7b111c8bb8757adb1cd64945123d79daa7d80bd63da292080242ddf6f8f73f3d",
+          "length": 72
+        },
+        {
+          "code": 6,
+          "offset": 131,
+          "profile": [
+            1,
+            1,
+            4624
+          ],
+          "applied_limit": 0,
+          "rows_before_limit": 0,
+          "obsolete": 1,
+          "length": 8
+        },
+        {
+          "code": 3,
+          "offset": 139,
+          "progress": [
+            1,
+            1,
+            1,
+            0,
+            0,
+            611625
+          ],
+          "length": 9
+        },
+        {
+          "code": 1,
+          "offset": 148,
+          "name": "",
+          "rows": 0,
+          "columns": 0,
+          "schema": [],
+          "wire_length": 36,
+          "frames": [
+            {
+              "method": 130,
+              "compressed_size": 20,
+              "uncompressed_size": 10,
+              "checksum": "a783ac6cd55c7a7cb5ac46bddb86e214"
+            }
+          ],
+          "native_length": 10,
+          "native_sha256": "e07d2d762f3e51b34b91f72c628ffbb4f0384ec1c38dd7c35e4b6b4f238f85b4",
+          "length": 38
+        },
+        {
+          "code": 3,
+          "offset": 186,
+          "progress": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            2833
+          ],
+          "length": 8
+        },
+        {
+          "code": 5,
+          "offset": 194,
+          "length": 1
+        }
+      ],
+      "verified_http_rows": {
+        "count": 0,
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "plain_before_schema": {
+      "sql": "INSERT INTO ch_core_tcp_compressed_insert_missing (n, s) VALUES",
+      "compression": false,
+      "blocks": [],
+      "block_oracles": [],
+      "request": "tcp_compressed_insert_plain_before_schema_request_rev54460.bytes",
+      "completion": "tcp_compressed_insert_plain_before_schema_completion_rev54460.bytes",
+      "completion_packets": [
+        {
+          "code": 2,
+          "offset": 0,
+          "exception_code": 60,
+          "exception_name": "DB::Exception",
+          "message": "DB::Exception: Table default.ch_core_tcp_compressed_insert_missing does not exist. Maybe you meant default.ch_core_tcp_compressed_insert_fixture?",
+          "stack_trace": "0. DB::Exception::Exception(DB::Exception::MessageMasked&&, int, bool) @ 0x0000000014335694\n1. DB::Exception::Exception(String&&, int, String, bool) @ 0x000000000ef10e58\n2. DB::Exception::Exception(PreformattedMessage&&, int) @ 0x000000000ef106cc\n3. DB::Exception::Exception<String, String, String, String>(int, FormatStringHelperImpl<std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type, std::type_identity<String>::type>, String&&, String&&, String&&, String&&) @ 0x000000000f014b64\n4. DB::IDatabase::getTable(String const&, std::shared_ptr<DB::Context const>) const @ 0x0000000017e473ec\n5. DB::DatabaseCatalog::getTableImpl(DB::StorageID const&, std::shared_ptr<DB::Context const>, std::optional<DB::Exception>*) const @ 0x0000000018da9420\n6. DB::Context::getOrCacheStorage(DB::StorageID const&, std::function<std::pair<std::shared_ptr<DB::IDatabase>, std::shared_ptr<DB::IStorage>> ()>) const @ 0x0000000018c51e70\n7. DB::DatabaseCatalog::getTable(DB::StorageID const&, std::shared_ptr<DB::Context const>) const @ 0x0000000018db4cb8\n8. DB::InterpreterInsertQuery::getTable(DB::ASTInsertQuery&) @ 0x0000000018f5ced0\n9. DB::InterpreterInsertQuery::execute() @ 0x0000000018f64494\n10. DB::executeQueryImpl(char const*, char const*, std::shared_ptr<DB::Context>, DB::QueryFlags, DB::QueryProcessingStage::Enum, std::unique_ptr<DB::ReadBuffer, std::default_delete<DB::ReadBuffer>>&, boost::intrusive_ptr<DB::IAST>&, std::shared_ptr<DB::ImplicitTransactionControlExecutor>, std::function<void ()>, DB::QueryResultDetails&) @ 0x000000001947b908\n11. DB::executeQuery(std::basic_string_view<char, std::char_traits<char>>, std::shared_ptr<DB::Context>, DB::QueryFlags, DB::QueryProcessingStage::Enum) @ 0x00000000194754ec\n12. DB::TCPHandler::runImpl() @ 0x000000001aa3bbd8\n13. DB::TCPHandler::run() @ 0x000000001aa5b348\n14. Poco::Net::TCPServerConnection::start() @ 0x000000001fde8f18\n15. Poco::Net::TCPServerDispatcher::run() @ 0x000000001fde9520\n16. Poco::PooledThread::run() @ 0x000000001fdaad78\n17. Poco::ThreadImpl::runnableEntry(void*) @ 0x000000001fda8ff0\n18. ? @ 0x00000000000803c8\n19. ? @ 0x00000000000e9edc\n",
+          "has_nested": false,
+          "length": 2326
+        }
+      ],
+      "recovery_sql": "SELECT toUInt64(13) AS n, 'user_1' AS s",
+      "recovery_request": "tcp_compressed_insert_plain_before_schema_recovery_request_rev54460.bytes",
+      "recovery": "tcp_compressed_insert_plain_before_schema_recovery_rev54460.bytes",
+      "recovery_packets": [
+        {
+          "code": 1,
+          "offset": 0,
+          "name": "",
+          "rows": 0,
+          "columns": 2,
+          "schema": [
+            [
+              "n",
+              "UInt64"
+            ],
+            [
+              "s",
+              "String"
+            ]
+          ],
+          "frames": [],
+          "native_length": 30,
+          "native_sha256": "624d5c6e30f14627e2b48f99477009116fbadd01b455aadf502b3040d726775e",
+          "length": 32
+        },
+        {
+          "code": 1,
+          "offset": 32,
+          "name": "",
+          "rows": 1,
+          "columns": 2,
+          "schema": [
+            [
+              "n",
+              "UInt64"
+            ],
+            [
+              "s",
+              "String"
+            ]
+          ],
+          "frames": [],
+          "native_length": 45,
+          "native_sha256": "7b111c8bb8757adb1cd64945123d79daa7d80bd63da292080242ddf6f8f73f3d",
+          "length": 47
+        },
+        {
+          "code": 6,
+          "offset": 79,
+          "profile": [
+            1,
+            1,
+            4624
+          ],
+          "applied_limit": 0,
+          "rows_before_limit": 0,
+          "obsolete": 1,
+          "length": 8
+        },
+        {
+          "code": 3,
+          "offset": 87,
+          "progress": [
+            1,
+            1,
+            1,
+            0,
+            0,
+            528292
+          ],
+          "length": 9
+        },
+        {
+          "code": 1,
+          "offset": 96,
+          "name": "",
+          "rows": 0,
+          "columns": 0,
+          "schema": [],
+          "frames": [],
+          "native_length": 10,
+          "native_sha256": "e07d2d762f3e51b34b91f72c628ffbb4f0384ec1c38dd7c35e4b6b4f238f85b4",
+          "length": 12
+        },
+        {
+          "code": 3,
+          "offset": 108,
+          "progress": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            1833
+          ],
+          "length": 8
+        },
+        {
+          "code": 5,
+          "offset": 116,
+          "length": 1
+        }
+      ],
+      "verified_http_rows": {
+        "count": 0,
+        "length": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    }
+  },
+  "files": {
+    "tcp_compressed_insert_multi_request_rev54460.bytes": {
+      "length": 334,
+      "sha256": "12caacf2491f63a0c7cf4c27c82f4234e208a6903558baa8b4cd001ca12e22f6"
+    },
+    "tcp_compressed_insert_multi_schema_rev54460.bytes": {
+      "length": 121,
+      "sha256": "2467d56c7f69a3b975af017632800847cc265909a574162879c2302908739aba"
+    },
+    "tcp_compressed_insert_multi_block0_rev54460.bytes": {
+      "length": 72,
+      "sha256": "b2207815bc2101aaadf109be482eadee99600766ecff59f0b84bb738bcfc44b7"
+    },
+    "tcp_compressed_insert_multi_block1_rev54460.bytes": {
+      "length": 4425,
+      "sha256": "aa6b3e23a874aa1d532d5cc8d4ed07e257ca84e20cd3d81525146406029d950f"
+    },
+    "tcp_compressed_insert_multi_finish_rev54460.bytes": {
+      "length": 38,
+      "sha256": "27ba1af6e9b5561c07b5975e29da7019e3f12eec60535f94b4864511b3a4f2ca"
+    },
+    "tcp_compressed_insert_multi_completion_rev54460.bytes": {
+      "length": 1,
+      "sha256": "e77b9a9ae9e30b0dbdb6f510a264ef9de781501d7b6b92ae89eb059c5ab743db"
+    },
+    "tcp_compressed_insert_multi_recovery_request_rev54460.bytes": {
+      "length": 354,
+      "sha256": "dd7e42707f64404aeae57d8cace558a0e0031d32d4690b7569db949b9d7ae438"
+    },
+    "tcp_compressed_insert_multi_recovery_rev54460.bytes": {
+      "length": 4566,
+      "sha256": "f929ef9b43ab77dd9c0073c56b8c237d264808d1660c251d9f6668feb7897be8"
+    },
+    "tcp_compressed_insert_rejected_request_rev54460.bytes": {
+      "length": 340,
+      "sha256": "c34448dcb2f067db9d8403765d909e5e9b0f543f5f2d43363657e3948ce3e3a7"
+    },
+    "tcp_compressed_insert_rejected_schema_rev54460.bytes": {
+      "length": 121,
+      "sha256": "2467d56c7f69a3b975af017632800847cc265909a574162879c2302908739aba"
+    },
+    "tcp_compressed_insert_rejected_block0_rev54460.bytes": {
+      "length": 74,
+      "sha256": "e6e10b9668a06f1be6715a256e185620301db01fc24ff602399d84f9b0580e9d"
+    },
+    "tcp_compressed_insert_rejected_finish_rev54460.bytes": {
+      "length": 38,
+      "sha256": "27ba1af6e9b5561c07b5975e29da7019e3f12eec60535f94b4864511b3a4f2ca"
+    },
+    "tcp_compressed_insert_rejected_completion_rev54460.bytes": {
+      "length": 2462,
+      "sha256": "9b656b8edfb5a12c2634a597513a959b0a51eec8bd220a037ce6f932e81c9bba"
+    },
+    "tcp_compressed_insert_before_schema_request_rev54460.bytes": {
+      "length": 305,
+      "sha256": "cc7594d357fd83942a43e64b32a7dfcb5b129d42a89a40d612fcde5ee6bcf8c1"
+    },
+    "tcp_compressed_insert_before_schema_completion_rev54460.bytes": {
+      "length": 2326,
+      "sha256": "d0071e3bed76cbe83278e4fbf07fadf71960bb3b6c0edb3954c710a572f7785c"
+    },
+    "tcp_compressed_insert_before_schema_recovery_request_rev54460.bytes": {
+      "length": 344,
+      "sha256": "ee373da34f180cf82bd8e8f3f11756a118c3bc4dbee9fd42bc7a682127732fb9"
+    },
+    "tcp_compressed_insert_before_schema_recovery_rev54460.bytes": {
+      "length": 195,
+      "sha256": "e487c1d66f6f4a9faf15a893de842cfc53047ef2793b7abf92801aa0076c22eb"
+    },
+    "tcp_compressed_insert_plain_before_schema_request_rev54460.bytes": {
+      "length": 291,
+      "sha256": "5163e00fb9cce4a1785248a5b24612d0b4ae9f81a7468bcdf0815c973e4f94f3"
+    },
+    "tcp_compressed_insert_plain_before_schema_completion_rev54460.bytes": {
+      "length": 2326,
+      "sha256": "d0071e3bed76cbe83278e4fbf07fadf71960bb3b6c0edb3954c710a572f7785c"
+    },
+    "tcp_compressed_insert_plain_before_schema_recovery_request_rev54460.bytes": {
+      "length": 330,
+      "sha256": "3e682b514d434ccda6493167f01c66586074ebc36990d424660c539c051f4ce6"
+    },
+    "tcp_compressed_insert_plain_before_schema_recovery_rev54460.bytes": {
+      "length": 117,
+      "sha256": "0449e46cdc7aa6eb926c42a61856141dbf4bed58f6112f43a169b163f7ba23f9"
+    }
+  }
+}

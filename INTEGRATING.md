@@ -129,11 +129,11 @@ dispatch. It reports Progress, ProfileInfo, Log, ProfileEvents, Totals,
 Extremes, Exception, and EndOfStream as typed events. It does not own sockets,
 TLS, timeouts, pooling, or cancellation: there is no Cancel packet yet, so a
 driver that abandons a query mid-stream must discard the connection. The first
-engine handles SELECT with optional compression and uncompressed INSERT.
-Use `Connection::with_compression(true)` to enable compressed SELECT responses.
+engine handles SELECT and INSERT with optional compression.
+Use `Connection::with_compression(true)` to enable it for both directions.
 The engine decodes NONE, LZ4, and ZSTD frames without choosing the server's
-codec. Client-fed INSERT on that connection returns
-`ProtocolError::CompressedInsertUnsupported`.
+codec. Outbound INSERT blocks use LZ4 frames with at most 1 MiB of plaintext
+each. Packet codes and table names stay raw.
 See `crates/ch-tcp-proto/README.md`
 for the driver loop and a tested `run_select` example.
 
@@ -167,7 +167,12 @@ partial or queued Log/ProfileEvents packets. Match column names and types to
 the schema, since the server can reorder columns, fill omitted columns, drop
 unknown columns, and coerce mismatched types. TableColumns metadata preserves
 raw bytes, including non-UTF-8 literals. Its retention cap can truncate the
-metadata without failing the upload. The engine stays sans-I/O throughout.
+metadata without failing the upload. An Exception after the schema fails the
+connection, including after `finish_insert`. Before the schema, the ordinary
+query Exception reuse rules apply once the initial request has been taken
+and flushed. All transferred output must reach the socket in order before
+a later Query. The engine stays
+sans-I/O throughout.
 
 Each `Event::Data` payload is exactly one complete Native block at the
 connection's `effective_revision()`, and the payloads concatenate into one
@@ -401,8 +406,8 @@ Send those bytes as the body of an `INSERT INTO t FORMAT Native` request. Notes 
   preamble and no per-column marker, and the stream ends at EOF. For TCP, use
   the connection's effective revision. Frame each encoded block separately
   when compression is enabled, including the empty end marker. Packet codes
-  and block names stay outside the compressed envelope. Transport and packet
-  framing remain the client's responsibility.
+  and block names stay outside the compressed envelope. `ch-tcp-proto` handles
+  packet framing through its INSERT API. Drivers own transport.
 - Coverage: encode is at full type parity with decode. Every type the crate decodes it also encodes, so a batch the core produced round-trips back to Native bytes. Only a type the decoder itself does not support returns `EncodeError::UnsupportedType`.
 - Validation: the input is your in-memory buffers, not wire bytes, but encode still validates the whole batch before writing anything and returns `EncodeError::InconsistentBatch` on a malformed column (wrong length, bad offsets, width mismatch, out-of-range `LowCardinality` index, a null in a non-nullable column). A rejected batch produces no partial bytes.
 - Round trip: `decode(encode(x))` reproduces the buffers. The "Encoding" section of `CODEC_CONTRACT.md` has the precise preconditions, encoder choices, and round-trip guarantees.

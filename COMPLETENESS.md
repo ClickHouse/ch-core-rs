@@ -92,12 +92,12 @@ default; the user may override it.
   `encode_block` allocation as material. Further open-ended
   `AggregateFunction` work also remains paused because each signature needs a
   separately confirmed unframed state-boundary codec.
-- **Recommended next:** wire compressed frames into the sibling packet engine.
-  Core now decodes every method `network_compression_method` accepts at
-  `v26.8.1.2041-lts`: NONE, LZ4, LZ4HC (the same 0x82 byte), and ZSTD. Its
-  revision-54460 uncompressed SELECT and INSERT support is complete, and real-server
-  LZ4/ZSTD fixtures are present. Revision-54492 String size streams and
-  sparse/replicated serialization remain on the broader codec roadmap.
+- **TCP compression checkpoint, 2026-11-17:** the sibling packet engine supports
+  compressed SELECT and INSERT at revision 54460. Outbound blocks use LZ4.
+  Inbound frames accept NONE, LZ4/LZ4HC, and ZSTD. Captured INSERT success,
+  rejection, and recovery before the schema match `v26.8.1.2041-lts`. Cancellation,
+  revision-54492 String size streams, and sparse/replicated serialization remain
+  on the broader roadmap.
 - **Key references:** the MultiPoint and Geometry contract is in
   `CODEC_CONTRACT.md`. The logical and column models are in
   `src/schema.rs` and `src/column.rs`; parser, binary descriptor, decode/scan,
@@ -1127,8 +1127,8 @@ is a separate sibling crate, not part of this codec's type-completeness bar.
 Tracked elsewhere (README roadmap), intentionally not part of this tracker:
 
 - The native TCP protocol engine, `crates/ch-tcp-proto`: handshake, Ping, and
-  uncompressed SELECT and INSERT at revision 54460; compression and
-  cancellation are tracked in its README and the root README roadmap.
+  SELECT and INSERT with optional compression at revision 54460. Cancellation
+  is tracked in its README and the root README roadmap.
 - Per-runtime zero-copy adapters in the bindings (those live in the client
   repos).
 - Row-major materialization (a binding concern by design).

@@ -1,5 +1,5 @@
 use super::*;
-use ch_core_rs::compression::{compress_lz4_frame, write_lz4_frame};
+use ch_core_rs::compression::{compress_lz4_frame, decompress_frame};
 
 const EXCEPTION_FAILED: State = State::Failed(FailureKind::ServerException);
 const PROTOCOL_FAILED: State = State::Failed(FailureKind::Protocol);
@@ -1118,14 +1118,14 @@ fn active_query_snapshots_compression_setting() {
 }
 
 #[test]
-fn compressed_client_fed_insert_is_rejected_atomically() {
+fn compressed_insert_queues_the_same_request_as_query() {
     let mut engine = ready_engine().with_compression(true);
-    assert_eq!(
-        engine.insert(Query::new("INSERT INTO items VALUES")),
-        Err(ProtocolError::CompressedInsertUnsupported)
-    );
-    assert_eq!(engine.state(), State::Ready);
-    assert!(engine.take_output().is_empty());
+    let query = Query::new("INSERT INTO items VALUES");
+    let mut via_query = ready_engine().with_compression(true);
+    via_query.query(query.clone()).unwrap();
+    engine.insert(query).unwrap();
+    assert_eq!(engine.state(), State::AwaitingInsertSchema);
+    assert_eq!(engine.take_output(), via_query.take_output());
 }
 
 #[test]
@@ -1453,6 +1453,242 @@ fn inserting_engine() -> Connection {
     engine
 }
 
+fn compressed_inserting_engine() -> Connection {
+    let mut engine = ready_engine().with_compression(true);
+    engine
+        .insert(Query::new("INSERT INTO items VALUES"))
+        .unwrap();
+    let _ = engine.take_output();
+    engine
+        .feed(&compressed_packet(
+            SERVER_PACKET_DATA,
+            &[&framed_int64_block(&[])],
+        ))
+        .unwrap();
+    assert!(matches!(
+        events(&mut engine).as_slice(),
+        [Event::InsertSchema(_)]
+    ));
+    assert_eq!(engine.state(), State::Inserting);
+    engine
+}
+
+fn take_compressed_client_block(bytes: &mut &[u8]) -> (Vec<u8>, usize) {
+    assert_eq!(&bytes[..2], &[CLIENT_PACKET_DATA as u8, 0]);
+    *bytes = &bytes[2..];
+    let mut native = Vec::new();
+    let mut frames = 0;
+    let mut scanner = native_scanner(ENGINE_REVISION);
+    loop {
+        let frame = decompress_frame(bytes, ChecksumMode::Verify).unwrap();
+        assert!(frame.plaintext_len() <= INSERT_FRAME_PLAINTEXT);
+        native.extend_from_slice(frame.plaintext());
+        let consumed = frame.consumed();
+        *bytes = &bytes[consumed..];
+        frames += 1;
+        if let BlockBoundary::Complete { consumed, .. } = scanner.scan(&native).unwrap() {
+            assert_eq!(consumed, native.len());
+            return (native, frames);
+        }
+    }
+}
+
+#[test]
+fn compressed_insert_schema_and_raw_metadata_are_split_independent() {
+    let schema = framed_int64_block(&[]);
+    let telemetry = framed_int64_block(&[79]);
+    let split = schema.len() / 2;
+    let mut response = table_columns_packet("", "columns format version: 1\n");
+    response.extend(compressed_packet(
+        SERVER_PACKET_DATA,
+        &[&schema[..split], &schema[split..]],
+    ));
+    for packet in [SERVER_PACKET_LOG, SERVER_PACKET_PROFILE_EVENTS] {
+        response.extend([packet as u8, 0]);
+        response.extend_from_slice(&telemetry);
+    }
+    for chunk in 1..=response.len() {
+        let mut engine = ready_engine().with_compression(true);
+        engine
+            .insert(Query::new("INSERT INTO items VALUES"))
+            .unwrap();
+        let _ = engine.take_output();
+        for part in response.chunks(chunk) {
+            engine.feed(part).unwrap();
+        }
+        assert_eq!(engine.state(), State::Inserting, "chunk {chunk}");
+        assert_eq!(
+            events(&mut engine),
+            [
+                Event::TableColumns {
+                    table_name: Vec::new(),
+                    description: b"columns format version: 1\n".to_vec(),
+                    truncated: false,
+                },
+                Event::InsertSchema(schema.clone()),
+                Event::Log(telemetry.clone()),
+                Event::ProfileEvents(telemetry.clone()),
+            ]
+        );
+    }
+}
+
+#[test]
+fn compressed_insert_writes_multiple_blocks_and_frames() {
+    let blocks = [
+        framed_int64_block(&[13, 79]),
+        framed_int64_block(&[]),
+        framed_string_block(INSERT_FRAME_PLAINTEXT + 13),
+    ];
+    let mut engine = compressed_inserting_engine();
+    for block in &blocks {
+        engine.insert_data(block).unwrap();
+    }
+    engine.finish_insert().unwrap();
+    let output = engine.take_output();
+    let mut remaining = output.as_slice();
+    for (index, block) in blocks.iter().enumerate() {
+        let (decoded, frames) = take_compressed_client_block(&mut remaining);
+        assert_eq!(&decoded, block);
+        assert_eq!(frames, if index == 2 { 2 } else { 1 });
+    }
+    assert_eq!(
+        take_compressed_client_block(&mut remaining),
+        (EMPTY_NATIVE_BLOCK.to_vec(), 1)
+    );
+    assert!(remaining.is_empty());
+    engine.feed(&[SERVER_PACKET_END_OF_STREAM as u8]).unwrap();
+    assert_eq!(events(&mut engine), [Event::EndOfStream]);
+    assert_eq!(engine.state(), State::Ready);
+}
+
+#[test]
+fn insert_snapshots_compression_for_schema_upload_and_finish() {
+    let block = framed_int64_block(&[13, 79]);
+    for compressed in [false, true] {
+        let mut engine = ready_engine().with_compression(compressed);
+        engine
+            .insert(Query::new("INSERT INTO items VALUES"))
+            .unwrap();
+        let _ = engine.take_output();
+        engine = engine.with_compression(!compressed);
+        let schema = framed_int64_block(&[]);
+        let packet = if compressed {
+            compressed_packet(SERVER_PACKET_DATA, &[&schema])
+        } else {
+            data_packet(&schema)
+        };
+        engine.feed(&packet).unwrap();
+        assert_eq!(events(&mut engine), [Event::InsertSchema(schema)]);
+        engine.insert_data(&block).unwrap();
+        engine.finish_insert().unwrap();
+        let output = engine.take_output();
+        if compressed {
+            let mut remaining = output.as_slice();
+            assert_eq!(take_compressed_client_block(&mut remaining).0, block);
+            assert_eq!(
+                take_compressed_client_block(&mut remaining).0,
+                EMPTY_NATIVE_BLOCK
+            );
+            assert!(remaining.is_empty());
+        } else {
+            let mut expected = vec![CLIENT_PACKET_DATA as u8, 0];
+            expected.extend_from_slice(&block);
+            put_empty_data_packet(&mut expected, false);
+            assert_eq!(output, expected);
+        }
+    }
+}
+
+#[test]
+fn compressed_insert_rejects_invalid_uploads_atomically() {
+    let block = framed_string_block_of_len(MIN_MAX_BLOCK_BYTES, |_| b'x');
+    let mut engine = compressed_inserting_engine().with_max_block_bytes(block.len());
+    engine.insert_data(&block).unwrap();
+    let before = engine.output.clone();
+    let oversized = framed_string_block(MIN_MAX_BLOCK_BYTES + 13);
+    let concatenated = [framed_int64_block(&[13]), framed_int64_block(&[79])].concat();
+    for invalid in [
+        oversized.as_slice(),
+        &[0xff; 16],
+        &block[..block.len() - 1],
+        concatenated.as_slice(),
+        EMPTY_NATIVE_BLOCK,
+    ] {
+        assert!(matches!(
+            engine.insert_data(invalid),
+            Err(ProtocolError::InvalidInsertBlock(_))
+        ));
+        assert_eq!(engine.output, before);
+        assert_eq!(engine.state(), State::Inserting);
+    }
+    let zero_rows = framed_int64_block(&[]);
+    engine.insert_data(&zero_rows).unwrap();
+    let output = engine.take_output();
+    let mut remaining = output.as_slice();
+    assert_eq!(take_compressed_client_block(&mut remaining).0, block);
+    assert_eq!(take_compressed_client_block(&mut remaining).0, zero_rows);
+    assert!(remaining.is_empty());
+}
+
+#[test]
+fn compressed_insert_schema_rejects_malformed_or_oversized_frames() {
+    let schema = framed_int64_block(&[]);
+    let mut checksum = compressed_packet(SERVER_PACKET_DATA, &[&schema]);
+    checksum[2] ^= 1;
+    let mut codec = compressed_packet(SERVER_PACKET_DATA, &[&schema]);
+    codec[2 + 16] = 0x7f;
+    let mut trailing = schema.clone();
+    trailing.push(0);
+    let mut oversized = vec![SERVER_PACKET_DATA as u8, 0];
+    oversized.extend(none_frame(&vec![0; MIN_MAX_BLOCK_BYTES + 1]));
+    for packet in [
+        checksum,
+        codec,
+        compressed_packet(SERVER_PACKET_DATA, &[&trailing]),
+        oversized,
+    ] {
+        for chunk in [1, packet.len()] {
+            let mut engine = ready_engine()
+                .with_compression(true)
+                .with_max_block_bytes(MIN_MAX_BLOCK_BYTES);
+            engine
+                .insert(Query::new("INSERT INTO items VALUES"))
+                .unwrap();
+            let mut error = None;
+            for part in packet.chunks(chunk) {
+                if let Err(failure) = engine.feed(part) {
+                    error = Some(failure);
+                    break;
+                }
+            }
+            assert!(matches!(
+                error,
+                Some(ProtocolError::Compression(_))
+                    | Some(ProtocolError::NativeBlockTooLarge { .. })
+            ));
+            assert_eq!(engine.state(), PROTOCOL_FAILED);
+            assert!(engine.take_output().is_empty());
+            assert!(events(&mut engine).is_empty());
+        }
+    }
+}
+
+#[test]
+fn compressed_insert_truncated_schema_reports_transport_eof() {
+    let packet = compressed_packet(SERVER_PACKET_DATA, &[&framed_int64_block(&[])]);
+    for end in 0..packet.len() {
+        let mut engine = ready_engine().with_compression(true);
+        engine
+            .insert(Query::new("INSERT INTO items VALUES"))
+            .unwrap();
+        engine.feed(&packet[..end]).unwrap();
+        assert_eq!(engine.finish(), Err(ProtocolError::UnexpectedEof));
+        assert_eq!(engine.state(), PROTOCOL_FAILED);
+        assert!(engine.take_output().is_empty());
+    }
+}
+
 #[test]
 fn insert_queues_query_and_external_table_terminator() {
     let mut engine = ready_engine();
@@ -1463,7 +1699,7 @@ fn insert_queues_query_and_external_table_terminator() {
     let output = engine.take_output();
     assert_eq!(output.first(), Some(&(CLIENT_PACKET_QUERY as u8)));
     let mut terminator = Vec::new();
-    put_empty_data_packet(&mut terminator);
+    put_empty_data_packet(&mut terminator, false);
     assert!(output.ends_with(&terminator));
 }
 
@@ -1849,7 +2085,7 @@ fn insert_finish_is_single_use_and_waits_for_end_of_stream() {
     engine.finish_insert().unwrap();
     assert_eq!(engine.state(), State::FinishingInsert);
     let mut terminator = Vec::new();
-    put_empty_data_packet(&mut terminator);
+    put_empty_data_packet(&mut terminator, false);
     assert_eq!(engine.take_output(), terminator);
     assert!(matches!(
         engine.finish_insert(),
@@ -1891,7 +2127,7 @@ fn insert_rejects_end_of_stream_table_columns_and_data_during_upload() {
 }
 
 #[test]
-fn insert_exception_in_every_phase_fails_and_discards_output() {
+fn insert_exception_with_queued_or_unfinished_upload_fails_and_discards_output() {
     let failure = exception(241, b"DB::Exception", b"insert failed", b"", 0);
 
     let mut awaiting = ready_engine();
@@ -1922,6 +2158,186 @@ fn insert_exception_in_every_phase_fails_and_discards_output() {
             events(engine).as_slice(),
             [Event::Exception(error)] if error.code == 241
         ));
+    }
+}
+
+#[test]
+fn insert_exception_reuse_requires_transferred_request_before_schema() {
+    let failure = exception(241, b"DB::Exception", b"insert failed", b"", 0);
+    for compressed in [false, true] {
+        for phase in [
+            State::AwaitingInsertSchema,
+            State::Inserting,
+            State::FinishingInsert,
+        ] {
+            for transfer_output in [false, true] {
+                for split in 0..=failure.len() {
+                    let mut engine = if phase == State::AwaitingInsertSchema {
+                        let mut engine = ready_engine().with_compression(compressed);
+                        engine
+                            .insert(Query::new("INSERT INTO missing VALUES"))
+                            .unwrap();
+                        engine
+                    } else if compressed {
+                        compressed_inserting_engine()
+                    } else {
+                        inserting_engine()
+                    };
+                    if phase != State::AwaitingInsertSchema {
+                        engine.insert_data(&framed_int64_block(&[13])).unwrap();
+                    }
+                    if phase == State::FinishingInsert {
+                        engine.finish_insert().unwrap();
+                    }
+                    if transfer_output {
+                        assert!(!engine.take_output().is_empty());
+                    }
+                    engine.feed(&failure[..split]).unwrap();
+                    engine.feed(&failure[split..]).unwrap();
+                    let reusable = transfer_output && phase == State::AwaitingInsertSchema;
+                    assert_eq!(
+                        engine.state(),
+                        if reusable {
+                            State::Ready
+                        } else {
+                            EXCEPTION_FAILED
+                        },
+                        "compressed {compressed}, phase {phase:?}, transfer {transfer_output}, split {split}"
+                    );
+                    assert!(engine.take_output().is_empty());
+                    assert!(matches!(
+                        events(&mut engine).as_slice(),
+                        [Event::Exception(error)] if error.code == 241
+                    ));
+                    if reusable {
+                        engine.query(Query::new("SELECT 79")).unwrap();
+                        let block = framed_int64_block(&[79]);
+                        let mut response = if compressed {
+                            compressed_packet(SERVER_PACKET_DATA, &[&block])
+                        } else {
+                            data_packet(&block)
+                        };
+                        response.push(SERVER_PACKET_END_OF_STREAM as u8);
+                        engine.feed(&response).unwrap();
+                        assert_eq!(
+                            events(&mut engine),
+                            [Event::Data(block), Event::EndOfStream]
+                        );
+                        assert_eq!(engine.state(), State::Ready);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn insert_cast_exception_after_transferred_terminator_is_terminal() {
+    let block = |first_type: &str, rows: u64, first: &[u8], second: &[u8]| {
+        let mut bytes = vec![1, 0, 2];
+        bytes.extend_from_slice(&(-1_i32).to_le_bytes());
+        bytes.push(0);
+        put_varuint(&mut bytes, 2);
+        put_varuint(&mut bytes, rows);
+        for (name, type_name, data) in [("a", first_type, first), ("c", "String", second)] {
+            put_string(&mut bytes, name);
+            put_string(&mut bytes, type_name);
+            bytes.push(0);
+            bytes.extend_from_slice(data);
+        }
+        bytes
+    };
+    let schema = block("UInt64", 0, &[], &[]);
+    let upload = block("String", 1, b"\x03abc", b"\x06unread");
+    let failure = exception(
+        6,
+        b"DB::Exception",
+        b"Cannot parse string 'abc' as UInt64",
+        b"",
+        0,
+    );
+    for compressed in [false, true] {
+        for split in 0..=failure.len() {
+            let mut engine = ready_engine().with_compression(compressed);
+            engine
+                .insert(Query::new("INSERT INTO items VALUES"))
+                .unwrap();
+            let _ = engine.take_output();
+            let packet = if compressed {
+                compressed_packet(SERVER_PACKET_DATA, &[&schema])
+            } else {
+                data_packet(&schema)
+            };
+            engine.feed(&packet).unwrap();
+            assert_eq!(events(&mut engine), [Event::InsertSchema(schema.clone())]);
+            engine.insert_data(&upload).unwrap();
+            engine.finish_insert().unwrap();
+            assert!(!engine.take_output().is_empty());
+            engine.feed(&failure[..split]).unwrap();
+            engine.feed(&failure[split..]).unwrap();
+            assert_eq!(engine.state(), EXCEPTION_FAILED);
+            assert!(matches!(
+                events(&mut engine).as_slice(),
+                [Event::Exception(error)] if error.code == 6
+            ));
+            assert!(matches!(
+                engine.query(Query::new("SELECT 79")),
+                Err(ProtocolError::InvalidState { .. })
+            ));
+        }
+    }
+}
+
+#[test]
+fn compressed_insert_reserves_the_full_packet_bound_before_writing() {
+    let mut engine = compressed_inserting_engine();
+    let block = framed_string_block(INSERT_FRAME_PLAINTEXT + 13);
+    let bound = 2 + block
+        .chunks(INSERT_FRAME_PLAINTEXT)
+        .map(|chunk| FRAME_PREFIX_LEN + chunk.len() + chunk.len() / 255 + 16)
+        .sum::<usize>();
+    engine.insert_data(&block).unwrap();
+    assert!(engine.output.capacity() >= bound);
+    engine.output.clear();
+    let before = engine.output.as_ptr();
+    engine.insert_data(&block).unwrap();
+    assert_eq!(engine.output.as_ptr(), before);
+    let output = engine.take_output();
+    let mut bytes = output.as_slice();
+    assert_eq!(take_compressed_client_block(&mut bytes), (block, 2));
+    assert!(bytes.is_empty());
+}
+
+#[test]
+fn insert_exception_reuse_preserves_terminal_codes_and_wire_settings_rules() {
+    for compressed in [false, true] {
+        for (code, settings, prior_packet, expected) in [
+            (62, false, false, State::Ready),
+            (62, true, false, EXCEPTION_FAILED),
+            (62, true, true, State::Ready),
+            (702, false, true, EXCEPTION_FAILED),
+            (101, false, false, EXCEPTION_FAILED),
+        ] {
+            let mut engine = ready_engine().with_compression(compressed);
+            let mut request = Query::new("INSERT INTO missing VALUES");
+            if settings {
+                request = request.with_setting("max_threads", "1");
+            }
+            engine.insert(request).unwrap();
+            let _ = engine.take_output();
+            if prior_packet {
+                engine.feed(&table_columns_packet("", "columns")).unwrap();
+                let _ = events(&mut engine);
+            }
+            engine
+                .feed(&exception(code, b"DB::Exception", b"failed", b"", 0))
+                .unwrap();
+            assert_eq!(
+                engine.state(),
+                expected,
+                "compressed {compressed}, code {code}, settings {settings}, prior {prior_packet}"
+            );
+        }
     }
 }
 

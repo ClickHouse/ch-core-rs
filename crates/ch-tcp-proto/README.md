@@ -6,12 +6,12 @@ sockets, TLS, timeouts, cancellation, and connection pooling. The engine
 accepts arbitrary byte chunks, queues protocol events, and queues ordered bytes
 to send.
 
-The initial scope is deliberately small: handshake, Ping/Pong, SELECT with
-optional compression, and uncompressed INSERT at protocol revision 54460.
+The initial scope is deliberately small: handshake, Ping/Pong, SELECT and
+INSERT with optional compression at protocol revision 54460.
 SELECT results emit complete Native block bytes plus typed Progress, ProfileInfo, ProfileEvents, Log, Totals,
 Extremes, Exception, and EndOfStream events. INSERT emits its schema separately
-before accepting client blocks. Cancellation, external tables, and compressed
-INSERT are not implemented yet.
+before accepting client blocks. Cancellation and external tables are not
+implemented yet.
 
 Enable compression with `Connection::new(hello)?.with_compression(true)`.
 The engine writes the compression flag into every Query and compresses the
@@ -19,8 +19,12 @@ empty external-data marker with LZ4. Server Data, Totals, and Extremes bodies
 are decompressed before their Native bytes are emitted. Each frame selects its
 own codec: NONE, LZ4, or ZSTD. The engine does not send
 `network_compression_method`; server settings choose the response codec.
-`insert` on a compressed connection returns
-`ProtocolError::CompressedInsertUnsupported` before queuing any bytes.
+Client-fed INSERT blocks use LZ4 frames with at most 1 MiB of plaintext each.
+Both the external-data marker and the upload terminator are compressed. The
+server schema block is decompressed before `InsertSchema` is emitted. Outbound
+ZSTD is deferred because core only writes LZ4 frames. Response ZSTD remains
+supported. `CompressedInsertUnsupported` is deprecated and retained for source
+compatibility, but is no longer returned.
 
 ## Driver loop
 
@@ -377,24 +381,28 @@ Call `finish_insert()` once to queue the empty Data end marker and enter
 `FinishingInsert`. Flush it, then keep feeding and draining through
 `Event::EndOfStream`. Log and ProfileEvents may arrive during the exchange. An
 Exception at any phase is an `Event::Exception`; stop uploading and report it.
-Exceptions in an exchange started with `insert` fail the connection and discard
-queued upload bytes. Protocol failures, including a failed `finish()`, also
-discard queued output not yet taken, in every state including the handshake.
-Discard the socket after either failure. After the external-table marker has
-been consumed, an upload-phase Exception can leave the server draining client
-data. Errors before the schema or after the upload terminator do not require
-that upload drain. The engine conservatively retires the connection in all
-`insert` error phases. There is no successful EndOfStream after an Exception.
+INSERT Exceptions discard queued upload bytes. An Exception before the schema
+permits reuse when all queued output has been taken and flushed, subject to
+the terminal-code and first-response settings rules below. An Exception after
+the schema always retires the connection, including after `finish_insert`.
+The server may have stopped reading inside a block, so sending the terminator
+does not establish safe alignment. An Exception while the initial request
+remains queued also retires it. Protocol failures, including a
+failed `finish()`, discard queued output and fail the connection. Discard the
+socket whenever the state is `Failed`. There is no successful EndOfStream
+after an Exception.
 Drain all events even when `feed` reports a protocol error. `finish()` still
 means transport EOF, not end of INSERT input.
 
-Outbound blocks use one scan and one copy into the output queue. The engine
-does not materialize rows or re-encode values. Take output between blocks to
-bound queued upload memory. After consuming `InsertSchema`, upload and finish
-calls can proceed while Log or ProfileEvents packets are partially received or
-queued. Drivers should still feed and drain incoming events regularly. A
-partly received Exception or unidentified packet blocks upload until it is
-parsed, so a known pending failure cannot be bypassed by another upload call.
+Uncompressed outbound blocks use one scan and one copy into the output queue.
+Compressed blocks use the same scan, then write LZ4 frames into the queue. The
+engine does not materialize rows or re-encode values. Take output between
+blocks to bound queued upload memory. After consuming `InsertSchema`, upload
+and finish calls can proceed while Log or ProfileEvents packets are partially
+received or queued. Drivers should still feed and drain incoming events
+regularly. A partly received Exception or unidentified packet blocks upload
+until it is parsed, so a known pending failure cannot be bypassed by another
+upload call.
 
 ## Contract
 
@@ -434,9 +442,11 @@ parsed, so a known pending failure cannot be bypassed by another upload call.
   - Once a query context exists, other query errors normally leave the
     connection reusable. The wire does not identify every server throw site,
     so a driver must still honor transport EOF and I/O failures.
-  - Exchanges started with `insert()` always fail the connection on Exception,
-    because upload drain completion cannot be established from the Exception
-    packet alone. Queued upload bytes are discarded.
+  - INSERT Exceptions during `Inserting` or `FinishingInsert`, or while output
+    remains queued, fail the connection. Before the schema, the same reuse
+    rules as SELECT apply. Queued upload bytes are discarded.
+    `take_output` transfers ownership to the driver, which must flush all
+    transferred bytes in order before reusing the connection.
 - There is no Cancel packet and no reset. A driver that abandons a query before
   its EndOfStream or Exception, for example on a timeout, must discard the
   `Connection` and its socket rather than reuse them.
@@ -461,8 +471,7 @@ parsed, so a known pending failure cannot be bypassed by another upload call.
 - Query support is limited to statements whose complete response uses the
   initial SELECT result exchange, including fully specified inline INSERTs
   and INSERT SELECT. Use `insert` for a client-fed INSERT.
-  input(), external tables,
-  parallel-replica exchanges, cancellation, and compressed INSERT are not
+  input(), external tables, parallel-replica exchanges and cancellation are not
   supported. The engine does not parse SQL to classify statements.
 - The engine frames result blocks with core's scanner, so a result column type
   core cannot decode fails the whole connection with `ProtocolError::Decode`.
@@ -563,8 +572,9 @@ Log, ProfileEvents, and TableColumns remain raw at revision 54460.
 Core's scan-only boundary parser finds the block's exact end without allocating decoded
 columns. Malformed inbound bodies surface as `ProtocolError::Decode` and fail
 the connection; malformed outbound INSERT bodies return `InvalidInsertBlock`
-and leave the connection usable. Failure to reserve the outbound copy returns
-`InsertOutputAllocationFailed` before changing state or output.
+and leave the connection usable. Both uncompressed and compressed uploads
+reserve the entire packet before writing. Allocation failures return
+`InsertOutputAllocationFailed` and leave state and output unchanged.
 
 Framing retains progress through column bodies and runtime type-table
 prefixes, including Dynamic, JSON, AggregateFunction, and nested containers.
@@ -585,8 +595,13 @@ The INSERT sequence is confirmed at `v26.8.1.2041-lts` in
 `src/Server/TCPHandler.cpp`, `TCPHandler::{readTemporaryTables,startInsertQuery,processInsertQuery,receivePacketsExpectData,processData,sendTableColumns,sendEndOfStream}`.
 `NativeWriter::write` and `NativeReader::read` in `src/Formats/` define the
 block body. The handler sends an upload Exception before `skipData` drains
-remaining input during upload. The engine conservatively retires connections
-started with `insert` on errors. Inline completion without a schema is confirmed in
+remaining input during upload. `NativeReader::read` can throw before consuming
+the whole block. `TCPHandler::processUnexpectedData` starts a fresh reader
+while draining, so unread block bytes can prevent the drain from reaching a
+sent terminator. After-schema Exceptions therefore retire the connection.
+The before-schema recovery rule is inferred from the initial external-table
+marker handling and verified by compressed and uncompressed live captures.
+Inline completion without a schema is confirmed in
 `src/Interpreters/InterpreterInsertQuery.cpp`,
 `InterpreterInsertQuery::{buildInsertPipeline,buildInsertSelectPipeline}`,
 and the completed-pipeline dispatch in `TCPHandler.cpp`.
