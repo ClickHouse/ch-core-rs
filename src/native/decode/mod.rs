@@ -1691,11 +1691,8 @@ fn decode_values(
         None
     };
 
-    // A geo alias legal directly inside `Nullable` is only `Nullable(Point)`
-    // (the array-based kinds and `Nested` are rejected by the parser); expand it
-    // to its `Tuple` so the Tuple arm below handles the body after the null map,
-    // the ordinary `Nullable(Tuple(...))` framing.
-    let delegate = inner.physical_delegate_ref();
+    // Resolve aliases below Nullable before dispatching the physical body.
+    let delegate = inner.resolved_physical_delegate_ref();
     let inner = delegate.as_deref().unwrap_or(inner);
 
     // Tuple is a container of element columns decoded as a unit (each element
@@ -4307,13 +4304,9 @@ fn is_resumable(ch_type: &ChType) -> bool {
     }
 }
 
-/// Whether `Nullable(inner)` walks the same bytes in the task walker as in
-/// [`skip_values`]. That walker unwraps the null map, expands at most ONE alias
-/// level, then accepts only a Tuple or a leaf body; anything else (a nested
-/// wrapper or container, a chained alias) is an `UnsupportedType` there, so it
-/// must stay on that path here too rather than be silently accepted.
+/// Whether the task walker supports the resolved physical body below Nullable.
 fn is_resumable_nullable_inner(inner: &ChType) -> bool {
-    let delegate = inner.physical_delegate_ref();
+    let delegate = inner.resolved_physical_delegate_ref();
     let inner = delegate.as_deref().unwrap_or(inner);
     match inner {
         ChType::Tuple(elements) => elements.iter().all(|(_, element)| is_resumable(element)),
@@ -5941,9 +5934,8 @@ fn skip_values(
         other => other,
     };
 
-    // Expand a geo alias legal directly inside `Nullable` (only `Nullable(Point)`
-    // -> `Tuple`), the scan-side mirror of `decode_values`.
-    let delegate = inner.physical_delegate_ref();
+    // Resolve aliases below Nullable, matching `decode_values`.
+    let delegate = inner.resolved_physical_delegate_ref();
     let inner = delegate.as_deref().unwrap_or(inner);
 
     // Tuple after the Nullable unwrap, mirroring `decode_values`: a
