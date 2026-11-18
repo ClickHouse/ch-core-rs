@@ -859,9 +859,8 @@ fn encode_column_values(
     } else {
         ch_type
     };
-    // Expand a geo alias legal directly inside `Nullable` (only `Nullable(Point)`
-    // -> `Tuple`), so the Tuple arm below writes its body after the null map.
-    let delegate = value_type.physical_delegate_ref();
+    // Resolve aliases below Nullable before writing the value body.
+    let delegate = value_type.resolved_physical_delegate_ref();
     let value_type = delegate.as_deref().unwrap_or(value_type);
     // Tuple after the Nullable unwrap, mirroring the decode side: a
     // `Nullable(Tuple(...))` writes its per-row null map above, then the tuple

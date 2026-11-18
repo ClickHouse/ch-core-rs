@@ -7,6 +7,10 @@ version; patch releases remain backward compatible.
 
 ## Unreleased
 
+- Fix `encode_block` rejecting `SimpleAggregateFunction(f, Nullable(T))` inside
+  Array, Tuple, Map, Nested, and Variant with a mismatched-column error. Alias
+  chains below Nullable now encode and decode in any position. Type headers and
+  nullability checks are unchanged.
 - ZSTD compression frames (method byte 0x90) now decode. Before, they returned
   `CompressionError::UnsupportedCodec`. A ZSTD frame that claims more output
   than its payload can hold fails early with `InvalidUncompressedSize`. Real
