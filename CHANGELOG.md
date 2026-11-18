@@ -7,6 +7,17 @@ version; patch releases remain backward compatible.
 
 ## Unreleased
 
+- `ch-tcp-proto`: support compressed client-fed INSERT. Upload blocks and the
+  empty upload terminator use LZ4 frames, with at most 1 MiB of plaintext per
+  frame. Server schema blocks use the existing compressed receive path.
+  `CompressedInsertUnsupported` is deprecated and no longer returned.
+  Captured revision-54460 exchanges cover engine-written multi-frame uploads,
+  server rejection, and recovery from errors before the upload schema.
+- Changed: `ch-tcp-proto` Exceptions before `InsertSchema` now leave the
+  connection `Ready` instead of `Failed`, for compressed and uncompressed
+  INSERT. The request must have been taken and flushed, and the ordinary query
+  Exception rules still apply. Exceptions during or after upload remain
+  terminal, including after `finish_insert`.
 - Fix `encode_block` rejecting `SimpleAggregateFunction(f, Nullable(T))` inside
   Array, Tuple, Map, Nested, and Variant with a mismatched-column error. Alias
   chains below Nullable now encode and decode in any position. Type headers and
@@ -41,8 +52,7 @@ version; patch releases remain backward compatible.
   method byte. Plaintext size is checked against `max_block_bytes`, and frame
   length against the worst-case compressed size for that budget, before the
   payload is buffered. A bad frame fails the connection with
-  `ProtocolError::Compression`. `insert` on a compressed connection returns
-  `ProtocolError::CompressedInsertUnsupported` and queues nothing. Real server
+  `ProtocolError::Compression`. Real server
   fixtures at revision 54460 cover LZ4, NONE and ZSTD, multi-frame blocks,
   Totals and Extremes, a mid-stream exception, cancel, and reuse.
 - Add `native::binary_value::write_binary_type_prefix` and

@@ -163,7 +163,11 @@ The compression flag is sent on every Query. The empty client Data block
 after Query is LZ4-framed too, as required by `TCPHandler::initBlockInput`
 and `processData` in `src/Server/TCPHandler.cpp` at the same tag. The engine
 does not send `network_compression_method` and accepts each supported method
-per frame. Client-fed compressed INSERT remains unsupported.
+per frame. Client-fed INSERT writes LZ4 frames with at most 1 MiB of plaintext
+each, flushes at each Native block boundary, and compresses the upload
+terminator too. Server schema Data uses the same compressed receive path.
+This matches `Connection::sendData` in `src/Client/Connection.cpp` at
+`v26.8.1.2041-lts`.
 
 HTTP output normally auto-flushes after each chunk, so captured
 Native frames align with blocks. Confirmed HTTP response buffering through

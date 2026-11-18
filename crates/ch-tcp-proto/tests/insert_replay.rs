@@ -286,10 +286,7 @@ fn replay(
     let oracle = ORACLES.iter().find(|o| o.label == capture.label).unwrap();
     assert_oracle(capture.schema, &schema, oracle.schema);
     if capture.label == "before_schema" {
-        assert_eq!(
-            connection.state(),
-            State::Failed(FailureKind::ServerException)
-        );
+        assert_eq!(connection.state(), State::Ready);
         return (schema, Vec::new(), Vec::new());
     }
     if matches!(
@@ -345,7 +342,7 @@ fn replay(
             State::Ready
         }
     );
-    if capture.label == "completion_exception" && capture.finish.is_empty() {
+    if capture.label == "completion_exception" {
         assert!(connection.take_output().is_empty());
     }
     assert_eq!(connection.finish(), Ok(()));
