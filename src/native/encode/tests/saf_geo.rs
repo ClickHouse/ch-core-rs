@@ -1011,6 +1011,38 @@ fn nested_saf_preserves_nullability_validation() {
 }
 
 #[test]
+fn double_nullable_is_inconsistent_batch() {
+    let nullable = |inner| ChType::Nullable(Box::new(inner));
+    let values = || {
+        Column::UInt64(PrimitiveColumn::new_nullable(
+            vec![13, 79],
+            Bitmap::from_ch_null_map(&[0, 1]),
+        ))
+    };
+    let cases = [
+        (nullable(nullable(ChType::UInt64)), values()),
+        (
+            ChType::Array(Box::new(nullable(nullable(ChType::UInt64)))),
+            Column::Array(ArrayColumn::new(vec![0, 1, 2], values())),
+        ),
+    ];
+    for (ch_type, column) in cases {
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "value".into(),
+                ch_type,
+            }]),
+            vec![column],
+            2,
+        );
+        assert!(matches!(
+            encode_block(&batch, &EncodeOptions::default()),
+            Err(EncodeError::InconsistentBatch { .. })
+        ));
+    }
+}
+
+#[test]
 fn nested_saf_map_key_validation() {
     for rows in [0, 2] {
         let batch = ColBatch::new(
