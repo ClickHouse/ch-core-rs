@@ -2486,6 +2486,21 @@ aggregate descriptor forms. The server writes SimpleAggregateFunction with
 `0x2e` and AggregateFunction with `0x25`; AggregateFunction value encoding
 remains unsupported.
 
+A zero-width single value is `Tuple()` or a Tuple whose elements are all
+zero-width, through aliases and LowCardinality. It has no value bytes, so an
+`Array` or `Map` count of them is not backed by input. Both helpers keep the
+1,000,000-element cap on such a count per container. Within the cap,
+`decode_binary_value` appends the whole run in one step per tuple node, and
+`encode_binary_value` writes the count after checking each child tuple length
+once. An empty run does no work in either direction. Encode runs the per-row
+checks from the first short row, or from the start when the run's columns carry
+a tuple validity bitmap, a LowCardinality dictionary, or a shape mismatch, so
+its errors match per-row encoding. `Nullable`, `Array`, `Map`,
+and `Nothing` elements are not zero-width here: each value reads at least one
+byte, and a non-null `Nothing` is `Unsupported`. `decode_binary_value` rejects
+`FixedString(0)` and `QBit(T, 0)` as `Invalid`, since neither type parser can
+produce them.
+
 For a top-level SharedVariant or JSON shared cell, strip the top-level
 `Nullable(T)` to `T`, or `LowCardinality(Nullable(T))` to `LowCardinality(T)`,
 before writing both the descriptor and value. Route null rows as Dynamic NULL

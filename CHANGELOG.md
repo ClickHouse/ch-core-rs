@@ -7,6 +7,13 @@ version; patch releases remain backward compatible.
 
 ## Unreleased
 
+- `decode_binary_value` and `encode_binary_value` handle an `Array` or `Map`
+  run of zero-width `Tuple()` values in constant time per tuple node instead of
+  once per element. Before, a small nested value such as
+  `Array(Tuple(Tuple(Tuple())))` could drive work far beyond its input size.
+  The 1,000,000-element cap per container is unchanged.
+- `decode_binary_value` returns `BinaryValueError::Invalid` for a caller-built
+  `FixedString(0)` or `QBit(T, 0)` type, matching `encode_binary_value`.
 - ZSTD compression frames (method byte 0x90) now decode. Before, they returned
   `CompressionError::UnsupportedCodec`. A ZSTD frame that claims more output
   than its payload can hold fails early with `InvalidUncompressedSize`. Real

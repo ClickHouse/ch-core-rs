@@ -56,6 +56,18 @@ const MAX_ZERO_WIDTH_ELEMENTS: usize = 1_000_000;
 /// or FixedString allocations.
 const MAX_NULL_DEFAULT_BYTES: usize = 1 << 24;
 
+#[cfg(test)]
+thread_local! {
+    static VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one per-value step, so tests can bound work without timing.
+#[inline]
+fn count_visit() {
+    #[cfg(test)]
+    VISITS.with(|visits| visits.set(visits.get() + 1));
+}
+
 struct NullDefaultBudget {
     remaining: usize,
 }
@@ -274,12 +286,16 @@ enum ValueBuilder {
         offsets: Vec<i64>,
         elements: Box<ValueBuilder>,
         zero_width: bool,
+        /// Elements are zero-width tuples, appended without a per-element loop.
+        fill: bool,
     },
     Map {
         offsets: Vec<i64>,
         keys: Box<ValueBuilder>,
         values: Box<ValueBuilder>,
         zero_width: bool,
+        /// Keys and values are zero-width tuples, appended without a loop.
+        fill: bool,
     },
     Tuple {
         fields: Vec<ValueBuilder>,
@@ -306,6 +322,16 @@ impl ValueBuilder {
             ChType::Float32 => Self::Float32(Vec::new()),
             ChType::Float64 => Self::Float64(Vec::new()),
             ChType::BFloat16 => Self::BFloat16(Vec::new()),
+            ChType::QBit { dimension: 0, .. } => {
+                return Err(BinaryValueError::Invalid(
+                    "QBit dimension must be positive".into(),
+                ))
+            }
+            ChType::FixedString(0) => {
+                return Err(BinaryValueError::Invalid(
+                    "FixedString width must be positive".into(),
+                ))
+            }
             ChType::QBit {
                 element_type,
                 dimension,
@@ -358,17 +384,25 @@ impl ValueBuilder {
             // A LowCardinality single value carries no dictionary framing; the
             // decoded column is the plain inner column.
             ChType::LowCardinality(inner) => Self::new(inner)?,
-            ChType::Array(inner) => Self::Array {
-                offsets: vec![0],
-                elements: Box::new(Self::new(inner)?),
-                zero_width: has_zero_width_values(inner),
-            },
-            ChType::Map(key, value) => Self::Map {
-                offsets: vec![0],
-                keys: Box::new(Self::new(key)?),
-                values: Box::new(Self::new(value)?),
-                zero_width: has_zero_width_values(key) && has_zero_width_values(value),
-            },
+            ChType::Array(inner) => {
+                let elements = Self::new(inner)?;
+                Self::Array {
+                    offsets: vec![0],
+                    fill: elements.is_zero_width(),
+                    elements: Box::new(elements),
+                    zero_width: has_zero_width_values(inner),
+                }
+            }
+            ChType::Map(key, value) => {
+                let (keys, values) = (Self::new(key)?, Self::new(value)?);
+                Self::Map {
+                    offsets: vec![0],
+                    fill: keys.is_zero_width() && values.is_zero_width(),
+                    keys: Box::new(keys),
+                    values: Box::new(values),
+                    zero_width: has_zero_width_values(key) && has_zero_width_values(value),
+                }
+            }
             ChType::Tuple(elements) => Self::Tuple {
                 fields: elements
                     .iter()
@@ -403,12 +437,39 @@ impl ValueBuilder {
         }
     }
 
+    /// Whether values of this builder are zero bytes: `Tuple()` or a Tuple of
+    /// only such builders.
+    fn is_zero_width(&self) -> bool {
+        matches!(self, ValueBuilder::Tuple { fields, .. } if fields.iter().all(Self::is_zero_width))
+    }
+
+    /// Append `n` values of a zero-width builder in one step per tuple node.
+    fn append_zero_width(&mut self, n: usize) -> Result<(), BinaryValueError> {
+        if n == 0 {
+            return Ok(());
+        }
+        count_visit();
+        let ValueBuilder::Tuple { fields, rows } = self else {
+            return Err(BinaryValueError::Invalid(
+                "internal: zero-width fill on non-Tuple".into(),
+            ));
+        };
+        for field in fields.iter_mut() {
+            field.append_zero_width(n)?;
+        }
+        *rows = rows
+            .checked_add(n)
+            .ok_or_else(|| BinaryValueError::Invalid("Tuple row count overflows usize".into()))?;
+        Ok(())
+    }
+
     /// Append one value from the reader.
     fn append_value(
         &mut self,
         reader: &mut ByteReader,
         null_budget: &mut NullDefaultBudget,
     ) -> Result<(), BinaryValueError> {
+        count_visit();
         match self {
             // The server cannot serialize a Nothing value; only null rows
             // (which take the default path) are representable.
@@ -484,10 +545,15 @@ impl ValueBuilder {
                 offsets,
                 elements,
                 zero_width,
+                fill,
             } => {
                 let count = read_element_count(reader, *zero_width, "Array element")?;
-                for _ in 0..count {
-                    elements.append_value(reader, null_budget)?;
+                if *fill {
+                    elements.append_zero_width(count)?;
+                } else {
+                    for _ in 0..count {
+                        elements.append_value(reader, null_budget)?;
+                    }
                 }
                 push_end_offset(offsets, count)?;
             }
@@ -496,11 +562,17 @@ impl ValueBuilder {
                 keys,
                 values,
                 zero_width,
+                fill,
             } => {
                 let count = read_element_count(reader, *zero_width, "Map entry")?;
-                for _ in 0..count {
-                    keys.append_value(reader, null_budget)?;
-                    values.append_value(reader, null_budget)?;
+                if *fill {
+                    keys.append_zero_width(count)?;
+                    values.append_zero_width(count)?;
+                } else {
+                    for _ in 0..count {
+                        keys.append_value(reader, null_budget)?;
+                        values.append_value(reader, null_budget)?;
+                    }
                 }
                 push_end_offset(offsets, count)?;
             }
@@ -520,6 +592,7 @@ impl ValueBuilder {
         &mut self,
         null_budget: &mut NullDefaultBudget,
     ) -> Result<(), BinaryValueError> {
+        count_visit();
         match self {
             ValueBuilder::Nothing { rows } => *rows += 1,
             ValueBuilder::Bool(values) => {
@@ -1243,6 +1316,51 @@ fn check_zero_width_count(
     Ok(())
 }
 
+/// Rows below the returned bound hold valid zero-width values (`Tuple()` or a
+/// Tuple of only such types), which encode to no bytes, so the per-row loop can
+/// start there. `None` when the type is not zero-width, or a column shape, tuple
+/// validity bitmap, or LowCardinality dictionary needs per-row checks. Errors
+/// always come from the per-row path.
+fn zero_width_bound(ch_type: &ChType, column: &Column, end: usize) -> Option<usize> {
+    count_visit();
+    match ch_type {
+        ChType::SimpleAggregateFunction { inner, .. } => zero_width_bound(inner, column, end),
+        ChType::LowCardinality(_) if matches!(column, Column::Dictionary(_)) => None,
+        ChType::LowCardinality(inner) => zero_width_bound(inner, column, end),
+        ChType::Tuple(elements) => match column {
+            Column::Tuple(c) => zero_width_tuple_bound(elements.iter().map(|(_, ty)| ty), c, end),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// [`zero_width_bound`] for one `Tuple` column under `elements`, shared with
+/// the `Nested` alias.
+fn zero_width_tuple_bound<'a>(
+    elements: impl ExactSizeIterator<Item = &'a ChType>,
+    c: &TupleColumn,
+    end: usize,
+) -> Option<usize> {
+    if elements.len() != c.fields.len() || c.validity.is_some() {
+        return None;
+    }
+    let mut bound = c.len.min(end);
+    for (element, field) in elements.zip(&c.fields) {
+        bound = bound.min(zero_width_bound(element, field, end)?);
+    }
+    Some(bound)
+}
+
+/// First row of `start..end` the per-row loop must visit.
+#[inline]
+fn first_checked_row(start: usize, end: usize, bound: impl FnOnce() -> Option<usize>) -> usize {
+    if start == end {
+        return end;
+    }
+    bound().map_or(start, |bound| bound.max(start))
+}
+
 fn fixed_slice(data: &[u8], width: usize, row: usize) -> Result<&[u8], BinaryValueError> {
     row.checked_mul(width)
         .and_then(|start| data.get(start..start.checked_add(width)?))
@@ -1281,6 +1399,7 @@ fn encode_value(
     column: &Column,
     row: usize,
 ) -> Result<(), BinaryValueError> {
+    count_visit();
     macro_rules! le {
         ($c:expr) => {{
             reject_null($c.validity.as_ref(), row)?;
@@ -1474,7 +1593,8 @@ fn encode_value(
             let (start, end) = offset_range(&c.offsets, row)?;
             check_zero_width_count(end - start, || needs_element_count_cap(inner, true))?;
             write_varint(buf, (end - start) as u64);
-            for i in start..end {
+            let from = first_checked_row(start, end, || zero_width_bound(inner, &c.values, end));
+            for i in from..end {
                 encode_value(buf, inner, &c.values, i)?;
             }
         }
@@ -1489,8 +1609,12 @@ fn encode_value(
                     .all(|(_, ty)| needs_element_count_cap(ty, true))
             })?;
             write_varint(buf, (end - start) as u64);
-            for i in start..end {
-                encode_tuple(buf, ch_type, fields.iter().map(|(_, ty)| ty), tuple, i)?;
+            let elements = || fields.iter().map(|(_, ty)| ty);
+            let from = first_checked_row(start, end, || {
+                zero_width_tuple_bound(elements(), tuple, end)
+            });
+            for i in from..end {
+                encode_tuple(buf, ch_type, elements(), tuple, i)?;
             }
         }
         (ChType::Map(key, value), Column::Map(c)) => {
@@ -1505,7 +1629,11 @@ fn encode_value(
                 needs_element_count_cap(key, true) && needs_element_count_cap(value, true)
             })?;
             write_varint(buf, (end - start) as u64);
-            for i in start..end {
+            let from = first_checked_row(start, end, || {
+                let key = zero_width_bound(key, keys, end)?;
+                Some(key.min(zero_width_bound(value, values, end)?))
+            });
+            for i in from..end {
                 encode_value(buf, key, keys, i)?;
                 encode_value(buf, value, values, i)?;
             }
@@ -1955,6 +2083,301 @@ mod tests {
             panic!("expected Array")
         };
         assert_eq!(c.offsets, vec![0, 5]);
+    }
+
+    /// Run `f` and return its result with the number of per-value steps taken.
+    fn with_visits<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        VISITS.with(|visits| visits.set(0));
+        let out = f();
+        (out, VISITS.with(|visits| visits.get()))
+    }
+
+    /// `depth` single-field Tuples around `Tuple()`.
+    fn nested_empty_tuple(depth: usize) -> String {
+        format!("{}Tuple(){}", "Tuple(".repeat(depth), ")".repeat(depth))
+    }
+
+    #[test]
+    fn zero_width_runs_take_constant_steps() {
+        let max = MAX_ZERO_WIDTH_ELEMENTS as u64;
+        let mut nested_arrays = varint(100);
+        for _ in 0..100 {
+            nested_arrays.extend(varint(max));
+        }
+        let cases = [
+            (format!("Array({})", nested_empty_tuple(97)), varint(max)),
+            (
+                format!(
+                    "Map({}, {})",
+                    nested_empty_tuple(89),
+                    nested_empty_tuple(89)
+                ),
+                varint(max),
+            ),
+            ("Array(Array(Tuple()))".to_string(), nested_arrays),
+            (
+                "Array(SimpleAggregateFunction(any, SimpleAggregateFunction(any, Tuple(Tuple()))))"
+                    .to_string(),
+                varint(max),
+            ),
+            (
+                "Nested(a Tuple(), b Tuple(Tuple()))".to_string(),
+                varint(max),
+            ),
+        ];
+        for (name, bytes) in cases {
+            let ch_type = parse(&name);
+            let (column, decode_steps) = with_visits(|| decode_binary_value(&ch_type, &bytes));
+            let column = column.unwrap_or_else(|e| panic!("decode {name}: {e}"));
+            let (encoded, encode_steps) = with_visits(|| encode_one(&ch_type, &column, 0));
+            assert_eq!(encoded, bytes, "{name}");
+            assert!(decode_steps < 1_000, "{name}: {decode_steps} decode steps");
+            assert!(encode_steps < 1_000, "{name}: {encode_steps} encode steps");
+        }
+
+        let ch_type = parse(&format!("Array({})", nested_empty_tuple(97)));
+        let mut column = &decode_binary_value(&ch_type, &varint(max)).unwrap();
+        let Column::Array(array) = column else {
+            panic!("expected Array")
+        };
+        column = &array.values;
+        for _ in 0..=97 {
+            let Column::Tuple(tuple) = column else {
+                panic!("expected Tuple")
+            };
+            assert_eq!(tuple.len, MAX_ZERO_WIDTH_ELEMENTS);
+            column = tuple.fields.first().unwrap_or(column);
+        }
+    }
+
+    #[test]
+    fn empty_zero_width_runs_take_constant_steps() {
+        let n = 10_000;
+        let wide = format!("Tuple({})", vec!["Tuple()"; 990].join(", "));
+        for name in [
+            format!("Array(Array({}))", nested_empty_tuple(97)),
+            format!(
+                "Array(Map({}, {}))",
+                nested_empty_tuple(97),
+                nested_empty_tuple(97)
+            ),
+            format!("Array(Array({wide}))"),
+        ] {
+            let ch_type = parse(&name);
+            let bytes = [varint(n as u64), vec![0; n]].concat();
+            let (column, decode_steps) = with_visits(|| decode_binary_value(&ch_type, &bytes));
+            let column = column.unwrap();
+            let (encoded, encode_steps) = with_visits(|| encode_one(&ch_type, &column, 0));
+            assert_eq!(encoded, bytes);
+            assert!(decode_steps < 2 * n, "{decode_steps} decode steps");
+            assert!(encode_steps < 2 * n, "{encode_steps} encode steps");
+        }
+    }
+
+    #[test]
+    fn encode_zero_width_errors_match_the_per_row_path() {
+        fn tuple(len: usize, fields: Vec<Column>) -> Column {
+            Column::Tuple(TupleColumn::new(fields, len))
+        }
+        fn array(offsets: Vec<i64>, values: Column) -> Column {
+            Column::Array(ArrayColumn::new(offsets, values))
+        }
+        fn map(offsets: Vec<i64>, keys: Column, values: Column, len: usize) -> Column {
+            Column::Map(MapColumn::new(offsets, tuple(len, vec![keys, values])))
+        }
+        fn dict(indices: Vec<i32>) -> Column {
+            Column::Dictionary(crate::column::DictionaryColumn::new(
+                indices,
+                tuple(1, vec![]),
+            ))
+        }
+        let nothing = || Column::Nothing(NothingColumn::new(3));
+        let null_at_3 = Column::Tuple(TupleColumn::new_nullable(
+            vec![],
+            5,
+            Bitmap::from_ch_null_map(&[0, 0, 0, 1, 0]),
+        ));
+        let cases = [
+            (
+                "Array(Tuple())",
+                array(vec![2, 6], tuple(4, vec![])),
+                "row 4 is out of range for 4 rows",
+            ),
+            (
+                "Map(Tuple(), Tuple())",
+                map(vec![0, 5], tuple(2, vec![]), tuple(5, vec![]), 5),
+                "row 2 is out of range for 2 rows",
+            ),
+            (
+                "Map(Tuple(), Tuple())",
+                map(vec![0, 5], tuple(5, vec![]), tuple(3, vec![]), 5),
+                "row 3 is out of range for 3 rows",
+            ),
+            (
+                "Map(Tuple(), Tuple(Tuple()))",
+                map(
+                    vec![0, 5],
+                    tuple(5, vec![]),
+                    tuple(5, vec![tuple(3, vec![])]),
+                    5,
+                ),
+                "row 3 is out of range for 3 rows",
+            ),
+            (
+                "Nested(a Tuple())",
+                array(vec![0, 5], tuple(2, vec![tuple(5, vec![])])),
+                "row 2 is out of range for 2 rows",
+            ),
+            (
+                "Nested(a Tuple())",
+                array(vec![0, 5], tuple(5, vec![tuple(3, vec![])])),
+                "row 3 is out of range for 3 rows",
+            ),
+            (
+                "Array(Tuple(Tuple()))",
+                array(vec![0, 5], tuple(5, vec![tuple(1, vec![])])),
+                "row 1 is out of range for 1 rows",
+            ),
+            (
+                "Array(Tuple(Tuple()))",
+                array(vec![0, 5], tuple(5, vec![null_at_3])),
+                "null row under a non-nullable type",
+            ),
+            (
+                "Array(LowCardinality(Tuple()))",
+                array(vec![0, 3], dict(vec![0, 7, 0])),
+                "row 7 is out of range for 1 rows",
+            ),
+            (
+                "Array(LowCardinality(Tuple()))",
+                array(vec![0, 3], dict(vec![0, -1, 0])),
+                "row 1 has negative dictionary index",
+            ),
+            (
+                "Array(Tuple(Nothing))",
+                array(vec![0, 3], tuple(1, vec![nothing()])),
+                "unsupported binary value type: Nothing",
+            ),
+            (
+                "Array(Tuple(Tuple(), Nothing))",
+                array(vec![0, 3], tuple(1, vec![tuple(3, vec![]), nothing()])),
+                "unsupported binary value type: Nothing",
+            ),
+            (
+                "Map(Tuple(), Tuple(Nothing))",
+                map(vec![0, 3], tuple(1, vec![]), tuple(3, vec![nothing()]), 3),
+                "unsupported binary value type: Nothing",
+            ),
+        ];
+        for (name, column, expected) in cases {
+            let mut buf = vec![0xaa];
+            let err = encode_binary_value(&mut buf, &parse(name), &column, 0)
+                .expect_err(name)
+                .to_string();
+            assert!(err.contains(expected), "{name}: {err}");
+            assert_eq!(buf, [0xaa], "{name}");
+        }
+
+        // The dictionary fallback still encodes valid indexes.
+        let ch_type = parse("Array(LowCardinality(Tuple()))");
+        assert_eq!(
+            encode_one(&ch_type, &array(vec![0, 3], dict(vec![0, 0, 0])), 0),
+            [3]
+        );
+    }
+
+    #[test]
+    fn byte_backed_zero_width_values_keep_their_limits() {
+        let n = MAX_ZERO_WIDTH_ELEMENTS + 1;
+        let with_count = |count: usize, tail: Vec<u8>| [varint(count as u64), tail].concat();
+        let flags: Vec<u8> = (0..n).map(|i| (i % 2) as u8).collect();
+        // (type, value, whether encode accepts it back)
+        let cases = [
+            ("Array(Nullable(Nothing))", with_count(n, vec![1; n]), true),
+            // Encode caps Nullable(Tuple()) runs at the zero-width limit.
+            ("Array(Nullable(Tuple()))", with_count(n, flags), false),
+            ("Map(UInt32, Tuple())", with_count(n, vec![13; 4 * n]), true),
+            (
+                "Array(Tuple(UInt8, Tuple()))",
+                with_count(n, vec![79; n]),
+                true,
+            ),
+            (
+                "Array(Tuple(Tuple(), Tuple()))",
+                with_count(n - 1, vec![]),
+                true,
+            ),
+            ("Map(Tuple(), Tuple())", with_count(n - 1, vec![]), true),
+            (
+                "Tuple(Array(Tuple()), Array(Tuple()))",
+                [varint(999_999), varint(999_999)].concat(),
+                true,
+            ),
+        ];
+        for (name, bytes, reencodes) in cases {
+            let ch_type = parse(name);
+            let column = decode_binary_value(&ch_type, &bytes)
+                .unwrap_or_else(|e| panic!("decode {name}: {e}"));
+            if reencodes {
+                assert_eq!(encode_one(&ch_type, &column, 0), bytes, "{name}");
+            }
+        }
+        // The per-container cap is unchanged for zero-width runs.
+        for name in ["Array(Tuple(Tuple(), Tuple()))", "Map(Tuple(), Tuple())"] {
+            assert!(matches!(
+                decode_binary_value(&parse(name), &varint(n as u64)),
+                Err(BinaryValueError::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_zero_width_fixed_string_and_qbit() {
+        let fixed = ChType::FixedString(0);
+        let qbit = ChType::QBit {
+            element_type: QBitElementType::Float32,
+            dimension: 0,
+        };
+        let nested = ChType::Tuple(vec![
+            (
+                None,
+                ChType::Array(Box::new(ChType::Array(Box::new(fixed.clone())))),
+            ),
+            (None, ChType::String),
+        ]);
+        for ch_type in [fixed, qbit, nested] {
+            assert!(matches!(
+                decode_binary_value(&ch_type, &[0]),
+                Err(BinaryValueError::Invalid(ref reason)) if reason.contains("must be positive")
+            ));
+        }
+    }
+
+    #[test]
+    fn encode_zero_width_runs_validate_child_lengths() {
+        let ch_type = parse("Array(Tuple())");
+        let array = |offsets: Vec<i64>, tuple: TupleColumn| {
+            Column::Array(ArrayColumn::new(offsets, Column::Tuple(tuple)))
+        };
+        let short = array(vec![0, 5], TupleColumn::new(vec![], 3));
+        let mut buf = vec![0xaa];
+        assert!(matches!(
+            encode_binary_value(&mut buf, &ch_type, &short, 0),
+            Err(BinaryValueError::Invalid(_))
+        ));
+        assert_eq!(buf, [0xaa]);
+        // An empty run is not checked against the child, as before.
+        let empty = array(vec![7, 7], TupleColumn::new(vec![], 3));
+        assert_eq!(encode_one(&ch_type, &empty, 0), [0]);
+
+        // A tuple validity bitmap takes the per-row path.
+        let valid = TupleColumn::new_nullable(vec![], 3, Bitmap::all_valid(3));
+        assert_eq!(encode_one(&ch_type, &array(vec![0, 3], valid), 0), [3]);
+        let null = TupleColumn::new_nullable(vec![], 3, Bitmap::from_ch_null_map(&[0, 1, 0]));
+        assert!(matches!(
+            encode_binary_value(&mut Vec::new(), &ch_type, &array(vec![0, 3], null), 0),
+            Err(BinaryValueError::Invalid(_))
+        ));
     }
 
     #[test]
