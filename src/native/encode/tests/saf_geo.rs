@@ -1,4 +1,5 @@
 use super::*;
+use crate::native::stream_decoder::StreamDecoder;
 
 /// `SimpleAggregateFunction(sum, Float64)` over three rows; the column buffer
 /// is the physical Float64 (no new Column variant).
@@ -826,4 +827,325 @@ fn empty_deep_array() -> Column {
         vec![0],
         Column::Float64(PrimitiveColumn::new(vec![])),
     ))
+}
+
+fn nested_nullable_saf_batches(null_map: &[u8], wrong_variant: bool) -> Vec<ColBatch> {
+    let rows = null_map.len();
+    let validity = Bitmap::from_ch_null_map(null_map);
+    let values = if wrong_variant {
+        Column::UInt32(PrimitiveColumn::new_nullable(vec![13; rows], validity))
+    } else {
+        Column::UInt64(PrimitiveColumn::new_nullable(vec![13; rows], validity))
+    };
+    let offsets: Vec<_> = (0..=rows as i64).collect();
+    let tuple = || Column::Tuple(TupleColumn::new(vec![values.clone()], rows));
+    let cases = [
+        (
+            "Array(SimpleAggregateFunction(max, Nullable(UInt64)))",
+            Column::Array(ArrayColumn::new(offsets.clone(), values.clone())),
+        ),
+        (
+            "Tuple(SimpleAggregateFunction(max, Nullable(UInt64)))",
+            tuple(),
+        ),
+        (
+            "Tuple(value SimpleAggregateFunction(max, Nullable(UInt64)))",
+            tuple(),
+        ),
+        (
+            "Map(UInt64, SimpleAggregateFunction(max, Nullable(UInt64)))",
+            Column::Map(map_column(
+                offsets.clone(),
+                Column::UInt64(PrimitiveColumn::new(vec![79; rows])),
+                values.clone(),
+            )),
+        ),
+        (
+            "Nested(value SimpleAggregateFunction(max, Nullable(UInt64)))",
+            Column::Array(ArrayColumn::new(offsets.clone(), tuple())),
+        ),
+        (
+            "Array(SimpleAggregateFunction(max, SimpleAggregateFunction(max, Nullable(UInt64))))",
+            Column::Array(ArrayColumn::new(offsets.clone(), values.clone())),
+        ),
+        (
+            "Array(Nullable(SimpleAggregateFunction(max, UInt64)))",
+            Column::Array(ArrayColumn::new(offsets.clone(), values.clone())),
+        ),
+        (
+            "Array(SimpleAggregateFunction(max, Nullable(SimpleAggregateFunction(max, UInt64))))",
+            Column::Array(ArrayColumn::new(offsets.clone(), values.clone())),
+        ),
+        (
+            "Nullable(SimpleAggregateFunction(max, SimpleAggregateFunction(max, UInt64)))",
+            values.clone(),
+        ),
+        (
+            "SimpleAggregateFunction(max, Nullable(SimpleAggregateFunction(max, SimpleAggregateFunction(max, UInt64))))",
+            values.clone(),
+        ),
+        (
+            "Array(Nullable(SimpleAggregateFunction(max, SimpleAggregateFunction(max, UInt64))))",
+            Column::Array(ArrayColumn::new(offsets.clone(), values.clone())),
+        ),
+        (
+            "Tuple(Nullable(SimpleAggregateFunction(max, SimpleAggregateFunction(max, UInt64))))",
+            tuple(),
+        ),
+        (
+            "Map(UInt64, Nullable(SimpleAggregateFunction(max, SimpleAggregateFunction(max, UInt64))))",
+            Column::Map(map_column(
+                offsets.clone(),
+                Column::UInt64(PrimitiveColumn::new(vec![79; rows])),
+                values.clone(),
+            )),
+        ),
+        (
+            "Nested(value Nullable(SimpleAggregateFunction(max, SimpleAggregateFunction(max, UInt64))))",
+            Column::Array(ArrayColumn::new(offsets.clone(), tuple())),
+        ),
+        (
+            "Variant(Array(SimpleAggregateFunction(max, Nullable(UInt64))), String)",
+            Column::Variant(VariantColumn::try_new(
+                &vec![0; rows],
+                vec![
+                    Column::Array(ArrayColumn::new(offsets, values)),
+                    Column::Utf8(utf8_column(&[])),
+                ],
+            ).unwrap()),
+        ),
+    ];
+    cases
+        .into_iter()
+        .map(|(name, column)| {
+            ColBatch::new(
+                Schema::new(vec![Field {
+                    name: "value".into(),
+                    ch_type: parse_ch_type(name).unwrap(),
+                }]),
+                vec![column],
+                rows,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn roundtrip_nested_nullable_saf() {
+    for null_map in [&[0, 0][..], &[0, 1], &[1, 1], &[]] {
+        for batch in nested_nullable_saf_batches(null_map, false) {
+            for revision in [0, DBMS_TCP_PROTOCOL_VERSION] {
+                if batch.num_rows == 0 {
+                    let bytes = encode_block(
+                        &batch,
+                        &EncodeOptions {
+                            protocol_revision: revision,
+                            ..EncodeOptions::default()
+                        },
+                    )
+                    .unwrap();
+                    let decoded = decode_all_bytes(
+                        &bytes,
+                        &DecodeOptions {
+                            protocol_revision: revision,
+                            ..DecodeOptions::default()
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(decoded.schema, batch.schema);
+                    assert_eq!(decoded.num_rows(), 0);
+                } else {
+                    roundtrip(&batch, revision);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_nullable_saf_rejects_wrong_buffers() {
+    for null_map in [&[0, 0][..], &[0, 1], &[]] {
+        for batch in nested_nullable_saf_batches(null_map, true) {
+            assert!(matches!(
+                encode_block(&batch, &EncodeOptions::default()),
+                Err(EncodeError::InconsistentBatch { .. })
+            ));
+        }
+    }
+}
+
+#[test]
+fn nested_saf_preserves_nullability_validation() {
+    for mut batch in nested_nullable_saf_batches(&[0, 1], false) {
+        let name = batch.schema.fields[0].ch_type.to_string();
+        let non_nullable = name
+            .replace("Nullable(UInt64)", "UInt64")
+            .replace(
+                "Nullable(SimpleAggregateFunction(max, UInt64))",
+                "SimpleAggregateFunction(max, UInt64)",
+            )
+            .replace(
+                "Nullable(SimpleAggregateFunction(max, SimpleAggregateFunction(max, UInt64)))",
+                "SimpleAggregateFunction(max, SimpleAggregateFunction(max, UInt64))",
+            );
+        assert_ne!(name, non_nullable);
+        batch.schema.fields[0].ch_type = parse_ch_type(&non_nullable).unwrap();
+        assert!(matches!(
+            encode_block(&batch, &EncodeOptions::default()),
+            Err(EncodeError::InconsistentBatch { .. })
+        ));
+    }
+
+    let mut batch = nested_nullable_saf_batches(&[0, 1], false).remove(0);
+    let Column::Array(array) = &mut batch.columns[0] else {
+        panic!("expected Array");
+    };
+    let Column::UInt64(values) = array.values.as_mut() else {
+        panic!("expected UInt64");
+    };
+    values.validity = Some(Bitmap::from_ch_null_map(&[0]));
+    assert!(matches!(
+        encode_block(&batch, &EncodeOptions::default()),
+        Err(EncodeError::InconsistentBatch { .. })
+    ));
+}
+
+#[test]
+fn nested_saf_map_key_validation() {
+    for rows in [0, 2] {
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "value".into(),
+                ch_type: parse_ch_type(
+                    "Map(SimpleAggregateFunction(max, SimpleAggregateFunction(max, UInt64)), UInt64)",
+                )
+                .unwrap(),
+            }]),
+            vec![Column::Map(map_column(
+                (0..=rows as i64).collect(),
+                Column::UInt64(PrimitiveColumn::new(vec![13; rows])),
+                Column::UInt64(PrimitiveColumn::new(vec![79; rows])),
+            ))],
+            rows,
+        );
+        if rows > 0 {
+            roundtrip(&batch, 0);
+            roundtrip(&batch, DBMS_TCP_PROTOCOL_VERSION);
+        } else {
+            encode_block(&batch, &EncodeOptions::default()).unwrap();
+        }
+        let mut invalid = batch.clone();
+        let Column::Map(map) = &mut invalid.columns[0] else {
+            panic!("expected Map");
+        };
+        let Column::Tuple(entries) = map.entries.as_mut() else {
+            panic!("expected Tuple");
+        };
+        entries.fields[0] = Column::UInt32(PrimitiveColumn::new(vec![13; rows]));
+        assert!(matches!(
+            encode_block(&invalid, &EncodeOptions::default()),
+            Err(EncodeError::InconsistentBatch { .. })
+        ));
+        let mut invalid = batch;
+        invalid.schema.fields[0].ch_type = ChType::Map(
+            Box::new(ChType::SimpleAggregateFunction {
+                func: "max".into(),
+                inner: Box::new(ChType::Nullable(Box::new(ChType::UInt64))),
+            }),
+            Box::new(ChType::UInt64),
+        );
+        assert!(matches!(
+            encode_block(&invalid, &EncodeOptions::default()),
+            Err(EncodeError::UnsupportedType { .. })
+        ));
+    }
+}
+
+#[test]
+fn rev0_frames_nullable_chained_saf_bytes() {
+    let name = "Array(SimpleAggregateFunction(max, Nullable(SimpleAggregateFunction(max, SimpleAggregateFunction(max, UInt64)))))";
+    for null_map in [&[0, 0][..], &[0, 1], &[1, 1], &[]] {
+        let rows = null_map.len();
+        let batch = ColBatch::new(
+            Schema::new(vec![Field {
+                name: "value".into(),
+                ch_type: parse_ch_type(name).unwrap(),
+            }]),
+            vec![Column::Array(ArrayColumn::new(
+                (0..=rows as i64).collect(),
+                Column::UInt64(PrimitiveColumn::new_nullable(
+                    vec![13; rows],
+                    Bitmap::from_ch_null_map(null_map),
+                )),
+            ))],
+            rows,
+        );
+        let mut expected = vec![1, rows as u8];
+        write_string(&mut expected, b"value");
+        write_string(&mut expected, name.as_bytes());
+        for offset in 1..=rows as u64 {
+            expected.extend_from_slice(&offset.to_le_bytes());
+        }
+        expected.extend_from_slice(null_map);
+        for _ in 0..rows {
+            expected.extend_from_slice(&13u64.to_le_bytes());
+        }
+        assert_eq!(
+            encode_block(&batch, &EncodeOptions::default()).unwrap(),
+            expected
+        );
+        if rows > 0 {
+            roundtrip(&batch, 0);
+            roundtrip(&batch, DBMS_TCP_PROTOCOL_VERSION);
+        }
+    }
+}
+
+fn roundtrip_streamed_saf(batch: &ColBatch, revision: u64) {
+    let bytes = encode_block(
+        batch,
+        &EncodeOptions {
+            protocol_revision: revision,
+            ..EncodeOptions::default()
+        },
+    )
+    .unwrap();
+    let mut decoder = StreamDecoder::new(DecodeOptions {
+        protocol_revision: revision,
+        ..DecodeOptions::default()
+    });
+    let mut chunks = Vec::new();
+    for byte in bytes.chunks(1) {
+        chunks.extend(decoder.feed(byte).unwrap());
+    }
+    chunks.extend(decoder.finish().unwrap());
+    assert_eq!(chunks.len(), 1);
+    assert_batches_eq(batch, &chunks[0]);
+}
+
+#[test]
+fn stream_nested_nullable_saf() {
+    for null_map in [&[0, 0][..], &[0, 1], &[1, 1]] {
+        for batch in nested_nullable_saf_batches(null_map, false) {
+            for revision in [0, DBMS_TCP_PROTOCOL_VERSION] {
+                roundtrip_streamed_saf(&batch, revision);
+            }
+        }
+    }
+}
+
+#[test]
+fn roundtrip_nullable_saf_point() {
+    for name in [
+        "Nullable(SimpleAggregateFunction(max, Point))",
+        "Nullable(SimpleAggregateFunction(max, SimpleAggregateFunction(max, Point)))",
+        "SimpleAggregateFunction(max, Nullable(SimpleAggregateFunction(max, Point)))",
+    ] {
+        let mut batch = nullable_point_batch();
+        batch.schema.fields[0].ch_type = parse_ch_type(name).unwrap();
+        for revision in [0, DBMS_TCP_PROTOCOL_VERSION] {
+            roundtrip(&batch, revision);
+            roundtrip_streamed_saf(&batch, revision);
+        }
+    }
 }
