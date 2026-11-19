@@ -2501,7 +2501,9 @@ checks from the first short row, or from the start when the run's columns carry
 a tuple validity bitmap, a LowCardinality dictionary, or a shape mismatch, so
 its errors match per-row encoding. `Nullable`, `Array`, `Map`,
 and `Nothing` elements are not zero-width here: each value reads at least one
-byte, and a non-null `Nothing` is `Unsupported`. `decode_binary_value` rejects
+byte, and a non-null `Nothing` is `Unsupported`. `encode_binary_value` also
+caps a run of `Nullable` zero-width values at 1,000,000, so a longer decoded
+run does not encode again. `decode_binary_value` rejects
 `FixedString(0)` and `QBit(T, 0)` as `Invalid`, since neither type parser can
 produce them.
 
