@@ -20,6 +20,7 @@ cross-checked against the matching `.server-ref` tag `v26.8.1.2041-lts`.
 | `multi_block_rev0.native` | HTTP `FORMAT Native`, `max_block_size=2` | `0` | `01 02 01 6e 05 49 6e 74 33 32 0d 00 00 00 0e 00` |
 | `json_string_rev0.native` | HTTP `FORMAT Native`, `output_format_native_write_json_as_string=1` | `0` | `01 04 01 6a 26 4a 53 4f 4e 28 6d 61 78 5f 64 79` |
 | `json_flattened_rev0.native` | HTTP `FORMAT Native`, `output_format_native_use_flattened_dynamic_and_json_serialization=1` | `0` | `01 04 01 6a 26 4a 53 4f 4e 28 6d 61 78 5f 64 79` |
+| `zero_width_dynamic_rev0.native` | HTTP `FORMAT Native` | `0` | `02 01 01 76 14 44 79 6e 61 6d 69 63 28 6d 61 78` |
 
 The revision-54485 fixture starts with the 10-byte `BlockInfo` preamble:
 `01 00 02 ff ff ff ff 03 00 00`.
@@ -87,6 +88,13 @@ capture the 8-, 16-, and 32-byte accumulator layouts, the special float,
 Decimal, and Enum promotion paths, nullable sum's flag plus conditional
 accumulator, and the strict one-zero-byte nothingNull state against the real
 server.
+
+`zero_width_dynamic_rev0.native` has one row and two `Dynamic(max_types=0)`
+columns, so every value is a SharedVariant cell. `v` holds `Array(Tuple())`
+with 79 elements, cell bytes `1e 1f 00 4f`. `w` holds `Array(Array(Tuple()))`
+with inner lengths 13 and 0, cell bytes `1e 1e 1f 00 02 0d 00`. `Tuple()` has
+no value bytes in this format, so these counts are not backed by payload bytes.
+The test checks the single-value helpers still decode and re-encode them.
 
 Zero-row HTTP and `clickhouse-client` Native queries on the current local
 server emit an empty response, not a schema-bearing zero-row Native block. The

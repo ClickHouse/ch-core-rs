@@ -535,6 +535,18 @@ FORMAT Native
 SQL
 )
 
+# Zero-width Array(Tuple()) values in Dynamic SharedVariant cells. With
+# max_types=0 every value goes to SharedVariant as a binary descriptor plus one
+# serializeBinary value, where Tuple() is zero bytes.
+zero_width_dynamic_query=$(
+  cat <<'SQL'
+SELECT
+    CAST(arrayMap(x -> tuple(), range(79)), 'Dynamic(max_types=0)') AS v,
+    CAST([arrayMap(x -> tuple(), range(13)), []], 'Dynamic(max_types=0)') AS w
+FORMAT Native
+SQL
+)
+
 capture() {
   local name="$1"
   local query="$2"
@@ -568,5 +580,7 @@ capture "json_string_rev0.native" "${json_aux_query}" \
 # and NO shared-data stream.
 capture "json_flattened_rev0.native" "${json_aux_query}" \
   --data-urlencode "output_format_native_use_flattened_dynamic_and_json_serialization=1"
+
+capture "zero_width_dynamic_rev0.native" "${zero_width_dynamic_query}"
 
 echo "Wrote fixtures to ${fixture_dir}"

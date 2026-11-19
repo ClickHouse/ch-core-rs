@@ -2623,3 +2623,57 @@ fn server_shared_cells_reencode_byte_for_byte() {
         }
     }
 }
+
+/// Server-written zero-width SharedVariant cells: `Array(Tuple())` counts have
+/// no payload bytes behind them but are legal and must round-trip.
+#[test]
+fn server_zero_width_shared_cells_decode_and_reencode() {
+    use ch_core_rs::native::binary_value::{
+        decode_binary_value, encode_binary_value, read_binary_type_prefix, write_binary_type_prefix,
+    };
+
+    let bytes = include_bytes!("fixtures/zero_width_dynamic_rev0.native");
+    let batch = decode_all_bytes(bytes, &DecodeOptions::default()).expect("fixture decodes");
+    let mut cells = Vec::new();
+    for chunk in &batch.chunks {
+        for column in &chunk.columns {
+            collect_shared_cells(column, &mut cells);
+        }
+    }
+    assert_eq!(
+        cells,
+        [
+            vec![0x1e, 0x1f, 0x00, 0x4f],
+            vec![0x1e, 0x1e, 0x1f, 0x00, 0x02, 0x0d, 0x00]
+        ]
+    );
+
+    // (type, offsets per Array level from the outside in, empty tuple count)
+    let expected: [(&str, &[&[i64]], usize); 2] = [
+        ("Array(Tuple())", &[&[0, 79]], 79),
+        ("Array(Array(Tuple()))", &[&[0, 2], &[0, 13, 13]], 13),
+    ];
+    for (cell, (type_name, levels, tuples)) in cells.iter().zip(expected) {
+        let (ch_type, consumed) = read_binary_type_prefix(cell).expect("descriptor parses");
+        assert_eq!(ch_type.to_string(), type_name);
+        let value = decode_binary_value(&ch_type, &cell[consumed..]).expect("value decodes");
+        let mut leaf = &value;
+        for offsets in levels {
+            let Column::Array(array) = leaf else {
+                panic!("expected Array, got {leaf:?}");
+            };
+            assert_eq!(array.offsets, *offsets);
+            leaf = &array.values;
+        }
+        let Column::Tuple(tuple) = leaf else {
+            panic!("expected Tuple, got {leaf:?}");
+        };
+        assert!(tuple.fields.is_empty());
+        assert_eq!(tuple.len, tuples);
+
+        let mut again = Vec::new();
+        write_binary_type_prefix(&mut again, &ch_type).expect("descriptor encodes");
+        encode_binary_value(&mut again, &ch_type, &value, 0).expect("value encodes");
+        assert_eq!(&again, cell);
+    }
+}
