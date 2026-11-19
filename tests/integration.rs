@@ -82,6 +82,257 @@ fixture_tests! {
         protocol_revision: 0,
         assert: assert_json_flattened,
     },
+    json_multipart_rev0: {
+        file: "json_multipart_rev0.native",
+        protocol_revision: 0,
+        assert: assert_json_multipart,
+    },
+    json_multipart_rev54460: {
+        file: "json_multipart_rev54460.native",
+        protocol_revision: 54460,
+        assert: assert_json_multipart,
+    },
+    json_multipart_rev54485: {
+        file: "json_multipart_rev54485.native",
+        protocol_revision: 54485,
+        assert: assert_json_multipart,
+    },
+    json_mixed_rows_rev0: {
+        file: "json_mixed_rows_rev0.native",
+        protocol_revision: 0,
+        assert: assert_json_mixed_rows,
+    },
+    json_shared_rev0: {
+        file: "json_shared_rev0.native",
+        protocol_revision: 0,
+        assert: assert_json_shared,
+    },
+    json_shared_rev54460: {
+        file: "json_shared_rev54460.native",
+        protocol_revision: 54460,
+        assert: assert_json_shared,
+    },
+    json_shared_rev54485: {
+        file: "json_shared_rev54485.native",
+        protocol_revision: 54485,
+        assert: assert_json_shared,
+    },
+}
+
+fn decode_shared_row(column: &Column, row: usize) -> (ChType, Column) {
+    use ch_core_rs::native::binary_value::{
+        decode_binary_value, encode_binary_value, read_binary_type_prefix, write_binary_type_prefix,
+    };
+    let Column::Dynamic(dynamic) = column else {
+        panic!("expected Dynamic")
+    };
+    let (id, offset) = dynamic.value_position(row).unwrap();
+    let DynamicChild::Shared(cells) = &dynamic.children[id as usize] else {
+        panic!("expected SharedVariant row")
+    };
+    let cell = cells.value(offset as usize);
+    let (ch_type, consumed) = read_binary_type_prefix(cell).unwrap();
+    let column = decode_binary_value(&ch_type, &cell[consumed..])
+        .unwrap_or_else(|error| panic!("{ch_type}: {error}"));
+    assert_eq!(column.len(), 1);
+    let mut encoded = Vec::new();
+    write_binary_type_prefix(&mut encoded, &ch_type).unwrap();
+    encode_binary_value(&mut encoded, &ch_type, &column, 0).unwrap();
+    let (encoded_type, encoded_prefix) = read_binary_type_prefix(&encoded).unwrap();
+    assert_eq!(encoded_type, ch_type);
+    assert_eq!(
+        decode_binary_value(&encoded_type, &encoded[encoded_prefix..]).unwrap(),
+        column
+    );
+    (ch_type, column)
+}
+
+fn assert_json_shared_int(column: &Column, row: usize, path: &str, expected: Option<i64>) {
+    use ch_core_rs::native::binary_value::{decode_binary_value, read_binary_type_prefix};
+    let body = structured_json(column);
+    let start = body.shared_offsets[row] as usize;
+    let end = body.shared_offsets[row + 1] as usize;
+    let index = (start..end).find(|&index| body.shared_paths.value(index) == path.as_bytes());
+    if let Some(expected) = expected {
+        let cell = body.shared_values.value(index.expect("missing JSON path"));
+        let (ty, consumed) = read_binary_type_prefix(cell).unwrap();
+        assert_eq!(ty, ChType::Int64);
+        let Column::Int64(values) = decode_binary_value(&ty, &cell[consumed..]).unwrap() else {
+            panic!("expected Int64 path")
+        };
+        assert_eq!(values.values, [expected]);
+    } else {
+        assert!(index.is_none(), "unexpected JSON path {path}");
+    }
+}
+
+fn assert_json_shared(batch: &ChunkedBatch) {
+    use ch_core_rs::native::binary_value::{decode_binary_value, encode_binary_value};
+    assert_eq!(batch.num_rows(), 4);
+    let mut row_number = 0;
+    for chunk in &batch.chunks {
+        for row in 0..chunk.num_rows {
+            let n = row_number;
+            let (_, root) = decode_shared_row(chunk.column(0), row);
+            assert_json_shared_int(&root, 0, "n.x", [Some(13), None, None, Some(79)][n]);
+            if n == 0 {
+                assert_json_shared_int(&root, 0, "a", Some(17));
+                assert_json_shared_int(&root, 0, "z", Some(79));
+                assert_utf8_column(&structured_json(&root).shared_paths, &[b"a", b"n.x", b"z"]);
+            }
+            let (_, array) = decode_shared_row(chunk.column(1), row);
+            let Column::Array(array) = array else {
+                panic!("expected Array(JSON)")
+            };
+            assert_eq!(array.offsets, [0, 2]);
+            assert_json_shared_int(&array.values, 0, "k", [Some(1), None, None, Some(79)][n]);
+            assert_eq!(
+                structured_json(&array.values).shared_offsets[2],
+                structured_json(&array.values).shared_offsets[1]
+            );
+            let (_, tuple) = decode_shared_row(chunk.column(2), row);
+            let Column::Tuple(tuple) = tuple else {
+                panic!("expected Tuple")
+            };
+            assert_json_shared_int(&tuple.fields[0], 0, "k", Some(79));
+            let Column::UInt8(integer) = &tuple.fields[1] else {
+                panic!("expected UInt8")
+            };
+            assert_eq!(integer.values, [17]);
+            let (_, map) = decode_shared_row(chunk.column(3), row);
+            let Column::Map(map) = map else {
+                panic!("expected Map")
+            };
+            assert_eq!(map.offsets, [0, 1]);
+            let Column::Tuple(entries) = map.entries.as_ref() else {
+                panic!("expected entries")
+            };
+            assert_utf8_values(&entries.fields[0], &[b"user_1"]);
+            assert_json_shared_int(&entries.fields[1], 0, "k", Some(13));
+            let (ty, typed) = decode_shared_row(chunk.column(5), row);
+            let body = structured_json(&typed);
+            assert_eq!(body.typed.len(), 2);
+            assert_eq!(body.typed[0].0, "a");
+            let Column::Int64(values) = &body.typed[0].1 else {
+                panic!("expected typed Int64")
+            };
+            assert_eq!(values.values, [[13], [0], [0], [79]][n]);
+            assert_eq!(
+                values.validity.as_ref().unwrap().is_valid(0),
+                n == 0 || n == 3
+            );
+            assert_eq!(body.typed[1].0, "b");
+            assert_utf8_values(&body.typed[1].1, &[if n == 0 { b"user_1" } else { b"" }]);
+            assert_json_shared_int(&typed, 0, "d", if n == 0 { Some(79) } else { None });
+            assert_json_shared_int(&typed, 0, "later", if n == 3 { Some(13) } else { None });
+            assert_json_shared_int(&typed, 0, "dropped", None);
+            assert_json_shared_int(&typed, 0, "omit_me", None);
+            let mut standalone = Vec::new();
+            encode_binary_value(&mut standalone, &ty, chunk.column(4), row).unwrap();
+            assert_eq!(decode_binary_value(&ty, &standalone).unwrap(), typed);
+            let (_, heterogeneous) = decode_shared_row(chunk.column(6), row);
+            let body = structured_json(&heterogeneous);
+            assert_eq!(body.shared_paths.value(0), b"mix");
+            assert_heterogeneous_json_cell(body.shared_values.value(0));
+            let (nested_type, nested) = decode_shared_row(chunk.column(8), row);
+            let body = structured_json(&nested);
+            assert_eq!(body.typed[0].0, "child");
+            assert_json_shared_int(&body.typed[0].1, 0, "k", Some(13));
+            let mut standalone = Vec::new();
+            encode_binary_value(&mut standalone, &nested_type, chunk.column(7), row).unwrap();
+            assert_eq!(
+                decode_binary_value(&nested_type, &standalone).unwrap(),
+                nested
+            );
+            row_number += 1;
+        }
+    }
+}
+
+fn assert_heterogeneous_json_cell(cell: &[u8]) {
+    use ch_core_rs::native::binary_value::{read_binary_type_prefix, write_binary_type_prefix};
+    let array_type = ChType::Array(Box::new(ChType::Dynamic {
+        max_types: JSON_DEFAULT_MAX_DYNAMIC_TYPES,
+    }));
+    let (ty, _) = read_binary_type_prefix(cell).unwrap();
+    assert_eq!(ty, array_type);
+    let mut expected = Vec::new();
+    write_binary_type_prefix(&mut expected, &array_type).unwrap();
+    expected.push(3);
+    write_binary_type_prefix(&mut expected, &ChType::Int64).unwrap();
+    expected.extend_from_slice(&1i64.to_le_bytes());
+    write_binary_type_prefix(&mut expected, &ChType::String).unwrap();
+    expected.push(6);
+    expected.extend_from_slice(b"user_1");
+    write_binary_type_prefix(&mut expected, &ChType::Nothing).unwrap();
+    assert_eq!(cell, expected);
+}
+
+fn assert_json_mixed_rows(batch: &ChunkedBatch) {
+    use ch_core_rs::native::binary_value::{
+        decode_binary_value, encode_binary_value, BinaryValueError,
+    };
+    assert_eq!(batch.num_rows(), 4);
+    let mut n = 0;
+    for chunk in &batch.chunks {
+        for row in 0..chunk.num_rows {
+            let mut encoded = vec![0xab];
+            let result = encode_binary_value(
+                &mut encoded,
+                &json_type(JSON_DEFAULT_MAX_DYNAMIC_PATHS, vec![]),
+                chunk.column(0),
+                row,
+            );
+            if n == 1 {
+                assert!(matches!(result, Err(BinaryValueError::Unsupported(_))));
+                assert_eq!(encoded, [0xab]);
+            } else {
+                result.unwrap();
+                let column = decode_binary_value(
+                    &json_type(JSON_DEFAULT_MAX_DYNAMIC_PATHS, vec![]),
+                    &encoded[1..],
+                )
+                .unwrap();
+                if n == 3 {
+                    let body = structured_json(&column);
+                    assert_eq!(body.shared_paths.value(0), b"mix");
+                    let cell = body.shared_values.value(0);
+                    let (ty, consumed) =
+                        ch_core_rs::native::binary_value::read_binary_type_prefix(cell).unwrap();
+                    assert_eq!(
+                        ty,
+                        ChType::Array(Box::new(ChType::Dynamic {
+                            max_types: JSON_DEFAULT_MAX_DYNAMIC_TYPES,
+                        }))
+                    );
+                    assert_eq!(&cell[consumed..], [0]);
+                } else {
+                    assert_json_shared_int(&column, 0, "mix", if n == 2 { Some(13) } else { None });
+                }
+            }
+            n += 1;
+        }
+    }
+}
+
+fn assert_json_multipart(batch: &ChunkedBatch) {
+    assert_eq!(batch.num_rows(), 2);
+    let mut n = 0;
+    for chunk in &batch.chunks {
+        for row in 0..chunk.num_rows {
+            let (_, value) = decode_shared_row(chunk.column(1), row);
+            if n == 0 {
+                assert_json_shared_int(&value, 0, "n.x", Some(13));
+            } else {
+                let Column::Array(array) = value else {
+                    panic!("expected Array(JSON)")
+                };
+                assert_eq!(array.offsets, [0, 1]);
+                assert_json_shared_int(&array.values, 0, "k", Some(1));
+            }
+            n += 1;
+        }
+    }
 }
 
 #[test]

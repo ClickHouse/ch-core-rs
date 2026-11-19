@@ -20,7 +20,8 @@ use crate::schema::{
     JSON_MAX_TYPED_PATHS, QBIT_MAX_DIMENSION,
 };
 
-const MAX_BINARY_TYPE_COMPLEXITY: usize = 1_000;
+// Crate policy: a JSON root plus 1000 Nullable scalar typed paths.
+pub(crate) const MAX_BINARY_TYPE_COMPLEXITY: usize = 2 * JSON_MAX_TYPED_PATHS + 1;
 const MAX_BINARY_TYPE_LIST: usize = 1_000_000;
 
 #[derive(Debug)]
@@ -53,15 +54,19 @@ impl std::fmt::Display for BinaryTypeError {
 pub(crate) fn read_binary_type(reader: &mut ByteReader) -> Result<ChType, BinaryTypeError> {
     let mut complexity = 0usize;
     let ch_type = read_binary_type_inner(reader, 0, &mut complexity)?;
+    check_type_construction(&ch_type)?;
+    Ok(ch_type)
+}
 
-    // Structural tags bypass the textual parser that normally enforces server
-    // constructor rules. Round-tripping the canonical spelling through that
-    // parser applies the same Nullable/container/Variant legality checks and
-    // rejects malformed binary headers before zero-row `empty_column` or a body
-    // decoder can reach an impossible arm.
+/// Structural tags bypass the textual parser that normally enforces server
+/// constructor rules. Round-tripping the canonical spelling through that
+/// parser applies the same Nullable/container/Variant legality checks and
+/// rejects malformed binary headers before zero-row `empty_column` or a body
+/// decoder can reach an impossible arm.
+pub(crate) fn check_type_construction(ch_type: &ChType) -> Result<(), BinaryTypeError> {
     let canonical = ch_type.to_string();
     match parse_ch_type(&canonical) {
-        Some(parsed) if parsed == ch_type => Ok(ch_type),
+        Some(parsed) if parsed == *ch_type => Ok(()),
         _ => Err(BinaryTypeError::Invalid(format!(
             "type {canonical} violates ClickHouse type-construction rules"
         ))),
@@ -1177,5 +1182,50 @@ mod tests {
             read_binary_type(&mut ByteReader::new(&over_paths)),
             Err(BinaryTypeError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn json_maximum_typed_paths_fit_the_descriptor_budget() {
+        for value_type in ["Int64", "Nullable(Int64)"] {
+            let paths = (0..JSON_MAX_TYPED_PATHS)
+                .map(|index| format!("p{index:04} {value_type}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let json = parse_ch_type(&format!("JSON({paths})")).unwrap();
+            let mut bytes = Vec::new();
+            write_binary_type(&mut bytes, &json);
+            assert_eq!(
+                read_binary_type(&mut ByteReader::new(&bytes)).unwrap(),
+                json
+            );
+            let mut scanner = BinaryTypeScanner::new();
+            let mut consumed = 0;
+            for end in (1..bytes.len())
+                .step_by(79)
+                .chain(std::iter::once(bytes.len()))
+            {
+                let mut reader = ByteReader::new(&bytes[consumed..end]);
+                let result = scanner.scan(&mut reader);
+                if end == bytes.len() {
+                    result.unwrap();
+                } else {
+                    assert!(
+                        matches!(result, Err(BinaryTypeError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof)
+                    );
+                }
+                consumed += reader.position();
+            }
+            assert_eq!(consumed, bytes.len());
+            if value_type == "Nullable(Int64)" {
+                let mut oversized = Vec::new();
+                write_binary_type(&mut oversized, &ChType::Array(Box::new(json)));
+                assert!(matches!(read_binary_type(&mut ByteReader::new(&oversized)),
+                    Err(BinaryTypeError::Invalid(reason)) if reason.contains("complexity")));
+                assert!(
+                    matches!(BinaryTypeScanner::new().scan(&mut ByteReader::new(&oversized)),
+                    Err(BinaryTypeError::Invalid(reason)) if reason.contains("complexity"))
+                );
+            }
+        }
     }
 }

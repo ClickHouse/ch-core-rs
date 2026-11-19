@@ -324,6 +324,13 @@ The physical column buffers are Arrow-shaped:
 
 The core covers the full ClickHouse scalar set plus containers (`Array`, `Tuple`, `Map`, `Nested`), `Variant`, `Dynamic`, `JSON`, wide integers, `LowCardinality(T)`, the geo types, `QBit`, a set of `AggregateFunction`/`SimpleAggregateFunction` states, and `Nullable(T)` over the supported inner types. The "Supported types" list in `README.md` is the current enumeration, and `CODEC_CONTRACT.md` is the per-type wire and buffer contract; this guide does not repeat the list so it cannot drift. Unsupported types fail with `DecodeError::UnsupportedType` on decode (and `EncodeError::UnsupportedType` on encode).
 
+Dynamic shared cells and JSON shared-data values retain their binary type
+descriptor and single-value payload. Decode them on demand with
+`native::binary_value::read_binary_type_prefix` and `decode_binary_value`.
+This supports JSON at the root and inside containers. JSON typed paths retain
+their declared child columns, and its other paths use tagged shared-data
+buffers. Bindings can process those buffers like standalone JSON.
+
 ClickHouse `String` is arbitrary bytes, not guaranteed UTF-8. The core stores the raw bytes. The current Arrow export uses Arrow utf8 format because the physical layout is offsets plus data, but strict Arrow consumers may reject invalid UTF-8 when importing or later validating the array. A binding that needs byte-faithful behavior should validate first, choose a bytes/binary fallback, or return a clear unsupported-for-Arrow error for invalid strings.
 
 ## Consumption Strategies

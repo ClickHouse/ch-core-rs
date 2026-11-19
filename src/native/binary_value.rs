@@ -20,10 +20,14 @@
 //! - SimpleAggregateFunction/geo/Geometry/Nested expand through
 //!   [`ChType::physical_delegate`], like every bulk dispatcher.
 //!
-//! `Variant`, `Dynamic`, and `AggregateFunction` values (an opaque
-//! per-function state) have no decoding here and report `Unsupported`, as do
-//! descriptors the crate does not parse (JSON), so a caller can keep
-//! those cells as raw bytes. Truncated payloads and trailing bytes after the
+//! - JSON: VarUInt path count, then path strings and row values. Declared
+//!   typed paths use their declared serializer. Other paths carry a binary type
+//!   descriptor and remain opaque cells in `StructuredJson::shared_values`.
+//!
+//! `Variant`, `Dynamic`, and `AggregateFunction` values report `Unsupported`.
+//! JSON typed paths require supported single-value codecs. Untyped path cells
+//! may contain Dynamic or Variant values, which are framed without materializing
+//! their contents. Truncated payloads and trailing bytes after the
 //! value are `Invalid`.
 //!
 //! [`write_binary_type_prefix`] and [`encode_binary_value`] are the inverses:
@@ -34,11 +38,15 @@ use std::io;
 
 use crate::bitmap::Bitmap;
 use crate::column::{
-    ArrayColumn, BoolColumn, Column, DecimalColumn, FixedBinaryColumn, MapColumn, NothingColumn,
-    PrimitiveColumn, QBitColumn, TupleColumn, Utf8Column,
+    ArrayColumn, BoolColumn, Column, DecimalColumn, DynamicChild, FixedBinaryColumn, JsonBody,
+    JsonColumn, MapColumn, NothingColumn, PrimitiveColumn, QBitColumn, StructuredJson, TupleColumn,
+    Utf8Column,
 };
 use crate::native::protocol::MAX_TYPE_DEPTH;
-use crate::native::type_binary::{read_binary_type, write_binary_type, BinaryTypeError};
+use crate::native::type_binary::{
+    check_type_construction, read_binary_type, write_binary_type, BinaryTypeError,
+    MAX_BINARY_TYPE_COMPLEXITY,
+};
 use crate::native::varint::{write_varint, ByteReader};
 use crate::schema::{ChType, QBitElementType, GEOMETRY_EXPANSION_DEPTH};
 
@@ -46,7 +54,7 @@ use crate::schema::{ChType, QBitElementType, GEOMETRY_EXPANSION_DEPTH};
 /// (`Tuple()`, `Nothing`); every other count is bounded by the bytes present.
 const MAX_ZERO_WIDTH_ELEMENTS: usize = 1_000_000;
 
-/// Maximum cumulative logical buffer bytes materialized for null placeholders
+/// Maximum cumulative null-placeholder bytes and zero-width default work
 /// while decoding one single value.
 ///
 /// A Nullable single value carries only its one-byte null flag, but Arrow-shaped
@@ -130,16 +138,20 @@ impl std::error::Error for BinaryValueError {}
 ///
 /// Returns the type and the number of descriptor bytes consumed, so the caller
 /// can hand the rest of the cell to [`decode_binary_value`]. An unparseable
-/// server type (JSON, Set, Function) is `Unsupported`; a malformed
+/// server type (Set, Function) is `Unsupported`; a malformed
 /// descriptor is `Invalid`.
 pub fn read_binary_type_prefix(bytes: &[u8]) -> Result<(ChType, usize), BinaryValueError> {
     let mut reader = ByteReader::new(bytes);
-    let ch_type = read_binary_type(&mut reader).map_err(|err| match err {
+    let ch_type = read_binary_type(&mut reader).map_err(type_error)?;
+    Ok((ch_type, reader.position()))
+}
+
+fn type_error(err: BinaryTypeError) -> BinaryValueError {
+    match err {
         BinaryTypeError::Unsupported(reason) => BinaryValueError::Unsupported(reason),
         BinaryTypeError::Invalid(reason) => BinaryValueError::Invalid(reason),
         BinaryTypeError::Io(err) => BinaryValueError::from(err),
-    })?;
-    Ok((ch_type, reader.position()))
+    }
 }
 
 /// Decode exactly one `serializeBinary` value of `ch_type` from `bytes` into a
@@ -147,8 +159,10 @@ pub fn read_binary_type_prefix(bytes: &[u8]) -> Result<(ChType, usize), BinaryVa
 /// type. `bytes` must contain the value and nothing else: truncation and
 /// trailing bytes are both `Invalid`. Null placeholders that have no backing
 /// value bytes share a cumulative 16 MiB materialization budget for this call.
+/// Missing typed paths and zero-width default nodes also consume budget units.
 pub fn decode_binary_value(ch_type: &ChType, bytes: &[u8]) -> Result<Column, BinaryValueError> {
-    let mut builder = ValueBuilder::new(ch_type)?;
+    check_type_depth(ch_type)?;
+    let mut builder = ValueBuilder::new(ch_type, 0)?;
     let mut reader = ByteReader::new(bytes);
     let mut null_budget = NullDefaultBudget::new();
     builder.append_value(&mut reader, &mut null_budget)?;
@@ -301,12 +315,26 @@ enum ValueBuilder {
         fields: Vec<ValueBuilder>,
         rows: usize,
     },
+    Json(Box<JsonValueBuilder>),
+}
+
+struct JsonValueBuilder {
+    typed: Vec<(String, ValueBuilder)>,
+    offsets: Vec<i64>,
+    paths: Utf8Column,
+    values: Utf8Column,
+    depth: usize,
+    seen: Vec<bool>,
+    path_order: Vec<(std::ops::Range<usize>, std::ops::Range<usize>)>,
 }
 
 impl ValueBuilder {
-    fn new(ch_type: &ChType) -> Result<Self, BinaryValueError> {
+    fn new(ch_type: &ChType, depth: usize) -> Result<Self, BinaryValueError> {
         if let Some(delegate) = ch_type.physical_delegate_ref() {
-            return Self::new(delegate.as_ref());
+            return Self::new(
+                delegate.as_ref(),
+                depth + usize::from(matches!(ch_type, ChType::SimpleAggregateFunction { .. })),
+            );
         }
         Ok(match ch_type {
             ChType::Nothing => Self::Nothing { rows: 0 },
@@ -336,7 +364,7 @@ impl ValueBuilder {
                 element_type,
                 dimension,
             } => Self::QBit {
-                values: Box::new(Self::new(&element_type.ch_type())?),
+                values: Box::new(Self::new(&element_type.ch_type(), depth + 1)?),
                 dimension: *dimension,
             },
             ChType::Date => Self::Date(Vec::new()),
@@ -379,13 +407,13 @@ impl ValueBuilder {
             }
             ChType::Nullable(inner) => Self::Nullable {
                 flags: Vec::new(),
-                inner: Box::new(Self::new(inner)?),
+                inner: Box::new(Self::new(inner, depth + 1)?),
             },
             // A LowCardinality single value carries no dictionary framing; the
             // decoded column is the plain inner column.
-            ChType::LowCardinality(inner) => Self::new(inner)?,
+            ChType::LowCardinality(inner) => Self::new(inner, depth + 1)?,
             ChType::Array(inner) => {
-                let elements = Self::new(inner)?;
+                let elements = Self::new(inner, depth + 1)?;
                 Self::Array {
                     offsets: vec![0],
                     fill: elements.is_zero_width(),
@@ -394,7 +422,7 @@ impl ValueBuilder {
                 }
             }
             ChType::Map(key, value) => {
-                let (keys, values) = (Self::new(key)?, Self::new(value)?);
+                let (keys, values) = (Self::new(key, depth + 1)?, Self::new(value, depth + 1)?);
                 Self::Map {
                     offsets: vec![0],
                     fill: keys.is_zero_width() && values.is_zero_width(),
@@ -406,17 +434,30 @@ impl ValueBuilder {
             ChType::Tuple(elements) => Self::Tuple {
                 fields: elements
                     .iter()
-                    .map(|(_, t)| Self::new(t))
+                    .map(|(_, t)| Self::new(t, depth + 1))
                     .collect::<Result<_, _>>()?,
                 rows: 0,
             },
-            // JSON values are not materialized here: shared-data and
-            // SharedVariant cells stay opaque, so a JSON-typed binary value is
-            // reported unsupported rather than partially decoded.
-            ChType::Variant(_)
-            | ChType::Dynamic { .. }
-            | ChType::Json { .. }
-            | ChType::AggregateFunction { .. } => {
+            ChType::Json { typed_paths, .. } => {
+                if typed_paths.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+                    return Err(BinaryValueError::Invalid(
+                        "JSON typed paths are not strictly sorted".into(),
+                    ));
+                }
+                Self::Json(Box::new(JsonValueBuilder {
+                    typed: typed_paths
+                        .iter()
+                        .map(|(path, ty)| Ok((path.clone(), Self::new(ty, depth + 1)?)))
+                        .collect::<Result<_, BinaryValueError>>()?,
+                    offsets: vec![0],
+                    paths: Utf8Column::new(vec![0], Vec::new()),
+                    values: Utf8Column::new(vec![0], Vec::new()),
+                    depth,
+                    seen: vec![false; typed_paths.len()],
+                    path_order: Vec::new(),
+                }))
+            }
+            ChType::Variant(_) | ChType::Dynamic { .. } | ChType::AggregateFunction { .. } => {
                 return Err(BinaryValueError::Unsupported(ch_type.to_string()))
             }
             // physical_delegate expanded these above.
@@ -474,7 +515,7 @@ impl ValueBuilder {
             // The server cannot serialize a Nothing value; only null rows
             // (which take the default path) are representable.
             ValueBuilder::Nothing { .. } => {
-                return Err(BinaryValueError::Unsupported("Nothing".into()))
+                return Err(BinaryValueError::Invalid("non-null Nothing value".into()))
             }
             ValueBuilder::Bool(values) => values.push(reader.read_u8()?),
             ValueBuilder::Int8(values) => values.push(reader.read_u8()? as i8),
@@ -582,6 +623,63 @@ impl ValueBuilder {
                 }
                 *rows += 1;
             }
+            ValueBuilder::Json(json) => {
+                let JsonValueBuilder {
+                    typed,
+                    offsets,
+                    paths,
+                    values,
+                    depth,
+                    seen,
+                    path_order,
+                } = json.as_mut();
+                let row_start = reader.position();
+                let row_bytes = reader.remaining_slice();
+                let count = read_element_count(reader, false, "JSON path")?;
+                seen.fill(false);
+                path_order.clear();
+                for _ in 0..count {
+                    let path = read_json_path(reader)?;
+                    let path_end = reader.position() - row_start;
+                    if let Ok(index) = typed.binary_search_by(|(name, _)| name.as_bytes().cmp(path))
+                    {
+                        if seen[index] {
+                            return Err(BinaryValueError::Invalid(
+                                "duplicate JSON typed path".into(),
+                            ));
+                        }
+                        seen[index] = true;
+                        typed[index].1.append_value(reader, null_budget)?;
+                    } else {
+                        let start = reader.position();
+                        let ty = read_value_type(reader, *depth + 1)?;
+                        ty.skip(reader)?;
+                        path_order.push((
+                            path_end - path.len()..path_end,
+                            start - row_start..reader.position() - row_start,
+                        ));
+                    }
+                }
+                path_order
+                    .sort_unstable_by(|a, b| row_bytes[a.0.clone()].cmp(&row_bytes[b.0.clone()]));
+                if path_order
+                    .windows(2)
+                    .any(|pair| row_bytes[pair[0].0.clone()] == row_bytes[pair[1].0.clone()])
+                {
+                    return Err(BinaryValueError::Invalid("duplicate JSON path".into()));
+                }
+                for (path, cell) in path_order.iter() {
+                    append_utf8(paths, &row_bytes[path.clone()])?;
+                    append_utf8(values, &row_bytes[cell.clone()])?;
+                }
+                // Each missing default charges the budget at least 1.
+                for ((_, builder), seen) in typed.iter_mut().zip(seen.iter()) {
+                    if !seen {
+                        builder.append_default(null_budget)?;
+                    }
+                }
+                push_end_offset(offsets, path_order.len())?;
+            }
         }
         Ok(())
     }
@@ -594,7 +692,10 @@ impl ValueBuilder {
     ) -> Result<(), BinaryValueError> {
         count_visit();
         match self {
-            ValueBuilder::Nothing { rows } => *rows += 1,
+            ValueBuilder::Nothing { rows } => {
+                null_budget.charge(1)?;
+                *rows += 1;
+            }
             ValueBuilder::Bool(values) => {
                 null_budget.charge(1)?;
                 values.push(0);
@@ -727,10 +828,23 @@ impl ValueBuilder {
                 offsets.push(last);
             }
             ValueBuilder::Tuple { fields, rows } => {
+                null_budget.charge(1)?;
                 for field in fields.iter_mut() {
                     field.append_default(null_budget)?;
                 }
                 *rows += 1;
+            }
+            ValueBuilder::Json(json) => {
+                let JsonValueBuilder { typed, offsets, .. } = json.as_mut();
+                // Every other default charges at least 1, so only an empty
+                // JSON needs its own charge.
+                if typed.is_empty() {
+                    null_budget.charge(1)?;
+                }
+                for (_, field) in typed {
+                    field.append_default(null_budget)?;
+                }
+                push_end_offset(offsets, 0)?;
             }
         }
         Ok(())
@@ -846,6 +960,31 @@ impl ValueBuilder {
                 ));
                 Column::Map(MapColumn::new(offsets, entries))
             }
+            ValueBuilder::Json(json) => {
+                let JsonValueBuilder {
+                    typed,
+                    offsets,
+                    paths,
+                    values,
+                    ..
+                } = *json;
+                let len = offsets.len() - 1;
+                let typed = typed
+                    .into_iter()
+                    .map(|(path, builder)| Ok((path, builder.finish(None)?)))
+                    .collect::<Result<_, BinaryValueError>>()?;
+                Column::Json(
+                    JsonColumn::structured(StructuredJson::from_parts(
+                        typed,
+                        Vec::new(),
+                        offsets,
+                        paths,
+                        values,
+                        len,
+                    ))
+                    .with_validity(validity),
+                )
+            }
             ValueBuilder::Tuple { fields, rows } => {
                 let columns = fields
                     .into_iter()
@@ -869,6 +1008,277 @@ fn push_end_offset(offsets: &mut Vec<i64>, count: usize) -> Result<(), BinaryVal
         .ok_or_else(|| BinaryValueError::Invalid("element count overflows i64 offsets".into()))?;
     offsets.push(end);
     Ok(())
+}
+
+fn append_utf8(column: &mut Utf8Column, bytes: &[u8]) -> Result<(), BinaryValueError> {
+    let end = column
+        .data
+        .len()
+        .checked_add(bytes.len())
+        .and_then(|end| i32::try_from(end).ok())
+        .ok_or_else(|| BinaryValueError::Invalid("JSON data exceeds i32 offsets".into()))?;
+    column.data.extend_from_slice(bytes);
+    column.offsets.push(end);
+    Ok(())
+}
+
+fn read_json_path<'a>(reader: &mut ByteReader<'a>) -> Result<&'a [u8], BinaryValueError> {
+    let len = usize::try_from(reader.read_varint()?)
+        .map_err(|_| BinaryValueError::Invalid("JSON path length overflows usize".into()))?;
+    Ok(reader.read_slice(len)?)
+}
+
+fn read_value_type(reader: &mut ByteReader, depth: usize) -> Result<SkipPlan, BinaryValueError> {
+    let ty = read_binary_type(reader).map_err(type_error)?;
+    check_type(&ty, None, depth).ok_or_else(too_deep)?;
+    if ty == ChType::Nothing {
+        // Dynamic NULL has only its Nothing descriptor.
+        Ok(SkipPlan::Fixed(0))
+    } else {
+        SkipPlan::new(&ty, depth)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SKIP_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Compiled row framing for one binary descriptor.
+///
+/// At v26.8.1.2041-lts, SerializationObject::serializeBinary writes a path
+/// count, then path/value pairs. Declared typed paths use their serializer;
+/// every other value starts with a DataTypesBinaryEncoding descriptor.
+enum SkipPlan {
+    Nothing,
+    Fixed(usize),
+    String,
+    Nullable(Box<SkipPlan>),
+    Array(Box<SkipPlan>),
+    Map(Box<SkipPlan>),
+    Tuple(Vec<SkipPlan>),
+    QBit {
+        dimension: usize,
+        bytes: usize,
+    },
+    Json {
+        typed: Vec<(String, SkipPlan)>,
+        depth: usize,
+    },
+    Dynamic {
+        depth: usize,
+    },
+    Variant(Vec<SkipPlan>),
+    Unsupported(String),
+}
+
+impl SkipPlan {
+    fn new(ch_type: &ChType, depth: usize) -> Result<Self, BinaryValueError> {
+        if depth > MAX_TYPE_DEPTH {
+            return Err(too_deep());
+        }
+        if let Some(delegate) = ch_type.physical_delegate_ref() {
+            return Self::new(
+                delegate.as_ref(),
+                depth + usize::from(matches!(ch_type, ChType::SimpleAggregateFunction { .. })),
+            );
+        }
+        let width = match ch_type {
+            ChType::Nothing => return Ok(Self::Nothing),
+            ChType::Bool | ChType::Int8 | ChType::UInt8 | ChType::Enum8 { .. } => 1,
+            ChType::Int16
+            | ChType::UInt16
+            | ChType::Date
+            | ChType::Enum16 { .. }
+            | ChType::BFloat16 => 2,
+            ChType::Int32
+            | ChType::UInt32
+            | ChType::Float32
+            | ChType::Date32
+            | ChType::DateTime { .. }
+            | ChType::Time
+            | ChType::Ipv4 => 4,
+            ChType::Int64
+            | ChType::UInt64
+            | ChType::Float64
+            | ChType::DateTime64 { .. }
+            | ChType::Time64 { .. }
+            | ChType::Interval(_) => 8,
+            ChType::Int128 | ChType::UInt128 | ChType::Uuid | ChType::Ipv6 => 16,
+            ChType::Int256 | ChType::UInt256 => 32,
+            ChType::Decimal { bits, .. } if matches!(bits, 32 | 64 | 128 | 256) => {
+                usize::from(*bits / 8)
+            }
+            ChType::FixedString(width) if *width != 0 => *width,
+            ChType::String => return Ok(Self::String),
+            ChType::Nullable(inner) => {
+                return Ok(Self::Nullable(Box::new(Self::new(inner, depth + 1)?)))
+            }
+            ChType::LowCardinality(inner) => return Self::new(inner, depth + 1),
+            ChType::Array(inner) => return Ok(Self::Array(Box::new(Self::new(inner, depth + 1)?))),
+            ChType::Map(key, value) => {
+                return Ok(Self::Map(Box::new(Self::sequence([
+                    Self::new(key, depth + 1)?,
+                    Self::new(value, depth + 1)?,
+                ])?)))
+            }
+            ChType::Tuple(fields) => {
+                return Self::sequence(
+                    fields
+                        .iter()
+                        .map(|(_, ty)| Self::new(ty, depth + 1))
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+            }
+            ChType::QBit {
+                element_type,
+                dimension,
+            } => {
+                let bytes = dimension
+                    .checked_mul(element_type.byte_width())
+                    .ok_or_else(|| {
+                        BinaryValueError::Invalid("QBit payload size overflows usize".into())
+                    })?;
+                return Ok(Self::QBit {
+                    dimension: *dimension,
+                    bytes,
+                });
+            }
+            ChType::Json { typed_paths, .. } => {
+                return Ok(Self::Json {
+                    typed: typed_paths
+                        .iter()
+                        .map(|(path, ty)| Ok((path.clone(), Self::new(ty, depth + 1)?)))
+                        .collect::<Result<_, BinaryValueError>>()?,
+                    depth,
+                })
+            }
+            ChType::Dynamic { .. } => return Ok(Self::Dynamic { depth }),
+            ChType::Variant(alternatives) => {
+                return Ok(Self::Variant(
+                    alternatives
+                        .iter()
+                        .map(|ty| Self::new(ty, depth + 1))
+                        .collect::<Result<_, _>>()?,
+                ))
+            }
+            ChType::AggregateFunction { .. } => return Ok(Self::Unsupported(ch_type.to_string())),
+            // Bad Decimal widths and FixedString(0). Aliases returned above.
+            ChType::Decimal { .. }
+            | ChType::FixedString(_)
+            | ChType::SimpleAggregateFunction { .. }
+            | ChType::Geo(_)
+            | ChType::Geometry
+            | ChType::Nested(_) => {
+                return Err(BinaryValueError::Invalid(
+                    "invalid binary value type".into(),
+                ))
+            }
+        };
+        Ok(Self::Fixed(width))
+    }
+
+    fn sequence(parts: impl IntoIterator<Item = Self>) -> Result<Self, BinaryValueError> {
+        let mut sequence = Vec::new();
+        let mut width = 0usize;
+        for part in parts {
+            if let Self::Fixed(bytes) = part {
+                width = width.checked_add(bytes).ok_or_else(|| {
+                    BinaryValueError::Invalid("tuple payload size overflows usize".into())
+                })?;
+            } else {
+                if width != 0 {
+                    sequence.push(Self::Fixed(width));
+                    width = 0;
+                }
+                sequence.push(part);
+            }
+        }
+        if width != 0 {
+            sequence.push(Self::Fixed(width));
+        }
+        Ok(match sequence.len() {
+            0 => Self::Fixed(0),
+            1 => sequence.remove(0),
+            _ => Self::Tuple(sequence),
+        })
+    }
+
+    fn skip(&self, reader: &mut ByteReader) -> Result<(), BinaryValueError> {
+        #[cfg(test)]
+        SKIP_STEPS.with(|steps| steps.set(steps.get() + 1));
+        match self {
+            Self::Nothing => {
+                return Err(BinaryValueError::Invalid("non-null Nothing value".into()))
+            }
+            Self::Fixed(bytes) => reader.skip(*bytes)?,
+            Self::String => {
+                let len = usize::try_from(reader.read_varint()?).map_err(|_| {
+                    BinaryValueError::Invalid("String length overflows usize".into())
+                })?;
+                reader.skip(len)?;
+            }
+            Self::Nullable(inner) => {
+                if reader.read_u8()? == 0 {
+                    inner.skip(reader)?;
+                }
+            }
+            Self::Array(inner) | Self::Map(inner) => {
+                let what = if matches!(self, Self::Array(_)) {
+                    "Array element"
+                } else {
+                    "Map entry"
+                };
+                let count =
+                    read_element_count(reader, matches!(inner.as_ref(), Self::Fixed(0)), what)?;
+                if let Self::Fixed(width) = inner.as_ref() {
+                    let bytes = count.checked_mul(*width).ok_or_else(|| {
+                        BinaryValueError::Invalid("container payload size overflows usize".into())
+                    })?;
+                    reader.skip(bytes)?;
+                } else {
+                    for _ in 0..count {
+                        inner.skip(reader)?;
+                    }
+                }
+            }
+            Self::Tuple(fields) => {
+                for field in fields {
+                    field.skip(reader)?;
+                }
+            }
+            Self::QBit { dimension, bytes } => {
+                if reader.read_varint()? != *dimension as u64 {
+                    return Err(BinaryValueError::Invalid("QBit dimension mismatch".into()));
+                }
+                reader.skip(*bytes)?;
+            }
+            Self::Json { typed, depth } => {
+                let count = read_element_count(reader, false, "JSON path")?;
+                for _ in 0..count {
+                    let path = read_json_path(reader)?;
+                    match typed.binary_search_by(|(name, _)| name.as_bytes().cmp(path)) {
+                        Ok(index) => typed[index].1.skip(reader)?,
+                        Err(_) => read_value_type(reader, depth + 1)?.skip(reader)?,
+                    }
+                }
+            }
+            Self::Dynamic { depth } => read_value_type(reader, depth + 1)?.skip(reader)?,
+            Self::Variant(alternatives) => {
+                let discriminator = reader.read_u8()?;
+                if discriminator != u8::MAX {
+                    let plan = alternatives
+                        .get(usize::from(discriminator))
+                        .ok_or_else(|| {
+                            BinaryValueError::Invalid("invalid Variant discriminator".into())
+                        })?;
+                    plan.skip(reader)?;
+                }
+            }
+            Self::Unsupported(name) => return Err(BinaryValueError::Unsupported(name.clone())),
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -935,9 +1345,9 @@ pub fn write_binary_type_prefix(
 /// shared data. Nullable flags are for nested values, such as elements of
 /// `Array(Nullable(T))`.
 ///
-/// `Variant`, `Dynamic`, `JSON`, `AggregateFunction`, and non-null `Nothing`
-/// values are `Unsupported`, matching the decoder. A row out of range or a
-/// column whose shape does not match `ch_type`, or a null row under a
+/// `Variant`, `Dynamic`, and `AggregateFunction` values are `Unsupported`,
+/// matching the decoder. Non-null `Nothing` values are `Invalid`. A row out of
+/// range or a column whose shape does not match `ch_type`, or a null row under a
 /// non-nullable type, is `Invalid`. The column is caller memory rather than
 /// wire input, but malformed buffers still return an error instead of panicking.
 /// On error `buf` is left as it was.
@@ -955,7 +1365,7 @@ pub fn encode_binary_value(
         return Err(mismatch(ch_type));
     }
     let start = buf.len();
-    let result = encode_value(buf, ch_type, column, row);
+    let result = encode_value(buf, ch_type, column, row, 0);
     if result.is_err() {
         buf.truncate(start);
     }
@@ -968,6 +1378,7 @@ pub fn encode_binary_value(
 struct TypeCheck {
     supported: bool,
     matches: bool,
+    descriptor_nodes: usize,
 }
 
 impl TypeCheck {
@@ -975,20 +1386,29 @@ impl TypeCheck {
     fn combine(&mut self, other: Self) {
         self.supported &= other.supported;
         self.matches &= other.matches;
+        self.descriptor_nodes = self.descriptor_nodes.saturating_add(other.descriptor_nodes);
+    }
+
+    fn check_descriptor_complexity(self) -> Result<(), BinaryValueError> {
+        if self.descriptor_nodes > MAX_BINARY_TYPE_COMPLEXITY {
+            return Err(BinaryValueError::Invalid(format!(
+                "complexity exceeds {MAX_BINARY_TYPE_COMPLEXITY}"
+            )));
+        }
+        Ok(())
     }
 }
 
-/// Check depth, coverage, and optional column shape in one allocation-free
-/// traversal. None means too deep. Every type child is visited even if its
+/// Check depth, coverage, descriptor nodes, and optional column shape without
+/// allocations. None means too deep. Every type child is visited even if its
 /// column shape is already wrong, before any error can render the type.
 /// Depth charges match `encode::validate::type_depth`, including empty aliases.
 ///
-/// Single-child wrappers (`Nullable`, `LowCardinality`, `Array`, and the
-/// `SimpleAggregateFunction` alias) are walked in a loop, so a chain like
+/// Single-child wrappers (`Nullable`, `LowCardinality`, and `Array`) are walked
+/// in a loop, so a chain like
 /// `Array(LowCardinality(Nullable(String)))` costs one frame and a hostile
-/// million-deep chain is rejected without recursion. Only branching nodes
-/// (`Tuple`, `Map`, `Nested`, and the unsupported families) recurse, and the
-/// depth gate bounds that recursion.
+/// million-deep chain is rejected without recursion. Branching nodes and
+/// `SimpleAggregateFunction` recurse, bounded by the depth gate.
 #[inline]
 fn check_type(
     mut ch_type: &ChType,
@@ -998,14 +1418,23 @@ fn check_type(
     let mut check = TypeCheck {
         supported: true,
         matches: true,
+        descriptor_nodes: 0,
     };
     loop {
         if depth > MAX_TYPE_DEPTH {
             return None;
         }
+        check.descriptor_nodes = check.descriptor_nodes.saturating_add(1);
         match ch_type {
-            ChType::Nullable(inner) | ChType::SimpleAggregateFunction { inner, .. } => {
+            ChType::Nullable(inner) => {
                 ch_type = inner;
+            }
+            ChType::SimpleAggregateFunction { inner, .. } => {
+                let inner = check_type(inner, column, depth + 1)?;
+                check.supported &= inner.supported;
+                check.matches &= inner.matches;
+                // The descriptor writer uses one Custom tag for this alias.
+                return Some(check);
             }
             ChType::LowCardinality(inner) => {
                 if let Some(Column::Dictionary(dict)) = column {
@@ -1113,7 +1542,7 @@ fn check_type(
             }
             ChType::Variant(alternatives) => {
                 for ty in alternatives {
-                    check_type(ty, None, depth + 1)?;
+                    check.combine(check_type(ty, None, depth + 1)?);
                 }
                 check.supported = false;
                 return Some(check);
@@ -1126,10 +1555,38 @@ fn check_type(
                 return Some(check);
             }
             ChType::Json { typed_paths, .. } => {
-                for (_, ty) in typed_paths {
-                    check_type(ty, None, depth + 1)?;
+                let body = match column {
+                    Some(Column::Json(JsonColumn {
+                        body: JsonBody::Structured(body),
+                        ..
+                    })) => Some(body.as_ref()),
+                    Some(Column::Json(_)) => {
+                        check.supported = false;
+                        None
+                    }
+                    Some(_) => {
+                        check.matches = false;
+                        None
+                    }
+                    None => None,
+                };
+                check.matches &= !typed_paths.windows(2).any(|pair| pair[0].0 >= pair[1].0);
+                if let Some(body) = body {
+                    check.matches &= body.typed.len() == typed_paths.len()
+                        && !body.typed.windows(2).any(|pair| pair[0].0 >= pair[1].0);
                 }
-                check.supported = false;
+                for (path, ty) in typed_paths {
+                    let child = body.and_then(|body| {
+                        body.typed
+                            .binary_search_by(|(name, _)| name.as_bytes().cmp(path.as_bytes()))
+                            .ok()
+                            .map(|index| &body.typed[index].1)
+                    });
+                    if body.is_some() && child.is_none() {
+                        check.matches = false;
+                    }
+                    check.combine(check_type(ty, child, depth + 1)?);
+                }
                 return Some(check);
             }
             ChType::Dynamic { .. } => {
@@ -1137,6 +1594,9 @@ fn check_type(
                 return Some(check);
             }
             _ => {
+                if matches!(ch_type, ChType::QBit { .. }) {
+                    check.descriptor_nodes = check.descriptor_nodes.saturating_add(1);
+                }
                 if let Some(column) = column {
                     check.matches &= scalar_variant_matches(ch_type, column);
                 }
@@ -1222,7 +1682,7 @@ fn scalar_variant_matches(ch_type: &ChType, column: &Column) -> bool {
 #[cold]
 #[inline(never)]
 fn too_deep() -> BinaryValueError {
-    BinaryValueError::Invalid("type nesting too deep".into())
+    BinaryValueError::Invalid(format!("nesting exceeds {MAX_TYPE_DEPTH}"))
 }
 
 #[cold]
@@ -1367,6 +1827,138 @@ fn fixed_slice(data: &[u8], width: usize, row: usize) -> Result<&[u8], BinaryVal
         .ok_or_else(|| out_of_range(row, data.len().checked_div(width).unwrap_or(0)))
 }
 
+fn utf8_slice(column: &Utf8Column, row: usize) -> Result<&[u8], BinaryValueError> {
+    reject_null(column.validity.as_ref(), row)?;
+    let (start, end) = offset_range(&column.offsets, row)?;
+    column
+        .data
+        .get(start..end)
+        .ok_or_else(|| BinaryValueError::Invalid("invalid JSON string offsets".into()))
+}
+
+fn write_string(buf: &mut Vec<u8>, bytes: &[u8]) {
+    write_varint(buf, bytes.len() as u64);
+    buf.extend_from_slice(bytes);
+}
+
+fn write_shared_value(
+    buf: &mut Vec<u8>,
+    cell: &[u8],
+    depth: usize,
+) -> Result<(), BinaryValueError> {
+    let mut reader = ByteReader::new(cell);
+    let ty = read_value_type(&mut reader, depth)?;
+    ty.skip(&mut reader)?;
+    if reader.remaining() != 0 {
+        return Err(BinaryValueError::Invalid(
+            "trailing JSON shared value bytes".into(),
+        ));
+    }
+    buf.extend_from_slice(cell);
+    Ok(())
+}
+
+fn encode_json_value(
+    buf: &mut Vec<u8>,
+    typed_paths: &[(String, ChType)],
+    column: &JsonColumn,
+    row: usize,
+    depth: usize,
+) -> Result<(), BinaryValueError> {
+    reject_null(column.validity.as_ref(), row)?;
+    let JsonBody::Structured(body) = &column.body else {
+        return Err(BinaryValueError::Unsupported("JSON text body".into()));
+    };
+    if row >= body.len {
+        return Err(out_of_range(row, body.len));
+    }
+    let (start, end) = offset_range(&body.shared_offsets, row)?;
+    if end > body.shared_paths.len() || end > body.shared_values.len() {
+        return Err(BinaryValueError::Invalid(
+            "invalid JSON shared offsets".into(),
+        ));
+    }
+    let mut count = typed_paths
+        .len()
+        .checked_add(end - start)
+        .ok_or_else(|| BinaryValueError::Invalid("JSON path count overflows usize".into()))?;
+    for (_, dynamic) in &body.dynamic {
+        let id = dynamic
+            .type_ids
+            .get(row)
+            .ok_or_else(|| out_of_range(row, dynamic.len()))?;
+        if *id != u32::MAX {
+            count = count.checked_add(1).ok_or_else(|| {
+                BinaryValueError::Invalid("JSON path count overflows usize".into())
+            })?;
+        }
+    }
+    let mut paths = Vec::with_capacity(count);
+    paths.extend(body.typed.iter().map(|(path, _)| path.as_bytes()));
+    for (path, dynamic) in &body.dynamic {
+        if dynamic.type_ids[row] != u32::MAX {
+            paths.push(path.as_bytes());
+        }
+    }
+    for index in start..end {
+        let path = utf8_slice(&body.shared_paths, index)?;
+        paths.push(path);
+    }
+    paths.sort_unstable();
+    if paths.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(BinaryValueError::Invalid("duplicate JSON path".into()));
+    }
+    write_varint(buf, count as u64);
+    for (path, values) in &body.typed {
+        let index = typed_paths
+            .binary_search_by(|(name, _)| name.as_bytes().cmp(path.as_bytes()))
+            .map_err(|_| BinaryValueError::Invalid("unexpected JSON typed path".into()))?;
+        let ty = &typed_paths[index].1;
+        write_string(buf, path.as_bytes());
+        encode_value(buf, ty, values, row, depth + 1)?;
+    }
+    for (path, dynamic) in &body.dynamic {
+        let id = *dynamic
+            .type_ids
+            .get(row)
+            .ok_or_else(|| out_of_range(row, dynamic.len()))?;
+        if id == u32::MAX {
+            continue;
+        }
+        let offset = dynamic
+            .offsets
+            .get(row)
+            .and_then(|offset| usize::try_from(*offset).ok())
+            .ok_or_else(|| BinaryValueError::Invalid("invalid JSON dynamic offset".into()))?;
+        let child = dynamic
+            .children
+            .get(id as usize)
+            .ok_or_else(|| BinaryValueError::Invalid("invalid JSON dynamic type id".into()))?;
+        write_string(buf, path.as_bytes());
+        match child {
+            DynamicChild::Typed { ch_type, values } => {
+                let check = check_type(ch_type, Some(values), depth + 1).ok_or_else(too_deep)?;
+                check.check_descriptor_complexity()?;
+                if !check.matches {
+                    return Err(mismatch(ch_type));
+                }
+                check_type_construction(ch_type).map_err(type_error)?;
+                write_binary_type(buf, ch_type);
+                encode_value(buf, ch_type, values, offset, depth + 1)?;
+            }
+            DynamicChild::Shared(values) => {
+                write_shared_value(buf, utf8_slice(values, offset)?, depth + 1)?;
+            }
+        }
+    }
+    for index in start..end {
+        let path = utf8_slice(&body.shared_paths, index)?;
+        write_string(buf, path);
+        write_shared_value(buf, utf8_slice(&body.shared_values, index)?, depth + 1)?;
+    }
+    Ok(())
+}
+
 /// One row of a `Tuple` column under `elements`: shared by `Tuple` and the
 /// `Nested` alias, whose elements are an `Array` of this shape.
 #[inline]
@@ -1376,6 +1968,7 @@ fn encode_tuple<'a>(
     elements: impl ExactSizeIterator<Item = &'a ChType>,
     c: &TupleColumn,
     row: usize,
+    depth: usize,
 ) -> Result<(), BinaryValueError> {
     if elements.len() != c.fields.len() {
         return Err(mismatch(ch_type));
@@ -1385,7 +1978,7 @@ fn encode_tuple<'a>(
         return Err(out_of_range(row, c.len));
     }
     for (element, field) in elements.zip(&c.fields) {
-        encode_value(buf, element, field, row)?;
+        encode_value(buf, element, field, row, depth + 1)?;
     }
     Ok(())
 }
@@ -1398,8 +1991,12 @@ fn encode_value(
     ch_type: &ChType,
     column: &Column,
     row: usize,
+    depth: usize,
 ) -> Result<(), BinaryValueError> {
     count_visit();
+    if depth > MAX_TYPE_DEPTH {
+        return Err(too_deep());
+    }
     macro_rules! le {
         ($c:expr) => {{
             reject_null($c.validity.as_ref(), row)?;
@@ -1415,9 +2012,11 @@ fn encode_value(
         // Name-decoration aliases encode as their physical type. `Nested` has
         // its own arm below so its `Array(Tuple(..))` form is never built.
         (ChType::SimpleAggregateFunction { inner, .. }, _) => {
-            encode_value(buf, inner, column, row)?
+            encode_value(buf, inner, column, row, depth + 1)?
         }
-        (ChType::Geo(kind), _) => encode_value(buf, kind.underlying_type_ref(), column, row)?,
+        (ChType::Geo(kind), _) => {
+            encode_value(buf, kind.underlying_type_ref(), column, row, depth)?
+        }
 
         // Mirror the bulk null map: 0x00 then the value, or 0x01 and nothing.
         (ChType::Nullable(inner), _) => {
@@ -1428,7 +2027,7 @@ fn encode_value(
                 buf.push(1);
             } else {
                 buf.push(0);
-                encode_value(buf, inner, column, row)?;
+                encode_value(buf, inner, column, row, depth + 1)?;
             }
         }
         (ChType::LowCardinality(inner), Column::Dictionary(dict)) => {
@@ -1452,14 +2051,14 @@ fn encode_value(
             let index = usize::try_from(index).map_err(|_| {
                 BinaryValueError::Invalid(format!("row {row} has negative dictionary index"))
             })?;
-            encode_value(buf, value_type, &dict.values, index)?;
+            encode_value(buf, value_type, &dict.values, index, depth + 1)?;
         }
         // The plain inner column, as decode_binary_value returns it.
-        (ChType::LowCardinality(inner), _) => encode_value(buf, inner, column, row)?,
+        (ChType::LowCardinality(inner), _) => encode_value(buf, inner, column, row, depth + 1)?,
 
         (ChType::Nothing, Column::Nothing(c)) => {
             reject_null(c.validity.as_ref(), row)?;
-            return Err(BinaryValueError::Unsupported("Nothing".into()));
+            return Err(BinaryValueError::Invalid("non-null Nothing value".into()));
         }
         (ChType::Bool, Column::Bool(c)) => {
             reject_null(c.validity.as_ref(), row)?;
@@ -1595,7 +2194,7 @@ fn encode_value(
             write_varint(buf, (end - start) as u64);
             let from = first_checked_row(start, end, || zero_width_bound(inner, &c.values, end));
             for i in from..end {
-                encode_value(buf, inner, &c.values, i)?;
+                encode_value(buf, inner, &c.values, i, depth + 1)?;
             }
         }
         (ChType::Nested(fields), Column::Array(c)) => {
@@ -1614,7 +2213,7 @@ fn encode_value(
                 zero_width_tuple_bound(elements(), tuple, end)
             });
             for i in from..end {
-                encode_tuple(buf, ch_type, elements(), tuple, i)?;
+                encode_tuple(buf, ch_type, elements(), tuple, i, depth + 1)?;
             }
         }
         (ChType::Map(key, value), Column::Map(c)) => {
@@ -1634,17 +2233,24 @@ fn encode_value(
                 Some(key.min(zero_width_bound(value, values, end)?))
             });
             for i in from..end {
-                encode_value(buf, key, keys, i)?;
-                encode_value(buf, value, values, i)?;
+                encode_value(buf, key, keys, i, depth + 1)?;
+                encode_value(buf, value, values, i, depth + 1)?;
             }
         }
-        (ChType::Tuple(elements), Column::Tuple(c)) => {
-            encode_tuple(buf, ch_type, elements.iter().map(|(_, ty)| ty), c, row)?
+        (ChType::Tuple(elements), Column::Tuple(c)) => encode_tuple(
+            buf,
+            ch_type,
+            elements.iter().map(|(_, ty)| ty),
+            c,
+            row,
+            depth,
+        )?,
+        (ChType::Json { typed_paths, .. }, Column::Json(c)) => {
+            encode_json_value(buf, typed_paths, c, row, depth)?;
         }
         (
             ChType::Variant(_)
             | ChType::Dynamic { .. }
-            | ChType::Json { .. }
             | ChType::AggregateFunction { .. }
             | ChType::Geometry,
             _,
@@ -2038,6 +2644,641 @@ mod tests {
     }
 
     #[test]
+    fn json_typed_paths_use_names_and_default_missing_values() {
+        let ty = parse("Array(JSON(a Int64, b Nullable(String)))");
+        let mut bytes = vec![2, 2];
+        write_string(&mut bytes, b"b");
+        bytes.push(0);
+        write_string(&mut bytes, b"user_1");
+        write_string(&mut bytes, b"a");
+        bytes.extend_from_slice(&13i64.to_le_bytes());
+        bytes.push(0);
+        let column = decode_binary_value(&ty, &bytes).unwrap();
+        let Column::Array(array) = &column else {
+            panic!("expected Array")
+        };
+        let Column::Json(json) = array.values.as_ref() else {
+            panic!("expected JSON")
+        };
+        let JsonBody::Structured(body) = &json.body else {
+            panic!("expected structured")
+        };
+        let Column::Int64(a) = &body.typed[0].1 else {
+            panic!("expected Int64")
+        };
+        assert_eq!(a.values, [13, 0]);
+        let Column::Utf8(b) = &body.typed[1].1 else {
+            panic!("expected String")
+        };
+        assert_eq!(b.value(0), b"user_1");
+        assert_eq!(b.value(1), b"");
+        assert_eq!(b.validity.as_ref().unwrap().null_count(), 1);
+        let mut encoded = Vec::new();
+        encode_binary_value(&mut encoded, &ty, &column, 0).unwrap();
+        assert_eq!(decode_binary_value(&ty, &encoded).unwrap(), column);
+    }
+
+    #[test]
+    fn json_nullable_defaults_share_the_materialization_budget() {
+        let ty = parse("Nullable(JSON(a FixedString(16777215), b FixedString(16777215)))");
+        assert!(matches!(
+            decode_binary_value(&ty, &[1]),
+            Err(BinaryValueError::Invalid(reason)) if reason.contains("placeholder expansion")
+        ));
+        let ty = parse("Nullable(JSON(a Nullable(Int64)))");
+        let column = decode_binary_value(&ty, &[1]).unwrap();
+        assert_eq!(column.null_count(), 1);
+        let mut encoded = Vec::new();
+        encode_binary_value(&mut encoded, &ty, &column, 0).unwrap();
+        assert_eq!(encoded, [1]);
+        assert!(matches!(
+            decode_binary_value(&parse("JSON(v Variant(Int64, String))"), &[0]),
+            Err(BinaryValueError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn json_null_default_fits_one_max_width_fixed_string() {
+        let ty = parse("Nullable(JSON(a FixedString(16777215)))");
+        for bytes in [&[1][..], &[0, 0]] {
+            let column =
+                decode_binary_value(&ty, bytes).unwrap_or_else(|e| panic!("decode {bytes:?}: {e}"));
+            assert_eq!(column.len(), 1);
+        }
+    }
+
+    #[test]
+    fn json_missing_zero_width_defaults_charge_the_budget() {
+        for name in [
+            "JSON(a Tuple(), b Tuple())",
+            "JSON(a Tuple(Tuple(), Tuple()))",
+            "JSON(a Tuple(Nothing, Nothing))",
+        ] {
+            let mut builder = ValueBuilder::new(&parse(name), 0).unwrap();
+            let mut reader = ByteReader::new(&[0]);
+            let mut budget = NullDefaultBudget { remaining: 1 };
+            assert!(
+                matches!(
+                    builder.append_value(&mut reader, &mut budget),
+                    Err(BinaryValueError::Invalid(reason)) if reason.contains("placeholder expansion")
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_wide_missing_defaults_stop_before_exhausting_the_input() {
+        for (count, value_type) in [
+            (999, ChType::Tuple(Vec::new())),
+            (1000, ChType::Tuple(vec![(None, ChType::Tuple(Vec::new()))])),
+        ] {
+            let json = ChType::Json {
+                max_dynamic_paths: 0,
+                max_dynamic_types: 0,
+                typed_paths: (0..count)
+                    .map(|index| (format!("p{index:04}"), value_type.clone()))
+                    .collect(),
+                skip_paths: Vec::new(),
+                skip_regexps: Vec::new(),
+            };
+            for (inner, row) in [(json.clone(), 0), (ChType::Nullable(Box::new(json)), 1)] {
+                let ty = ChType::Array(Box::new(inner));
+                let mut bytes = varint(1_000_000);
+                bytes.resize(bytes.len() + 1_000_000, row);
+                assert!(matches!(
+                    decode_binary_value(&ty, &bytes),
+                    Err(BinaryValueError::Invalid(reason)) if reason.contains("placeholder expansion")
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn json_shared_cells_reject_non_null_nothing_values() {
+        for (name, payload) in [
+            ("Array(Nothing)", vec![1]),
+            ("Array(Nothing)", varint(1_000_000)),
+            ("Array(Nothing)", varint(u64::MAX)),
+            ("Nullable(Nothing)", vec![0]),
+            ("Tuple(Nothing)", vec![]),
+            ("Map(Nothing, UInt8)", vec![1, 79]),
+            ("Map(String, Nothing)", vec![1, 1, b'k']),
+        ] {
+            let mut cell = Vec::new();
+            write_binary_type(&mut cell, &parse(name));
+            cell.extend(payload);
+            let mut bytes = vec![1];
+            write_string(&mut bytes, b"x");
+            bytes.extend_from_slice(&cell);
+            assert!(
+                matches!(
+                    decode_binary_value(&parse("JSON"), &bytes),
+                    Err(BinaryValueError::Invalid(_))
+                ),
+                "{name}"
+            );
+            let column = Column::Json(JsonColumn::structured(StructuredJson::from_parts(
+                Vec::new(),
+                Vec::new(),
+                vec![0, 1],
+                Utf8Column::new(vec![0, 1], vec![b'x']),
+                Utf8Column::new(vec![0, cell.len() as i32], cell),
+                1,
+            )));
+            let mut encoded = vec![0xab];
+            assert!(
+                matches!(
+                    encode_binary_value(&mut encoded, &parse("JSON"), &column, 0),
+                    Err(BinaryValueError::Invalid(_))
+                ),
+                "{name}"
+            );
+            assert_eq!(encoded, [0xab]);
+        }
+    }
+
+    #[test]
+    fn json_shared_cells_allow_nothing_only_when_null_or_empty() {
+        for (name, payload) in [
+            ("Nothing", vec![]),
+            ("Array(Nothing)", vec![0]),
+            ("Map(Nothing, UInt8)", vec![0]),
+            ("Map(String, Nothing)", vec![0]),
+            ("Nullable(Nothing)", vec![1]),
+            ("Array(Nullable(Nothing))", vec![3, 1, 1, 1]),
+            ("Array(Array(Nothing))", vec![2, 0, 0]),
+            ("Array(Dynamic)", vec![3, 0, 0, 0]),
+            ("Variant(String, UInt8)", vec![255]),
+        ] {
+            let mut bytes = vec![1];
+            write_string(&mut bytes, b"x");
+            write_binary_type(&mut bytes, &parse(name));
+            bytes.extend(payload);
+            let column = decode_binary_value(&parse("JSON"), &bytes)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let mut encoded = Vec::new();
+            encode_binary_value(&mut encoded, &parse("JSON"), &column, 0).unwrap();
+            assert_eq!(encoded, bytes, "{name}");
+        }
+    }
+
+    #[test]
+    fn json_rejects_truncation_trailing_bytes_and_duplicate_typed_paths() {
+        let ty = parse("JSON(a Int64)");
+        let mut bytes = vec![2];
+        write_string(&mut bytes, b"a");
+        bytes.extend_from_slice(&13i64.to_le_bytes());
+        write_string(&mut bytes, b"x");
+        write_binary_type(&mut bytes, &parse("Array(Nullable(String))"));
+        bytes.extend_from_slice(&[2, 1, 0]);
+        write_string(&mut bytes, b"user_1");
+        assert!(decode_binary_value(&ty, &bytes).is_ok());
+        for end in 0..bytes.len() {
+            assert!(
+                matches!(
+                    decode_binary_value(&ty, &bytes[..end]),
+                    Err(BinaryValueError::Invalid(_))
+                ),
+                "{end}"
+            );
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(matches!(
+            decode_binary_value(&ty, &trailing),
+            Err(BinaryValueError::Invalid(_))
+        ));
+        let mut duplicate = vec![2];
+        for _ in 0..2 {
+            write_string(&mut duplicate, b"a");
+            duplicate.extend_from_slice(&13i64.to_le_bytes());
+        }
+        assert!(matches!(
+            decode_binary_value(&ty, &duplicate),
+            Err(BinaryValueError::Invalid(_))
+        ));
+        assert!(matches!(
+            decode_binary_value(&parse("JSON"), &[1, 1, 255]),
+            Err(BinaryValueError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn json_embedded_descriptors_share_the_value_depth_limit() {
+        let ty = parse("JSON");
+        let descriptor = {
+            let mut bytes = Vec::new();
+            write_binary_type(&mut bytes, &ty);
+            bytes
+        };
+        for (depth, valid) in [(5, true), (MAX_TYPE_DEPTH + 1, false)] {
+            let mut bytes = Vec::new();
+            for _ in 0..depth {
+                bytes.extend_from_slice(&[1, 1, b'x']);
+                bytes.extend_from_slice(&descriptor);
+            }
+            bytes.push(0);
+            let decoded = decode_binary_value(&ty, &bytes);
+            assert_eq!(decoded.is_ok(), valid);
+            if let Ok(column) = decoded {
+                let mut encoded = Vec::new();
+                encode_binary_value(&mut encoded, &ty, &column, 0).unwrap();
+                assert_eq!(encoded, bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn json_rejects_colliding_writer_paths_and_repeated_shared_reader_paths() {
+        let ty = parse("JSON(a Int64)");
+        for (dynamic_names, shared_names) in [
+            (&["a"][..], &[][..]),
+            (&[][..], &["a"][..]),
+            (&["x"][..], &["x"][..]),
+            (&["x", "x"][..], &[][..]),
+            (&[][..], &["x", "x"][..]),
+        ] {
+            let mut paths = Utf8Column::new(vec![0], Vec::new());
+            let mut values = Utf8Column::new(vec![0], Vec::new());
+            let mut cell = Vec::new();
+            write_binary_type(&mut cell, &ChType::UInt8);
+            cell.push(79);
+            for path in shared_names {
+                append_utf8(&mut paths, path.as_bytes()).unwrap();
+                append_utf8(&mut values, &cell).unwrap();
+            }
+            let dynamic = dynamic_names
+                .iter()
+                .map(|path| {
+                    (
+                        (*path).to_string(),
+                        crate::column::DynamicColumn::try_new(
+                            &[0],
+                            vec![DynamicChild::Typed {
+                                ch_type: ChType::UInt8,
+                                values: Column::UInt8(PrimitiveColumn::new(vec![79])),
+                            }],
+                        )
+                        .unwrap(),
+                    )
+                })
+                .collect();
+            let column = Column::Json(JsonColumn::structured(StructuredJson::from_parts(
+                vec![("a".into(), Column::Int64(PrimitiveColumn::new(vec![13])))],
+                dynamic,
+                vec![0, shared_names.len() as i64],
+                paths,
+                values,
+                1,
+            )));
+            let mut encoded = vec![0xab];
+            assert!(matches!(encode_binary_value(&mut encoded, &ty, &column, 0),
+                Err(BinaryValueError::Invalid(reason)) if reason.contains("duplicate JSON path")));
+            assert_eq!(encoded, [0xab]);
+        }
+        let mut bytes = vec![2];
+        for _ in 0..2 {
+            write_string(&mut bytes, b"x");
+            write_binary_type(&mut bytes, &ChType::UInt8);
+            bytes.push(13);
+        }
+        assert!(matches!(decode_binary_value(&parse("JSON"), &bytes),
+            Err(BinaryValueError::Invalid(reason)) if reason.contains("duplicate JSON path")));
+    }
+
+    #[test]
+    fn geo_and_json_geo_values_roundtrip_at_the_type_depth_limit() {
+        for leaf in [
+            "Point",
+            "JSON(a Point)",
+            "SimpleAggregateFunction(any, Point)",
+            "Nested(a Point)",
+        ] {
+            let mut ty = parse(leaf);
+            let leaf_depth = match leaf {
+                "Point" => 1,
+                "Nested(a Point)" => 3,
+                _ => 2,
+            };
+            let mut bytes = vec![1; MAX_TYPE_DEPTH - leaf_depth];
+            for _ in leaf_depth..MAX_TYPE_DEPTH {
+                ty = ChType::Array(Box::new(ty));
+            }
+            if leaf.starts_with("JSON") {
+                bytes.push(1);
+                write_string(&mut bytes, b"a");
+            } else if leaf.starts_with("Nested") {
+                bytes.push(1);
+            }
+            bytes.extend_from_slice(&1.25f64.to_le_bytes());
+            bytes.extend_from_slice(&(-3.5f64).to_le_bytes());
+            let column = decode_binary_value(&ty, &bytes).unwrap();
+            let mut encoded = Vec::new();
+            encode_binary_value(&mut encoded, &ty, &column, 0).unwrap();
+            assert_eq!(encoded, bytes, "{leaf}");
+        }
+    }
+
+    #[test]
+    fn json_qbit_path_roundtrips_at_the_type_depth_limit() {
+        let mut ty = parse("JSON");
+        let mut bytes = vec![1; MAX_TYPE_DEPTH - 1];
+        for _ in 1..MAX_TYPE_DEPTH {
+            ty = ChType::Array(Box::new(ty));
+        }
+        bytes.push(1);
+        write_string(&mut bytes, b"x");
+        write_binary_type(&mut bytes, &parse("QBit(Float64, 1)"));
+        bytes.push(1);
+        bytes.extend_from_slice(&1.25f64.to_le_bytes());
+        let column = decode_binary_value(&ty, &bytes).unwrap();
+        let mut encoded = Vec::new();
+        encode_binary_value(&mut encoded, &ty, &column, 0).unwrap();
+        assert_eq!(encoded, bytes);
+    }
+
+    #[test]
+    fn descriptor_node_counts_follow_binary_writer() {
+        for (name, nodes) in [
+            ("UInt8", 1),
+            ("Array(Nullable(UInt8))", 3),
+            ("Tuple(UInt8, Array(UInt8))", 4),
+            ("Map(String, UInt8)", 3),
+            ("Nested(x UInt8, y Array(UInt8))", 4),
+            ("Point", 1),
+            ("SimpleAggregateFunction(any, Array(UInt8))", 1),
+            ("Array(SimpleAggregateFunction(any, Array(UInt8)))", 2),
+            ("QBit(Float64, 1)", 2),
+            ("Tuple(QBit(Float64, 1), UInt8)", 4),
+            ("JSON(x Nullable(UInt8))", 3),
+            ("Variant(String, UInt8)", 3),
+        ] {
+            let ty = parse(name);
+            assert_eq!(check_type(&ty, None, 0).unwrap().descriptor_nodes, nodes);
+            let tuple = ChType::Tuple(vec![(None, ty); MAX_BINARY_TYPE_COMPLEXITY / nodes]);
+            let check = check_type(&tuple, None, 0).unwrap();
+            let mut bytes = Vec::new();
+            write_binary_type(&mut bytes, &tuple);
+            assert_eq!(
+                read_binary_type_prefix(&bytes).is_ok(),
+                check.check_descriptor_complexity().is_ok(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_dynamic_child_descriptor_complexity_matches_decode() {
+        for count in [2000, 2001] {
+            let child_type = ChType::Tuple(vec![(None, ChType::UInt8); count]);
+            let child_values = Column::Tuple(TupleColumn::new(
+                vec![Column::UInt8(PrimitiveColumn::new(vec![79])); count],
+                1,
+            ));
+            let dynamic = crate::column::DynamicColumn::try_new(
+                &[0],
+                vec![DynamicChild::Typed {
+                    ch_type: child_type.clone(),
+                    values: child_values,
+                }],
+            )
+            .unwrap();
+            let column = Column::Json(JsonColumn::structured(StructuredJson::from_parts(
+                vec![],
+                vec![("x".into(), dynamic)],
+                vec![0, 0],
+                Utf8Column::new(vec![0], vec![]),
+                Utf8Column::new(vec![0], vec![]),
+                1,
+            )));
+            let ty = parse("JSON");
+            let mut encoded = vec![0xab];
+            let result = encode_binary_value(&mut encoded, &ty, &column, 0);
+            if count == 2000 {
+                result.unwrap();
+                let decoded = decode_binary_value(&ty, &encoded[1..]).unwrap();
+                let Column::Json(json) = &decoded else {
+                    panic!("expected JSON")
+                };
+                let JsonBody::Structured(body) = &json.body else {
+                    panic!("expected structured JSON")
+                };
+                let cell = body.shared_values.value(0);
+                let (decoded_type, prefix_len) = read_binary_type_prefix(cell).unwrap();
+                assert_eq!(decoded_type, child_type);
+                let Column::Tuple(tuple) =
+                    decode_binary_value(&decoded_type, &cell[prefix_len..]).unwrap()
+                else {
+                    panic!("expected Tuple")
+                };
+                assert_eq!(tuple.fields.len(), count);
+                assert!(tuple
+                    .fields
+                    .iter()
+                    .all(|field| matches!(field, Column::UInt8(values) if values.values == [79])));
+                let mut reencoded = vec![0xab];
+                encode_binary_value(&mut reencoded, &ty, &decoded, 0).unwrap();
+                assert_eq!(reencoded, encoded);
+            } else {
+                assert!(matches!(result,
+                    Err(BinaryValueError::Invalid(reason)) if reason.contains("complexity")));
+                assert_eq!(encoded, [0xab]);
+            }
+        }
+    }
+
+    #[test]
+    fn json_dynamic_child_rejects_illegal_type_construction() {
+        let child_type = ChType::Nullable(Box::new(parse("Array(UInt8)")));
+        let dynamic = crate::column::DynamicColumn::try_new(
+            &[0],
+            vec![DynamicChild::Typed {
+                ch_type: child_type.clone(),
+                values: Column::Array(ArrayColumn::new(
+                    vec![0, 1],
+                    Column::UInt8(PrimitiveColumn::new(vec![79])),
+                )),
+            }],
+        )
+        .unwrap();
+        let column = Column::Json(JsonColumn::structured(StructuredJson::from_parts(
+            vec![],
+            vec![("x".into(), dynamic)],
+            vec![0, 0],
+            Utf8Column::new(vec![0], vec![]),
+            Utf8Column::new(vec![0], vec![]),
+            1,
+        )));
+        let mut cell = Vec::new();
+        write_binary_type(&mut cell, &child_type);
+        let decode_err = read_binary_type_prefix(&cell).unwrap_err();
+        let mut buf = vec![0xab];
+        let encode_err = encode_binary_value(&mut buf, &parse("JSON"), &column, 0).unwrap_err();
+        assert!(matches!(encode_err, BinaryValueError::Invalid(_)));
+        assert_eq!(encode_err.to_string(), decode_err.to_string());
+        assert!(encode_err
+            .to_string()
+            .contains("violates ClickHouse type-construction rules"));
+        assert_eq!(buf, [0xab]);
+    }
+
+    #[test]
+    fn json_preserves_tagged_nothing_shared_values() {
+        let ty = parse("JSON");
+        let bytes = [1, 1, b'x', 0];
+        let column = decode_binary_value(&ty, &bytes).unwrap();
+        let Column::Json(json) = &column else {
+            panic!("expected JSON")
+        };
+        let JsonBody::Structured(body) = &json.body else {
+            panic!("expected structured JSON")
+        };
+        assert_eq!(body.shared_offsets, [0, 1]);
+        assert_eq!(body.shared_paths.value(0), b"x");
+        assert_eq!(body.shared_values.value(0), [0]);
+        let mut encoded = Vec::new();
+        encode_binary_value(&mut encoded, &ty, &column, 0).unwrap();
+        assert_eq!(encoded, bytes);
+        assert!(matches!(
+            decode_binary_value(&ChType::Nothing, &[]),
+            Err(BinaryValueError::Invalid(reason)) if reason == "non-null Nothing value"
+        ));
+    }
+
+    #[test]
+    fn json_shared_paths_are_sorted_with_values() {
+        let ty = parse("JSON");
+        let mut bytes = vec![4];
+        for (path, value) in [(b"z", 13u8), (&[255], 17), (b"a", 79), (&[128], 31)] {
+            write_string(&mut bytes, path);
+            write_binary_type(&mut bytes, &ChType::UInt8);
+            bytes.push(value);
+        }
+        let Column::Json(json) = decode_binary_value(&ty, &bytes).unwrap() else {
+            panic!("expected JSON")
+        };
+        let JsonBody::Structured(body) = json.body else {
+            panic!("expected structured JSON")
+        };
+        assert_eq!(body.shared_paths.value(0), b"a");
+        assert_eq!(body.shared_values.value(0), [1, 79]);
+        assert_eq!(body.shared_paths.value(1), b"z");
+        assert_eq!(body.shared_values.value(1), [1, 13]);
+        assert_eq!(body.shared_paths.value(2), [128]);
+        assert_eq!(body.shared_values.value(2), [1, 31]);
+        assert_eq!(body.shared_paths.value(3), [255]);
+        assert_eq!(body.shared_values.value(3), [1, 17]);
+        let column = Column::Json(JsonColumn::structured(*body));
+        let mut encoded = Vec::new();
+        encode_binary_value(&mut encoded, &ty, &column, 0).unwrap();
+        assert_eq!(decode_binary_value(&ty, &encoded).unwrap(), column);
+    }
+
+    #[test]
+    fn json_rejects_unsorted_or_duplicate_typed_metadata() {
+        for names in [["z", "a"], ["a", "a"]] {
+            let ty = ChType::Json {
+                max_dynamic_paths: 0,
+                max_dynamic_types: 0,
+                typed_paths: names
+                    .iter()
+                    .map(|name| ((*name).into(), ChType::UInt8))
+                    .collect(),
+                skip_paths: Vec::new(),
+                skip_regexps: Vec::new(),
+            };
+            assert!(matches!(
+                decode_binary_value(&ty, &[0]),
+                Err(BinaryValueError::Invalid(_))
+            ));
+            let column = Column::Json(JsonColumn::structured(StructuredJson::from_parts(
+                names
+                    .iter()
+                    .map(|name| {
+                        (
+                            (*name).into(),
+                            Column::UInt8(PrimitiveColumn::new(vec![13])),
+                        )
+                    })
+                    .collect(),
+                Vec::new(),
+                vec![0, 0],
+                Utf8Column::new(vec![0], Vec::new()),
+                Utf8Column::new(vec![0], Vec::new()),
+                1,
+            )));
+            let mut encoded = vec![0xab];
+            assert!(matches!(
+                encode_binary_value(&mut encoded, &parse("JSON(a UInt8, z UInt8)"), &column, 0),
+                Err(BinaryValueError::Invalid(_))
+            ));
+            assert_eq!(encoded, [0xab]);
+        }
+    }
+
+    #[test]
+    fn json_repeated_values_do_not_repeat_type_walks() {
+        let fields = (0..990)
+            .map(|index| (format!("v{index:03}"), ChType::UInt8))
+            .collect();
+        let nested = ChType::Array(Box::new(ChType::Nested(fields)));
+        let mut fields = vec![(None, ChType::Tuple(Vec::new())); 990];
+        fields.push((None, ChType::Int8));
+        let tuple = ChType::Array(Box::new(ChType::Tuple(fields)));
+        for (ty, value) in [(nested, 0), (tuple, 13)] {
+            let mut bytes = vec![1];
+            write_string(&mut bytes, b"x");
+            write_binary_type(&mut bytes, &ty);
+            write_varint(&mut bytes, 79);
+            bytes.extend(std::iter::repeat(value).take(79));
+            SKIP_STEPS.with(|steps| steps.set(0));
+            decode_binary_value(&parse("JSON"), &bytes).unwrap();
+            let steps = SKIP_STEPS.with(|steps| steps.get());
+            assert!(steps <= 79 + 2, "{steps} repeated type steps");
+        }
+    }
+
+    #[test]
+    fn json_caps_zero_width_tuple_shared_value_counts() {
+        let ty = parse("JSON");
+        for (count, valid) in [
+            (MAX_ZERO_WIDTH_ELEMENTS, true),
+            (MAX_ZERO_WIDTH_ELEMENTS + 1, false),
+            (usize::MAX, false),
+        ] {
+            let mut bytes = vec![1];
+            write_string(&mut bytes, b"x");
+            write_binary_type(&mut bytes, &parse("Array(Tuple())"));
+            write_varint(&mut bytes, count as u64);
+            match decode_binary_value(&ty, &bytes) {
+                Ok(column) => {
+                    assert!(valid);
+                    let mut encoded = Vec::new();
+                    encode_binary_value(&mut encoded, &ty, &column, 0).unwrap();
+                    assert_eq!(encoded, bytes);
+                }
+                Err(BinaryValueError::Invalid(reason)) => {
+                    assert!(!valid, "{reason}");
+                    assert!(reason.contains("Array element count"));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+        let mut bytes = vec![1];
+        write_string(&mut bytes, b"x");
+        write_binary_type(&mut bytes, &parse("Array(Array(Tuple()))"));
+        write_varint(&mut bytes, 13);
+        for _ in 0..13 {
+            write_varint(&mut bytes, MAX_ZERO_WIDTH_ELEMENTS as u64);
+        }
+        let column = decode_binary_value(&ty, &bytes).unwrap();
+        let mut encoded = Vec::new();
+        encode_binary_value(&mut encoded, &ty, &column, 0).unwrap();
+        assert_eq!(encoded, bytes);
+    }
+
+    #[test]
     fn rejects_truncated_and_trailing_payloads() {
         assert!(matches!(
             decode_binary_value(&ChType::Int32, &[0x01, 0x02]),
@@ -2151,6 +3392,23 @@ mod tests {
     }
 
     #[test]
+    fn json_typed_zero_width_runs_take_steps_per_type_node() {
+        let fields = 999;
+        let name = format!(
+            "JSON(a Array(Tuple({})))",
+            vec!["Tuple()"; fields].join(", ")
+        );
+        let ch_type = parse(&name);
+        let bytes = [vec![1, 1, b'a'], varint(MAX_ZERO_WIDTH_ELEMENTS as u64)].concat();
+        let (column, decode_steps) = with_visits(|| decode_binary_value(&ch_type, &bytes));
+        let column = column.unwrap();
+        let (encoded, encode_steps) = with_visits(|| encode_one(&ch_type, &column, 0));
+        assert_eq!(encoded, bytes);
+        assert!(decode_steps <= 2 * fields, "{decode_steps} decode steps");
+        assert!(encode_steps <= 2 * fields, "{encode_steps} encode steps");
+    }
+
+    #[test]
     fn empty_zero_width_runs_take_constant_steps() {
         let n = 10_000;
         let wide = format!("Tuple({})", vec!["Tuple()"; 990].join(", "));
@@ -2256,17 +3514,17 @@ mod tests {
             (
                 "Array(Tuple(Nothing))",
                 array(vec![0, 3], tuple(1, vec![nothing()])),
-                "unsupported binary value type: Nothing",
+                "non-null Nothing value",
             ),
             (
                 "Array(Tuple(Tuple(), Nothing))",
                 array(vec![0, 3], tuple(1, vec![tuple(3, vec![]), nothing()])),
-                "unsupported binary value type: Nothing",
+                "non-null Nothing value",
             ),
             (
                 "Map(Tuple(), Tuple(Nothing))",
                 map(vec![0, 3], tuple(1, vec![]), tuple(3, vec![nothing()]), 3),
-                "unsupported binary value type: Nothing",
+                "non-null Nothing value",
             ),
         ];
         for (name, column, expected) in cases {
@@ -2400,7 +3658,7 @@ mod tests {
         bytes.push(0x00);
         assert!(matches!(
             decode_binary_value(&parse("Array(Nothing)"), &bytes),
-            Err(BinaryValueError::Unsupported(_))
+            Err(BinaryValueError::Invalid(reason)) if reason == "non-null Nothing value"
         ));
         let bytes = varint(0);
         assert!(decode_binary_value(&parse("Array(Nothing)"), &bytes).is_ok());
@@ -2423,9 +3681,6 @@ mod tests {
             assert_eq!(parsed, ch_type);
             assert_eq!(consumed, bytes.len() - 4);
         }
-        // A JSON descriptor now parses (type_binary supports tag 0x30), so the
-        // prefix reader accepts it, but a JSON value is never materialized as a
-        // shared cell: decode_binary_value stays Unsupported rather than panicking.
         let json_type = parse("JSON");
         let mut json_bytes = Vec::new();
         write_binary_type(&mut json_bytes, &json_type);
@@ -2434,7 +3689,7 @@ mod tests {
         assert_eq!(consumed, json_bytes.len());
         assert!(matches!(
             decode_binary_value(&json_type, &[]),
-            Err(BinaryValueError::Unsupported(_))
+            Err(BinaryValueError::Invalid(_))
         ));
         // A truncated descriptor is invalid.
         assert!(matches!(
@@ -2651,6 +3906,55 @@ mod tests {
     }
 
     #[test]
+    fn skip_plan_consumption_matches_supported_value_decoding() {
+        let mut cases = value_cases();
+        cases.extend([
+            ("JSON", vec![0]),
+            ("JSON(a Int64)", vec![0]),
+            ("JSON", vec![2, 1, b'z', 0, 1, b'a', 1, 79]),
+        ]);
+        for (name, bytes) in cases {
+            let ty = parse(name);
+            let mut array = varint(2);
+            array.extend_from_slice(&bytes);
+            array.extend_from_slice(&bytes);
+            let mut tuple = bytes.clone();
+            tuple.push(79);
+            let mut map = vec![1, 1, b'k'];
+            map.extend_from_slice(&bytes);
+            for (ty, bytes) in [
+                (ty.clone(), bytes),
+                (ChType::Array(Box::new(ty.clone())), array),
+                (
+                    ChType::Tuple(vec![(None, ty.clone()), (None, ChType::UInt8)]),
+                    tuple,
+                ),
+                (ChType::Map(Box::new(ChType::String), Box::new(ty)), map),
+            ] {
+                decode_binary_value(&ty, &bytes).unwrap_or_else(|error| panic!("{ty}: {error}"));
+                let plan = SkipPlan::new(&ty, 0).unwrap();
+                let mut input = bytes.clone();
+                input.extend_from_slice(&[0xab, 0xcd]);
+                let mut reader = ByteReader::new(&input);
+                plan.skip(&mut reader)
+                    .unwrap_or_else(|error| panic!("{ty}: {error}"));
+                assert_eq!(reader.position(), bytes.len(), "{ty}");
+                assert_eq!(reader.remaining_slice(), [0xab, 0xcd], "{ty}");
+                for end in 0..bytes.len() {
+                    assert!(
+                        decode_binary_value(&ty, &bytes[..end]).is_err(),
+                        "{ty}: {end}"
+                    );
+                    assert!(
+                        plan.skip(&mut ByteReader::new(&bytes[..end])).is_err(),
+                        "{ty}: {end}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn encode_reads_any_row_of_bulk_columns() {
         // LowCardinality(Nullable(String)) in its bulk Dictionary shape: index 0
         // is the NULL slot, nulls live in the index validity.
@@ -2848,7 +4152,7 @@ mod tests {
         }
         for result in [value_result, prefix_result] {
             assert!(matches!(result, Err(BinaryValueError::Invalid(reason))
-                if reason == "type nesting too deep"));
+                if reason == format!("nesting exceeds {MAX_TYPE_DEPTH}")));
         }
         assert_eq!(buf, [0xaa]);
     }
@@ -3023,7 +4327,7 @@ mod tests {
         // types. The encoder must reject without recursively formatting one.
         std::mem::forget(ch_type);
         assert!(
-            matches!(result, Err(BinaryValueError::Invalid(reason)) if reason == "type nesting too deep")
+            matches!(result, Err(BinaryValueError::Invalid(reason)) if reason == format!("nesting exceeds {MAX_TYPE_DEPTH}"))
         );
         assert_eq!(buf, [0xaa]);
     }
@@ -3038,7 +4342,7 @@ mod tests {
         let result = write_binary_type_prefix(&mut buf, &ch_type);
         std::mem::forget(ch_type);
         assert!(matches!(result, Err(BinaryValueError::Invalid(reason))
-            if reason == "type nesting too deep"));
+            if reason == format!("nesting exceeds {MAX_TYPE_DEPTH}")));
         assert_eq!(buf, [0xaa]);
     }
 
@@ -3239,13 +4543,13 @@ mod tests {
             &ChType::Nothing,
             &Column::Nothing(NothingColumn::new(1)),
             0,
-            true,
+            false,
         );
         check(
             &parse("Nullable(Nothing)"),
             &Column::Nothing(NothingColumn::new_nullable(1, Bitmap::all_valid(1))),
             0,
-            true,
+            false,
         );
     }
 }

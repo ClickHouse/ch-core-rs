@@ -212,6 +212,11 @@ block bytes for `INSERT` with `native::encode::encode_block` or
 `decode_*_binary_types` entry points. Bytes from `encode_*_binary_types` require
 `input_format_native_decode_types_in_binary_format=1` on the receiving INSERT.
 
+Dynamic shared cells and JSON shared-data values stay as binary blobs during
+bulk decode. Use `native::binary_value::read_binary_type_prefix` and
+`decode_binary_value` to decode a cell on demand, including JSON inside
+containers. The corresponding writers build cells for encoding.
+
 ## Repo layout
 
 The root package remains `ch-core-rs`. The workspace also contains

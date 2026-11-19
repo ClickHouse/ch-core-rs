@@ -29,6 +29,14 @@ version; patch releases remain backward compatible.
   Array, Tuple, Map, Nested, and Variant with a mismatched-column error. Alias
   chains below Nullable now encode and decode in any position. Type headers and
   nullability checks are unchanged.
+- `decode_binary_value` and `encode_binary_value` now support structured JSON
+  instead of returning `Unsupported`, including JSON inside arrays, tuples, and
+  maps. These on-demand helpers preserve typed paths and tagged shared paths.
+  Bulk Dynamic and JSON shared cells stay opaque. Non-null Nothing values now
+  return `Invalid` in both helpers.
+- Binary type descriptors with 1001 to 2001 nodes now decode. The 2001-node
+  budget is a crate resource limit. Type-depth errors now say
+  `nesting exceeds 100` instead of `type nesting too deep`.
 - ZSTD compression frames (method byte 0x90) now decode. Before, they returned
   `CompressionError::UnsupportedCodec`. A ZSTD frame that claims more output
   than its payload can hold fails early with `InvalidUncompressedSize`. Real

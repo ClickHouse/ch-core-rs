@@ -21,6 +21,13 @@ cross-checked against the matching `.server-ref` tag `v26.8.1.2041-lts`.
 | `json_string_rev0.native` | HTTP `FORMAT Native`, `output_format_native_write_json_as_string=1` | `0` | `01 04 01 6a 26 4a 53 4f 4e 28 6d 61 78 5f 64 79` |
 | `json_flattened_rev0.native` | HTTP `FORMAT Native`, `output_format_native_use_flattened_dynamic_and_json_serialization=1` | `0` | `01 04 01 6a 26 4a 53 4f 4e 28 6d 61 78 5f 64 79` |
 | `zero_width_dynamic_rev0.native` | HTTP `FORMAT Native` | `0` | `02 01 01 76 14 44 79 6e 61 6d 69 63 28 6d 61 78` |
+| `json_shared_rev0.native` | HTTP `FORMAT Native` | `0` | `09 04 01 6a 14 44 79 6e 61 6d 69 63 28 6d 61 78` |
+| `json_shared_rev54460.native` | Same query with `client_protocol_version=54460` | `54460` | `01 00 02 ff ff ff ff 00 09 04 01 6a 14 44 79 6e` |
+| `json_shared_rev54485.native` | Same query with `client_protocol_version=54485` | `54485` | `01 00 02 ff ff ff ff 03 00 00 09 04 01 6a 14 44` |
+| `json_multipart_rev0.native` | HTTP `FORMAT Native` from two MergeTree parts | `0` | `02 01 02 69 64 05 55 49 6e 74 38 00 01 64 07 44` |
+| `json_multipart_rev54460.native` | Same table with `client_protocol_version=54460` | `54460` | `01 00 02 ff ff ff ff 00 02 01 02 69 64 05 55 49` |
+| `json_multipart_rev54485.native` | Same table with `client_protocol_version=54485` | `54485` | `01 00 02 ff ff ff ff 03 00 00 02 01 02 69 64 05` |
+| `json_mixed_rows_rev0.native` | HTTP `FORMAT Native`, mixed JSON runtime children | `0` | `01 04 01 6a 04 4a 53 4f 4e 00 00 00 00 00 00 00` |
 
 The revision-54485 fixture starts with the 10-byte `BlockInfo` preamble:
 `01 00 02 ff ff ff ff 03 00 00`.
@@ -100,6 +107,43 @@ Zero-row HTTP and `clickhouse-client` Native queries on the current local
 server emit an empty response, not a schema-bearing zero-row Native block. The
 decoder's zero-row block behavior remains covered by unit tests in
 `src/native/decode/tests/`.
+
+## JSON values in Dynamic shared cells
+
+The `json_shared` and `json_multipart` fixtures were captured on 2026-11-17
+from ClickHouse `26.8.1.2041`, matched to source tag `v26.8.1.2041-lts`.
+Regenerate them through `scripts/gen_fixtures.sh` with
+`CLICKHOUSE_CONNECT_TEST_HOST=127.0.0.1` and `no_proxy=127.0.0.1`.
+Revision 54460 uses Dynamic V1 and revision 54485 uses V2. The JSON
+single-value payload uses the same path-count layout in both versions.
+
+`json_shared` contains four rows and nine columns. It covers JSON at the
+root and inside Array, Tuple, and Map values, parameterized JSON with two
+typed paths and skip lists, empty objects, null and absent paths, a
+heterogeneous array, and a typed path whose own type is JSON. Standalone
+typed and nested JSON columns provide comparison values for their copies
+inside Dynamic. The tests decode shared cells through the public binary
+value helpers and check the values, including `n.x = 13` and array element
+`k = 1`. The first root JSON row has three untyped paths. Its helper output
+must retain the path/value pairs in sorted order `[a, n.x, z]`. The
+heterogeneous array check asserts its descriptor and every tagged element.
+
+`json_multipart` reads a plain Dynamic column from two MergeTree parts,
+written in separate INSERT requests with merges stopped. One row contains
+JSON and the other Array(JSON). The capture script creates a uniquely
+named table and drops it on completion or failure. These captures also
+exercise separate Native blocks.
+
+A JSON row's typed-path order comes from an unordered server map, and its
+binary descriptor path lists are canonicalized by the core. JSON re-encoding
+tests therefore check decoded values rather than requiring identical path
+ordering in the bytes.
+
+`json_mixed_rows_rev0.native` contains one JSON column and four rows: an
+empty object, a heterogeneous array path, a scalar path, and an empty array
+path. The heterogeneous row reaches an unsupported Dynamic leaf in the
+single-value writer. The other rows encode successfully, including the empty
+Array(Dynamic), without inspecting the unrelated row's runtime values.
 
 ## Refreshing
 

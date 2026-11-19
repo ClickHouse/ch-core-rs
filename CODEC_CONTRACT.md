@@ -2483,8 +2483,14 @@ parse and value materialization into the bulk path. On demand,
 one-row column, and `write_binary_type_prefix` plus `encode_binary_value` write
 one row of a column back as a blob, so a caller can build the SharedVariant
 child or JSON shared data that `encode_block` takes. The encode side covers the
-same types as the decode side and reproduces the server's value bytes.
-Descriptors also match, except SimpleAggregateFunction and AggregateFunction
+same types as the decode side and uses the server's single-value layout.
+This includes JSON at the root or nested in supported containers. Single-value
+JSON decodes into the same structured column model as bulk JSON: declared typed
+paths keep their child columns, while all other paths use tagged shared-data
+buffers. It does not infer a separate Dynamic child for each discovered path.
+JSON path order may differ because the server iterates unordered maps.
+Descriptors also match, except JSON path lists are canonicalized and
+SimpleAggregateFunction and AggregateFunction
 use the custom-name `0x2c` form that the server accepts instead of its native
 aggregate descriptor forms. The server writes SimpleAggregateFunction with
 `0x2e` and AggregateFunction with `0x25`; AggregateFunction value encoding
@@ -2551,8 +2557,19 @@ headers and Dynamic tables use `DataTypesBinaryEncoding` descriptors instead.
 The public `decode_*_binary_types` and `encode_*_binary_types` APIs select that
 out-of-band form while keeping `DecodeOptions` and `EncodeOptions` source
 compatible. The descriptor reader is bounded by `MAX_TYPE_DEPTH`, complexity
-1000, and list count 1,000,000, and rejects illegal wrappers, reserved tags, and
+2001, and list count 1,000,000, and rejects illegal wrappers, reserved tags, and
 unsupported descriptor forms before payload decode.
+The 2001-node budget is a crate resource policy, not server parity. It covers
+a JSON root with 1000 Nullable scalar typed paths, while 1000 typed
+Array(Nullable(Int64)) paths require 3001 nodes and remain rejected.
+ClickHouse decodes shared-cell descriptors without a complexity limit. Its
+Native binary-header setting `input_format_binary_max_type_complexity`
+defaults to 1000 and can be raised independently. The server's typed-path
+count cap remains 1000. These server limits are confirmed at
+`v26.8.1.2041-lts` in
+`src/DataTypes/DataTypesBinaryEncoding.cpp::decodeDataTypeImpl`,
+`src/DataTypes/DataTypeObject.h::MAX_TYPED_PATHS`, and
+`src/Core/FormatFactorySettings.h`.
 
 A zero-row Native block carries only the logical column header. NativeWriter
 suppresses the structure word, type table, child prefixes, routing, and bodies.
@@ -2695,10 +2712,78 @@ bytes; the type-aware per-column row-count guard excludes JSON (and any containe
 that bottoms out in it) and bounds it by its own read-before-allocate decode.
 SharedVariant and shared-data values are opaque binary blobs, one binary
 data-type descriptor followed by one `serializeBinary` payload, the same shape as
-a Dynamic SharedVariant cell, kept opaque and never materialized. A zero-row
+a Dynamic SharedVariant cell, kept opaque during bulk decoding. The
+single-value binary helpers can materialize these cells on demand. A zero-row
 Native block writes only the column header (no structure word, path list, or
 bodies); `empty_column` builds the declared typed paths with empty children and
 empty shared data.
+
+**Single-value binary payload:** JSON inside a shared cell uses a different
+layout from the bulk structure above. Its type descriptor starts with `0x30`,
+then UInt8 descriptor version `0`, VarUInt `max_dynamic_paths`, UInt8
+`max_dynamic_types`, a VarUInt-counted typed-path list of path strings and
+recursive type descriptors, a VarUInt-counted skip-path list, and a
+VarUInt-counted skip-regexp list. Strings use VarUInt byte lengths.
+
+The value starts with a VarUInt path count. Each entry is a path string followed
+by its value. Declared typed paths use their declared serializer without another
+type descriptor. Other paths carry a binary type descriptor followed by one
+value. The server writes typed paths first, then non-null dynamic paths, then
+shared-data paths, with no global ordering guarantee. Typed defaults are
+included even when a path was absent in the input document. An empty untyped
+object is one zero byte. The value has no bulk structure version word or path
+table, and its layout is the same inside V1 and V2 Dynamic shared cells.
+
+`decode_binary_value` preserves typed children and stores other entries in
+`StructuredJson` shared buffers, sorted by path within each row. Paths are
+compared as raw bytes and duplicates are rejected. Untyped path bytes are
+preserved without UTF-8 validation, like bulk shared paths.
+`encode_binary_value` accepts structured JSON
+from either this helper or bulk decoding. Typed paths require supported
+single-value codecs, so a declared Variant, Dynamic, or AggregateFunction typed
+path still returns `BinaryValueError::Unsupported`. Untyped paths can retain
+Variant and Dynamic payloads as opaque tagged cells. When encoding a
+bulk-decoded JSON column, only the selected row's runtime values need codecs.
+An unrelated row's unsupported child does not prevent encoding. A selected
+runtime value that reaches a Dynamic or Variant leaf still returns
+`Unsupported`, including such leaves inside nonempty containers. Empty
+containers do not visit their leaves and can encode.
+A preexisting shared path
+tagged Nothing is retained as the one-byte `0x00` cell. Normal JSON input omits
+null untyped paths, but the row serializer copies raw shared entries verbatim.
+Nothing has no non-null row payload. The opaque value walker permits it only
+as a tagged Dynamic NULL, including inside Array(Dynamic). Arrays and maps
+with a Nothing element, key, or value type must be empty. Nullable(Nothing)
+must carry a null flag.
+Non-null Nothing values return `BinaryValueError::Invalid` in both helpers.
+Runtime child descriptors written by the JSON helper use the same 2001-node
+complexity limit as the descriptor reader.
+Missing typed paths and zero-width default nodes consume units from the
+per-value materialization budget, even when they allocate no data bytes.
+Opaque values are framed with a plan compiled once per binary descriptor.
+Aliases and zero-width children are resolved during compilation, so repeated
+Array and Map values do not re-walk or clone their type trees.
+The helper preserves serialized paths without applying `SKIP` or `SKIP REGEXP`
+again. Normal server output has already applied its input skip rules. This
+differs from the server's row deserializer, which filters incoming paths using
+byte-prefix SKIP matching and RE2 full-match regexps.
+The bulk decoder continues to retain shared cells without parsing each one.
+These per-value layouts are
+**CONFIRMED** at `v26.8.1.2041-lts` in
+`src/DataTypes/Serializations/SerializationObject.cpp`
+(`SerializationObject::serializeBinary`, `deserializeBinary`),
+`src/DataTypes/Serializations/SerializationDynamic.cpp`
+(`SerializationDynamic::serializeBinary`),
+`src/DataTypes/Serializations/SerializationNothing.h`
+(`SerializationNothing::serializeBinary`, `deserializeBinary`),
+`src/Columns/ColumnDynamic.cpp`
+(`ColumnDynamic::serializeValueIntoSharedVariant`), and
+`src/DataTypes/DataTypesBinaryEncoding.cpp`
+(`encodeDataTypeImpl`, `decodeDataTypeImpl`).
+Shared-path ordering and row skip rules are confirmed in
+`src/Columns/ColumnObject.cpp::findPathLowerBoundInSharedData` and
+`src/DataTypes/Serializations/SerializationObject.cpp`
+(`deserializeBinary`, `shouldSkipPath`).
 
 **Arrow export:** a structured body exports as an Arrow struct (`+s`) whose
 children are, in fixed order: one child per declared typed path (each the path
