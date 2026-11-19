@@ -54,15 +54,19 @@ impl std::fmt::Display for BinaryTypeError {
 pub(crate) fn read_binary_type(reader: &mut ByteReader) -> Result<ChType, BinaryTypeError> {
     let mut complexity = 0usize;
     let ch_type = read_binary_type_inner(reader, 0, &mut complexity)?;
+    check_type_construction(&ch_type)?;
+    Ok(ch_type)
+}
 
-    // Structural tags bypass the textual parser that normally enforces server
-    // constructor rules. Round-tripping the canonical spelling through that
-    // parser applies the same Nullable/container/Variant legality checks and
-    // rejects malformed binary headers before zero-row `empty_column` or a body
-    // decoder can reach an impossible arm.
+/// Structural tags bypass the textual parser that normally enforces server
+/// constructor rules. Round-tripping the canonical spelling through that
+/// parser applies the same Nullable/container/Variant legality checks and
+/// rejects malformed binary headers before zero-row `empty_column` or a body
+/// decoder can reach an impossible arm.
+pub(crate) fn check_type_construction(ch_type: &ChType) -> Result<(), BinaryTypeError> {
     let canonical = ch_type.to_string();
     match parse_ch_type(&canonical) {
-        Some(parsed) if parsed == ch_type => Ok(ch_type),
+        Some(parsed) if parsed == *ch_type => Ok(()),
         _ => Err(BinaryTypeError::Invalid(format!(
             "type {canonical} violates ClickHouse type-construction rules"
         ))),
