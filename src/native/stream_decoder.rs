@@ -1441,10 +1441,18 @@ mod tests {
             scanner.scan(&data[..header_end + 1]).unwrap(),
             BlockBoundary::NeedMore
         );
-        let scanned = scanner.scan(&data).unwrap_err();
-        let decoded = block_end(&data, &DecodeOptions::default()).unwrap_err();
-        assert!(matches!(scanned, DecodeError::UnsupportedType { .. }));
-        assert_eq!(scanned.to_string(), decoded.to_string());
+        assert_eq!(
+            scanner.scan(&data).unwrap(),
+            BlockBoundary::Complete {
+                consumed: data.len(),
+                num_columns: 1,
+                num_rows: 2,
+            }
+        );
+        assert_eq!(
+            block_end(&data, &DecodeOptions::default()).unwrap(),
+            Some(data.len())
+        );
     }
 
     #[test]

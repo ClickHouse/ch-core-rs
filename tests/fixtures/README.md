@@ -490,8 +490,9 @@ block and terminator, then feeds the suffix and completion. This covers both
 partial packets and complete queued Log/ProfileEvents while writing. Query
 and terminator bytes must match the captures. Upload blocks are constructed
 through core's `encode_block` and their complete Data packets must match the
-accepted uploads. The schema is also decoded through core. INSERT Exceptions
-conservatively fail the engine connection.
+accepted uploads. The schema is also decoded through core. Upload-phase
+Exceptions fail the engine connection, including completion Exceptions after
+a transferred upload terminator. Before-schema errors can leave it reusable.
 
 The constraint capture's `completion_probe` and `exception_phase` fields state
 whether the server produced the failure before or after the upload terminator.
@@ -505,5 +506,64 @@ Confirmed source at `v26.8.1.2041-lts`:
 `src/Formats/NativeReader.cpp::NativeReader::read` describe schema delivery,
 client Data framing, per-block telemetry, the zero-column upload terminator,
 and error drain behavior. The server-reader findings distinguish that
-confirmed framing from the conservative engine policy of retiring failed
-INSERT connections.
+confirmed framing from the conservative engine policy of retiring connections
+that fail after the schema.
+
+## Revision 54460 compressed INSERT capture workflow
+
+Captured on 2026-11-17 from ClickHouse `26.8.1.2041`, source tag
+`v26.8.1.2041-lts`, on `127.0.0.1` with an empty password:
+
+```sh
+no_proxy=127.0.0.1 python3 -B scripts/gen_tcp_compressed_insert_fixtures.py
+python3 -B scripts/gen_tcp_compressed_insert_fixtures.py --check
+```
+
+The generator invokes the Rust `gen_compressed_insert_fixture_client` tool in
+a temporary directory. The tool uses `Connection`, core's Native encoder, and
+the LZ4 frame writer to generate client packets. Python sends those exact bytes
+to the live server and independently parses its replies. No HTTP-generated
+client frames are used. The offline check needs no server or Rust process.
+
+The four cases are:
+
+- `multi`: a compressed two-block UInt64/String upload. The second block has a
+  1,100,000-byte String and spans two LZ4 frames. EndOfStream confirms acceptance.
+  A compressed SELECT on the same socket reads the rows back, and an independent
+  HTTP query verifies storage.
+- `rejected`: a compressed block violates a table constraint, producing code
+  469 after the client sends its upload terminator. The replay expects a failed
+  connection and does not attempt reuse.
+- `before_schema`: a missing table produces code 60 before InsertSchema. The
+  same socket then runs a compressed SELECT and reads a known UInt64/String row.
+- `plain_before_schema`: the same before-schema error and recovery with
+  compression disabled.
+
+Before-schema INSERT requests carry no wire settings, so the first-response
+settings guard does not retire the connection. Recovery SELECTs disable logs
+and profile events. The temporary Memory table is dropped after capture.
+The manifest stores packet fields, frame sizes, Native lengths and SHA-256
+hashes, file lengths and hashes, and independent HTTP verification results.
+Large plaintext values are represented by hashes to keep the manifest small.
+
+`crates/ch-tcp-proto/tests/compressed_insert_replay.rs` replays all exchanges
+without sockets, including every split in schema and completion and bytewise
+feeds. It asserts exact client `take_output()` bytes, including the large
+multi-frame block, and checks decoded recovery rows. Its ignored live test
+exercises the Rust engine directly:
+
+```sh
+no_proxy=127.0.0.1 cargo test -p ch-tcp-proto --test compressed_insert_replay live_compressed_insert_select_round_trip -- --ignored
+```
+
+Confirmed at `v26.8.1.2041-lts` in
+`src/Server/TCPHandler.cpp`,
+`TCPHandler::{initBlockInput,processData,processUnexpectedData,receivePacketsExpectData,startInsertQuery,skipData,runImpl}`,
+and `src/Client/Connection.cpp`, `Connection::{sendQuery,sendData}`:
+compression applies to Native bodies in both directions, and the stock client
+flushes after each Native block. Its 1 MiB writer buffer can emit several frames
+per block. `src/Formats/NativeReader.cpp`, `NativeReader::read`, can throw before
+consuming a block. The exception drain starts a fresh reader, so unread block
+bytes can prevent it from reaching an already-sent terminator. Post-schema
+Exceptions remain terminal. Before-schema reuse is inferred from the consumed
+initial external-table marker and verified by the two live recovery captures.

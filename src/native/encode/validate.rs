@@ -1830,8 +1830,8 @@ fn validate_json<'a>(
     Ok(())
 }
 
-/// Whether `value_type` (the unwrapped inner value type) and `column` form a
-/// supported, matching pair this encoder can write.
+/// Whether `value_type` and `column` form a supported, matching pair this
+/// encoder can write.
 ///
 /// This must list exactly the matching arms of [`encode_column_body`], plus
 /// `LowCardinality`'s [`encode_low_cardinality_data`] path and `Array`'s
@@ -1840,6 +1840,9 @@ fn validate_json<'a>(
 /// column before any bytes are written, which is what lets [`write_block_into`]
 /// treat the body match as structurally infallible.
 fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
+    if let ChType::Nullable(inner) = value_type {
+        return column_variant_matches(inner, column);
+    }
     // A name-decoration alias (SimpleAggregateFunction, geo, Nested) matches the
     // column its physical delegate would, since decode produces the delegate's
     // Column variant (no new variant). Expand and recurse before the pair checks
@@ -1861,35 +1864,28 @@ fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
     }
     // `Array(T)` matches only if the flattened element column matches the
     // element value type in turn, recursing the same way `decode_array` decodes
-    // through `decode_values`. A `Nullable` element unwraps to its inner here
-    // (the element column carries the inner variant plus validity), exactly like
-    // the top-level unwrap in `validate_column`.
+    // through `decode_values`.
     if let (ChType::Array(inner), Column::Array(c)) = (value_type, column) {
-        return column_variant_matches(inner.inner(), c.values.as_ref());
+        return column_variant_matches(inner, c.values.as_ref());
     }
     // `Tuple(T1, ...)` matches only if the buffer carries exactly one field
     // column per declared element and each matches its element value type in
-    // turn (a `Nullable` element unwraps to its inner, like the Array arm
-    // above; a `LowCardinality` or nested container element recurses through
-    // this function's own dispatch). The zero-element `Tuple()` matches a
-    // zero-field `TupleColumn`.
+    // turn. The zero-element `Tuple()` matches a zero-field `TupleColumn`.
     if let (ChType::Tuple(elements), Column::Tuple(c)) = (value_type, column) {
         return elements.len() == c.fields.len()
             && elements
                 .iter()
                 .zip(&c.fields)
-                .all(|((_, t), col)| column_variant_matches(t.inner(), col));
+                .all(|((_, t), col)| column_variant_matches(t, col));
     }
     // `Map(K, V)` matches only if the entries buffer is a two-field Tuple
-    // column whose fields match the key and value types in turn (a `Nullable`
-    // value unwraps to its inner like everywhere else; a legal key is never
-    // `Nullable`, so its `inner()` is a no-op).
+    // column whose fields match the key and value types in turn.
     if let (ChType::Map(key, value), Column::Map(c)) = (value_type, column) {
         return match c.entries.as_ref() {
             Column::Tuple(t) => {
                 t.fields.len() == 2
-                    && column_variant_matches(key.inner(), &t.fields[0])
-                    && column_variant_matches(value.inner(), &t.fields[1])
+                    && column_variant_matches(key, &t.fields[0])
+                    && column_variant_matches(value, &t.fields[1])
             }
             _ => false,
         };
@@ -1899,7 +1895,7 @@ fn column_variant_matches(value_type: &ChType, column: &Column) -> bool {
             && alternatives
                 .iter()
                 .zip(&c.variants)
-                .all(|(t, child)| column_variant_matches(t.inner(), child));
+                .all(|(t, child)| column_variant_matches(t, child));
     }
     if let (ChType::Dynamic { .. }, Column::Dynamic(_)) = (value_type, column) {
         return true;

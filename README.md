@@ -122,7 +122,7 @@ Implemented:
 
 Not implemented yet:
 
-- Compressed TCP INSERT exchanges and query cancellation over TCP.
+- Query cancellation over TCP.
 - Language-specific materialization policy (bindings own this, by design).
 
 ## Supported types
@@ -164,9 +164,9 @@ In rough priority order:
    `ArrayBuffer`, NumPy export that does not route through Arrow.
 3. Insert-path completion: a streaming/sink encode API. Type parity is kept as
    each decoder type lands.
-4. Native TCP protocol engine, the rest of it: compressed INSERT exchanges
-   and cancellation. The handshake, Ping, SELECT with optional compression,
-   and uncompressed INSERT at revision 54460 ship in `ch-tcp-proto`.
+4. Native TCP protocol engine, the rest of it: cancellation. The handshake,
+   Ping, SELECT and INSERT with optional compression at revision 54460 ship
+   in `ch-tcp-proto`.
 
 ## Consuming
 
@@ -216,8 +216,8 @@ block bytes for `INSERT` with `native::encode::encode_block` or
 
 The root package remains `ch-core-rs`. The workspace also contains
 [`ch-tcp-proto`](crates/ch-tcp-proto/README.md), a sans-I/O TCP protocol engine.
-Its current scope is the revision-54460 handshake, Ping/Pong, SELECT with
-optional compression, and uncompressed INSERT exchanges with Native byte output
+Its current scope is the revision-54460 handshake, Ping/Pong, SELECT and INSERT
+with optional compression, Native byte output
 and query metadata events.
 The engine depends on core.
 
@@ -258,7 +258,7 @@ version and first-byte hexdumps.
 
 A working core under active development. The API is not yet stable. Decode and
 encode are at type parity, both verified against a live ClickHouse server. Not
-yet implemented: compressed TCP INSERT and cancellation; a
+yet implemented: TCP cancellation; a
 streaming/sink encode API is future work. Releases are tagged and semver'd, each
 recorded in `CHANGELOG.md`. `ARCHITECTURE.md` describes how the pieces fit
 together.

@@ -6,7 +6,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use ch_core_rs::compression::{
-    decompress_frame_into, frame_header, ChecksumMode, CompressionError, FrameHeader,
+    decompress_frame_into, frame_header, write_lz4_frame, ChecksumMode, CompressionError,
+    FrameHeader,
 };
 use ch_core_rs::native::decode::{DecodeError, DecodeOptions};
 use ch_core_rs::native::stream_decoder::{BlockBoundary, BlockScanner};
@@ -102,6 +103,8 @@ const EMPTY_NATIVE_BLOCK_LZ4: &[u8] = &[
 ];
 /// Checksum plus header bytes before a compression frame's payload.
 const FRAME_PREFIX_LEN: usize = 25;
+/// Default `CompressedWriteBuffer` size at v26.8.1.2041-lts.
+const INSERT_FRAME_PLAINTEXT: usize = 1024 * 1024;
 
 // Thresholds from `src/Core/ProtocolDefines.h` at v26.8.1.2041-lts.
 const MIN_REVISION_WITH_SERVER_TIMEZONE: u64 = 54_058;
@@ -478,9 +481,11 @@ pub enum Event {
     /// for the connection-level query cases below, where the connection
     /// becomes [`State::Failed`] with [`FailureKind::ServerException`]. Other
     /// query errors return to [`State::Ready`] after this event is queued.
-    /// Every exchange started with [`Connection::insert`] conservatively
-    /// fails on Exception and discards queued upload bytes, because the server
-    /// may be waiting for the rest of an upload in its skip-data path.
+    /// Ordinary INSERT errors return to Ready before the schema, provided all
+    /// queued request bytes were taken by the driver. After the schema they
+    /// fail the connection because the server's Native reader may have stopped
+    /// inside an upload block.
+    /// Every INSERT Exception discards queued output.
     /// Either way it is the last event of its exchange: no EndOfStream, Log,
     /// or ProfileEvents follows it.
     ///
@@ -510,6 +515,14 @@ pub enum Event {
     /// - Once the query context exists, other query errors normally leave the
     ///   connection reusable. The wire does not identify every server throw
     ///   site, so drivers must still honor transport EOF and I/O failures.
+    /// - `TCPHandler::runImpl` sends the Exception before `skipData` drains
+    ///   any remaining client Data through the no-column marker. Before the
+    ///   schema, the initial external-table marker suffices. After the schema,
+    ///   the upload marker is required. `NativeReader::read` in
+    ///   `src/Formats/NativeReader.cpp` can fail inside a block, while
+    ///   `TCPHandler::processUnexpectedData` starts a fresh reader. The upload
+    ///   marker does not establish safe alignment, so the engine retires the
+    ///   connection after the schema.
     ///
     /// Boxed to keep [`Event`] small.
     Exception(Box<ServerException>),
@@ -528,11 +541,11 @@ const _: () = assert!(
 #[non_exhaustive]
 pub enum FailureKind {
     /// The server sent a complete Exception packet in the handshake or
-    /// pre-query phase, a connection-level query Exception, or any INSERT
-    /// Exception. The server closes in the first cases. INSERT is treated as
-    /// terminal because safe reuse would require finishing or draining its
-    /// skip-data exchange. Bytes after the Exception are not parsed. See
-    /// [`Event::Exception`] for details.
+    /// pre-query phase, a connection-level query Exception, or an INSERT
+    /// Exception after the schema or before its request was transferred. The
+    /// server closes in the first cases. An INSERT reader may be misaligned
+    /// or still require draining its upload. Bytes after the Exception are not
+    /// parsed. See [`Event::Exception`] for details.
     ServerException,
     /// Malformed, unexpected, oversized, or truncated input.
     Protocol,
@@ -651,16 +664,17 @@ pub enum ProtocolError {
     /// then fails with [`ProtocolError::Decode`] on the first block. Keep the
     /// setting disabled server-side.
     BinaryNativeTypeEncodingUnsupported,
-    /// Client-fed INSERT compression is not implemented yet.
-    ///
-    /// A connection configured with [`Connection::with_compression`] may run
-    /// queries, including inline INSERT forms that need no later client data,
-    /// but [`Connection::insert`] is rejected before writing anything.
+    /// Retained for compatibility. Compressed INSERT is supported and this
+    /// variant is no longer returned.
+    #[deprecated(note = "compressed INSERT is supported")]
     CompressedInsertUnsupported,
-    /// Core rejected a ClickHouse compression frame.
+    /// Core rejected or could not write a ClickHouse compression frame.
     ///
-    /// The connection fails because the next packet boundary cannot be found
-    /// safely. The [`CompressionError`] is also returned by [`Error::source`].
+    /// An inbound error fails the connection because its next packet boundary
+    /// cannot be found safely. An outbound framing error leaves output and
+    /// state unchanged. Allocation failures from [`Connection::insert_data`]
+    /// use [`ProtocolError::InsertOutputAllocationFailed`]. The
+    /// [`CompressionError`] is also returned by [`Error::source`].
     Compression(CompressionError),
     /// An inbound Native block exceeded the per-packet limit. Always fatal:
     /// the connection fails with [`FailureKind::Protocol`].
@@ -751,10 +765,11 @@ impl fmt::Display for ProtocolError {
             Self::BinaryNativeTypeEncodingUnsupported => formatter.write_str(
                 "output_format_native_encode_types_in_binary_format accepts only \"0\"",
             ),
+            #[allow(deprecated)]
             Self::CompressedInsertUnsupported => {
                 formatter.write_str("compressed client-fed INSERT is not supported")
             }
-            Self::Compression(_) => formatter.write_str("compression frame decode failed"),
+            Self::Compression(_) => formatter.write_str("compression frame failed"),
             Self::NativeBlockTooLarge { limit } => {
                 write!(formatter, "Native block exceeds the {limit} byte limit")
             }
@@ -855,6 +870,7 @@ impl PartialEq for ProtocolError {
             (InvalidInsertBlock(left), InvalidInsertBlock(right)) => left == right,
             (InvalidInsertSchema, InvalidInsertSchema) => true,
             (BinaryNativeTypeEncodingUnsupported, BinaryNativeTypeEncodingUnsupported) => true,
+            #[allow(deprecated)]
             (CompressedInsertUnsupported, CompressedInsertUnsupported) => true,
             (Compression(left), Compression(right)) => left == right,
             (NativeBlockTooLarge { limit: left }, NativeBlockTooLarge { limit: right }) => {
@@ -1008,7 +1024,7 @@ struct ClientIdentity {
 }
 
 /// Incremental handshake, Ping/Pong, and Query engine with optional compressed
-/// SELECT.
+/// SELECT and INSERT.
 ///
 /// Events have exactly one channel: [`Self::feed`] reports only errors, and
 /// every completed packet is queued for [`Self::poll_event`]. A `Vec` return
@@ -1218,10 +1234,9 @@ impl Connection {
     /// LZ4/LZ4HC, and ZSTD frame methods are accepted according to each frame's
     /// method byte. Packet codes and table names remain raw.
     ///
-    /// Client-fed compressed INSERT is deferred: [`Self::insert`] returns
-    /// [`ProtocolError::CompressedInsertUnsupported`] without changing the
-    /// connection. Inline INSERT forms sent through [`Self::query`] remain
-    /// supported because they need no later client Data packet.
+    /// INSERT schema blocks are decompressed through the same path. Client
+    /// upload blocks and their end marker use LZ4. Upload frames contain at
+    /// most 1 MiB of plaintext and never cross Native block boundaries.
     pub fn with_compression(mut self, enabled: bool) -> Self {
         self.compression = enabled;
         self
@@ -1313,7 +1328,7 @@ impl Connection {
         )
     }
 
-    /// Starts an uncompressed INSERT that may request client Native blocks.
+    /// Starts an INSERT that may request client Native blocks.
     ///
     /// The queued bytes are the Query packet followed by the empty Data block
     /// that terminates external tables. Drain the resulting
@@ -1326,11 +1341,10 @@ impl Connection {
     /// The same Query validation and 64 MiB request limit as [`Self::query`]
     /// apply. A server Exception may end any INSERT phase. If one arrives,
     /// queued upload bytes are discarded so they cannot leak into a later
-    /// exchange.
+    /// exchange. Reuse is allowed before the schema only when all queued
+    /// output was taken, subject to the connection-level error rules in
+    /// [`Event::Exception`].
     pub fn insert(&mut self, query: Query) -> Result<(), ProtocolError> {
-        if self.compression {
-            return Err(ProtocolError::CompressedInsertUnsupported);
-        }
         self.start_query(
             query,
             State::AwaitingInsertSchema,
@@ -1409,16 +1423,11 @@ impl Connection {
                 });
             }
         }
-        let empty_data_body = if self.compression {
-            EMPTY_NATIVE_BLOCK_LZ4
-        } else {
-            EMPTY_NATIVE_BLOCK
-        };
         let packet_size = query_packet_len(
             &query,
             &self.identity,
             &self.quota_key,
-            empty_data_body.len(),
+            empty_native_block(self.compression).len(),
         )
         .ok_or(ProtocolError::QueryOutputTooLarge {
             length: usize::MAX,
@@ -1477,9 +1486,7 @@ impl Connection {
             }
         }
         put_string(packet, "");
-        put_varuint(packet, CLIENT_PACKET_DATA);
-        put_string(packet, "");
-        packet.extend_from_slice(empty_data_body);
+        put_empty_data_packet(packet, self.compression);
         debug_assert_eq!(packet.len() - start, packet_size);
         self.active_query_sent_settings = !query.settings.is_empty();
         self.active_query_has_server_packet = false;
@@ -1511,6 +1518,13 @@ impl Connection {
     ///   [`InsertBlockError`] says which.
     /// - [`ProtocolError::InsertOutputAllocationFailed`] if the Data packet
     ///   cannot be reserved in the output queue.
+    /// - [`ProtocolError::Compression`] if LZ4 framing fails.
+    ///
+    /// With compression enabled for the active Query, the block body is
+    /// written directly into the output queue as LZ4 frames. Confirmed at
+    /// `v26.8.1.2041-lts`, `src/Client/Connection.cpp::Connection::sendData`
+    /// flushes `CompressedWriteBuffer` after each Native block, keeping the
+    /// packet code and table name outside compression.
     pub fn insert_data(&mut self, native_block: &[u8]) -> Result<(), ProtocolError> {
         if self.state != State::Inserting {
             return Err(ProtocolError::InvalidState {
@@ -1573,11 +1587,19 @@ impl Connection {
             ));
         }
 
-        let additional = native_block.len().checked_add(2).ok_or(
-            ProtocolError::InsertOutputAllocationFailed {
-                additional: usize::MAX,
-            },
-        )?;
+        let additional = if self.active_query_compression {
+            native_block
+                .chunks(INSERT_FRAME_PLAINTEXT)
+                .try_fold(2_usize, |total, chunk| {
+                    let len = chunk.len();
+                    total.checked_add(FRAME_PREFIX_LEN + len + len / 255 + 16)
+                })
+        } else {
+            native_block.len().checked_add(2)
+        }
+        .ok_or(ProtocolError::InsertOutputAllocationFailed {
+            additional: usize::MAX,
+        })?;
         // Reserve the whole packet before writing any of it, so a failure
         // leaves `output` untouched and the header and body are written
         // without a reallocation between them. Exact sizing for an empty
@@ -1589,9 +1611,24 @@ impl Connection {
             self.output.try_reserve(additional)
         };
         reserved.map_err(|_| ProtocolError::InsertOutputAllocationFailed { additional })?;
+        let start = self.output.len();
         put_varuint(&mut self.output, CLIENT_PACKET_DATA);
         put_string(&mut self.output, "");
-        self.output.extend_from_slice(native_block);
+        if self.active_query_compression {
+            for chunk in native_block.chunks(INSERT_FRAME_PLAINTEXT) {
+                if let Err(error) = write_lz4_frame(chunk, &mut self.output) {
+                    self.output.truncate(start);
+                    return Err(match error {
+                        CompressionError::AllocationFailed { .. } => {
+                            ProtocolError::InsertOutputAllocationFailed { additional }
+                        }
+                        error => error.into(),
+                    });
+                }
+            }
+        } else {
+            self.output.extend_from_slice(native_block);
+        }
         Ok(())
     }
 
@@ -1614,7 +1651,7 @@ impl Connection {
                 state: self.state,
             });
         }
-        put_empty_data_packet(&mut self.output);
+        put_empty_data_packet(&mut self.output, self.active_query_compression);
         self.state = State::FinishingInsert;
         Ok(())
     }
@@ -1672,14 +1709,14 @@ impl Connection {
     /// EOF closes a `Ready` engine successfully. It is truncation during
     /// handshake, SELECT, INSERT, or Ping, or whenever a packet is incomplete.
     /// After a terminal server Exception it succeeds unless bytes followed
-    /// the Exception. Every INSERT Exception is treated as terminal even when
-    /// the server may instead be waiting in its skip-data path. Reusable
-    /// query-time exceptions leave the engine Ready instead (see
-    /// [`Event::Exception`]). After a protocol failure it returns the error
-    /// that failed the connection. EOF that fails the connection discards
-    /// untaken output, as in [`Self::feed`]. Events queued before EOF stay
-    /// queued; drain them afterwards as usual. The first EOF outcome is
-    /// stored and every later call returns it again.
+    /// the Exception. Reusable SELECT and INSERT exceptions leave the engine
+    /// Ready instead. An INSERT Exception after the schema remains terminal
+    /// because its Native reader may be misaligned. See
+    /// [`Event::Exception`] for the reuse rules. After a protocol failure it
+    /// returns the error that failed the connection. EOF that fails the
+    /// connection discards untaken output, as in [`Self::feed`]. Events queued
+    /// before EOF stay queued; drain them afterwards as usual. The first EOF
+    /// outcome is stored and every later call returns it again.
     pub fn finish(&mut self) -> Result<(), ProtocolError> {
         if let Some(result) = &self.finish_result {
             return result.clone();
@@ -1919,8 +1956,10 @@ impl Connection {
                             self.state,
                             State::AwaitingInsertSchema | State::Inserting | State::FinishingInsert
                         );
-                        let query_exception = self.state == State::Querying;
-                        let terminal = !query_exception
+                        let reusable_phase = self.state == State::Querying
+                            || (self.state == State::AwaitingInsertSchema
+                                && self.output.is_empty());
+                        let terminal = !reusable_phase
                             || is_terminal_query_exception(
                                 &exception,
                                 self.active_query_sent_settings,
@@ -1995,7 +2034,13 @@ impl Connection {
 
         let mut cursor = Cursor::new(bytes);
         let packet = cursor.varuint()?;
-        let first_query_packet = if self.state == State::Querying {
+        let first_query_packet = if matches!(
+            self.state,
+            State::Querying
+                | State::AwaitingInsertSchema
+                | State::Inserting
+                | State::FinishingInsert
+        ) {
             let first = !self.active_query_has_server_packet;
             self.active_query_has_server_packet = true;
             first
@@ -2116,10 +2161,9 @@ impl Connection {
     fn start_block(&mut self, kind: BlockKind) {
         let revision = self.effective_revision.unwrap_or(ENGINE_REVISION);
         let compressed = self.active_query_compression
-            && self.state == State::Querying
             && matches!(
                 kind,
-                BlockKind::Data | BlockKind::Totals | BlockKind::Extremes
+                BlockKind::Data | BlockKind::Totals | BlockKind::Extremes | BlockKind::InsertSchema
             );
         self.pending = Some(PendingPacket::Block(BlockProgress::new(
             kind,
@@ -2852,10 +2896,18 @@ fn put_string(output: &mut Vec<u8>, value: &str) {
 /// Writes a client Data packet carrying `Block::empty()` at revision 54460.
 /// Confirmed at `v26.8.1.2041-lts`, `src/Server/TCPHandler.cpp`,
 /// `TCPHandler::processData` treats any zero-column block as end-of-upload.
-fn put_empty_data_packet(output: &mut Vec<u8>) {
+fn put_empty_data_packet(output: &mut Vec<u8>, compressed: bool) {
     put_varuint(output, CLIENT_PACKET_DATA);
     put_string(output, "");
-    output.extend_from_slice(EMPTY_NATIVE_BLOCK);
+    output.extend_from_slice(empty_native_block(compressed));
+}
+
+fn empty_native_block(compressed: bool) -> &'static [u8] {
+    if compressed {
+        EMPTY_NATIVE_BLOCK_LZ4
+    } else {
+        EMPTY_NATIVE_BLOCK
+    }
 }
 
 fn escaped_content_len(value: &[u8]) -> Option<usize> {
