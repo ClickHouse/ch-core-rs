@@ -11,6 +11,11 @@ version; patch releases remain backward compatible.
   `default-features = false` the crate is pure Rust, which the wasm32 build
   needs, and ZSTD frames return `CompressionError::UnsupportedCodec`. Default
   builds are unchanged.
+- Fix `encode_block` on 32-bit targets: a huge row count for zero-width
+  `Nothing` or `Tuple()` columns wrapped the output size and returned a
+  truncated block. Zero-width, `Bool`, null-map and `QBit` output is now
+  reserved with a checked size, and a block that cannot be allocated returns
+  the new `EncodeError::OutputTooLarge` instead of panicking.
 - `decode_binary_value` and `encode_binary_value` handle an `Array` or `Map`
   run of zero-width `Tuple()` values in constant time per tuple node instead of
   once per element. Before, a small nested value such as
