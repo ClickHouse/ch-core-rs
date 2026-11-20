@@ -7,6 +7,10 @@ version; patch releases remain backward compatible.
 
 ## Unreleased
 
+- ZSTD frame support is now the default `zstd` cargo feature. With
+  `default-features = false` the crate is pure Rust, which the wasm32 build
+  needs, and ZSTD frames return `CompressionError::UnsupportedCodec`. Default
+  builds are unchanged.
 - `decode_binary_value` and `encode_binary_value` handle an `Array` or `Map`
   run of zero-width `Tuple()` values in constant time per tuple node instead of
   once per element. Before, a small nested value such as

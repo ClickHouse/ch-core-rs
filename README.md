@@ -118,7 +118,8 @@ Implemented:
 - Decode ClickHouse compression frames with LZ4, ZSTD, or NONE and verify
   CityHash128 1.0.2 checksums. Encode LZ4 frames for inserts. LZ4 is
   hand-written; CityHash128 uses `cityhash-rs` and ZSTD uses the `zstd` crate,
-  which builds libzstd from C source, so a C compiler is needed to build.
+  which builds libzstd from C source, so a C compiler is needed to build. ZSTD
+  is the default `zstd` feature; turn it off for a pure-Rust build.
 
 Not implemented yet:
 

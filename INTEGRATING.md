@@ -66,7 +66,9 @@ to obtain typed columnar buffers.
 
 - Runtime dependencies are `cityhash-rs` for CityHash128 and the `zstd` crate
   for ZSTD frames. LZ4 is hand-written. `zstd` builds libzstd from C source, so
-  building this crate needs a C compiler.
+  building this crate needs a C compiler. ZSTD sits behind the default `zstd`
+  feature. With `default-features = false` the crate is pure Rust and ZSTD
+  frames return `CompressionError::UnsupportedCodec`.
 - A crate building on Rust 1.81 must pin jobserver after a fresh lockfile,
   because 0.1.35 needs Rust 1.85: `cargo update -p jobserver --precise 0.1.34`.
 - It is downstream agnostic. The core owns binary decoding and the shared columnar model. It does not build host-language objects or make language-specific policy decisions.

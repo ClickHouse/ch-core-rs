@@ -117,7 +117,8 @@ They accept plaintext Native bytes independently of revision or
 type layout and write payloads directly after the reserved header, avoiding a
 separate payload copy. LZ4 block coding is hand-written safe Rust, checksums
 use `cityhash-rs::cityhash_102_128`, and ZSTD decode uses the `zstd` crate over
-libzstd. ZSTD grows the output `Vec` by exactly the claimed plaintext size,
+libzstd. ZSTD is the default `zstd` cargo feature. Without it, a ZSTD frame
+returns `CompressionError::UnsupportedCodec { method: 0x90 }`. ZSTD grows the output `Vec` by exactly the claimed plaintext size,
 zero-filled, and libzstd decodes into that slice with a reused per-thread
 context, so it never writes past the claim. A payload libzstd rejects,
 including invalid trailing bytes and output larger than the claim, returns
