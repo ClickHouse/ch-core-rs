@@ -54,6 +54,7 @@ use std::borrow::Cow;
 
 mod cityhash;
 mod lz4;
+#[cfg(feature = "zstd")]
 mod zstd;
 
 use cityhash::city_hash128;
@@ -339,7 +340,9 @@ struct BlockHeader {
 /// decoder returns for it: [`CompressionError::Lz4Malformed`] for LZ4,
 /// [`CompressionError::InvalidUncompressedSize`] for ZSTD, and
 /// [`CompressionError::SizeMismatch`] for NONE, whose payload length must equal
-/// the plaintext size. The returned sizes remain untrusted declarations.
+/// the plaintext size. Without the `zstd` feature a ZSTD frame returns
+/// [`CompressionError::UnsupportedCodec`]. The returned sizes remain untrusted
+/// declarations.
 pub fn frame_header(data: &[u8]) -> Result<FrameHeader, CompressionError> {
     let header = parse_frame_prefix(data)?;
     check_expansion(
@@ -382,7 +385,7 @@ fn parse_frame_prefix(data: &[u8]) -> Result<FrameHeader, CompressionError> {
             uncompressed_size: plaintext_size,
         });
     }
-    if method != METHOD_NONE && method != METHOD_LZ4 && method != METHOD_ZSTD {
+    if !is_supported_method(method) {
         return Err(CompressionError::UnsupportedCodec { method });
     }
 
@@ -391,6 +394,13 @@ fn parse_frame_prefix(data: &[u8]) -> Result<FrameHeader, CompressionError> {
         compressed_size: compressed_size as usize,
         plaintext_size: plaintext_size as usize,
     })
+}
+
+/// Whether this build decodes `method`. ZSTD needs the `zstd` feature.
+fn is_supported_method(method: u8) -> bool {
+    method == METHOD_NONE
+        || method == METHOD_LZ4
+        || (cfg!(feature = "zstd") && method == METHOD_ZSTD)
 }
 
 /// Reject a plaintext size that a `payload_len`-byte payload of `method` cannot
@@ -406,6 +416,7 @@ fn check_expansion(
             actual: payload_len,
         }),
         METHOD_LZ4 => lz4::check_claim(payload_len, plaintext_size),
+        #[cfg(feature = "zstd")]
         METHOD_ZSTD => zstd::check_claim(payload_len, plaintext_size),
         _ => Ok(()),
     }
@@ -510,6 +521,7 @@ pub fn decompress_frame(
             Cow::Borrowed(payload)
         }
         METHOD_LZ4 => Cow::Owned(lz4::decompress_block(payload, header.uncompressed_size)?),
+        #[cfg(feature = "zstd")]
         METHOD_ZSTD => Cow::Owned(zstd::decompress_block(payload, header.uncompressed_size)?),
         other => return Err(CompressionError::UnsupportedCodec { method: other }),
     };
@@ -557,6 +569,7 @@ pub fn decompress_frame_into(
             }
         }
         METHOD_LZ4 => lz4::decompress_block_into(payload, header.uncompressed_size, out),
+        #[cfg(feature = "zstd")]
         METHOD_ZSTD => zstd::decompress_block_into(payload, header.uncompressed_size, out),
         other => Err(CompressionError::UnsupportedCodec { method: other }),
     };
@@ -918,7 +931,6 @@ mod tests {
         let payload = 1u32;
         let compressed = HEADER_SIZE as u32 + payload;
         let lz4_max = 255 + 24;
-        let zstd_max = 32 * 1024;
 
         assert!(frame_header(&prefix(METHOD_LZ4, compressed, lz4_max)).is_ok());
         assert_eq!(
@@ -930,13 +942,17 @@ mod tests {
             Err(CompressionError::Lz4Malformed)
         );
 
-        assert!(frame_header(&prefix(METHOD_ZSTD, compressed, zstd_max)).is_ok());
-        assert_eq!(
-            frame_header(&prefix(METHOD_ZSTD, compressed, zstd_max + 1)),
-            Err(CompressionError::InvalidUncompressedSize {
-                uncompressed_size: zstd_max + 1
-            })
-        );
+        #[cfg(feature = "zstd")]
+        {
+            let zstd_max = 32 * 1024;
+            assert!(frame_header(&prefix(METHOD_ZSTD, compressed, zstd_max)).is_ok());
+            assert_eq!(
+                frame_header(&prefix(METHOD_ZSTD, compressed, zstd_max + 1)),
+                Err(CompressionError::InvalidUncompressedSize {
+                    uncompressed_size: zstd_max + 1
+                })
+            );
+        }
 
         assert!(frame_header(&prefix(METHOD_NONE, compressed, payload)).is_ok());
         assert_eq!(
@@ -1173,6 +1189,35 @@ mod tests {
         ));
     }
 
+    #[cfg(not(feature = "zstd"))]
+    #[test]
+    fn zstd_without_the_feature_is_an_unsupported_codec() {
+        let block = frame_block(METHOD_ZSTD, 4, b"not decoded");
+        assert_eq!(
+            frame_header(&block),
+            Err(CompressionError::UnsupportedCodec {
+                method: METHOD_ZSTD
+            })
+        );
+        let err = decompress_frame(&block, ChecksumMode::Verify).unwrap_err();
+        assert_eq!(
+            err,
+            CompressionError::UnsupportedCodec {
+                method: METHOD_ZSTD
+            }
+        );
+        let mut out = b"keep me".to_vec();
+        let err = decompress_frame_into(&block, ChecksumMode::Verify, &mut out).unwrap_err();
+        assert_eq!(
+            err,
+            CompressionError::UnsupportedCodec {
+                method: METHOD_ZSTD
+            }
+        );
+        assert_eq!(out, b"keep me");
+    }
+
+    #[cfg(feature = "zstd")]
     #[test]
     fn zstd_roundtrips_and_appends() {
         let raw = b"ZSTD compressed Native bytes, user_1 and user_2";
@@ -1189,6 +1234,7 @@ mod tests {
         assert_eq!(out, [b"prefix:".as_slice(), raw].concat());
     }
 
+    #[cfg(feature = "zstd")]
     #[test]
     fn zstd_accepts_concatenated_frames() {
         let first = b"first half, ";
@@ -1217,6 +1263,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "zstd")]
     #[test]
     fn zstd_malformed_payloads_roll_back_with_exact_errors() {
         let raw = b"ZSTD compressed Native bytes";
@@ -1237,6 +1284,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "zstd")]
     #[test]
     fn zstd_wrong_size_rolls_back_with_exact_errors() {
         let raw = b"ZSTD compressed Native bytes";
@@ -1269,6 +1317,7 @@ mod tests {
         assert!(matches!(err, CompressionError::ZstdMalformed), "{err:?}");
     }
 
+    #[cfg(feature = "zstd")]
     #[test]
     fn zstd_oversized_claim_fails_before_reserving() {
         // A tiny frame with a valid checksum that claims the full 1 GiB.

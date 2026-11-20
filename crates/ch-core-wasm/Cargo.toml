@@ -1,0 +1,19 @@
+[package]
+name = "ch-core-wasm"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+description = "C ABI over ch-core-rs for WebAssembly hosts, with JS glue for Node.js and browsers"
+license = "Apache-2.0"
+repository = "https://github.com/ClickHouse/ch-core-rs"
+publish = false
+
+[lib]
+# cdylib is the .wasm. rlib lets `cargo test` run the ABI natively.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Without the default `zstd` feature: libzstd is C, which a wasm32 build would
+# need clang and llvm-ar to compile. This crate decodes plain HTTP Native
+# bodies, which carry no compression frames.
+ch-core-rs = { path = "../..", default-features = false }

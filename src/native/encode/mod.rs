@@ -106,6 +106,13 @@ pub enum EncodeError {
     /// The batch is internally inconsistent: the column count does not match the
     /// schema field count, or a column's length does not match `num_rows`.
     InconsistentBatch { detail: String },
+    /// The encoded block would not fit in memory. Zero-width columns
+    /// (`Nothing`, `Tuple()`) and bit-packed ones (`Bool`, null maps, `QBit`)
+    /// write more bytes than their buffers hold, so a large row count can ask
+    /// for more output than the address space allows, notably on 32-bit
+    /// targets such as wasm32. Carries the extra byte count requested, or
+    /// `usize::MAX` when even that overflowed.
+    OutputTooLarge { additional: usize },
 }
 
 impl std::fmt::Display for EncodeError {
@@ -123,6 +130,9 @@ impl std::fmt::Display for EncodeError {
             }
             EncodeError::InconsistentBatch { detail } => {
                 write!(f, "inconsistent batch: {detail}")
+            }
+            EncodeError::OutputTooLarge { additional } => {
+                write!(f, "cannot allocate {additional} more bytes of Native output")
             }
         }
     }
@@ -854,7 +864,7 @@ fn encode_column_values(
         return Err(column_error(field, ch_type));
     }
     let value_type = if let ChType::Nullable(inner) = ch_type {
-        encode_null_map(buf, column);
+        encode_null_map(buf, column)?;
         inner.as_ref()
     } else {
         ch_type
@@ -1120,6 +1130,7 @@ fn encode_tuple_data(
     options: &EncodeOptions,
 ) -> Result<(), EncodeError> {
     if elements.is_empty() {
+        reserve_output(buf, col.len)?;
         buf.resize(buf.len() + col.len, b'0');
         return Ok(());
     }
@@ -1270,9 +1281,9 @@ fn encode_array_data(
 /// time (the same shape as [`encode_bool_data`] and the inverse of
 /// [`crate::bitmap::Bitmap::from_ch_null_map`]), so the per-row `index / 8` and
 /// `index % 8` recompute is amortized to one shift per bit.
-fn encode_null_map(buf: &mut Vec<u8>, column: &Column) {
+fn encode_null_map(buf: &mut Vec<u8>, column: &Column) -> Result<(), EncodeError> {
     let num_rows = column.len();
-    buf.reserve(num_rows);
+    reserve_output(buf, num_rows)?;
     match column.validity() {
         None => buf.resize(buf.len() + num_rows, 0x00),
         Some(validity) => {
@@ -1293,6 +1304,17 @@ fn encode_null_map(buf: &mut Vec<u8>, column: &Column) {
             }
         }
     }
+    Ok(())
+}
+
+/// Reserve `additional` more output bytes, or fail with
+/// [`EncodeError::OutputTooLarge`]. Used where the byte count comes from a row
+/// count rather than from an existing buffer. `try_reserve` rejects a
+/// `buf.len() + additional` that overflows, so after it succeeds that sum is
+/// in range and a following `resize` cannot wrap.
+fn reserve_output(buf: &mut Vec<u8>, additional: usize) -> Result<(), EncodeError> {
+    buf.try_reserve(additional)
+        .map_err(|_| EncodeError::OutputTooLarge { additional })
 }
 
 /// Encode one column's value body (no header, no null map) into `buf`.
@@ -1318,9 +1340,10 @@ fn encode_column_body(
         // ASCII '0' placeholder byte per row. The decoder accepts arbitrary
         // placeholder values, but encode uses the server's canonical byte.
         (ChType::Nothing, Column::Nothing(c)) => {
+            reserve_output(buf, c.len)?;
             buf.resize(buf.len() + c.len, b'0');
         }
-        (ChType::Bool, Column::Bool(c)) => encode_bool_data(buf, c),
+        (ChType::Bool, Column::Bool(c)) => encode_bool_data(buf, c)?,
         (ChType::Int8, Column::Int8(c)) => encode_primitive!(buf, &c.values, i8),
         (ChType::Int16, Column::Int16(c)) => encode_primitive!(buf, &c.values, i16),
         (ChType::Int32, Column::Int32(c)) => encode_primitive!(buf, &c.values, i32),
@@ -1336,7 +1359,7 @@ fn encode_column_body(
         // so write the contiguous array buffer without conversion.
         (ChType::BFloat16, Column::BFloat16(c)) => encode_bfloat16_data(buf, c),
         (ChType::QBit { element_type, .. }, Column::QBit(c)) => {
-            encode_qbit_data(buf, c, *element_type)
+            encode_qbit_data(buf, c, *element_type)?
         }
         // Temporal types are plain little-endian primitives at their native width;
         // timezone and precision live only in the type string (rendered by
@@ -1427,8 +1450,8 @@ fn encode_column_body(
 /// the per-row `index / 8` and `index % 8` recompute is amortized to one shift per
 /// bit. [`validate_column`] checks `col.bitmap.len() >= col.len.div_ceil(8)` before
 /// any bytes are written, so every index read here is in range.
-fn encode_bool_data(buf: &mut Vec<u8>, col: &BoolColumn) {
-    buf.reserve(col.len);
+fn encode_bool_data(buf: &mut Vec<u8>, col: &BoolColumn) -> Result<(), EncodeError> {
+    reserve_output(buf, col.len)?;
     let full_bytes = col.len / 8;
     for &byte in &col.bitmap[..full_bytes] {
         for bit in 0..8 {
@@ -1442,6 +1465,7 @@ fn encode_bool_data(buf: &mut Vec<u8>, col: &BoolColumn) {
             buf.push((byte >> bit) & 1);
         }
     }
+    Ok(())
 }
 
 /// Encode a `String` column body: one varint length prefix then the raw value
@@ -1503,15 +1527,29 @@ fn encode_qbit_words<T, W, F>(
     num_rows: usize,
     dimension: usize,
     to_word: F,
-) where
+) -> Result<(), EncodeError>
+where
     W: QBitWord,
     F: Fn(&T) -> W,
 {
     let bit_width = W::BYTES * 8;
     let bytes_per_plane_row = dimension / 8 + usize::from(dimension % 8 != 0);
-    let plane_stride = num_rows * bytes_per_plane_row;
+    // Planes round each row up to whole bytes, so the output can be up to
+    // eight times the input. Check the size instead of trusting it.
+    let plane_stride =
+        num_rows
+            .checked_mul(bytes_per_plane_row)
+            .ok_or(EncodeError::OutputTooLarge {
+                additional: usize::MAX,
+            })?;
+    let total = plane_stride
+        .checked_mul(bit_width)
+        .ok_or(EncodeError::OutputTooLarge {
+            additional: usize::MAX,
+        })?;
+    reserve_output(buf, total)?;
     let start = buf.len();
-    buf.resize(start + plane_stride * bit_width, 0);
+    buf.resize(start + total, 0);
     let out = &mut buf[start..];
 
     for row in 0..num_rows {
@@ -1540,9 +1578,14 @@ fn encode_qbit_words<T, W, F>(
             }
         }
     }
+    Ok(())
 }
 
-fn encode_qbit_data(buf: &mut Vec<u8>, col: &QBitColumn, element_type: QBitElementType) {
+fn encode_qbit_data(
+    buf: &mut Vec<u8>,
+    col: &QBitColumn,
+    element_type: QBitElementType,
+) -> Result<(), EncodeError> {
     let num_rows = col.len();
     match (element_type, col.values.as_ref()) {
         (QBitElementType::BFloat16, Column::BFloat16(values)) => {

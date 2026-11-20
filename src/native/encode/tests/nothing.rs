@@ -196,3 +196,29 @@ fn low_cardinality_nothing_is_not_encodable() {
         Err(EncodeError::UnsupportedType { .. })
     ));
 }
+
+/// Zero-width rows cost no input memory, so the row count alone sizes the
+/// output. An impossible size must be an error. Before the checked reserve,
+/// `buf.len() + rows` wrapped on 32-bit targets and truncated the block.
+#[test]
+fn encode_zero_width_rows_past_the_address_space_is_an_error() {
+    let rows = usize::MAX;
+    for (ch_type, column) in [
+        (ChType::Nothing, Column::Nothing(NothingColumn::new(rows))),
+        (
+            ChType::Tuple(Vec::new()),
+            Column::Tuple(TupleColumn::new(Vec::new(), rows)),
+        ),
+    ] {
+        let batch = ColBatch {
+            schema: Schema::new(vec![Field {
+                name: "z".into(),
+                ch_type,
+            }]),
+            columns: vec![column],
+            num_rows: rows,
+        };
+        let err = encode_block(&batch, &EncodeOptions::default()).unwrap_err();
+        assert_eq!(err, EncodeError::OutputTooLarge { additional: rows });
+    }
+}

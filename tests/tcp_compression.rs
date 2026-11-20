@@ -17,7 +17,9 @@ const HTTP_LZ4: &[u8] = include_bytes!("fixtures/http_multi_rev54460_lz4.native"
 const TCP_PLAIN: &[u8] = include_bytes!("fixtures/tcp_multi_rev54460.packets");
 const TCP_LZ4: &[u8] = include_bytes!("fixtures/tcp_multi_rev54460_lz4.packets");
 const TCP_LARGE: &[u8] = include_bytes!("fixtures/tcp_large_rev54460_lz4.packets");
+#[cfg(feature = "zstd")]
 const TCP_ZSTD: &[u8] = include_bytes!("fixtures/tcp_multi_rev54460_zstd.packets");
+#[cfg(feature = "zstd")]
 const TCP_LARGE_ZSTD: &[u8] = include_bytes!("fixtures/tcp_large_rev54460_zstd.packets");
 
 fn options() -> DecodeOptions {
@@ -148,6 +150,7 @@ fn tcp_compressed_and_plain_packets_decode_identically() {
     assert_small_values(&plain);
 }
 
+#[cfg(feature = "zstd")]
 #[test]
 fn tcp_zstd_and_plain_packets_decode_identically() {
     let (plain, _) = packets(TCP_PLAIN, false);
@@ -157,6 +160,7 @@ fn tcp_zstd_and_plain_packets_decode_identically() {
     assert_small_values(&compressed);
 }
 
+#[cfg(feature = "zstd")]
 #[test]
 fn tcp_large_zstd_block_matches_lz4_across_frames() {
     let (expected, expected_frames) = packets(TCP_LARGE, true);
@@ -166,6 +170,7 @@ fn tcp_large_zstd_block_matches_lz4_across_frames() {
     assert_eq!(frames[1], [1_048_576, 51_465]);
 }
 
+#[cfg(feature = "zstd")]
 #[test]
 fn real_zstd_frame_retries_truncation_and_preserves_packet_suffix() {
     // Each packet begins with the raw Data code and empty block name.

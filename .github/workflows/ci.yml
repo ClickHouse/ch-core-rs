@@ -48,3 +48,47 @@ jobs:
 
       - name: Check against MSRV
         run: cargo +1.81 check --workspace --all-targets --locked
+
+      - name: Check the wasm crate for wasm32 against MSRV
+        run: |
+          rustup target add wasm32-unknown-unknown --toolchain 1.81
+          cargo +1.81 check -p ch-core-wasm --target wasm32-unknown-unknown --locked
+
+  wasm:
+    name: wasm32 build + JS tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install pinned Rust toolchain and the wasm32 target
+        run: |
+          rustup show
+          rustup target add wasm32-unknown-unknown
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Core without the zstd feature (clippy + test)
+        run: |
+          cargo clippy -p ch-core-rs --no-default-features --all-targets -- -D warnings
+          cargo test -p ch-core-rs --no-default-features
+
+      - name: Clippy for wasm32 (deny warnings)
+        run: cargo clippy -p ch-core-wasm --target wasm32-unknown-unknown -- -D warnings
+
+      - name: Build the .wasm
+        run: crates/ch-core-wasm/scripts/build.sh
+
+      - name: Size budget (1 MiB uncompressed)
+        run: |
+          size=$(stat -c %s crates/ch-core-wasm/dist/ch_core_wasm.wasm)
+          echo "ch_core_wasm.wasm: $size bytes"
+          test "$size" -le 1048576
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: JS glue tests
+        working-directory: crates/ch-core-wasm
+        run: npm test

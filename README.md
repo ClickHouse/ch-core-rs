@@ -118,7 +118,8 @@ Implemented:
 - Decode ClickHouse compression frames with LZ4, ZSTD, or NONE and verify
   CityHash128 1.0.2 checksums. Encode LZ4 frames for inserts. LZ4 is
   hand-written; CityHash128 uses `cityhash-rs` and ZSTD uses the `zstd` crate,
-  which builds libzstd from C source, so a C compiler is needed to build.
+  which builds libzstd from C source, so a C compiler is needed to build. ZSTD
+  is the default `zstd` feature; turn it off for a pure-Rust build.
 
 Not implemented yet:
 
@@ -224,7 +225,9 @@ The root package remains `ch-core-rs`. The workspace also contains
 Its current scope is the revision-54460 handshake, Ping/Pong, SELECT and INSERT
 with optional compression, Native byte output
 and query metadata events.
-The engine depends on core.
+The engine depends on core. [`ch-core-wasm`](crates/ch-core-wasm/README.md)
+compiles core to WebAssembly behind a small C ABI, with JS glue for Node.js and
+browsers.
 
 - `src/schema.rs` - ClickHouse logical type model.
 - `src/column.rs` - Arrow-compatible physical column buffers.

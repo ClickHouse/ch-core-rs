@@ -1,6 +1,6 @@
 [workspace]
-members = ["crates/ch-tcp-proto"]
-default-members = [".", "crates/ch-tcp-proto"]
+members = ["crates/ch-tcp-proto", "crates/ch-core-wasm"]
+default-members = [".", "crates/ch-tcp-proto", "crates/ch-core-wasm"]
 resolver = "2"
 # Agent worktrees under .claude/worktrees are full checkouts with their own
 # root manifest. Exclude them so Cargo does not treat them as members.
@@ -26,8 +26,14 @@ publish = false
 cityhash-rs = "1.0.1"
 # Builds libzstd from source, so a C compiler is needed at build time. Its cc
 # build dependency pulls in jobserver. jobserver 0.1.35 requires Rust 1.85, so
-# Cargo.lock holds 0.1.34 and the MSRV CI job checks with --locked.
-zstd = { version = "0.14", default-features = false }
+# Cargo.lock holds 0.1.34 and the MSRV CI job checks with --locked. Optional
+# behind the default `zstd` feature so a pure-Rust build, such as the wasm32
+# one, can leave out the C code. Without it, ZSTD frames are rejected as
+# `CompressionError::UnsupportedCodec`.
+zstd = { version = "0.14", default-features = false, optional = true }
+
+[features]
+default = ["zstd"]
 
 # Test and bench only, never linked into the library. liblz4 (through the
 # safe `lz4` wrapper over `lz4-sys`) is the reference implementation for the
@@ -42,3 +48,12 @@ harness = false
 [[bench]]
 name = "block_scanner"
 harness = false
+
+# Release profile for the .wasm (`--profile wasm-release`), kept separate so
+# it does not change the release and bench builds of the other crates.
+[profile.wasm-release]
+inherits = "release"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"

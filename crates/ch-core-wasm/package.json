@@ -1,0 +1,24 @@
+{
+  "name": "ch-core-wasm",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ch-core-rs (ClickHouse FORMAT Native codec) compiled to WebAssembly, with JS glue over its C ABI",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./js/index.d.ts",
+      "node": "./js/node.mjs",
+      "default": "./js/web.mjs"
+    }
+  },
+  "types": "./js/index.d.ts",
+  "files": ["js", "dist", "ABI.md"],
+  "scripts": {
+    "build": "./scripts/build.sh",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

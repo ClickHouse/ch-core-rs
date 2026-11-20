@@ -55,11 +55,19 @@ These are the reasons the crate exists. Do not erode them.
 ### Workspace
 
 The repo is a Cargo workspace. The root package is `ch-core-rs`. A second
-crate, `crates/ch-tcp-proto`, is the sans-I/O TCP protocol engine. Its only
-runtime dependency is `ch-core-rs` by path. Core's invariants apply to it as
-well: no panics on untrusted input, the same MSRV (`rust-version = "1.81"`),
-and the dependency policy below. Run checks with
-`--workspace` so both crates are covered.
+crate, `crates/ch-tcp-proto`, is the sans-I/O TCP protocol engine. A third,
+`crates/ch-core-wasm`, compiles core to WebAssembly behind a small C ABI with
+hand-written JS glue. Both depend only on `ch-core-rs` by path. Core's
+invariants apply to them as well: no panics on untrusted input, the same MSRV
+(`rust-version = "1.81"`), and the dependency policy below. Run checks with
+`--workspace` so every crate is covered.
+
+`ch-core-wasm` is not a language binding in the sense above. It exposes core's
+columnar buffers through a C ABI, which is a public contract documented in
+`crates/ch-core-wasm/ABI.md`. Keep it columnar: no row building and no client
+methods, which belong in clickhouse-js. Results are copied out of linear
+memory, never handed to JS as views. Bump `ABI_VERSION` for any breaking ABI
+change. It builds core without the C `zstd` feature.
 
 ### Dependencies
 
