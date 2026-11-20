@@ -7,6 +7,8 @@ version; patch releases remain backward compatible.
 
 ## Unreleased
 
+## v0.3.0
+
 - `decode_binary_value` and `encode_binary_value` handle an `Array` or `Map`
   run of zero-width `Tuple()` values in constant time per tuple node instead of
   once per element. Before, a small nested value such as
@@ -162,7 +164,8 @@ version; patch releases remain backward compatible.
   `TrailingBytes`, `NoColumns`) and leave state and output unchanged;
   `InsertOutputAllocationFailed` reports a failed output reservation.
   `NativeBlockTooLarge` now means only an inbound block and is always fatal.
-  Every Exception in an `insert` exchange is terminal. TableColumns fields
+  An Exception after `InsertSchema` is terminal. See the Changed entry above
+  for an Exception before it. TableColumns fields
   share one `max_block_bytes` retention budget, and a declared field length
   above 64 times `max_block_bytes` fails as corruption with `StringTooLong`.
   Replay fixtures are captured from ClickHouse 26.8.
@@ -170,6 +173,14 @@ version; patch releases remain backward compatible.
   discards queued output not yet returned by `take_output` in every state,
   including the handshake. Take output before feeding if it must be written
   regardless.
+- LowCardinality index validation in `BlockScanner` and `insert_data` uses a
+  separate inlined loop per index width, so it runs several times faster.
+  Accepted input, errors and error order are unchanged.
+- Add `ch-tcp-proto`, a sans-I/O ClickHouse TCP engine in a new
+  `crates/ch-tcp-proto` workspace member. It runs the revision-54460
+  handshake and Ping/Pong and reports server Exceptions as events. Drivers
+  feed it bytes and send the bytes it returns. Sockets and TLS stay in the
+  driver.
 
 ## v0.2.1
 
