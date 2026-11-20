@@ -225,7 +225,9 @@ The root package remains `ch-core-rs`. The workspace also contains
 Its current scope is the revision-54460 handshake, Ping/Pong, SELECT and INSERT
 with optional compression, Native byte output
 and query metadata events.
-The engine depends on core.
+The engine depends on core. [`ch-core-wasm`](crates/ch-core-wasm/README.md)
+compiles core to WebAssembly behind a small C ABI, with JS glue for Node.js and
+browsers.
 
 - `src/schema.rs` - ClickHouse logical type model.
 - `src/column.rs` - Arrow-compatible physical column buffers.

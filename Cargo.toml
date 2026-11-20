@@ -1,6 +1,6 @@
 [workspace]
-members = ["crates/ch-tcp-proto"]
-default-members = [".", "crates/ch-tcp-proto"]
+members = ["crates/ch-tcp-proto", "crates/ch-core-wasm"]
+default-members = [".", "crates/ch-tcp-proto", "crates/ch-core-wasm"]
 resolver = "2"
 # Agent worktrees under .claude/worktrees are full checkouts with their own
 # root manifest. Exclude them so Cargo does not treat them as members.
@@ -48,3 +48,12 @@ harness = false
 [[bench]]
 name = "block_scanner"
 harness = false
+
+# Release profile for the .wasm (`--profile wasm-release`), kept separate so
+# it does not change the release and bench builds of the other crates.
+[profile.wasm-release]
+inherits = "release"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"

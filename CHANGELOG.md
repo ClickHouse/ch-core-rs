@@ -7,6 +7,12 @@ version; patch releases remain backward compatible.
 
 ## Unreleased
 
+- New workspace crate `ch-core-wasm`: core compiled to WebAssembly behind a
+  small, versioned C ABI (`crates/ch-core-wasm/ABI.md`), with hand-written JS
+  glue for Node.js and browsers. It decodes Native bodies into column buffers,
+  streams decode, and encodes column buffers back to Native. Results are
+  copied out of wasm memory, never returned as views. It has no dependencies
+  beyond core and is not published yet.
 - ZSTD frame support is now the default `zstd` cargo feature. With
   `default-features = false` the crate is pure Rust, which the wasm32 build
   needs, and ZSTD frames return `CompressionError::UnsupportedCodec`. Default

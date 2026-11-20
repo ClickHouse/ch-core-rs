@@ -30,6 +30,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ch-core-wasm"
+version = "0.1.0"
+dependencies = [
+ "ch-core-rs",
+]
+
+[[package]]
 name = "ch-tcp-proto"
 version = "0.1.0"
 dependencies = [
