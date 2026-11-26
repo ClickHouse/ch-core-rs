@@ -168,8 +168,16 @@ impl HttpBackend {
                 .and_then(|tag| split_exception(&plain, tag))
                 .unwrap_or_else(|| split_error_body(&plain, self.revision, binary_types));
             let error = server_failure(&message, exception_code.as_deref(), status);
-            let blocks = decode(&plain[..data_len], &frames, self.revision, binary_types)
-                .unwrap_or_default();
+            // The exception is the error to report: keep the blocks decoded
+            // before a decode error.
+            let mut blocks = Vec::new();
+            let _ = decode(
+                &plain[..data_len],
+                &frames,
+                self.revision,
+                binary_types,
+                &mut blocks,
+            );
             return Ok(Outcome {
                 blocks,
                 timezone,
@@ -191,13 +199,15 @@ impl HttpBackend {
             ),
             None => (&plain[..], None),
         };
-        let blocks = match decode(data, &frames, self.revision, binary_types) {
-            Ok(blocks) => blocks,
+        let mut blocks = Vec::new();
+        if let Err(e) = decode(data, &frames, self.revision, binary_types, &mut blocks) {
             // With an exception, the server can stop in the middle of a
-            // block; the exception is the error to report.
-            Err(_) if error.is_some() => Vec::new(),
-            Err(e) => return Err(Failure::Other(e)),
-        };
+            // block: keep the blocks before it, as over tcp. The exception is
+            // the error to report.
+            if error.is_none() {
+                return Err(Failure::Other(e));
+            }
+        }
         Ok(Outcome {
             blocks,
             timezone,
@@ -283,8 +293,9 @@ fn starts_with_exception(bytes: &[u8]) -> bool {
     server_error_code(&head).is_some()
 }
 
-/// Decodes the Native stream. It feeds the decoder one frame of plaintext at
-/// a time, so that blocks that cross frames go through the streaming path.
+/// Decodes the Native stream into `blocks`. It feeds the decoder one frame of
+/// plaintext at a time, so that blocks that cross frames go through the
+/// streaming path. On an error, `blocks` keeps the blocks decoded before it.
 /// `binary_types`: the server writes the column types in the binary encoding
 /// (`output_format_native_encode_types_in_binary_format`), which needs the
 /// decoder of that mode (`INTEGRATING.md`).
@@ -293,7 +304,8 @@ fn decode(
     frames: &[usize],
     revision: u64,
     binary_types: bool,
-) -> Result<Vec<ColBatch>, String> {
+    blocks: &mut Vec<ColBatch>,
+) -> Result<(), String> {
     let mut options = DecodeOptions::default();
     options.protocol_revision = revision;
     let mut decoder = if binary_types {
@@ -301,7 +313,6 @@ fn decode(
     } else {
         StreamDecoder::new(options)
     };
-    let mut blocks = Vec::new();
     let mut rest = data;
     for &len in frames {
         if rest.is_empty() {
@@ -327,12 +338,13 @@ fn decode(
             .finish()
             .map_err(|e| format!("ch-core-rs: decode the Native result: {e}"))?,
     );
-    Ok(blocks)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ch_core_rs::column::Column;
 
     #[test]
     fn exception_block() {
@@ -392,12 +404,9 @@ mod tests {
             split_error_body(&body, 0, false),
             (2 * block.len(), message.to_vec())
         );
-        assert_eq!(
-            decode(&body[..2 * block.len()], &[], 0, false)
-                .unwrap()
-                .len(),
-            2
-        );
+        let mut blocks = Vec::new();
+        decode(&body[..2 * block.len()], &[], 0, false, &mut blocks).unwrap();
+        assert_eq!(blocks.len(), 2);
         // Only the text.
         assert_eq!(split_error_body(message, 0, false), (0, message.to_vec()));
         // Not blocks and not an exception: all of it is the text.
@@ -409,11 +418,33 @@ mod tests {
 
     #[test]
     fn empty_body_is_no_blocks() {
-        assert!(
-            decode(&[], &[], PROTOCOL_REVISION, false)
-                .unwrap()
-                .is_empty()
-        );
+        let mut blocks = Vec::new();
+        decode(&[], &[], PROTOCOL_REVISION, false, &mut blocks).unwrap();
+        assert!(blocks.is_empty());
         assert_eq!(decompress_all(&[]).unwrap(), (Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn truncated_block_keeps_the_blocks_before_it() {
+        // Native blocks at revision 0: 1 column, 1 row, `x UInt8` = 7, 13, 79.
+        let block = |value: u8| [b"\x01\x01\x01x\x05UInt8".as_slice(), &[value]].concat();
+        let data = [block(7), block(13), block(79)].concat();
+        // The last block without its value byte, in one piece, and one
+        // frame per block.
+        let cut = &data[..data.len() - 1];
+        let len = block(7).len();
+        for frames in [Vec::new(), vec![len, len, len - 1]] {
+            let mut blocks = Vec::new();
+            let error = decode(cut, &frames, 0, false, &mut blocks).unwrap_err();
+            assert!(error.contains("truncated"), "{error}");
+            let values: Vec<u8> = blocks
+                .iter()
+                .flat_map(|b| match &b.columns[0] {
+                    Column::UInt8(c) => c.values.clone(),
+                    c => panic!("{c:?}"),
+                })
+                .collect();
+            assert_eq!(values, [7, 13], "frames {frames:?}");
+        }
     }
 }
