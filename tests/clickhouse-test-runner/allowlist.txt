@@ -11,9 +11,9 @@
 # The known failures are at the end of this file, one section per group.
 # KNOWN_FAILURES=<id> selects the tests of a group (see README.md).
 #
-# Running: http 10303, tcp 10420 (10257 over both protocols,
+# Running: http 10302, tcp 10419 (10256 over both protocols,
 # 163 only=tcp, 0 only=http, 0 known=http, 46 known=tcp).
-# Known failures: 410 tests in 17 groups (6 decoder, 5 engine,
+# Known failures: 411 tests in 17 groups (6 decoder, 5 engine,
 # 6 shim).
 
 00001_select_1
@@ -4270,7 +4270,6 @@
 03040_dynamic_type_alters_1_compact_merge_tree
 03040_dynamic_type_alters_1_memory
 03040_dynamic_type_alters_1_wide_merge_tree
-03040_dynamic_type_alters_2_compact_merge_tree
 03040_dynamic_type_alters_2_wide_merge_tree
 03040_recursive_cte_postgres_6
 03041_analyzer_gigachad_join
@@ -10567,10 +10566,14 @@
 #     SELECT [1::Dynamic, 'a'::Dynamic]::Dynamic(max_types=0) AS d, then
 #     read_binary_type_prefix + decode_binary_value of the shared cell
 #     -- unsupported binary value type: Dynamic; expected ['1','a']
+#   03040_dynamic_type_alters_2_compact_merge_tree fails only in some runs
+#   (3 of 260 at -j 8), when the server puts its Array(Dynamic) value into
+#   the shared variant.
 #   Protocols: http, tcp
 #   Issue: not filed yet
-#   Tests: http 2, tcp 2
+#   Tests: http 3, tcp 3
 # 03036_dynamic_read_shared_subcolumns_small  # [decoder-binary-value-nested-dynamic]
+# 03040_dynamic_type_alters_2_compact_merge_tree  # [decoder-binary-value-nested-dynamic]
 # 03382_dynamic_serialization_default_settings  # [decoder-binary-value-nested-dynamic]
 
 #-----------------------------------------------------------------------------

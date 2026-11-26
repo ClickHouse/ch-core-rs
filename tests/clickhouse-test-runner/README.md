@@ -412,8 +412,8 @@ not listed; see [`AGENTS.md`](AGENTS.md#environment-causes). The program does
 not try `.sh` tests.
 
 At the pinned version 26.10.4.207, of the 12,961 `.sql` and `.sql.j2` tests,
-10,303 run over `http` and 10,420 over `tcp` (10,257 over both protocols, 163
-over `tcp` only, 46 over `http` only). 410 tests are known failures in 17 groups: 6 groups of the
+10,302 run over `http` and 10,419 over `tcp` (10,256 over both protocols, 163
+over `tcp` only, 46 over `http` only). 411 tests are known failures in 17 groups: 6 groups of the
 decoder, 5 of the TCP engine and 6 of the program. The other tests cannot
 pass for an environment cause, are long tests (the sweep of "Grow the
 allowlist" gives `--no-long`), the runner skips them on this server (tests
