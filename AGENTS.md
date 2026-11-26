@@ -346,3 +346,7 @@ and so on) stays in the bindings, never here.
 - Do not use names like `alice` or `bob` as generic placeholders.
 - Prefer values like `13`, `79`, `user_1`, and `user_2`, or similarly neutral
   domain-appropriate values.
+
+## Upstream SQL Test Harness
+
+- For work in `tests/clickhouse-test-runner/`, read `tests/clickhouse-test-runner/AGENTS.md`.
